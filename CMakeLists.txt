@@ -82,20 +82,26 @@ target_sources(libxcp PRIVATE
         src/xcp_error.cpp
         src/command_codec.cpp
         src/response_parser.cpp
-        src/session.cpp)
-
-# 阶段 3 起启用（UDP Transport 实现）：
-#   src/udp_header_codec.cpp
-#   src/udp_transport.cpp
+        src/session.cpp
+        src/udp_header_codec.cpp
+        src/udp_transport.cpp
+        src/command_executor.cpp
+        src/memory_access.cpp
+        src/xcp_master.cpp)
 
 target_include_directories(libxcp
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
-# 协议核心仅依赖线程库（Session/Executor 内部同步），不依赖任何 Socket API
+# 协议核心仅依赖线程库（Session/Executor 内部同步）；
+# UdpTransport 使用平台 Socket，Windows 需显式链接 ws2_32。
 find_package(Threads REQUIRED)
 target_link_libraries(libxcp PUBLIC Threads::Threads)
+
+if(WIN32)
+  target_link_libraries(libxcp PUBLIC ws2_32)
+endif()
 
 set_target_properties(libxcp PROPERTIES
         OUTPUT_NAME xcp

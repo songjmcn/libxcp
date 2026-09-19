@@ -20,24 +20,22 @@ constexpr ElementCount kMaxElementsPerField = 0xFFU;
 }  // namespace
 
 CommandCodec::CommandCodec(ByteOrder byte_order) noexcept
-    : byte_order_(byte_order) {}
+    : m_byte_order_(byte_order) {}
 
-ByteOrder CommandCodec::byteOrder() const noexcept { return byte_order_; }
+ByteOrder CommandCodec::GetByteOrder() const noexcept { return m_byte_order_; }
 
-void CommandCodec::writeU16(Bytes& buf, std::uint16_t val) const {
-    if (byte_order_ == ByteOrder::Intel) {
-        // 小端：低字节在前
+void CommandCodec::WriteU16(Bytes& buf, std::uint16_t val) const {
+    if (m_byte_order_ == ByteOrder::Intel) {
         buf.push_back(static_cast<std::uint8_t>(val & 0xFFU));
         buf.push_back(static_cast<std::uint8_t>((val >> 8) & 0xFFU));
     } else {
-        // 大端：高字节在前
         buf.push_back(static_cast<std::uint8_t>((val >> 8) & 0xFFU));
         buf.push_back(static_cast<std::uint8_t>(val & 0xFFU));
     }
 }
 
-void CommandCodec::writeU32(Bytes& buf, std::uint32_t val) const {
-    if (byte_order_ == ByteOrder::Intel) {
+void CommandCodec::WriteU32(Bytes& buf, std::uint32_t val) const {
+    if (m_byte_order_ == ByteOrder::Intel) {
         buf.push_back(static_cast<std::uint8_t>(val & 0xFFU));
         buf.push_back(static_cast<std::uint8_t>((val >> 8) & 0xFFU));
         buf.push_back(static_cast<std::uint8_t>((val >> 16) & 0xFFU));
@@ -50,7 +48,7 @@ void CommandCodec::writeU32(Bytes& buf, std::uint32_t val) const {
     }
 }
 
-Bytes CommandCodec::encodeConnect(std::uint8_t mode) const {
+Bytes CommandCodec::EncodeConnect(std::uint8_t mode) const {
     // CONNECT: [FF][mode]，mode 0x00=普通 / 0x01=用户自定义
     Bytes cto;
     cto.reserve(2);
@@ -59,7 +57,7 @@ Bytes CommandCodec::encodeConnect(std::uint8_t mode) const {
     return cto;
 }
 
-Bytes CommandCodec::encodeDisconnect() const {
+Bytes CommandCodec::EncodeDisconnect() const {
     Bytes cto;
     cto.reserve(2);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::Disconnect));
@@ -67,7 +65,7 @@ Bytes CommandCodec::encodeDisconnect() const {
     return cto;
 }
 
-Bytes CommandCodec::encodeGetStatus() const {
+Bytes CommandCodec::EncodeGetStatus() const {
     Bytes cto;
     cto.reserve(2);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::GetStatus));
@@ -75,7 +73,7 @@ Bytes CommandCodec::encodeGetStatus() const {
     return cto;
 }
 
-Bytes CommandCodec::encodeSynch() const {
+Bytes CommandCodec::EncodeSynch() const {
     Bytes cto;
     cto.reserve(2);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::Synch));
@@ -83,7 +81,7 @@ Bytes CommandCodec::encodeSynch() const {
     return cto;
 }
 
-Bytes CommandCodec::encodeGetCommModeInfo() const {
+Bytes CommandCodec::EncodeGetCommModeInfo() const {
     Bytes cto;
     cto.reserve(2);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::GetCommModeInfo));
@@ -91,21 +89,20 @@ Bytes CommandCodec::encodeGetCommModeInfo() const {
     return cto;
 }
 
-Bytes CommandCodec::encodeSetMta(AddressExtension extension,
+Bytes CommandCodec::EncodeSetMta(AddressExtension extension,
                                  Address address) const {
-    // SET_MTA: [F6][reserved=0x00][EXT][ADD 4 字节按 Session Byte Order]
     Bytes cto;
     cto.reserve(7);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::SetMta));
     cto.push_back(0x00U);  // reserved
     cto.push_back(extension);
-    writeU32(cto, address);
+    WriteU32(cto, address);
     return cto;
 }
 
-Bytes CommandCodec::encodeUpload(ElementCount number_of_elements) const {
+Bytes CommandCodec::EncodeUpload(ElementCount number_of_elements) const {
     if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
-        throw detail::makeInvalidArgument(
+        throw detail::MakeInvalidArgument(
             "UPLOAD NumberOfElements 超出单字节字段范围 1..255: " +
             std::to_string(number_of_elements));
     }
@@ -117,23 +114,21 @@ Bytes CommandCodec::encodeUpload(ElementCount number_of_elements) const {
     return cto;
 }
 
-Bytes CommandCodec::encodeShortUpload(ElementCount number_of_elements,
+Bytes CommandCodec::EncodeShortUpload(ElementCount number_of_elements,
                                       AddressExtension extension,
                                       Address address) const {
     if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
-        throw detail::makeInvalidArgument(
+        throw detail::MakeInvalidArgument(
             "SHORT_UPLOAD NumberOfElements 超出单字节字段范围 1..255: " +
             std::to_string(number_of_elements));
     }
-    // SHORT_UPLOAD: [F4][n][reserved=0x00][EXT][ADD 4 字节按 Session Byte
-    // Order]
     Bytes cto;
     cto.reserve(8);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::ShortUpload));
     cto.push_back(static_cast<std::uint8_t>(number_of_elements));
     cto.push_back(0x00U);  // reserved
     cto.push_back(extension);
-    writeU32(cto, address);
+    WriteU32(cto, address);
     return cto;
 }
 

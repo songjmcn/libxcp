@@ -19,37 +19,37 @@ TEST(XcpException, KeepsStructuredFields) {
                           CommandCode::Upload, ErrorCode::AccessLocked, 2,
                           "socket closed");
 
-    EXPECT_EQ(ex.category(), ErrorCategory::ProtocolError);
-    EXPECT_EQ(ex.commandCode(),
+    EXPECT_EQ(ex.Category(), ErrorCategory::ProtocolError);
+    EXPECT_EQ(ex.GetCommandCode(),
               std::optional<CommandCode>(CommandCode::Upload));
-    EXPECT_EQ(ex.errorCode(),
+    EXPECT_EQ(ex.GetErrorCode(),
               std::optional<ErrorCode>(ErrorCode::AccessLocked));
-    EXPECT_EQ(ex.retryCount(), 2);
-    EXPECT_EQ(ex.transportError(), "socket closed");
+    EXPECT_EQ(ex.RetryCount(), 2);
+    EXPECT_EQ(ex.TransportError(), "socket closed");
     EXPECT_STREQ(ex.what(), "Slave 拒绝访问");
 }
 
 TEST(XcpException, DefaultsAreEmptyOptionals) {
     const XcpException ex(ErrorCategory::InvalidArgument, "参数非法");
-    EXPECT_FALSE(ex.commandCode().has_value());
-    EXPECT_FALSE(ex.errorCode().has_value());
-    EXPECT_EQ(ex.retryCount(), 0);
-    EXPECT_TRUE(ex.transportError().empty());
+    EXPECT_FALSE(ex.GetCommandCode().has_value());
+    EXPECT_FALSE(ex.GetErrorCode().has_value());
+    EXPECT_EQ(ex.RetryCount(), 0);
+    EXPECT_TRUE(ex.TransportError().empty());
 }
 
 TEST(XcpException, IsCatchableAsRuntimeError) {
     bool caught = false;
     try {
-        throw detail::makeTimeout("等待 UPLOAD 响应超时", CommandCode::Upload,
+        throw detail::MakeTimeout("等待 UPLOAD 响应超时", CommandCode::Upload,
                                   1);
     } catch (const std::runtime_error& e) {
         caught = true;
         const auto* xcp_ex = dynamic_cast<const XcpException*>(&e);
         ASSERT_NE(xcp_ex, nullptr);
-        EXPECT_EQ(xcp_ex->category(), ErrorCategory::Timeout);
-        EXPECT_EQ(xcp_ex->commandCode(),
+        EXPECT_EQ(xcp_ex->Category(), ErrorCategory::Timeout);
+        EXPECT_EQ(xcp_ex->GetCommandCode(),
                   std::optional<CommandCode>(CommandCode::Upload));
-        EXPECT_EQ(xcp_ex->retryCount(), 1);
+        EXPECT_EQ(xcp_ex->RetryCount(), 1);
     }
     EXPECT_TRUE(caught);
 }
@@ -71,33 +71,33 @@ TEST(ErrorCategoryName, CoversAllCategories) {
 }
 
 TEST(DetailFactories, SetCategoryAndPayload) {
-    EXPECT_EQ(detail::makeInvalidArgument("a").category(),
+    EXPECT_EQ(detail::MakeInvalidArgument("a").Category(),
               ErrorCategory::InvalidArgument);
-    EXPECT_EQ(detail::makeInvalidState("b").category(),
+    EXPECT_EQ(detail::MakeInvalidState("b").Category(),
               ErrorCategory::InvalidState);
 
-    const auto transport_err = detail::makeTransportError("c", "WSAEACCES");
-    EXPECT_EQ(transport_err.category(), ErrorCategory::TransportError);
-    EXPECT_EQ(transport_err.transportError(), "WSAEACCES");
+    const auto transport_err = detail::MakeTransportError("c", "WSAEACCES");
+    EXPECT_EQ(transport_err.Category(), ErrorCategory::TransportError);
+    EXPECT_EQ(transport_err.TransportError(), "WSAEACCES");
 
-    const auto malformed = detail::makeMalformedPacket("d");
-    EXPECT_EQ(malformed.category(), ErrorCategory::MalformedPacket);
+    const auto malformed = detail::MakeMalformedPacket("d");
+    EXPECT_EQ(malformed.Category(), ErrorCategory::MalformedPacket);
 
-    const auto protocol_err = detail::makeProtocolError(
+    const auto protocol_err = detail::MakeProtocolError(
         "e", CommandCode::Connect, ErrorCode::CmdBusy);
-    EXPECT_EQ(protocol_err.category(), ErrorCategory::ProtocolError);
-    EXPECT_EQ(protocol_err.commandCode(),
+    EXPECT_EQ(protocol_err.Category(), ErrorCategory::ProtocolError);
+    EXPECT_EQ(protocol_err.GetCommandCode(),
               std::optional<CommandCode>(CommandCode::Connect));
-    EXPECT_EQ(protocol_err.errorCode(),
+    EXPECT_EQ(protocol_err.GetErrorCode(),
               std::optional<ErrorCode>(ErrorCode::CmdBusy));
 
-    EXPECT_EQ(detail::makeUnsupportedFeature("f").category(),
+    EXPECT_EQ(detail::MakeUnsupportedFeature("f").Category(),
               ErrorCategory::UnsupportedFeature);
 
     const auto recovery =
-        detail::makeRecoveryFailed("g", CommandCode::Synch, 3);
-    EXPECT_EQ(recovery.category(), ErrorCategory::RecoveryFailed);
-    EXPECT_EQ(recovery.retryCount(), 3);
+        detail::MakeRecoveryFailed("g", CommandCode::Synch, 3);
+    EXPECT_EQ(recovery.Category(), ErrorCategory::RecoveryFailed);
+    EXPECT_EQ(recovery.RetryCount(), 3);
 }
 
 }  // namespace

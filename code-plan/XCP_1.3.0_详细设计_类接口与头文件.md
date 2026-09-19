@@ -275,10 +275,10 @@ enum class PacketType : std::uint8_t {
 };
 
 /// @brief 从原始首字节判断 Packet 类型
-/// @param firstByte 收到的 XCP Packet 首字节
+/// @param first_byte 收到的 XCP Packet 首字节
 /// @return PacketType 枚举值；若为 DAQ DTO 范围则返回 std::nullopt
 /// @note 返回 nullopt 表示该包是 DAQ DTO，调用方应按 DTO 路径处理
-std::optional<PacketType> classifyPacket(std::uint8_t firstByte);
+std::optional<PacketType> ClassifyPacket(std::uint8_t first_byte);
 
 }  // namespace calmcar::xcp
 ```
@@ -313,7 +313,7 @@ enum class ErrorCode : std::uint8_t {
 };
 
 /// @brief 将错误码转换为字符串名称（用于诊断和日志）
-std::string_view errorCodeName(ErrorCode code);
+std::string_view ErrorCodeName(ErrorCode code);
 
 }  // namespace calmcar::xcp
 ```
@@ -342,7 +342,7 @@ enum class EventCode : std::uint8_t {
 };
 
 /// @brief 将事件码转换为字符串名称
-std::string_view eventCodeName(EventCode code);
+std::string_view EventCodeName(EventCode code);
 
 }  // namespace calmcar::xcp
 ```
@@ -366,10 +366,10 @@ enum class AddressGranularity : std::uint8_t {
 };
 
 /// @brief 将 AG 转为字节数
-constexpr std::uint8_t agToBytes(AddressGranularity ag) noexcept;
+constexpr std::uint8_t AgToBytes(AddressGranularity ag) noexcept;
 
 /// @brief 将字节数转为 AG（仅接受 1/2/4）
-std::optional<AddressGranularity> bytesToAg(std::uint8_t bytes) noexcept;
+std::optional<AddressGranularity> BytesToAg(std::uint8_t bytes) noexcept;
 
 }  // namespace calmcar::xcp
 ```
@@ -392,7 +392,7 @@ enum class Resource : std::uint8_t {
 using ResourceMask = std::underlying_type_t<Resource>;
 
 /// @brief 检查掩码中是否包含指定资源
-constexpr bool hasResource(ResourceMask mask, Resource res) noexcept;
+constexpr bool HasResource(ResourceMask mask, Resource res) noexcept;
 
 }  // namespace calmcar::xcp
 ```
@@ -413,7 +413,7 @@ enum class SessionState {
 };
 
 /// @brief 将 Session 状态转为字符串
-std::string_view sessionStateName(SessionState state);
+std::string_view SessionStateName(SessionState state);
 
 }  // namespace calmcar::xcp
 ```
@@ -425,37 +425,37 @@ namespace calmcar::xcp {
 
 /// @brief CONNECT 响应解析结果（COMM_MODE_BASIC 已拆解）
 struct ConnectResponse {
-    ResourceMask resourceMask;         ///< RESOURCE 字段
-    ByteOrder byteOrder;               ///< COMM_MODE_BASIC 中的字节序
-    AddressGranularity addressGranularity;  ///< COMM_MODE_BASIC 中的 AG
-    bool slaveBlockModeSupported;      ///< COMM_MODE_BASIC 中的 Block Mode 位
-    bool optionalCommModeAvailable;    ///< COMM_MODE_BASIC 中的 Optional 信息可用位
-    std::uint8_t maxCto;               ///< MAX_CTO（0x08..0xFF）
-    std::uint16_t maxDto;              ///< MAX_DTO（0x0008..0xFFFF）
-    std::uint8_t protocolLayerVersion; ///< Protocol Layer 主版本
-    std::uint8_t transportLayerVersion;///< Transport Layer 主版本
+    ResourceMask m_resource_mask_;                    ///< RESOURCE 字段
+    ByteOrder m_byte_order_;                          ///< COMM_MODE_BASIC 中的字节序
+    AddressGranularity m_address_granularity_;        ///< COMM_MODE_BASIC 中的 AG
+    bool m_slave_block_mode_supported_;               ///< COMM_MODE_BASIC 中的 Block Mode 位
+    bool m_optional_comm_mode_available_;             ///< COMM_MODE_BASIC 中的 Optional 信息可用位
+    std::uint8_t m_max_cto_;                          ///< MAX_CTO（0x08..0xFF）
+    std::uint16_t m_max_dto_;                         ///< MAX_DTO（0x0008..0xFFFF）
+    std::uint8_t m_protocol_layer_version_;           ///< Protocol Layer 主版本
+    std::uint8_t m_transport_layer_version_;          ///< Transport Layer 主版本
 };
 
 /// @brief GET_STATUS 响应解析结果
 struct GetStatusResponse {
-    bool resume;           ///< bit7
-    bool daqRunning;       ///< bit6
-    bool clearDaqReq;      ///< bit3
-    bool storeDaqReq;      ///< bit2
-    bool storeCalReq;      ///< bit0
-    ResourceMask resourceProtection;  ///< 当前资源保护状态
-    std::uint8_t stateNumber;         ///< ECU State 编号
-    std::uint16_t sessionConfigId;    ///< Session Configuration ID
+    bool m_resume_;                         ///< bit7
+    bool m_daq_running_;                    ///< bit6
+    bool m_clear_daq_req_;                  ///< bit3
+    bool m_store_daq_req_;                  ///< bit2
+    bool m_store_cal_req_;                  ///< bit0
+    ResourceMask m_resource_protection_;    ///< 当前资源保护状态
+    std::uint8_t m_state_number_;           ///< ECU State 编号
+    std::uint16_t m_session_config_id_;     ///< Session Configuration ID
 };
 
 /// @brief GET_COMM_MODE_INFO 响应解析结果
 struct GetCommModeInfoResponse {
-    std::uint8_t commModeOptional;  ///< Master Block Mode / Interleaved Mode 能力
-    std::uint8_t maxBs;             ///< Block Mode 最大块大小
-    std::uint8_t minSt;             ///< 最小分离时间（单位 100μs）
-    std::uint8_t queueSize;         ///< Interleaved Mode 队列深度
-    std::uint8_t driverVersionMajor;///< Driver Version 高 nibble
-    std::uint8_t driverVersionMinor;///< Driver Version 低 nibble
+    std::uint8_t m_comm_mode_optional_;       ///< Master Block Mode / Interleaved Mode 能力
+    std::uint8_t m_max_bs_;                    ///< Block Mode 最大块大小
+    std::uint8_t m_min_st_;                    ///< 最小分离时间（单位 100μs）
+    std::uint8_t m_queue_size_;                ///< Interleaved Mode 队列深度
+    std::uint8_t m_driver_version_major_;      ///< Driver Version 高 nibble
+    std::uint8_t m_driver_version_minor_;      ///< Driver Version 低 nibble
 };
 
 }  // namespace calmcar::xcp
@@ -468,15 +468,16 @@ namespace calmcar::xcp {
 
 /// @brief XCP 40 位地址（32-bit Address + 8-bit Extension）
 struct XcpAddress40 {
-    Address address;                ///< 32 位地址
-    AddressExtension extension;     ///< 8 位地址扩展
+    Address m_address_;                         ///< 32 位地址
+    AddressExtension m_extension_;              ///< 8 位地址扩展
 
     /// @brief 地址前进指定元素数（按 AG 换算为字节数）
     /// @param elements 前进的元素数
-    /// @param ag 地址粒度
+    /// @param address_granularity 地址粒度
     /// @return 前进后的新地址；溢出时返回 nullopt
-    [[nodiscard]] std::optional<XcpAddress40> advance(ElementCount elements,
-                                                       AddressGranularity ag) const noexcept;
+    [[nodiscard]] std::optional<XcpAddress40> Advance(
+        ElementCount elements,
+        AddressGranularity address_granularity) const noexcept;
 };
 
 /// @brief 比较运算符
@@ -492,10 +493,10 @@ namespace calmcar::xcp {
 
 /// @brief 完整 Session 参数快照（CONNECT + 后续查询的不可变结果）
 struct SessionParameters {
-    ConnectResponse connect;
-    std::optional<GetCommModeInfoResponse> commModeInfo;  ///< 仅在查询成功时存在
-    std::optional<GetStatusResponse> status;              ///< 仅在查询成功时存在
-    bool shortUploadAvailable = true;  ///< SHORT_UPLOAD 是否可用（遇 ERR_CMD_UNKNOWN 后置 false）
+    ConnectResponse m_connect_;                              ///< CONNECT 响应参数
+    std::optional<GetCommModeInfoResponse> m_comm_mode_info_;///< 仅在查询成功时存在
+    std::optional<GetStatusResponse> m_status_;              ///< 仅在查询成功时存在
+    bool m_short_upload_available_ = true;                   ///< SHORT_UPLOAD 是否可用
 };
 
 }  // namespace calmcar::xcp
@@ -533,7 +534,7 @@ enum class ErrorCategory {
 };
 
 /// @brief 将错误分类转为字符串
-std::string_view errorCategoryName(ErrorCategory cat);
+std::string_view ErrorCategoryName(ErrorCategory cat);
 
 }  // namespace calmcar::xcp
 ```
@@ -551,38 +552,38 @@ public:
     /// @brief 构造异常
     /// @param category 错误分类
     /// @param message 人类可读的错误描述
-    /// @param commandCode 相关命令码（可选，用于诊断）
-    /// @param errorCode 协议错误码（仅 ProtocolError 时有效）
-    /// @param retryCount 恢复重试次数（仅恢复场景有效）
-    /// @param transportError 底层 Transport 错误描述（可选）
+    /// @param command_code 相关命令码（可选，用于诊断）
+    /// @param error_code 协议错误码（仅 ProtocolError 时有效）
+    /// @param retry_count 恢复重试次数（仅恢复场景有效）
+    /// @param transport_error 底层 Transport 错误描述（可选）
     XcpException(ErrorCategory category,
                  std::string message,
-                 std::optional<CommandCode> commandCode = std::nullopt,
-                 std::optional<ErrorCode> errorCode = std::nullopt,
-                 int retryCount = 0,
-                 std::string transportError = "");
+                 std::optional<CommandCode> command_code = std::nullopt,
+                 std::optional<ErrorCode> error_code = std::nullopt,
+                 int retry_count = 0,
+                 std::string transport_error = "");
 
     /// @brief 获取错误分类
-    [[nodiscard]] ErrorCategory category() const noexcept;
+    [[nodiscard]] ErrorCategory Category() const noexcept;
 
     /// @brief 获取相关命令码
-    [[nodiscard]] std::optional<CommandCode> commandCode() const noexcept;
+    [[nodiscard]] std::optional<CommandCode> CommandCode() const noexcept;
 
     /// @brief 获取协议错误码（仅 ProtocolError）
-    [[nodiscard]] std::optional<ErrorCode> errorCode() const noexcept;
+    [[nodiscard]] std::optional<ErrorCode> ErrorCode() const noexcept;
 
     /// @brief 获取恢复重试次数
-    [[nodiscard]] int retryCount() const noexcept;
+    [[nodiscard]] int RetryCount() const noexcept;
 
     /// @brief 获取底层 Transport 错误描述
-    [[nodiscard]] std::string_view transportError() const noexcept;
+    [[nodiscard]] std::string_view TransportError() const noexcept;
 
 private:
-    ErrorCategory category_;
-    std::optional<CommandCode> commandCode_;
-    std::optional<ErrorCode> errorCode_;
-    int retryCount_;
-    std::string transportError_;
+    ErrorCategory m_category_;
+    std::optional<CommandCode> m_command_code_;
+    std::optional<ErrorCode> m_error_code_;
+    int m_retry_count_;
+    std::string m_transport_error_;
 };
 
 }  // namespace calmcar::xcp
@@ -594,27 +595,27 @@ private:
 namespace calmcar::xcp::detail {
 
 /// @brief 构造 InvalidArgument 异常
-[[nodiscard]] XcpException makeInvalidArgument(std::string msg);
+[[nodiscard]] XcpException MakeInvalidArgument(std::string msg);
 
 /// @brief 构造 InvalidState 异常
-[[nodiscard]] XcpException makeInvalidState(std::string msg);
+[[nodiscard]] XcpException MakeInvalidState(std::string msg);
 
 /// @brief 构造 TransportError 异常
-[[nodiscard]] XcpException makeTransportError(std::string msg, std::string transportDetail = "");
+[[nodiscard]] XcpException MakeTransportError(std::string msg, std::string transport_detail = "");
 
 /// @brief 构造 Timeout 异常
-[[nodiscard]] XcpException makeTimeout(std::string msg, std::optional<CommandCode> cmd, int retry);
+[[nodiscard]] XcpException MakeTimeout(std::string msg, std::optional<CommandCode> cmd, int retry);
 
 /// @brief 构造 MalformedPacket 异常
-[[nodiscard]] XcpException makeMalformedPacket(std::string msg);
+[[nodiscard]] XcpException MakeMalformedPacket(std::string msg);
 
 /// @brief 构造 ProtocolError 异常
-[[nodiscard]] XcpException makeProtocolError(std::string msg,
+[[nodiscard]] XcpException MakeProtocolError(std::string msg,
                                               CommandCode cmd,
                                               ErrorCode code);
 
 /// @brief 构造 UnsupportedFeature 异常
-[[nodiscard]] XcpException makeUnsupportedFeature(std::string msg);
+[[nodiscard]] XcpException MakeUnsupportedFeature(std::string msg);
 
 }  // namespace calmcar::xcp::detail
 ```
@@ -648,17 +649,17 @@ public:
     /// @param packet 完整 XCP Packet 字节（不含 Transport Header）
     /// @note 此方法在 Transport 工作线程调用；packet 只在本次回调期间有效，
     ///       监听器若需异步保存必须复制字节。
-    virtual void onPacketReceived(BytesView packet) = 0;
+    virtual void OnPacketReceived(BytesView packet) = 0;
 
     /// @brief Transport 通道已关闭（正常关闭或错误关闭）
     /// @param reason 关闭原因描述
-    /// @note 此方法在 Transport 工作线程调用；调用后不再有 onPacketReceived
-    virtual void onTransportClosed(std::string_view reason) = 0;
+    /// @note 此方法在 Transport 工作线程调用；调用后不再有 OnPacketReceived
+    virtual void OnTransportClosed(std::string_view reason) = 0;
 
     /// @brief Transport 发生可恢复错误（如畸形 Datagram 丢弃）
     /// @param message 错误描述
     /// @note 此方法在 Transport 工作线程调用；Transport 不会因此关闭
-    virtual void onTransportWarning(std::string_view message) = 0;
+    virtual void OnTransportWarning(std::string_view message) = 0;
 };
 
 }  // namespace calmcar::xcp
@@ -681,20 +682,20 @@ public:
     /// @param listener 包监听器，生命周期须长于 Transport 使用期
     /// @throws XcpException(TransportError) 打开失败
     /// @note 打开后 Transport 内部线程开始接收并通过 listener 回调
-    virtual void open(IPacketListener& listener) = 0;
+    virtual void Open(IPacketListener& listener) = 0;
 
     /// @brief 关闭 Transport 通道
     /// @note 关闭后不再调用 listener 回调；可安全重复调用
-    virtual void close() = 0;
+    virtual void Close() = 0;
 
     /// @brief 发送一个完整的 XCP CTO Packet
     /// @param packet 完整 XCP Packet 字节（不含 Transport Header）
     /// @throws XcpException(TransportError) 发送失败
     /// @note 此方法可在任意线程调用；实现需保证线程安全
-    virtual void send(BytesView packet) = 0;
+    virtual void Send(BytesView packet) = 0;
 
     /// @brief Transport 是否已打开
-    [[nodiscard]] virtual bool isOpen() const noexcept = 0;
+    [[nodiscard]] virtual bool IsOpen() const noexcept = 0;
 };
 
 }  // namespace calmcar::xcp
@@ -733,35 +734,35 @@ constexpr std::size_t kUdpMaxXcpPacket = kUdpMaxDatagramSize - kUdpHeaderSize;
 /// @brief 编码后的单个 XCP on Ethernet Frame（Header + 一个 XCP Packet）
 /// @details 一个 UDP Datagram 可以包含一个或多个此类 Frame；本项目发送方向默认一个 Datagram 只放一个 Frame。
 struct UdpFrame {
-    Bytes data;  ///< LEN(u16le) + CTR(u16le) + XCP Packet
+    Bytes m_data_;  ///< LEN(u16le) + CTR(u16le) + XCP Packet
 };
 
 /// @brief 解码后的 UDP Header 字段
 struct UdpHeader {
-    DatagramLen len;  ///< 原始 XCP Packet 字节数
-    DatagramCtr ctr;  ///< 该 XCP Frame 的独立计数器
+    DatagramLen m_len_;  ///< 原始 XCP Packet 字节数
+    DatagramCtr m_ctr_;  ///< 该 XCP Frame 的独立计数器
 };
 
 /// @brief Datagram 内单个 XCP Frame 的只读视图
-/// @note xcpPacket 的生命周期不超过传入 decodeUdpDatagram() 的字节视图。
+/// @note m_xcp_packet_ 的生命周期不超过传入 DecodeUdpDatagram() 的字节视图。
 struct UdpFrameView {
-    UdpHeader header;
-    BytesView xcpPacket;
+    UdpHeader m_header_;
+    BytesView m_xcp_packet_;
 };
 
 /// @brief 编码一个 XCP on Ethernet Frame
-/// @param xcpPacket 原始 XCP Packet（不含 Transport Header）
+/// @param xcp_packet 原始 XCP Packet（不含 Transport Header）
 /// @param ctr 该 Frame 的发送计数器值
 /// @return 编码后的 Frame
-/// @throws XcpException(InvalidArgument) xcpPacket.size() > kUdpMaxXcpPacket (65503)
-[[nodiscard]] UdpFrame encodeUdpFrame(BytesView xcpPacket, DatagramCtr ctr);
+/// @throws XcpException(InvalidArgument) xcp_packet.size() > kUdpMaxXcpPacket (65503)
+[[nodiscard]] UdpFrame EncodeUdpFrame(BytesView xcp_packet, DatagramCtr ctr);
 
 /// @brief 解码一个 UDP Datagram 中连续打包的全部 XCP Frame
 /// @param datagram 完整 UDP Payload
 /// @return 全部 Frame 视图；空 Datagram、Header 不完整、LEN 为 0、LEN 越界或末尾残留字节时返回 nullopt
 /// @note XCP 1.1 Part 3 允许一个 UDP Datagram 包含多个完整 Frame，
 ///       但任何单个 Frame 都不得跨 Datagram 边界。
-[[nodiscard]] std::optional<std::vector<UdpFrameView>> decodeUdpDatagram(BytesView datagram) noexcept;
+[[nodiscard]] std::optional<std::vector<UdpFrameView>> DecodeUdpDatagram(BytesView datagram) noexcept;
 
 }  // namespace calmcar::xcp
 ```
@@ -785,33 +786,33 @@ namespace calmcar::xcp {
 /// @brief UDP Transport 配置参数
 struct UdpTransportConfig {
     /// @brief 远端 Slave IPv4 地址（如 "192.168.1.10" 或 "127.0.0.1"）
-    std::string remoteHost;
+    std::string m_remote_host_;
 
     /// @brief 远端 Slave UDP 业务端口
-    std::uint16_t remotePort = 0;
+    std::uint16_t m_remote_port_ = 0;
 
     /// @brief 本地绑定 IPv4 地址（默认 "0.0.0.0"，Loopback 测试用 "127.0.0.1"）
-    std::string localHost = "0.0.0.0";
+    std::string m_local_host_ = "0.0.0.0";
 
     /// @brief 本地绑定端口（0 表示由 OS 分配临时端口）
-    std::uint16_t localPort = 0;
+    std::uint16_t m_local_port_ = 0;
 
     /// @brief 接收超时（毫秒），0 表示阻塞接收
     ///        实际用于内部线程的周期性检查，不影响上层命令超时
-    std::uint32_t receivePollIntervalMs = 100;
+    std::uint32_t m_receive_poll_interval_ms_ = 100;
 
     /// @brief 最大允许的单个 XCP Frame 内原始 Packet 长度（字节）
     ///        默认 kUdpMaxXcpPacket (65503)；可设更小值以避免 IP 分片
-    std::size_t maxFramePacketSize = kUdpMaxXcpPacket;
+    std::size_t m_max_frame_packet_size_ = kUdpMaxXcpPacket;
 
     /// @brief 最大允许的 UDP Datagram Payload 长度（字节）
     ///        默认 kUdpMaxDatagramSize (65507)，限制连续打包 Frame 的总长度
-    std::size_t maxDatagramSize = kUdpMaxDatagramSize;
+    std::size_t m_max_datagram_size_ = kUdpMaxDatagramSize;
 
-    /// @brief 是否严格匹配远端端口（true 时要求收到的包来自 remotePort）
+    /// @brief 是否严格匹配远端端口（true 时要求收到的包来自 m_remote_port_）
     /// @details 这是 Master 侧的项目安全策略，不是 XCP 1.1 Part 3 对 Slave
-    ///          连接绑定规则的复刻；设 false 时仅匹配 remoteHost。
-    bool strictRemotePort = true;
+    ///          连接绑定规则的复刻；设 false 时仅匹配 m_remote_host_。
+    bool m_strict_remote_port_ = true;
 };
 
 }  // namespace calmcar::xcp
@@ -855,75 +856,75 @@ public:
 
     /// @brief 打开 Transport 通道
     /// @throws XcpException(TransportError) Socket 创建、绑定失败
-    void open(IPacketListener& listener) override;
+    void Open(IPacketListener& listener) override;
 
     /// @brief 关闭 Transport 通道
-    void close() override;
+    void Close() override;
 
     /// @brief 发送一个完整的 XCP CTO Packet
     /// @throws XcpException(TransportError) 发送失败
-    void send(BytesView packet) override;
+    void Send(BytesView packet) override;
 
     /// @brief Transport 是否已打开
-    [[nodiscard]] bool isOpen() const noexcept override;
+    [[nodiscard]] bool IsOpen() const noexcept override;
 
     /// @brief 获取当前发送方向 CTR 值（诊断用）
-    [[nodiscard]] DatagramCtr sendCtr() const noexcept;
+    [[nodiscard]] DatagramCtr SendCtr() const noexcept;
 
     /// @brief 获取最近收到的接收方向 CTR 值（诊断用）
-    [[nodiscard]] std::optional<DatagramCtr> lastReceiveCtr() const noexcept;
+    [[nodiscard]] std::optional<DatagramCtr> LastReceiveCtr() const noexcept;
 
 private:
     /// @brief 接收线程主循环
-    void receiveLoop();
+    void ReceiveLoop();
 
     /// @brief 处理收到的 UDP Datagram
     /// @details 先校验来源和 Datagram 长度，再解码其中连续打包的全部 Frame；
     ///          每个通过 CTR 校验的 Frame 分别回调给 IPacketListener。
     /// @return true 表示已正常处理；false 表示需要退出循环
-    bool handleDatagram(const std::uint8_t* data, std::size_t size,
-                         const std::string& srcIp, std::uint16_t srcPort);
+    bool HandleDatagram(const std::uint8_t* data, std::size_t size,
+                         const std::string& src_ip, std::uint16_t src_port);
 
     /// @brief 处理 Datagram 内的单个 Frame
     /// @param frame 已完成 LEN 边界校验的 Frame 视图
     /// @return true 表示 Frame 已交付上层；false 表示因 CTR 规则丢弃
-    bool handleFrame(const UdpFrameView& frame);
+    bool HandleFrame(const UdpFrameView& frame);
 
     /// @brief 检查源地址是否匹配配置的远端
-    bool isRemoteMatch(const std::string& srcIp, std::uint16_t srcPort) const;
+    bool IsRemoteMatch(const std::string& src_ip, std::uint16_t src_port) const;
 
     /// @brief 打开 Transport 时固定的 UDP 参数
-    UdpTransportConfig config_;
+    UdpTransportConfig m_config_;
 
     /// @brief 回调接收完整 XCP Packet 的监听器（非拥有）
-    IPacketListener* listener_ = nullptr;
+    IPacketListener* m_listener_ = nullptr;
 
     /// @brief 平台 Socket 资源的私有实现声明
     struct SocketImpl;
 
     /// @brief 平台 UDP Socket 资源的拥有者
-    std::unique_ptr<SocketImpl> socket_;
+    std::unique_ptr<SocketImpl> m_socket_;
 
     /// @brief Transport 接收工作线程
-    std::thread receiveThread_;
+    std::thread m_receive_thread_;
 
     /// @brief 接收循环运行标记
-    std::atomic<bool> running_{false};
+    std::atomic<bool> m_running_{false};
 
     /// @brief 保护发送、Frame 编码与 CTR 递增的互斥量
-    mutable std::mutex sendMutex_;
+    mutable std::mutex m_send_mutex_;
 
     /// @brief 下一个 Master→Slave XCP Frame 使用的 CTR
-    std::atomic<DatagramCtr> sendCtr_{0};
+    std::atomic<DatagramCtr> m_send_ctr_{0};
 
     /// @brief 保护接收 CTR 基线和最近值的互斥量
-    mutable std::mutex recvMutex_;
+    mutable std::mutex m_recv_mutex_;
 
     /// @brief 最近接收并接受的 Slave→Master Frame CTR
-    std::optional<DatagramCtr> lastRecvCtr_;
+    std::optional<DatagramCtr> m_last_recv_ctr_;
 
     /// @brief 是否已由首个合法接收 Frame 建立 CTR 基线
-    bool recvBaselineEstablished_ = false;
+    bool m_recv_baseline_established_ = false;
 };
 
 }  // namespace calmcar::xcp
@@ -934,8 +935,8 @@ private:
 ```
 接收策略（与 XCP 1.1 Part 3 及项目策略一致）：
 1. 一个 UDP Datagram 可按 LEN 顺序解出多个完整 Frame；每个 Frame 均独立执行 CTR 检查。
-2. 首个合法 Frame 建立 lastRecvCtr_ 基线，接收并推进。
-3. CTR == 期望值（lastRecvCtr_ + 1 mod 65536）→ 接收，推进。
+2. 首个合法 Frame 建立 m_last_recv_ctr_ 基线，接收并推进。
+3. CTR == 期望值（m_last_recv_ctr_ + 1 mod 65536）→ 接收，推进。
 4. 前向跳号（模 65536 差值 1..32767）→ 接收当前 Frame，报告缺口，推进。
 5. 重复或后向乱序（差值 1..32767 反方向）→ 丢弃该 Frame，报告诊断。
 6. 恰好相差 0x8000 → 歧义，丢弃该 Frame，报告诊断。
@@ -963,60 +964,60 @@ namespace calmcar::xcp {
 class CommandCodec {
 public:
     /// @brief 构造编码器
-    /// @param byteOrder Session 字节序（CONNECT 后确定）
-    explicit CommandCodec(ByteOrder byteOrder) noexcept;
+    /// @param byte_order Session 字节序（CONNECT 后确定）
+    explicit CommandCodec(ByteOrder byte_order) noexcept;
 
     // ---- 命令编码 ----
 
     /// @brief 编码 CONNECT 命令
     /// @param mode 0x00=普通, 0x01=用户自定义
     /// @return CTO: [0xFF][mode]
-    [[nodiscard]] Bytes encodeConnect(std::uint8_t mode = 0x00) const;
+    [[nodiscard]] Bytes EncodeConnect(std::uint8_t mode = 0x00) const;
 
     /// @brief 编码 DISCONNECT 命令
     /// @return CTO: [0xFE][0x00]
-    [[nodiscard]] Bytes encodeDisconnect() const;
+    [[nodiscard]] Bytes EncodeDisconnect() const;
 
     /// @brief 编码 GET_STATUS 命令
     /// @return CTO: [0xFD][0x00]
-    [[nodiscard]] Bytes encodeGetStatus() const;
+    [[nodiscard]] Bytes EncodeGetStatus() const;
 
     /// @brief 编码 SYNCH 命令
     /// @return CTO: [0xFC][0x00]
-    [[nodiscard]] Bytes encodeSynch() const;
+    [[nodiscard]] Bytes EncodeSynch() const;
 
     /// @brief 编码 GET_COMM_MODE_INFO 命令
     /// @return CTO: [0xFB][0x00]
-    [[nodiscard]] Bytes encodeGetCommModeInfo() const;
+    [[nodiscard]] Bytes EncodeGetCommModeInfo() const;
 
     /// @brief 编码 SET_MTA 命令
     /// @param extension 地址扩展
     /// @param address 32 位地址
     /// @return CTO: [0xF6][reserved][extension][addr_b0..b3]
-    [[nodiscard]] Bytes encodeSetMta(AddressExtension extension, Address address) const;
+    [[nodiscard]] Bytes EncodeSetMta(AddressExtension extension, Address address) const;
 
     /// @brief 编码 UPLOAD 命令
-    /// @param numberOfElements 要读取的元素数（以 AG 为单位）
-    /// @return CTO: [0xF5][numberOfElements]
-    [[nodiscard]] Bytes encodeUpload(ElementCount numberOfElements) const;
+    /// @param number_of_elements 要读取的元素数（以 AG 为单位）
+    /// @return CTO: [0xF5][number_of_elements]
+    [[nodiscard]] Bytes EncodeUpload(ElementCount number_of_elements) const;
 
     /// @brief 编码 SHORT_UPLOAD 命令
-    /// @param numberOfElements 要读取的元素数
+    /// @param number_of_elements 要读取的元素数
     /// @param extension 地址扩展
     /// @param address 32 位地址
-    /// @return CTO: [0xF4][numberOfElements][reserved][extension][addr_b0..b3]
-    [[nodiscard]] Bytes encodeShortUpload(ElementCount numberOfElements,
+    /// @return CTO: [0xF4][number_of_elements][reserved][extension][addr_b0..b3]
+    [[nodiscard]] Bytes EncodeShortUpload(ElementCount number_of_elements,
                                            AddressExtension extension,
                                            Address address) const;
 
 private:
-    ByteOrder byteOrder_;
+    ByteOrder m_byte_order_;
 
     /// @brief 按字节序写入 16 位值到缓冲区
-    void writeU16(Bytes& buf, std::uint16_t val) const;
+    void WriteU16(Bytes& buf, std::uint16_t val) const;
 
     /// @brief 按字节序写入 32 位值到缓冲区
-    void writeU32(Bytes& buf, std::uint32_t val) const;
+    void WriteU32(Bytes& buf, std::uint32_t val) const;
 };
 
 }  // namespace calmcar::xcp
@@ -1055,32 +1056,32 @@ namespace calmcar::xcp {
 
 /// @brief Positive Response 内容（按命令区分）
 struct PositiveResponse {
-    CommandCode command;  ///< 对应的命令码（由调用方传入或从上下文推断）
-    Bytes data;           ///< RES 后的数据（不含 0xFF 前缀）
+    CommandCode m_command_;  ///< 对应的命令码（由调用方传入或从上下文推断）
+    Bytes m_data_;           ///< RES 后的数据（不含 0xFF 前缀）
 };
 
 /// @brief Negative Response 内容
 struct NegativeResponse {
-    ErrorCode errorCode;              ///< ERR Packet 的 Byte 1
-    Bytes additionalInfo;             ///< 可选附加信息（Byte 2..）
+    ErrorCode m_error_code_;          ///< ERR Packet 的 Byte 1
+    Bytes m_additional_info_;         ///< 可选附加信息（Byte 2..）
 };
 
 /// @brief Event Packet 内容
 struct EventPacket {
-    EventCode eventCode;              ///< EV Packet 的 Byte 1
-    Bytes info;                       ///< 可选 Event 信息（Byte 2..）
+    EventCode m_event_code_;          ///< EV Packet 的 Byte 1
+    Bytes m_info_;                    ///< 可选 Event 信息（Byte 2..）
 };
 
 /// @brief Service Request Packet 内容
 struct ServicePacket {
-    std::uint8_t serviceCode;         ///< SERV Packet 的 Byte 1
-    Bytes data;                       ///< 可选 Service 数据
+    std::uint8_t m_service_code_;     ///< SERV Packet 的 Byte 1
+    Bytes m_data_;                    ///< 可选 Service 数据
 };
 
 /// @brief DTO Packet（本阶段仅识别，不解析内容）
 struct DtoPacket {
-    std::uint8_t pid;                 ///< 原始 PID（0x00..0xFB）
-    Bytes data;                       ///< DTO 数据
+    std::uint8_t m_pid_;              ///< 原始 PID（0x00..0xFB）
+    Bytes m_data_;                    ///< DTO 数据
 };
 
 /// @brief 解析后的 Packet 联合类型
@@ -1099,37 +1100,37 @@ using ParsedPacket = std::variant<
 class ResponseParser {
 public:
     /// @brief 构造解析器
-    /// @param byteOrder Session 字节序
-    explicit ResponseParser(ByteOrder byteOrder) noexcept;
+    /// @param ByteOrder Session 字节序
+    explicit ResponseParser(ByteOrder byte_order) noexcept;
 
     /// @brief 解析一个完整的 XCP Packet
     /// @param packet 完整 XCP Packet 字节
-    /// @param expectedCommand 调用方期望的命令码（用于 PositiveResponse.command）
+    /// @param expected_command 调用方期望的命令码（用于 PositiveResponse.command）
     /// @return 解析结果；畸形包返回 nullopt
-    [[nodiscard]] std::optional<ParsedPacket> parse(BytesView packet,
-                                                      CommandCode expectedCommand) const;
+    [[nodiscard]] std::optional<ParsedPacket> Parse(BytesView packet,
+                                                      CommandCode expected_command) const;
 
     // ---- 专用解析方法 ----
 
     /// @brief 解析 CONNECT 响应
-    /// @param resData RES 后的数据（不含 0xFF 前缀）
+    /// @param res_data RES 后的数据（不含 0xFF 前缀）
     /// @return 解析结果；格式非法返回 nullopt
-    [[nodiscard]] std::optional<ConnectResponse> parseConnectResponse(BytesView resData) const;
+    [[nodiscard]] std::optional<ConnectResponse> ParseConnectResponse(BytesView res_data) const;
 
     /// @brief 解析 GET_STATUS 响应
-    [[nodiscard]] std::optional<GetStatusResponse> parseGetStatusResponse(BytesView resData) const;
+    [[nodiscard]] std::optional<GetStatusResponse> ParseGetStatusResponse(BytesView res_data) const;
 
     /// @brief 解析 GET_COMM_MODE_INFO 响应
-    [[nodiscard]] std::optional<GetCommModeInfoResponse> parseGetCommModeInfoResponse(BytesView resData) const;
+    [[nodiscard]] std::optional<GetCommModeInfoResponse> ParseGetCommModeInfoResponse(BytesView res_data) const;
 
 private:
-    ByteOrder byteOrder_;
+    ByteOrder m_byte_order_;
 
     /// @brief 按字节序读取 16 位值
-    [[nodiscard]] std::uint16_t readU16(BytesView data, std::size_t offset) const;
+    [[nodiscard]] std::uint16_t ReadU16(BytesView data, std::size_t offset) const;
 
     /// @brief 按字节序读取 32 位值
-    [[nodiscard]] std::uint32_t readU32(BytesView data, std::size_t offset) const;
+    [[nodiscard]] std::uint32_t ReadU32(BytesView data, std::size_t offset) const;
 };
 
 }  // namespace calmcar::xcp
@@ -1181,93 +1182,93 @@ public:
     // ---- 状态查询 ----
 
     /// @brief 获取当前 Session 状态
-    [[nodiscard]] SessionState state() const;
+    [[nodiscard]] SessionState State() const;
 
     /// @brief 是否已连接（Connected 状态）
-    [[nodiscard]] bool isConnected() const;
+    [[nodiscard]] bool IsConnected() const;
 
     /// @brief 是否有等待响应的命令（Outstanding Command）
-    [[nodiscard]] bool hasPendingCommand() const;
+    [[nodiscard]] bool HasPendingCommand() const;
 
     // ---- 状态迁移 ----
 
     /// @brief 进入 Connecting 状态
     /// @throws XcpException(InvalidState) 当前状态不允许连接
-    void beginConnecting();
+    void BeginConnecting();
 
     /// @brief CONNECT 成功，保存参数并进入 Connected
     /// @throws XcpException(InvalidArgument) 参数校验失败
-    void establishConnection(const ConnectResponse& connectResponse);
+    void EstablishConnection(const ConnectResponse& connect_response);
 
     /// @brief 进入 Disconnecting 状态
     /// @throws XcpException(InvalidState) 当前状态不允许断开
-    void beginDisconnecting();
+    void BeginDisconnecting();
 
     /// @brief DISCONNECT 成功，进入 Disconnected
-    void completeDisconnection();
+    void CompleteDisconnection();
 
     /// @brief 进入 Recovering 状态
     /// @throws XcpException(InvalidState) 当前状态不允许恢复
-    void beginRecovery();
+    void BeginRecovery();
 
     /// @brief 恢复成功，回到 Connected
-    void completeRecovery();
+    void CompleteRecovery();
 
     /// @brief 标记 Session 为 Failed
     /// @param reason 失败原因
-    void fail(std::string_view reason);
+    void Fail(std::string_view reason);
 
     /// @brief 重置到 Disconnected（用于强制清理）
-    void reset();
+    void Reset();
 
     // ---- Outstanding Command 管理 ----
 
     /// @brief 标记命令已发送，等待响应
     /// @throws XcpException(InvalidState) 已有 Pending Command
-    void markCommandSent(CommandCode cmd);
+    void MarkCommandSent(CommandCode cmd);
 
     /// @brief 标记命令响应已收到
-    void clearPendingCommand();
+    void ClearPendingCommand();
 
     /// @brief 获取当前 Pending 命令码
-    [[nodiscard]] std::optional<CommandCode> pendingCommand() const;
+    [[nodiscard]] std::optional<CommandCode> PendingCommand() const;
 
     // ---- 参数访问 ----
 
     /// @brief 获取 Session 参数快照
-    [[nodiscard]] SessionParameters parameters() const;
+    [[nodiscard]] SessionParameters Parameters() const;
 
     /// @brief 更新 GET_COMM_MODE_INFO 结果
-    void updateCommModeInfo(const GetCommModeInfoResponse& info);
+    void UpdateCommModeInfo(const GetCommModeInfoResponse& info);
 
     /// @brief 更新 GET_STATUS 结果
-    void updateStatus(const GetStatusResponse& status);
+    void UpdateStatus(const GetStatusResponse& status);
 
     /// @brief 标记 SHORT_UPLOAD 不可用（降级）
-    void disableShortUpload();
+    void DisableShortUpload();
 
     /// @brief 获取当前 Byte Order
-    [[nodiscard]] ByteOrder byteOrder() const;
+    [[nodiscard]] ByteOrder GetByteOrder() const;
 
     /// @brief 获取当前 AG
-    [[nodiscard]] AddressGranularity addressGranularity() const;
+    [[nodiscard]] AddressGranularity GetAddressGranularity() const;
 
     /// @brief 获取 MAX_CTO
-    [[nodiscard]] std::uint8_t maxCto() const;
+    [[nodiscard]] std::uint8_t MaxCto() const;
 
     /// @brief 获取 MAX_DTO
-    [[nodiscard]] std::uint16_t maxDto() const;
+    [[nodiscard]] std::uint16_t MaxDto() const;
 
 private:
-    mutable std::mutex mutex_;
-    SessionState state_ = SessionState::Disconnected;
-    SessionParameters params_;
-    std::optional<CommandCode> pendingCommand_;
-    std::string failReason_;
+    mutable std::mutex m_mutex_;
+    SessionState m_state_ = SessionState::Disconnected;
+    SessionParameters m_params_;
+    std::optional<CommandCode> m_pending_command_;
+    std::string m_fail_reason_;
 
     /// @brief 校验 CONNECT 参数
     /// @throws XcpException(InvalidArgument) 参数非法
-    void validateConnectParams(const ConnectResponse& resp) const;
+    void ValidateConnectParams(const ConnectResponse& resp) const;
 };
 
 }  // namespace calmcar::xcp
@@ -1297,18 +1298,18 @@ namespace calmcar::xcp {
 /// @brief 命令超时配置
 struct CommandTimeouts {
     /// @brief 普通命令超时（毫秒）
-    std::chrono::milliseconds commandTimeout{1000};
+    std::chrono::milliseconds m_command_timeout_{1000};
 
     /// @brief SYNCH 恢复超时（毫秒）
-    std::chrono::milliseconds synchTimeout{1000};
+    std::chrono::milliseconds m_synch_timeout_{1000};
 
     /// @brief 最大恢复重试次数（不含首次尝试）
-    int maxRetries = 2;
+    int m_max_retries_ = 2;
 };
 
 /// @brief 命令执行结果
 struct CommandResult {
-    ParsedPacket response;  ///< 最终收到的响应（RES 或 ERR）
+    ParsedPacket m_response_;  ///< 最终收到的响应（RES 或 ERR）
 };
 
 /// @brief 事件观察者接口（可选，用于上层接收异步 Event）
@@ -1317,13 +1318,13 @@ public:
     virtual ~IEventListener() = default;
 
     /// @brief 收到异步 Event
-    virtual void onEvent(const EventPacket& event) = 0;
+    virtual void OnEvent(const EventPacket& event) = 0;
 
     /// @brief 收到异步 Service Request
-    virtual void onService(const ServicePacket& service) = 0;
+    virtual void OnService(const ServicePacket& service) = 0;
 
     /// @brief 收到 DTO（本阶段仅识别）
-    virtual void onDto(const DtoPacket& dto) = 0;
+    virtual void OnDto(const DtoPacket& dto) = 0;
 };
 
 /// @brief 命令执行器
@@ -1336,20 +1337,20 @@ public:
     /// @param transport Transport 实例
     /// @param session Session 实例
     /// @param timeouts 超时配置
-    /// @param eventListener 事件监听器（可选，可为 nullptr）
+    /// @param event_listener 事件监听器（可选，可为 nullptr）
     CommandExecutor(IXcpTransport& transport,
                     Session& session,
                     CommandTimeouts timeouts = {},
-                    IEventListener* eventListener = nullptr);
+                    IEventListener* event_listener = nullptr);
 
     /// @brief 析构
     ~CommandExecutor() override;
 
     // ---- IPacketListener 实现 ----
 
-    void onPacketReceived(BytesView packet) override;
-    void onTransportClosed(std::string_view reason) override;
-    void onTransportWarning(std::string_view message) override;
+    void OnPacketReceived(BytesView packet) override;
+    void OnTransportClosed(std::string_view reason) override;
+    void OnTransportWarning(std::string_view message) override;
 
     // ---- 命令执行 ----
 
@@ -1357,101 +1358,101 @@ public:
     /// @param mode 0x00=普通, 0x01=用户自定义
     /// @return CONNECT 响应解析结果
     /// @throws XcpException 超时、协议错误或恢复失败
-    [[nodiscard]] ConnectResponse executeConnect(std::uint8_t mode = 0x00);
+    [[nodiscard]] ConnectResponse ExecuteConnect(std::uint8_t mode = 0x00);
 
     /// @brief 执行 DISCONNECT 命令
     /// @throws XcpException 超时或协议错误
-    void executeDisconnect();
+    void ExecuteDisconnect();
 
     /// @brief 执行 GET_STATUS 命令
     /// @return GET_STATUS 响应解析结果
-    [[nodiscard]] GetStatusResponse executeGetStatus();
+    [[nodiscard]] GetStatusResponse ExecuteGetStatus();
 
     /// @brief 执行 GET_COMM_MODE_INFO 命令
     /// @return 响应结果；若 Slave 返回 ERR_CMD_UNKNOWN 则返回 nullopt
-    [[nodiscard]] std::optional<GetCommModeInfoResponse> executeGetCommModeInfo();
+    [[nodiscard]] std::optional<GetCommModeInfoResponse> ExecuteGetCommModeInfo();
 
     /// @brief 执行 SET_MTA 命令
     /// @param extension 地址扩展
     /// @param address 32 位地址
-    void executeSetMta(AddressExtension extension, Address address);
+    void ExecuteSetMta(AddressExtension extension, Address address);
 
     /// @brief 执行 UPLOAD 命令
-    /// @param numberOfElements 元素数
+    /// @param number_of_elements 元素数
     /// @return 读取到的原始字节
-    [[nodiscard]] Bytes executeUpload(ElementCount numberOfElements);
+    [[nodiscard]] Bytes ExecuteUpload(ElementCount number_of_elements);
 
     /// @brief 执行 SHORT_UPLOAD 命令
-    /// @param numberOfElements 元素数
+    /// @param number_of_elements 元素数
     /// @param extension 地址扩展
     /// @param address 32 位地址
     /// @return 读取到的原始字节
-    [[nodiscard]] Bytes executeShortUpload(ElementCount numberOfElements,
+    [[nodiscard]] Bytes ExecuteShortUpload(ElementCount number_of_elements,
                                             AddressExtension extension,
                                             Address address);
 
     /// @brief 发送 SYNCH（用于恢复，通常不直接调用）
     /// @return true 表示收到 ERR_CMD_SYNCH（恢复成功）
-    bool sendSynch();
+    bool SendSynch();
 
 private:
     /// @brief 执行单条命令的通用流程（编码→发送→等待→解析）
     /// @param cmd 命令码
-    /// @param encodedPacket 已编码的 CTO
+    /// @param encoded_packet 已编码的 CTO
     /// @return 解析后的响应
     /// @throws XcpException 超时或协议错误
-    [[nodiscard]] ParsedPacket executeCommand(CommandCode cmd, BytesView encodedPacket);
+    [[nodiscard]] ParsedPacket ExecuteCommand(CommandCode cmd, BytesView encoded_packet);
 
     /// @brief 等待当前 Pending Command 的响应
     /// @param timeout 超时时长
     /// @return 收到的响应；超时返回 nullopt
-    [[nodiscard]] std::optional<ParsedPacket> waitForResponse(std::chrono::milliseconds timeout);
+    [[nodiscard]] std::optional<ParsedPacket> WaitForResponse(std::chrono::milliseconds timeout);
 
     /// @brief 超时恢复流程：SYNCH → 等待 ERR_CMD_SYNCH → 恢复隐含状态
     /// @param cmd 原命令码
     /// @throws XcpException 恢复失败
-    void performRecovery(CommandCode cmd);
+    void PerformRecovery(CommandCode cmd);
 
     // 依赖
-    IXcpTransport& transport_;
-    Session& session_;
-    CommandTimeouts timeouts_;
-    IEventListener* eventListener_;
+    IXcpTransport& m_transport_;
+    Session& m_session_;
+    CommandTimeouts m_timeouts_;
+    IEventListener* m_event_listener_;
 
     // Codec/Parser（在 Session 字节序确定后创建）
-    std::optional<CommandCodec> codec_;
-    std::optional<ResponseParser> parser_;
+    std::optional<CommandCodec> m_codec_;
+    std::optional<ResponseParser> m_parser_;
 
     // 同步
-    mutable std::mutex mutex_;
-    std::condition_variable responseCv_;
-    std::optional<ParsedPacket> pendingResponse_;
-    bool transportClosed_ = false;
-    std::string transportCloseReason_;
+    mutable std::mutex m_mutex_;
+    std::condition_variable m_response_cv_;
+    std::optional<ParsedPacket> m_pending_response_;
+    bool m_transport_closed_ = false;
+    std::string m_transport_close_reason_;
 
     // EV_CMD_PENDING 计时
-    bool cmdPendingReceived_ = false;
+    bool m_cmd_pending_received_ = false;
 };
 
 }  // namespace calmcar::xcp
 ```
 
-### 12.1 executeCommand 内部流程
+### 12.1 ExecuteCommand 内部流程
 
 ```text
-executeCommand(cmd, encodedPacket):
-  1. session_.markCommandSent(cmd)      // 检查无 Pending，设置 Pending
-  2. transport_.send(encodedPacket)
-  3. wait for responseCv_ with timeout
-     - onPacketReceived 回调中：
-       * RES/ERR → 唤醒 waitForResponse
+ExecuteCommand(cmd, encoded_packet):
+  1. m_session_.MarkCommandSent(cmd)      // 检查无 Pending，设置 Pending
+  2. m_transport_.Send(encoded_packet)
+  3. wait for m_response_cv_ with timeout
+     - OnPacketReceived 回调中：
+       * RES/ERR → 唤醒 WaitForResponse
        * EV(CMD_PENDING) → 重启 Timer，不唤醒
-       * EV(其他) → eventListener->onEvent()，不唤醒
-       * SERV → eventListener->onService()
-       * DTO → eventListener->onDto()
+       * EV(其他) → event_listener->OnEvent()，不唤醒
+       * SERV → event_listener->OnService()
+       * DTO → event_listener->OnDto()
   4. 若超时:
-       performRecovery(cmd)
-       重试原命令（最多 maxRetries 次）
+       PerformRecovery(cmd)
+       重试原命令（最多 m_max_retries_ 次）
   5. 若收到 RES → 返回 PositiveResponse
   6. 若收到 ERR:
        - ERR_CMD_SYNCH 仅在 Recovery 中视为成功
@@ -1487,52 +1488,52 @@ public:
     /// @brief 读取内存（以元素为单位）
     /// @param address 32 位地址
     /// @param extension 地址扩展
-    /// @param elementCount 元素数（以 AG 为单位）
+    /// @param element_count 元素数（以 AG 为单位）
     /// @return 读取到的原始字节
     /// @throws XcpException(InvalidArgument) 参数非法或地址溢出
     /// @throws XcpException 协议错误或超时
-    [[nodiscard]] Bytes readElements(Address address,
+    [[nodiscard]] Bytes ReadElements(Address address,
                                       AddressExtension extension,
-                                      ElementCount elementCount);
+                                      ElementCount element_count);
 
     /// @brief 读取内存（以字节为单位）
     /// @param address 32 位地址
     /// @param extension 地址扩展
-    /// @param byteCount 字节数（必须可被 AG 整除）
+    /// @param byte_count 字节数（必须可被 AG 整除）
     /// @return 读取到的原始字节
-    /// @throws XcpException(InvalidArgument) byteCount 不能被 AG 整除
-    [[nodiscard]] Bytes readBytes(Address address,
+    /// @throws XcpException(InvalidArgument) byte_count 不能被 AG 整除
+    [[nodiscard]] Bytes ReadBytes(Address address,
                                    AddressExtension extension,
-                                   ByteCount byteCount);
+                                   ByteCount byte_count);
 
     /// @brief 读取内存（单次 SHORT_UPLOAD，最多 MAX_CTO/AG 元素）
     /// @return 读取到的原始字节
-    [[nodiscard]] Bytes shortUpload(Address address,
+    [[nodiscard]] Bytes ShortUpload(Address address,
                                      AddressExtension extension,
-                                     ElementCount elementCount);
+                                     ElementCount element_count);
 
     /// @brief 读取内存（SET_MTA + 多次 UPLOAD 分块）
     /// @return 拼接后的完整字节序列
-    [[nodiscard]] Bytes uploadChunked(Address address,
+    [[nodiscard]] Bytes UploadChunked(Address address,
                                        AddressExtension extension,
-                                       ElementCount elementCount);
+                                       ElementCount element_count);
 
 private:
-    CommandExecutor& executor_;
-    Session& session_;
+    CommandExecutor& m_executor_;
+    Session& m_session_;
 
     /// @brief 检查 SHORT_UPLOAD 是否可用且单包可容纳
-    [[nodiscard]] bool canUseShortUpload(ElementCount elementCount) const;
+    [[nodiscard]] bool CanUseShortUpload(ElementCount element_count) const;
 
     /// @brief 计算 UPLOAD 单块最大元素数
-    [[nodiscard]] ElementCount maxUploadElements() const;
+    [[nodiscard]] ElementCount MaxUploadElements() const;
 
     /// @brief 计算 SHORT_UPLOAD 最大元素数
-    [[nodiscard]] ElementCount maxShortUploadElements() const;
+    [[nodiscard]] ElementCount MaxShortUploadElements() const;
 
     /// @brief 校验读取参数
     /// @throws XcpException(InvalidArgument) 参数非法或地址溢出
-    void validateRead(Address address, ElementCount elementCount) const;
+    void ValidateRead(Address address, ElementCount element_count) const;
 };
 
 }  // namespace calmcar::xcp
@@ -1565,10 +1566,10 @@ public:
     /// @brief 构造
     /// @param transport Transport 实例（XcpMaster 持有所有权）
     /// @param timeouts 命令超时配置
-    /// @param eventListener 事件监听器（可选）
+    /// @param event_listener 事件监听器（可选）
     explicit XcpMaster(std::unique_ptr<IXcpTransport> transport,
                         CommandTimeouts timeouts = {},
-                        IEventListener* eventListener = nullptr);
+                        IEventListener* event_listener = nullptr);
 
     /// @brief 析构，自动断开连接
     ~XcpMaster();
@@ -1580,54 +1581,54 @@ public:
     // ---- 连接管理 ----
 
     /// @brief 建立 XCP 连接
-    /// @details 执行: Transport.open → CONNECT → [GET_COMM_MODE_INFO] → GET_STATUS
+    /// @details 执行: Transport.Open → CONNECT → [GET_COMM_MODE_INFO] → GET_STATUS
     /// @throws XcpException 连接失败
-    void connect();
+    void Connect();
 
     /// @brief 断开 XCP 连接
-    /// @details 执行: DISCONNECT → Transport.close。即使失败也释放本地资源。
-    void disconnect();
+    /// @details 执行: DISCONNECT → Transport.Close。即使失败也释放本地资源。
+    void Disconnect();
 
     /// @brief 是否已连接
-    [[nodiscard]] bool isConnected() const;
+    [[nodiscard]] bool IsConnected() const;
 
     // ---- 内存读取 ----
 
     /// @brief 读取内存（以字节为单位）
     /// @param address 32 位地址
     /// @param extension 地址扩展
-    /// @param byteCount 字节数（必须可被 AG 整除）
+    /// @param byte_count 字节数（必须可被 AG 整除）
     /// @return 读取到的原始字节
-    [[nodiscard]] Bytes readMemory(Address address,
+    [[nodiscard]] Bytes ReadMemory(Address address,
                                     AddressExtension extension,
-                                    ByteCount byteCount);
+                                    ByteCount byte_count);
 
     /// @brief 读取内存（以元素为单位）
     /// @param address 32 位地址
     /// @param extension 地址扩展
-    /// @param elementCount 元素数（以 AG 为单位）
+    /// @param element_count 元素数（以 AG 为单位）
     /// @return 读取到的原始字节
-    [[nodiscard]] Bytes readMemory(Address address,
+    [[nodiscard]] Bytes ReadMemory(Address address,
                                     AddressExtension extension,
-                                    ElementCount elementCount);
+                                    ElementCount element_count);
 
     // ---- 状态查询 ----
 
     /// @brief 获取 Session 参数快照
-    [[nodiscard]] SessionParameters sessionParameters() const;
+    [[nodiscard]] SessionParameters GetSessionParameters() const;
 
     /// @brief 获取当前 Session 状态
-    [[nodiscard]] SessionState sessionState() const;
+    [[nodiscard]] SessionState GetSessionState() const;
 
     /// @brief 手动查询 GET_STATUS 并更新 Session
     /// @return GET_STATUS 响应
-    [[nodiscard]] GetStatusResponse queryStatus();
+    [[nodiscard]] GetStatusResponse QueryStatus();
 
 private:
-    std::unique_ptr<IXcpTransport> transport_;
-    Session session_;
-    std::unique_ptr<CommandExecutor> executor_;
-    std::unique_ptr<MemoryAccess> memoryAccess_;
+    std::unique_ptr<IXcpTransport> m_transport_;
+    Session m_session_;
+    std::unique_ptr<CommandExecutor> m_executor_;
+    std::unique_ptr<MemoryAccess> m_memory_access_;
 };
 
 }  // namespace calmcar::xcp
@@ -1659,35 +1660,35 @@ public:
     MockTransport() = default;
     ~MockTransport() override;
 
-    void open(IPacketListener& listener) override;
-    void close() override;
-    void send(BytesView packet) override;
-    [[nodiscard]] bool isOpen() const noexcept override;
+    void Open(IPacketListener& listener) override;
+    void Close() override;
+    void Send(BytesView packet) override;
+    [[nodiscard]] bool IsOpen() const noexcept override;
 
     // ---- 测试控制接口 ----
 
-    /// @brief 设置下次 send 时的响应
-    /// @param responseFunc 接收发送的 Packet，返回要回调的响应 Packet
-    void setResponse(std::function<Bytes(BytesView)> responseFunc);
+    /// @brief 设置下次 Send 时的响应
+    /// @param response_func 接收发送的 Packet，返回要回调的响应 Packet
+    void SetResponse(std::function<Bytes(BytesView)> response_func);
 
     /// @brief 主动注入异步 Packet（模拟 EV/SERV/DTO）
-    void injectPacket(BytesView packet);
+    void InjectPacket(BytesView packet);
 
     /// @brief 主动注入 Transport 关闭事件
-    void injectClose(std::string_view reason);
+    void InjectClose(std::string_view reason);
 
     /// @brief 主动注入 Transport 警告
-    void injectWarning(std::string_view message);
+    void InjectWarning(std::string_view message);
 
     /// @brief 获取已发送的 Packet 列表
-    [[nodiscard]] std::vector<Bytes> sentPackets() const;
+    [[nodiscard]] std::vector<Bytes> SentPackets() const;
 
 private:
-    IPacketListener* listener_ = nullptr;
-    bool open_ = false;
-    mutable std::mutex mutex_;
-    std::function<Bytes(BytesView)> responseFunc_;
-    std::vector<Bytes> sentPackets_;
+    IPacketListener* m_listener_ = nullptr;
+    bool m_open_ = false;
+    mutable std::mutex m_mutex_;
+    std::function<Bytes(BytesView)> m_response_func_;
+    std::vector<Bytes> m_sent_packets_;
 };
 
 }  // namespace calmcar::xcp::test
@@ -1719,19 +1720,19 @@ namespace calmcar::xcp::test {
 /// @brief 故障注入配置
 struct FaultInjection {
     /// @brief 丢弃第 N 个响应（0 表示不丢弃）
-    std::optional<std::size_t> dropResponseN;
+    std::optional<std::size_t> m_drop_response_n_;
 
     /// @brief 延迟第 N 个响应（毫秒）
-    std::optional<std::pair<std::size_t, std::uint32_t>> delayResponseN;
+    std::optional<std::pair<std::size_t, std::uint32_t>> m_delay_response_n_;
 
     /// @brief 对第 N 个响应使用错误 LEN
-    std::optional<std::size_t> corruptLenN;
+    std::optional<std::size_t> m_corrupt_len_n_;
 
     /// @brief 对第 N 个响应使用跳号 CTR
-    std::optional<std::size_t> jumpCtrN;
+    std::optional<std::size_t> m_jump_ctr_n_;
 
     /// @brief 对第 N 个响应使用重复 CTR
-    std::optional<std::size_t> duplicateCtrN;
+    std::optional<std::size_t> m_duplicate_ctr_n_;
 };
 
 /// @brief UDP 测试 Slave（Loopback）
@@ -1752,100 +1753,100 @@ public:
     // ---- 控制 ----
 
     /// @brief 启动 Slave 接收线程
-    void start();
+    void Start();
 
     /// @brief 停止 Slave
-    void stop();
+    void Stop();
 
     /// @brief 获取 Slave 绑定的端口（用于 Master 连接）
-    [[nodiscard]] std::uint16_t port() const;
+    [[nodiscard]] std::uint16_t Port() const;
 
     // ---- 测试配置 ----
 
     /// @brief 设置模拟内存内容
-    void setMemory(Address address, BytesView data);
+    void SetMemory(Address address, BytesView data);
 
     /// @brief 设置故障注入
-    void setFaultInjection(const FaultInjection& fault);
+    void SetFaultInjection(const FaultInjection& fault);
 
     /// @brief 获取收到的命令计数
-    [[nodiscard]] std::size_t commandCount() const;
+    [[nodiscard]] std::size_t CommandCount() const;
 
     /// @brief 向已连接 Master 发送一个包含多个 XCP Frame 的 UDP Datagram
-    /// @param xcpPackets 要按顺序打包的原始 XCP Packet 列表
+    /// @param xcp_packets 要按顺序打包的原始 XCP Packet 列表
     /// @throws XcpException(InvalidState) 尚未记录 CONNECT 来源端点
     /// @throws XcpException(InvalidArgument) Frame 或 Datagram 超过允许长度
     /// @details 仅用于验证 Master 接收端对 XCP 1.1 多 Frame UDP 打包的解析能力。
-    void sendPackedFrames(std::span<const BytesView> xcpPackets);
+    void SendPackedFrames(std::span<const BytesView> xcp_packets);
 
 private:
     /// @brief 接收线程主循环
-    /// @details 对每个 UDP Datagram 按 LEN 解析全部完整 Frame，再依序调用 handleCommand()。
-    void receiveLoop();
+    /// @details 对每个 UDP Datagram 按 LEN 解析全部完整 Frame，再依序调用 HandleCommand()。
+    void ReceiveLoop();
 
     /// @brief 处理收到的 UDP Datagram 中的一个 XCP Frame
-    /// @param xcpPacket Frame 内的原始 XCP Packet
-    /// @param sourceIp 发送方 IPv4 地址
-    /// @param sourcePort 发送方 UDP 端口
-    void handleCommand(BytesView xcpPacket,
-                       const std::string& sourceIp,
-                       std::uint16_t sourcePort);
+    /// @param xcp_packet Frame 内的原始 XCP Packet
+    /// @param source_ip 发送方 IPv4 地址
+    /// @param source_port 发送方 UDP 端口
+    void HandleCommand(BytesView xcp_packet,
+                       const std::string& source_ip,
+                       std::uint16_t source_port);
 
     /// @brief 判断来源是否符合当前逻辑 XCP 会话
     /// @details 未连接时只允许 CONNECT 建立会话；连接后仅匹配 CONNECT 来源 IP，
     ///          不要求后续命令使用同一源端口。
-    [[nodiscard]] bool isCurrentSessionSource(const std::string& sourceIp) const;
+    [[nodiscard]] bool IsCurrentSessionSource(const std::string& source_ip) const;
 
     /// @brief 发送响应到 CONNECT 时记录的来源 IP:port
-    void sendResponse(BytesView xcpPacket);
+    void SendResponse(BytesView xcp_packet);
 
     /// @brief 测试 Socket 私有实现声明
     struct SocketImpl;
 
     /// @brief Loopback UDP Socket 资源的拥有者
-    std::unique_ptr<SocketImpl> socket_;
+    std::unique_ptr<SocketImpl> m_socket_;
 
     /// @brief Socket 实际绑定的临时端口
-    std::uint16_t port_ = 0;
+    std::uint16_t m_port_ = 0;
 
     /// @brief 接收循环运行标记
-    std::atomic<bool> running_{false};
+    std::atomic<bool> m_running_{false};
 
     /// @brief 测试 Slave 接收线程
-    std::thread receiveThread_;
+    std::thread m_receive_thread_;
 
     /// @brief 保护模拟内存的互斥量
-    mutable std::mutex memoryMutex_;
+    mutable std::mutex m_memory_mutex_;
 
     /// @brief 按起始地址存储的模拟 ECU 内存块
-    std::map<Address, Bytes> memory_;
+    std::map<Address, Bytes> m_memory_;
 
     /// @brief 保护逻辑 Session、MTA、CTR 和故障配置的互斥量
-    std::mutex stateMutex_;
+    std::mutex m_state_mutex_;
 
     /// @brief 是否已建立模拟 XCP Session
-    bool connected_ = false;
+    bool m_connected_ = false;
 
     /// @brief CONNECT 报文来源 IPv4 地址
-    std::optional<std::string> connectSourceIp_;
+    std::optional<std::string> m_connect_source_ip_;
 
     /// @brief CONNECT 报文来源 UDP 端口，也是后续响应的固定目的端口
-    std::optional<std::uint16_t> connectSourcePort_;
+    std::optional<std::uint16_t> m_connect_source_port_;
 
     /// @brief 当前模拟 MTA 的 32 位地址部分
-    Address mta_ = 0;
+    Address m_mta_ = 0;
 
     /// @brief 当前模拟 MTA 的地址扩展部分
-    AddressExtension mtaExtension_ = 0;
+    AddressExtension m_mta_extension_ = 0;
 
     /// @brief 下一个 Slave→Master XCP Frame 使用的 CTR
-    DatagramCtr sendCtr_ = 0;
+    DatagramCtr m_send_ctr_ = 0;
 
     /// @brief 已处理的 XCP 命令总数
-    std::size_t commandCount_ = 0;
+    std::size_t m_command_count_ = 0;
 
     /// @brief 当前故障注入配置
-    FaultInjection fault_;
+    FaultInjection m_fault_;
 };
 
 }  // namespace calmcar::xcp::test
@@ -1853,8 +1854,8 @@ private:
 
 ### 15.3 XCP 1.1 UDP 多 Frame 与端点绑定测试要求
 
-1. `UdpHeaderCodec`：一个 Datagram 中连续编码两个 Frame 时，必须按 `Header_1 + Packet_1 + Header_2 + Packet_2` 顺序完整解析；任一 LEN 越界、截断 Header 或尾部残留字节，`decodeUdpDatagram()` 必须整体失败。
-2. `UdpTransport`：收到多 Frame Datagram 时，必须按 Frame 顺序分别执行 CTR 检查并回调 `IPacketListener::onPacketReceived()`；发送方向仍验证“一次 `send()` 发送一个 Frame/Datagram”的项目策略。
+1. `UdpHeaderCodec`：一个 Datagram 中连续编码两个 Frame 时，必须按 `Header_1 + Packet_1 + Header_2 + Packet_2` 顺序完整解析；任一 LEN 越界、截断 Header 或尾部残留字节，`DecodeUdpDatagram()` 必须整体失败。
+2. `UdpTransport`：收到多 Frame Datagram 时，必须按 Frame 顺序分别执行 CTR 检查并回调 `IPacketListener::OnPacketReceived()`；发送方向仍验证“一次 `Send()` 发送一个 Frame/Datagram”的项目策略。
 3. `UdpTestSlave`：未连接时仅对 CONNECT 的来源 IP:port 回复；连接后从同一 IP 的不同源端口收到命令时应处理该命令，但响应目的地必须保持原 CONNECT 来源 IP:port；其他 IP 的命令必须忽略。
 4. Loopback 测试必须覆盖：一个 Datagram 中的 `EV + RES`、两个连续 `RES/ERR` Frame、第二个 Frame LEN 损坏时整个 Datagram 不交付、以及 CTR 在同一 Datagram 内连续递增。
 5. 测试不得把多 Frame 打包的 CTR 当作 Datagram 级别的单一计数器；每个 Frame 的 Header 都独立消耗一个 CTR 值。
@@ -1869,29 +1870,29 @@ private:
 用户线程                Transport 工作线程
     |                        |
     v                        |
-XcpMaster::connect()         |
+XcpMaster::Connect()         |
     |                        |
     v                        |
-CommandExecutor::execute*()  |
+CommandExecutor::Execute*()  |
     |                        |
-    +-- transport_.send() -->|
+    +-- m_transport_.Send() -->|
     |                        |
-    +-- waitForResponse()    |
+    +-- WaitForResponse()    |
     |   (阻塞在 cv)          |
     |                        v
     |                Transport 收到 Datagram
     |                        |
-    |                IPacketListener::onPacketReceived()
+    |                IPacketListener::OnPacketReceived()
     |                        |
-    |                CommandExecutor::onPacketReceived()
+    |                CommandExecutor::OnPacketReceived()
     |                  (在工作线程执行)
     |                        |
-    |                  加锁 mutex_
-    |                  设置 pendingResponse_
+    |                  加锁 m_mutex_
+    |                  设置 m_pending_response_
     |                  notify cv
     |                        |
     v                        |
-waitForResponse() 唤醒        |
+WaitForResponse() 唤醒        |
     |                        |
     v                        |
 解析响应，返回用户            |
@@ -1901,24 +1902,24 @@ waitForResponse() 唤醒        |
 
 | 共享状态 | 保护机制 | 访问者 |
 |---|---|---|
-| `Session::state_` 等全部字段 | `Session::mutex_` | 用户线程 + Transport 线程 |
-| `CommandExecutor::pendingResponse_` | `CommandExecutor::mutex_` + `responseCv_` | 用户线程写(发送) + Transport 线程写(回调) |
-| `CommandExecutor::transportClosed_` | 同上 | 同上 |
-| `UdpTransport::sendCtr_` | `atomic` 或 `sendMutex_` | 用户线程 |
-| `UdpTransport::lastRecvCtr_` | `recvMutex_` | Transport 线程 |
+| `Session::m_state_` 等全部字段 | `Session::m_mutex_` | 用户线程 + Transport 线程 |
+| `CommandExecutor::m_pending_response_` | `CommandExecutor::m_mutex_` + `m_response_cv_` | 用户线程写(发送) + Transport 线程写(回调) |
+| `CommandExecutor::m_transport_closed_` | 同上 | 同上 |
+| `UdpTransport::m_send_ctr_` | `atomic` 或 `m_send_mutex_` | 用户线程 |
+| `UdpTransport::m_last_recv_ctr_` | `m_recv_mutex_` | Transport 线程 |
 
 ### 16.3 死锁规避
 
-- `CommandExecutor::onPacketReceived()` 在工作线程执行，**不得**在持锁状态下回调 `IEventListener`。
+- `CommandExecutor::OnPacketReceived()` 在工作线程执行，**不得**在持锁状态下回调 `IEventListener`。
 - 正确做法：先在锁内取出响应/事件，释放锁，再回调 `IEventListener`。
-- `Session` 的锁是独立的，`CommandExecutor` 调用 `Session` 方法时不会持有自己的 `mutex_`。
+- `Session` 的锁是独立的，`CommandExecutor` 调用 `Session` 方法时不会持有自己的 `m_mutex_`。
 
 ### 16.4 关闭语义
 
-- `UdpTransport::close()` 设置 `running_ = false`，关闭 Socket，`join()` 接收线程。
-- 接收线程退出前调用 `listener_->onTransportClosed()`。
-- `close()` 可在用户线程调用，与接收线程并发安全。
-- `close()` 可重复调用（幂等）。
+- `UdpTransport::Close()` 设置 `m_running_ = false`，关闭 Socket，`join()` 接收线程。
+- 接收线程退出前调用 `m_listener_->OnTransportClosed()`。
+- `Close()` 可在用户线程调用，与接收线程并发安全。
+- `Close()` 可重复调用（幂等）。
 
 ---
 
@@ -1990,7 +1991,7 @@ XCP 1.1 Part 3 允许一个 UDP Datagram 依次容纳一个或多个完整 Frame
 UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 ```
 
-每个 Frame 都有独立的 LEN 和 CTR；任一 Frame 不得跨 UDP Datagram 边界。本项目发送方向为简单且确定的策略：一次 `IXcpTransport::send()` 生成一个 Frame 并独占一个 UDP Datagram；接收方向必须能解析连续打包的多个 Frame。
+每个 Frame 都有独立的 LEN 和 CTR；任一 Frame 不得跨 UDP Datagram 边界。本项目发送方向为简单且确定的策略：一次 `IXcpTransport::Send()` 生成一个 Frame 并独占一个 UDP Datagram；接收方向必须能解析连续打包的多个 Frame。
 
 ### 17.6 COMM_MODE_BASIC 位定义（待官方规范确认）
 
@@ -2019,10 +2020,10 @@ UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 
 | 编号 | 问题 | 影响 | 当前状态 |
 |---|---|---|---|
-| Q1 | COMM_MODE_BASIC 的精确 bit 定义 | `parseConnectResponse` 实现 | 依据译文推断，需对照官方规范确认 |
+| Q1 | COMM_MODE_BASIC 的精确 bit 定义 | `ParseConnectResponse` 实现 | 依据译文推断，需对照官方规范确认 |
 | Q2 | CONNECT 响应中 MAX_DTO 是 1 字节还是 2 字节 | `ConnectResponse` 字段类型 | 示例 `FF 15 C0 08 08 00 10 10` 中 MAX_DTO=0x0008，看起来是 2 字节；但 MAX_CTO 后直接跟 MAX_DTO 两字节，再跟版本。需确认 |
-| Q3 | SET_MTA 中 address 字段的确切字节序 | `encodeSetMta` 实现 | 译文说"按 Session Byte Order"，但 SET_MTA 在 CONNECT 之前不能用，所以 CONNECT 后字节序已确定。确认 SET_MTA 的 address 确实用 Session Byte Order |
-| Q4 | SYNCH 命令是否需要特殊编码 | `encodeSynch` | 译文说 SYNCH 始终以 ERR_CMD_SYNCH 应答，命令本身格式 `[FC][00]`，需确认 |
+| Q3 | SET_MTA 中 address 字段的确切字节序 | `EncodeSetMta` 实现 | 译文说"按 Session Byte Order"，但 SET_MTA 在 CONNECT 之前不能用，所以 CONNECT 后字节序已确定。确认 SET_MTA 的 address 确实用 Session Byte Order |
+| Q4 | SYNCH 命令是否需要特殊编码 | `EncodeSynch` | 译文说 SYNCH 始终以 ERR_CMD_SYNCH 应答，命令本身格式 `[FC][00]`，需确认 |
 | Q5 | CMake 构建系统和测试框架选择 | 工程基线 | 当前仓库无 CMakeLists.txt，需确认使用 GoogleTest 还是其他 |
 | Q6 | `.clang-format` 文件是否存在 | 代码格式 | AGENTS.md 提到参考 .clang-format，需确认仓库中是否有此文件 |
 
@@ -2030,7 +2031,7 @@ UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 
 | 编号 | 决策 | 依据 |
 |---|---|---|
-| D1 | CTR 初值为 0，open() 时复位 | 计划文档 4.7 |
+| D1 | CTR 初值为 0，Open() 时复位 | 计划文档 4.7 |
 | D2 | 原命令最多 2 次恢复重试 | 计划文档 6.2 |
 | D3 | Master 侧默认严格匹配远端 IP+端口（可配置为仅匹配 IP） | 本项目安全策略；不等同于标准对 Slave 的连接绑定规则 |
 | D4 | UDP 不重排、不重传 Frame | 计划文档 4.7 |
@@ -2042,8 +2043,8 @@ UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 ### 18.3 可选增强（本阶段不实现，但接口预留）
 
 - `IEventListener` 接口已定义，本阶段 DTO 只上报不解析。
-- `UdpTransportConfig::strictRemotePort` 预留 NAT 兼容。
-- `Session::fail()` 预留 Failed 状态。
+- `UdpTransportConfig::m_strict_remote_port_` 预留 NAT 兼容。
+- `Session::Fail()` 预留 Failed 状态。
 
 ---
 
@@ -2111,22 +2112,22 @@ using namespace calmcar::xcp;
 
 // 1. 创建 Transport
 UdpTransportConfig cfg;
-cfg.remoteHost = "127.0.0.1";
-cfg.remotePort = slavePort;  // 从 UdpTestSlave 获取
-cfg.localHost = "127.0.0.1";
+cfg.m_remote_host_ = "127.0.0.1";
+cfg.m_remote_port_ = slave_port;  // 从 UdpTestSlave 获取
+cfg.m_local_host_ = "127.0.0.1";
 auto transport = std::make_unique<UdpTransport>(std::move(cfg));
 
 // 2. 创建 Master
 XcpMaster master(std::move(transport));
 
 // 3. 连接
-master.connect();  // CONNECT → GET_COMM_MODE_INFO → GET_STATUS
+master.Connect();  // CONNECT → GET_COMM_MODE_INFO → GET_STATUS
 
 // 4. 读取内存
-auto data = master.readMemory(0x70012340, 0x00, 4);  // 读 4 字节
+auto data = master.ReadMemory(0x70012340, 0x00, 4);  // 读 4 字节
 
 // 5. 断开
-master.disconnect();
+master.Disconnect();
 ```
 
 ### B.2 Mock Transport 测试
@@ -2136,17 +2137,23 @@ using namespace calmcar::xcp;
 using namespace calmcar::xcp::test;
 
 MockTransport transport;
-transport.setResponse([](BytesView sent) -> Bytes {
+transport.SetResponse([](BytesView sent) -> Bytes {
     // 检查 sent 是 CONNECT 命令
     // 返回 CONNECT 响应
     return {0xFF, 0x15, 0xC0, 0x08, 0x08, 0x00, 0x10, 0x10};
 });
 
 XcpMaster master(std::make_unique<MockTransport>(std::move(transport)));
-master.connect();
-// 断言 sessionParameters() 正确
+master.Connect();
+// 断言 master.GetSessionParameters() 正确
 ```
 
 ---
 
 > 本文档到此结束。所有接口定义均为设计阶段产物，未经编译验证。开始编码前需解决第 18 节中的开放问题。
+
+
+
+
+
+

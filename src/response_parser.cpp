@@ -39,11 +39,13 @@ constexpr std::uint8_t kResumeMask = 0x80U;
 }  // namespace
 
 ResponseParser::ResponseParser(ByteOrder byte_order) noexcept
-    : byte_order_(byte_order) {}
+    : m_byte_order_(byte_order) {}
 
-ByteOrder ResponseParser::byteOrder() const noexcept { return byte_order_; }
+ByteOrder ResponseParser::GetByteOrder() const noexcept {
+    return m_byte_order_;
+}
 
-std::optional<std::uint8_t> ResponseParser::readU8(
+std::optional<std::uint8_t> ResponseParser::ReadU8(
     BytesView data, std::size_t offset) noexcept {
     if (offset >= data.size()) {
         return std::nullopt;
@@ -51,14 +53,14 @@ std::optional<std::uint8_t> ResponseParser::readU8(
     return data[offset];
 }
 
-std::optional<std::uint16_t> ResponseParser::readU16(BytesView data,
+std::optional<std::uint16_t> ResponseParser::ReadU16(BytesView data,
                                                      std::size_t offset) const {
-    const auto lo = readU8(data, offset);
-    const auto hi = readU8(data, offset + 1);
+    const auto lo = ReadU8(data, offset);
+    const auto hi = ReadU8(data, offset + 1);
     if (!lo || !hi) {
         return std::nullopt;
     }
-    if (byte_order_ == ByteOrder::Intel) {
+    if (m_byte_order_ == ByteOrder::Intel) {
         return static_cast<std::uint16_t>(
             *lo | (static_cast<std::uint16_t>(*hi) << 8));
     }
@@ -66,7 +68,7 @@ std::optional<std::uint16_t> ResponseParser::readU16(BytesView data,
                                       *hi);
 }
 
-std::optional<ParsedPacket> ResponseParser::parse(
+std::optional<ParsedPacket> ResponseParser::Parse(
     BytesView packet, CommandCode expected_command) const {
     if (packet.empty()) {
         // 空 Packet 无法分类，视为畸形
@@ -79,8 +81,8 @@ std::optional<ParsedPacket> ResponseParser::parse(
     switch (pid) {
         case static_cast<std::uint8_t>(PacketType::Res): {
             PositiveResponse res;
-            res.command = expected_command;
-            res.data.assign(body.begin(), body.end());
+            res.m_command_ = expected_command;
+            res.m_data_.assign(body.begin(), body.end());
             return ParsedPacket{res};
         }
         case static_cast<std::uint8_t>(PacketType::Err): {
@@ -89,10 +91,10 @@ std::optional<ParsedPacket> ResponseParser::parse(
                 return std::nullopt;
             }
             NegativeResponse err;
-            err.rawErrorCode = body[0];
-            err.errorCode = toErrorCode(body[0]);
+            err.m_raw_error_code_ = body[0];
+            err.m_error_code_ = toErrorCode(body[0]);
             const BytesView extra = body.subspan(1);
-            err.additionalInfo.assign(extra.begin(), extra.end());
+            err.m_additional_info_.assign(extra.begin(), extra.end());
             return ParsedPacket{err};
         }
         case static_cast<std::uint8_t>(PacketType::Ev): {
@@ -100,10 +102,10 @@ std::optional<ParsedPacket> ResponseParser::parse(
                 return std::nullopt;
             }
             EventPacket ev;
-            ev.rawEventCode = body[0];
-            ev.eventCode = toEventCode(body[0]);
+            ev.m_raw_event_code_ = body[0];
+            ev.m_event_code_ = toEventCode(body[0]);
             const BytesView extra = body.subspan(1);
-            ev.info.assign(extra.begin(), extra.end());
+            ev.m_info_.assign(extra.begin(), extra.end());
             return ParsedPacket{ev};
         }
         case static_cast<std::uint8_t>(PacketType::Serv): {
@@ -111,34 +113,34 @@ std::optional<ParsedPacket> ResponseParser::parse(
                 return std::nullopt;
             }
             ServicePacket serv;
-            serv.serviceCode = body[0];
+            serv.m_service_code_ = body[0];
             const BytesView extra = body.subspan(1);
-            serv.data.assign(extra.begin(), extra.end());
+            serv.m_data_.assign(extra.begin(), extra.end());
             return ParsedPacket{serv};
         }
         default: {
             // 0x00..0xFB：DAQ DTO，本阶段仅识别不解析
             DtoPacket dto;
-            dto.pid = pid;
-            dto.data.assign(body.begin(), body.end());
+            dto.m_pid_ = pid;
+            dto.m_data_.assign(body.begin(), body.end());
             return ParsedPacket{dto};
         }
     }
 }
 
-std::optional<ConnectResponse> ResponseParser::parseConnectResponse(
+std::optional<ConnectResponse> ResponseParser::ParseConnectResponse(
     BytesView res_data) const {
     if (res_data.size() < kConnectResMinSize) {
         return std::nullopt;
     }
 
     ConnectResponse resp;
-    resp.resourceMask = res_data[0];
+    resp.m_resource_mask_ = res_data[0];
 
     const std::uint8_t comm_mode_basic = res_data[1];
-    resp.byteOrder = ((comm_mode_basic & kByteOrderMask) != 0U)
-                         ? ByteOrder::Motorola
-                         : ByteOrder::Intel;
+    resp.m_byte_order_ = ((comm_mode_basic & kByteOrderMask) != 0U)
+                             ? ByteOrder::Motorola
+                             : ByteOrder::Intel;
 
     const auto ag_field = static_cast<std::uint8_t>(
         (comm_mode_basic >> kAddressGranularityShift) & 0x03U);
@@ -147,23 +149,24 @@ std::optional<ConnectResponse> ResponseParser::parseConnectResponse(
         // AG 位域为保留值 11：非法协商结果
         return std::nullopt;
     }
-    resp.addressGranularity = *ag;
-    resp.slaveBlockModeSupported =
+    resp.m_address_granularity_ = *ag;
+    resp.m_slave_block_mode_supported_ =
         (comm_mode_basic & kSlaveBlockModeMask) != 0U;
-    resp.optionalCommModeAvailable = (comm_mode_basic & kOptionalMask) != 0U;
+    resp.m_optional_comm_mode_available_ =
+        (comm_mode_basic & kOptionalMask) != 0U;
 
-    resp.maxCto = res_data[2];
-    const auto max_dto = readU16(res_data, 3);
+    resp.m_max_cto_ = res_data[2];
+    const auto max_dto = ReadU16(res_data, 3);
     if (!max_dto) {
         return std::nullopt;
     }
-    resp.maxDto = *max_dto;
-    resp.protocolLayerVersion = res_data[5];
-    resp.transportLayerVersion = res_data[6];
+    resp.m_max_dto_ = *max_dto;
+    resp.m_protocol_layer_version_ = res_data[5];
+    resp.m_transport_layer_version_ = res_data[6];
     return resp;
 }
 
-std::optional<GetStatusResponse> ResponseParser::parseGetStatusResponse(
+std::optional<GetStatusResponse> ResponseParser::ParseGetStatusResponse(
     BytesView res_data) const {
     if (res_data.size() < kGetStatusResMinSize) {
         return std::nullopt;
@@ -171,36 +174,37 @@ std::optional<GetStatusResponse> ResponseParser::parseGetStatusResponse(
 
     GetStatusResponse resp;
     const std::uint8_t session_status = res_data[0];
-    resp.resume = (session_status & kResumeMask) != 0U;
-    resp.daqRunning = (session_status & kDaqRunningMask) != 0U;
-    resp.clearDaqReq = (session_status & kClearDaqReqMask) != 0U;
-    resp.storeDaqReq = (session_status & kStoreDaqReqMask) != 0U;
-    resp.storeCalReq = (session_status & kStoreCalReqMask) != 0U;
-    resp.resourceProtection = res_data[1];
-    resp.stateNumber = res_data[2];
-    const auto config_id = readU16(res_data, 3);
+    resp.m_resume_ = (session_status & kResumeMask) != 0U;
+    resp.m_daq_running_ = (session_status & kDaqRunningMask) != 0U;
+    resp.m_clear_daq_req_ = (session_status & kClearDaqReqMask) != 0U;
+    resp.m_store_daq_req_ = (session_status & kStoreDaqReqMask) != 0U;
+    resp.m_store_cal_req_ = (session_status & kStoreCalReqMask) != 0U;
+    resp.m_resource_protection_ = res_data[1];
+    resp.m_state_number_ = res_data[2];
+    const auto config_id = ReadU16(res_data, 3);
     if (!config_id) {
         return std::nullopt;
     }
-    resp.sessionConfigId = *config_id;
+    resp.m_session_config_id_ = *config_id;
     return resp;
 }
 
 std::optional<GetCommModeInfoResponse>
-ResponseParser::parseGetCommModeInfoResponse(BytesView res_data) const {
+ResponseParser::ParseGetCommModeInfoResponse(BytesView res_data) const {
     if (res_data.size() < kGetCommModeInfoResMinSize) {
         return std::nullopt;
     }
 
     GetCommModeInfoResponse resp;
-    resp.commModeOptional = res_data[1];
-    resp.maxBs = res_data[3];
-    resp.minSt = res_data[4];
-    resp.queueSize = res_data[5];
+    resp.m_comm_mode_optional_ = res_data[1];
+    resp.m_max_bs_ = res_data[3];
+    resp.m_min_st_ = res_data[4];
+    resp.m_queue_size_ = res_data[5];
     const std::uint8_t driver_version = res_data[6];
-    resp.driverVersionMajor =
+    resp.m_driver_version_major_ =
         static_cast<std::uint8_t>((driver_version >> 4) & 0x0FU);
-    resp.driverVersionMinor = static_cast<std::uint8_t>(driver_version & 0x0FU);
+    resp.m_driver_version_minor_ =
+        static_cast<std::uint8_t>(driver_version & 0x0FU);
     return resp;
 }
 

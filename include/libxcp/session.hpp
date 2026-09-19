@@ -42,121 +42,73 @@ public:
     // ---- 状态查询 ----
 
     /// @brief 获取当前 Session 状态
-    [[nodiscard]] SessionState state() const;
+    [[nodiscard]] SessionState State() const;
 
-    /// @brief 是否已连接（Connected 状态）
-    [[nodiscard]] bool isConnected() const;
+    [[nodiscard]] bool IsConnected() const;
 
-    /// @brief 是否有等待响应的命令（Outstanding Command）
-    [[nodiscard]] bool hasPendingCommand() const;
+    [[nodiscard]] bool HasPendingCommand() const;
 
-    /// @brief 最近一次 fail() 记录的原因；未失败时为空串
-    [[nodiscard]] std::string failReason() const;
+    [[nodiscard]] std::string FailReason() const;
 
     // ---- 状态迁移 ----
 
-    /**
-     * @brief 进入 Connecting 状态
-     * @throws XcpException(InvalidState) 当前状态不允许发起连接
-     */
-    void beginConnecting();
+    void BeginConnecting();
 
-    /**
-     * @brief CONNECT 成功，校验并保存参数，进入 Connected
-     * @param connect_response CONNECT 响应解析结果
-     * @throws XcpException(InvalidArgument) 参数校验失败
-     * @throws XcpException(InvalidState) 当前不在 Connecting 状态
-     */
-    void establishConnection(const ConnectResponse& connect_response);
+    void EstablishConnection(const ConnectResponse& connect_response);
 
-    /**
-     * @brief 进入 Disconnecting 状态
-     * @throws XcpException(InvalidState) 当前状态不允许断开
-     */
-    void beginDisconnecting();
+    void BeginDisconnecting();
 
-    /**
-     * @brief DISCONNECT 成功，清理协商参数并进入 Disconnected
-     */
-    void completeDisconnection();
+    void CompleteDisconnection();
 
-    /**
-     * @brief 进入 Recovering 状态
-     * @throws XcpException(InvalidState) 当前状态不允许恢复
-     */
-    void beginRecovery();
+    void BeginRecovery();
 
     /**
      * @brief SYNCH 恢复成功，回到 Connected
      */
-    void completeRecovery();
+    void CompleteRecovery();
 
-    /**
-     * @brief 标记 Session 为 Failed 并保留原因
-     * @param reason 失败原因
-     * @note 任何状态均可进入 Failed；协商参数一并清空，需重新连接。
-     */
-    void fail(std::string_view reason);
+    void Fail(std::string_view reason);
 
-    /**
-     * @brief 强制重置到 Disconnected（用于本地清理，不发送 DISCONNECT）
-     */
-    void reset();
+    void Reset();
 
     // ---- Outstanding Command 管理 ----
 
-    /**
-     * @brief 标记命令已发送，等待最终响应
-     * @param cmd 命令码
-     * @throws XcpException(InvalidState) 已有 Pending Command，或 Session 处于
-     *         Disconnected/Failed 等不可发送状态
-     */
-    void markCommandSent(CommandCode cmd);
+    void MarkCommandSent(CommandCode cmd);
 
-    /// @brief 标记命令响应已收到
-    void clearPendingCommand();
+    void ClearPendingCommand();
 
-    /// @brief 获取当前 Pending 命令码
-    [[nodiscard]] std::optional<CommandCode> pendingCommand() const;
+    [[nodiscard]] std::optional<CommandCode> PendingCommand() const;
 
     // ---- 参数访问 ----
 
-    /// @brief 获取 Session 参数快照
-    [[nodiscard]] SessionParameters parameters() const;
+    [[nodiscard]] SessionParameters Parameters() const;
 
-    /// @brief 更新 GET_COMM_MODE_INFO 结果
-    void updateCommModeInfo(const GetCommModeInfoResponse& info);
+    void UpdateCommModeInfo(const GetCommModeInfoResponse& info);
 
-    /// @brief 更新 GET_STATUS 结果
-    void updateStatus(const GetStatusResponse& status);
+    void UpdateStatus(const GetStatusResponse& status);
 
-    /// @brief 标记 SHORT_UPLOAD 不可用（遇 ERR_CMD_UNKNOWN 后降级）
-    void disableShortUpload();
+    void DisableShortUpload();
 
-    /// @brief 获取当前 Byte Order（未连接时返回 Intel）
-    [[nodiscard]] ByteOrder byteOrder() const;
+    [[nodiscard]] ByteOrder GetByteOrder() const;
 
-    /// @brief 获取当前 AG（未连接时返回 Byte）
-    [[nodiscard]] AddressGranularity addressGranularity() const;
+    [[nodiscard]] AddressGranularity GetAddressGranularity() const;
 
-    /// @brief 获取 MAX_CTO（未连接时返回 0）
-    [[nodiscard]] std::uint8_t maxCto() const;
+    [[nodiscard]] std::uint8_t MaxCto() const;
 
-    /// @brief 获取 MAX_DTO（未连接时返回 0）
-    [[nodiscard]] std::uint16_t maxDto() const;
+    [[nodiscard]] std::uint16_t MaxDto() const;
 
 private:
-    mutable std::mutex mutex_;                        ///< 保护以下全部字段
-    SessionState state_{SessionState::Disconnected};  ///< 当前状态
-    SessionParameters params_;                        ///< 协商参数
-    std::optional<CommandCode> pending_command_;  ///< 单 Outstanding Command
-    std::string fail_reason_;                     ///< 最近失败原因
+    mutable std::mutex m_mutex_;                        ///< 保护以下全部字段
+    SessionState m_state_{SessionState::Disconnected};  ///< 当前状态
+    SessionParameters m_params_;                        ///< 协商参数
+    std::optional<CommandCode> m_pending_command_;  ///< 单 Outstanding Command
+    std::string m_fail_reason_;                     ///< 最近失败原因
 
     /**
      * @brief 校验 CONNECT 参数合法性（调用方须已持锁）
      * @throws XcpException(InvalidArgument) 参数非法
      */
-    void validateConnectParams(const ConnectResponse& resp) const;
+    void ValidateConnectParams(const ConnectResponse& resp) const;
 };
 
 }  // namespace calmcar::xcp

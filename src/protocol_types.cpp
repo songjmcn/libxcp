@@ -202,15 +202,16 @@ std::optional<XcpAddress40> XcpAddress40::advance(
     // 先做乘法溢出检查（ElementCount * AG 字节数），再检查地址回绕
     const auto bytes = static_cast<std::uint64_t>(elements) *
                        static_cast<std::uint64_t>(agToBytes(ag));
-    const auto sum = static_cast<std::uint64_t>(address) + bytes;
+    const auto sum = static_cast<std::uint64_t>(m_address_) + bytes;
     if (sum > 0xFFFFFFFFULL) {
         return std::nullopt;
     }
-    return XcpAddress40{static_cast<Address>(sum), extension};
+    return XcpAddress40{static_cast<Address>(sum), m_extension_};
 }
 
 bool operator==(const XcpAddress40& lhs, const XcpAddress40& rhs) noexcept {
-    return lhs.address == rhs.address && lhs.extension == rhs.extension;
+    return lhs.m_address_ == rhs.m_address_ &&
+           lhs.m_extension_ == rhs.m_extension_;
 }
 
 }  // namespace calmcar::xcp

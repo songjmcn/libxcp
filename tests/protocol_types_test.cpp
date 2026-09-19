@@ -130,25 +130,25 @@ TEST(XcpAddress40, AdvancesByElementsInByteAg) {
     XcpAddress40 addr{0x70012340U, 0x02U};
     const auto next = addr.advance(4, AddressGranularity::Byte);
     ASSERT_TRUE(next.has_value());
-    EXPECT_EQ(next->address, 0x70012344U);
-    EXPECT_EQ(next->extension, 0x02U);  // 扩展位保持不变
+    EXPECT_EQ(next->m_address_, 0x70012344U);
+    EXPECT_EQ(next->m_extension_, 0x02U);  // 扩展位保持不变
 }
 
 TEST(XcpAddress40, AdvancesByElementsInWordAndDwordAg) {
     XcpAddress40 addr{0x1000U, 0x00U};
-    EXPECT_EQ(addr.advance(3, AddressGranularity::Word)->address, 0x1006U);
-    EXPECT_EQ(addr.advance(2, AddressGranularity::DWord)->address, 0x1008U);
+    EXPECT_EQ(addr.advance(3, AddressGranularity::Word)->m_address_, 0x1006U);
+    EXPECT_EQ(addr.advance(2, AddressGranularity::DWord)->m_address_, 0x1008U);
 }
 
 TEST(XcpAddress40, DetectsOverflow) {
     XcpAddress40 near_end{0xFFFFFFFFU, 0x00U};
     EXPECT_EQ(near_end.advance(1, AddressGranularity::Byte), std::nullopt);
-    EXPECT_EQ(near_end.advance(0, AddressGranularity::Byte)->address,
+    EXPECT_EQ(near_end.advance(0, AddressGranularity::Byte)->m_address_,
               0xFFFFFFFFU);
 
     XcpAddress40 last_byte{0xFFFFFFF0U, 0x00U};
     EXPECT_EQ(last_byte.advance(4, AddressGranularity::DWord), std::nullopt);
-    EXPECT_EQ(last_byte.advance(3, AddressGranularity::DWord)->address,
+    EXPECT_EQ(last_byte.advance(3, AddressGranularity::DWord)->m_address_,
               0xFFFFFFFCU);
 }
 

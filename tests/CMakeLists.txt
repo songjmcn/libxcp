@@ -11,8 +11,7 @@
 #   response_parser_test.cpp    —— RES/ERR/EV/SERV/DTO 分类与字段解析
 #   session_test.cpp            —— Session 状态机、参数校验、单 Pending Command
 #
-# 阶段 3+ 追加：udp_header_codec_test.cpp / udp_transport_test.cpp /
-#               memory_access_test.cpp / recovery_test.cpp /
+# 阶段 3~7 追加：memory_access_test.cpp / recovery_test.cpp /
 #               xcp_master_integration_test.cpp / xcp_udp_loopback_test.cpp
 # ============================================================================
 
@@ -39,7 +38,15 @@ add_executable(libxcp_tests
         xcp_error_test.cpp
         command_codec_test.cpp
         response_parser_test.cpp
-        session_test.cpp)
+        session_test.cpp
+        udp_header_codec_test.cpp
+        udp_transport_test.cpp
+        udp_test_slave_test.cpp
+        memory_access_test.cpp
+        recovery_test.cpp
+        xcp_master_integration_test.cpp
+        xcp_udp_loopback_test.cpp
+        udp_test_slave.cpp)
 
 target_link_libraries(libxcp_tests PRIVATE
         libxcp::libxcp
