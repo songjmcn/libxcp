@@ -1,0 +1,13 @@
+# 构建产物
+cmake-build-*/
+build/
+out/
+
+# 离线依赖缓存（由 CMake 的 .deps-cache/googletest 本地源机制使用，不入库）
+.deps-cache/
+
+# IDE
+.vs/
+.idea/
+.cache/
+compile_commands.json
