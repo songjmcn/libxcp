@@ -10,4 +10,7 @@ out/
 .vs/
 .idea/
 .cache/
+.vscode
 compile_commands.json
+__pycache__
+scripts

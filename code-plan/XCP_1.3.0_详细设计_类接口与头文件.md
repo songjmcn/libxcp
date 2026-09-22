@@ -142,84 +142,105 @@ namespace calmcar::xcp::detail {
 | 预处理宏 | 全大写，下划线分隔 | `CALMCAR_XCP_UDP_TRANSPORT_HPP_` |
 | `constexpr` 编译期常量 | `k` + 大驼峰 | `kUdpHeaderSize`、`kUdpMaxDatagramSize` |
 | 参数与局部变量 | 小写蛇形（snake_case） | `remote_port`、`xcp_packet`、`retry_count` |
-| 普通成员变量 | `m_` + 小写蛇形 + 末尾 `_` | `m_remote_port_`、`m_recv_callback_`、`m_session_state_` |
+| `class` 成员变量 | `m_` + 小写蛇形 + 末尾 `_` | `m_remote_port_`、`m_recv_callback_`、`m_session_state_` |
+| `struct` 成员变量 | 裸 `snake_case`，**不加** `m_` 前缀与末尾 `_` | `remote_host`、`error_code`、`max_cto`、`data` |
 | 静态成员变量 | `s_` + 小写蛇形 + 末尾 `_` | `s_instance_count_` |
 | 全局变量 | `g_` + 小写蛇形 + 末尾 `_` | `g_default_timeouts_` |
-| 布尔变量 | 仍按所属作用域前缀，不额外添加 `b` | `m_connected_`、`is_open`、`has_pending_command` |
-| 智能指针/容器 | 不添加类型缩写，仅遵循作用域前缀 | `m_transport_`、`m_pending_response_`、`xcp_packets` |
+| 布尔变量 | 仍按所属作用域前缀，不额外添加 `b` | class：`m_connected_`；struct：`strict_remote_port`；局部：`is_open`、`has_pending_command` |
+| 智能指针/容器 | 不添加类型缩写，仅遵循所属类别前缀 | class：`m_transport_`、`m_pending_response_`；struct：`additional_info`；局部：`xcp_packets` |
 
-**显式豁免（批次 3 裁决登记，以下三类不要求 `m_<snake>_` 前缀）**：
-
-| 类别 | 采用形式 | 豁免理由 | 现有实例 |
-|---|---|---|---|
-| 纯值语义聚合参数对象 | 裸 `snake_case` | 无成员函数，字段以位置初始化列表/直接赋值方式使用，前缀只增噪音 | `CommandTimeouts::{command_timeout, synch_timeout, max_retries}`；测试中 `AgCase`、`AgIntegrationCase`、局部 `Case` |
-| `.cpp` 内私有 PIMPL | 裸 `snake_case` | 不出现在公开头文件，不对外承诺；字段由宿主类独占访问 | `UdpTransport::SocketImpl::{winsock, handle, bound, remote}`、`UdpTestSlave::SocketImpl::{winsock, handle}` |
-| GoogleTest 夹具成员 | `<snake>_`（仅尾下划线） | 夹具成员在每个 `TEST_F` 体内被大量直接引用，`m_` 前缀显著降低可读性；尾下划线已足以区分于局部变量 | `slave_`、`ep_`、`ctr_`、`res_`、`slave`、`transport_ptr`、`master`、`session`、`executor` |
-
-> ⚠️ 豁免的**已知代价**（如实记录，不粉饰）：`CommandTimeouts` 因此成为公开头文件
-> `include/libxcp/` 中唯一不遵循 `m_<snake>_` 的结构体（其余 7 个均遵循），
-> 造成公开 API 内部的命名不一致。该代价已由用户知情接受；若日后要消除，
-> 改动量很小（3 个字段 × 各 2 处引用，纯机械），届时需同步回收本条豁免。
-
-> 说明：本项目的“匈牙利命名”采用**作用域前缀形式**，即成员变量统一使用 `m_<snake_case>_`，**上表三类豁免除外**。不使用 `str`、`u16`、`p` 等类型前缀，避免类型变化导致名称失真；类型信息由 C++ 类型系统表达。
+> 说明：本项目的"匈牙利命名"采用**作用域前缀形式**，且**按 `struct` / `class` 分流**：
+> `class` 成员统一 `m_<snake_case>_`，`struct` 成员统一裸 `snake_case`（GoogleTest 夹具成员按 §2.2.1.1 豁免）。
+> 不使用 `str`、`u16`、`p` 等类型前缀，避免类型变化导致名称失真；类型信息由 C++ 类型系统表达。
 >
-> 本文后续展示的接口原型均应在实现时按本节规则落地：函数名改为大驼峰，参数使用小写蛇形，成员变量使用 `m_<snake_case>_`（豁免类按上表）。协议报文中定义的字段名称仅在注释、报文图和标准术语说明中保留原始大写拼写。
+> 本文后续展示的接口原型均应在实现时按本节规则落地：函数名用大驼峰，参数与局部变量用小写蛇形，
+> 成员变量按 struct / class 分流。协议报文中定义的字段名称仅在注释、报文图和标准术语说明中
+> 保留原始大写拼写（如 `MAX_CTO`、`ERROR_CODE` 只出现在注释里，字段名写 `max_cto`、`error_code`）。
 
-#### 2.2.1.1 落地状态核对（批次 3）
+#### 2.2.1.1 struct 与 class 的判定依据（批次 4 裁决）
 
-函数命名已按本节规则统一；成员变量的命名偏差**已复核并裁决为显式豁免**（见下表与 §2.2.1.2）。
-证据：Release `/W4` 零警告构建 + 基于括号栈的全量扫描脚本（按类体作用域判定，
-排除函数体内局部变量与多行参数声明续行）。
+**按 `struct` / `class` 关键字判定，不按"是否有成员函数"或"是否纯数据"判定。**
 
-| 类别 | 状态 | 说明 |
+| 要点 | 说明 |
+|---|---|
+| 为什么可以只看关键字 | 实测产品代码（`include/` + `src/`）的 struct 中**只有 `XcpAddress40` 一个带成员函数**（`Advance()`，见 `protocol_types.hpp:292`；同文件 `ConnectResponse` L239-248、`GetStatusResponse` L255-263、`GetCommModeInfoResponse` L270-275 均无成员函数）；`UdpFrame`、`UdpHeader`、`UdpFrameView` 的编解码是**自由函数**（`EncodeUdpFrame` / `DecodeUdpDatagram`，`udp_header_codec.hpp`），不是成员函数。`tests/` 里的 `Fixture`（`recovery_test.cpp:210`）、`Harness`（`memory_access_test.cpp:260`）、`Rig`（`xcp_master_integration_test.cpp:316`）确实也带成员函数，但其成员**本就是裸 `snake_case`**，按关键字判定与按语义判定结果一致。故两种判法在本项目结论相同，而只有前者可被自动校验——后者会永久留下需要人工判断的分歧面 |
+| 有意接受的后果 | `XcpAddress40` 的成员函数照常 public，其字段仍按 struct 规则用裸名。C++ 中 `struct` 与 `class` 的差别本就是默认访问级别，以关键字作判据与语言语义一致 |
+| `class` 侧不变 | 所有 `class`（接口类 `IXcpTransport`、产品类 `UdpTransport`/`CommandExecutor`/`Session`/`XcpException`/`MemoryAccess`/`XcpMaster`/`CommandCodec`/`ResponseParser`，以及测试类 `MockTransport`/`UdpTestSlave`/`FakeSlave`/`MockXcpSlave`/`EventRecorder`/`ScriptedSlave`/`RecordingEvents`/`TransportObserver`）成员一律 `m_<snake>_` |
+| 唯一豁免 | **GoogleTest 夹具类的成员**用 `<snake>_`（仅尾下划线），例 `slave_`、`ep_`、`ctr_`、`res_`。理由：夹具成员在每个 `TEST_F` 体内被大量直接引用，`m_` 前缀显著降低可读性，而尾下划线已足以与局部变量区分。**该豁免只覆盖夹具类本身**，夹具内外定义在 `tests/` 的 helper class（如 `FakeSlave`、`MockXcpSlave`、`EventRecorder`）**不享有豁免**，仍须 `m_<snake>_` |
+| 匿名 `struct` | 函数体内的匿名 `struct`（如参数化测试的 `Case`）成员按裸 `snake_case`，与 struct 规则一致 |
+| `.cpp` 内私有 `struct`（PIMPL） | 同样按裸 `snake_case`（原批次 3 的"私有 PIMPL 豁免"已被 struct 主规则吸收，不再单列）。实例：`UdpTransport::SocketImpl::{winsock, handle, bound, remote}` |
+
+#### 2.2.1.2 裁决历史（批次 3 → 批次 4，保留以便追溯）
+
+> ⚠️ **以下批次 3 的裁决已被批次 4 推翻，仅作历史记录，不得再作为判据引用。**
+
+批次 3 曾把"纯值语义聚合参数对象"与"`.cpp` 内私有 PIMPL"登记为 `m_<snake>_` 的**显式豁免**，
+并写明一条"已知代价"：
+
+> ~~`CommandTimeouts` 因此成为公开头文件 `include/libxcp/` 中**唯一**不遵循 `m_<snake>_`
+> 的结构体（其余 7 个均遵循），造成公开 API 内部的命名不一致。~~
+
+该断言**已被证伪**。批次 4 确立 struct/class 分流后，`include/libxcp/` 中**所有** struct
+（`UdpTransportConfig`、`ConnectResponse`、`GetStatusResponse`、`GetCommModeInfoResponse`、
+`SessionParameters`、`XcpAddress40`、`UdpHeader`、`UdpFrame`、`UdpFrameView`、
+`PositiveResponse`、`NegativeResponse`、`EventPacket`、`ServicePacket`、`DtoPacket`、
+`CommandTimeouts`）一律使用裸名：`CommandTimeouts` 不再是例外，而是**默认合规**。
+故批次 4 撤销豁免表中"纯值聚合参数对象""私有 PIMPL"两行，只保留夹具成员豁免一行。
+
+同时撤销批次 3 的裁决口径~~"以代码现状为准，改设计文档，不做任何批量重命名"~~：
+批次 4 的口径改为**"以文档新规则为准，分批改造代码"**（代码侧待办见 §2.2.1.3）。
+
+> 方法论教训（沿用批次 3）：文档中"某项已全面符合"的断言，必须由可复跑的扫描器给出命中数，
+> 且扫描器要通过已知正例自检——"脚本跑通且零输出"不等于"检查通过"。
+>
+> ⚠️ **工具可得性说明（重要）**：本批次使用的审计脚本位于工作副本 `scripts/`，
+> 而 `.gitignore` 已包含 `scripts` 条目，故**这些脚本不入库**——新克隆的仓库中它们不存在。
+> 本节及 §2.2.1.3 给出的计数结论（文档侧 struct 64 字段全裸名、`m_<snake>_` 归零、
+> class 侧 59 字段全 `m_<snake>_`）是**当次本地实测结果**，他人复核需按下列要点重建工具，
+> 或改为逐条人工核对（代码侧锚点为各 struct 的**声明行**：
+> `protocol_types.hpp` — `ConnectResponse:238`、`GetStatusResponse:254`、
+> `GetCommModeInfoResponse:269`、`XcpAddress40:281`、`SessionParameters:303`；
+> `response_parser.hpp` — `PositiveResponse:24`、`NegativeResponse:30`、`EventPacket:40`、
+> `ServicePacket:50`、`DtoPacket:56`；
+> `udp_header_codec.hpp` — `UdpFrame:41`、`UdpHeader:46`、`UdpFrameView:56`；
+> `udp_transport_config.hpp` — `UdpTransportConfig:26`）。
+>
+> | 本地脚本（不入库） | 用途 | 关键设计要求 |
+> |---|---|---|
+> | `scripts/tools_audit_member_naming.py` | struct/class 成员风格分布 | 作用域栈解析 + **5 条已知正例自检**，自检不过则结论作废 |
+> | `scripts/tools_audit_rename_churn.py` | 改名引用面 / 跨类同名 / 新名撞名 | 一律由扫描器供数据，禁止手写字段清单 |
+> | `scripts/tools_audit_diff.py` | 文档 vs 代码字段集合比对 | 按 `m_` 前后缀归一后比较，区分"仅命名差异"与"字段集合差异" |
+
+#### 2.2.1.3 落地状态核对（批次 4）
+
+函数命名沿用批次 3 结论（已统一）；成员变量自批次 4 起按 **struct / class 分流**重新核对，
+核对手段为可复跑扫描器 `tools_audit_member_naming.py`（内置 5 条已知正例自检；
+该脚本按 §2.2.1.2 末"工具可得性说明"**不入库**，复核时需自备）。
+
+**设计文档侧（本文件内 ```cpp 原型）**
+
+| 对象 | 数量 | 状态 |
 |---|---|---|
-| 成员变量 `m_<snake>_` | ✅ 在**规则适用范围内**符合；范围外偏差已登记为豁免 | 批次 1 记录 §2 第 1 项遗留的 `<snake>_` 偏差已在 commit `92e8b5c` 消除；`protocol_types.hpp`、`response_parser.hpp`、`udp_header_codec.hpp`、`udp_transport_config.hpp`、`session.hpp`、`xcp_master.hpp`、`xcp_error.hpp` 的全部结构体字段均为 `m_<snake>_`。仅 `CommandTimeouts` 与私有 `SocketImpl` 及测试夹具按 §2.2.1 豁免表保留裸名/尾下划线 |
-| 静态成员 `s_<snake>_` | ✅ 已符合 | `WinsockSession::s_ref_count_` / `s_ok_`（平台适配层内部） |
-| 类型/枚举值 PascalCase | ✅ 已符合 | `CommandCode::Connect`、`Resource::CalPag`、`ByteOrder::Intel` 等 |
-| 自由函数 PascalCase | ✅ 批次 3 修正 | 原实现为 camelCase（`encodeUdpFrame`、`decodeUdpDatagram`、`errorCategoryName`、`classifyPacket`、`errorCodeName`、`toErrorCode`、`eventCodeName`、`toEventCode`、`agToBytes`、`commModeBasicToAg`、`agToCommModeBasicField`、`hasResource`、`sessionStateName`），已全部改为大驼峰 |
-| 成员函数 PascalCase | ✅ 批次 3 修正 | `XcpMaster::connect/disconnect/isConnected/readMemory*/sessionParameters/sessionState/queryStatus` → `Connect/Disconnect/IsConnected/ReadMemory*/GetSessionParameters/GetSessionState/QueryStatus`；`IEventListener::onEvent/onService/onDto` → `OnEvent/OnService/OnDto`；`XcpAddress40::advance` → `Advance`；`UdpTestSlave` 私有辅助 `sendResponse*/makeRes/makeErr/readAtMta/advanceMta` → 大驼峰 |
-| 匿名命名空间内部实现函数 | ⚠️ 保留 snake_case | `udp_transport.cpp` 的 `parseIpv4()`、`lastSocketError()`、`isTimeoutError()`、`ctrForwardDistance()` 等，以及 `command_executor.cpp` 的 `toHex()`、`protocolMessage()`。这些是 `.cpp` 内部链接的实现细节，不属于对外承诺的接口；保留小写以与"公开 API 大驼峰"形成视觉区分。**如需一并统一，属独立机械改动，不在本批次范围** |
-| 死声明 | ✅ 批次 3 删除 | `memory_access.hpp` 同时声明了 `ValidateRead` 与 `validateRead`（同签名重复），后者无定义无引用，已删除 |
+| `struct` 成员 | 17 个 struct / 64 字段 | ✅ 全部裸 `snake_case`（批次 4：§3.9、§3.10、§3.11、§6、§12、§15.2 共 41 字段由 `m_<snake>_` 转入；§7、§10 的 21 字段在批次 4 前置改动中已完成；另补入 `raw_error_code` / `raw_event_code` 2 字段使 §10 与代码字段集合一致） |
+| `class` 成员 | 8 个 class / 59 字段 | ✅ 全部 `m_<snake>_`，未受本轮改动影响 |
+| 散文/表格/示例中的字段引用 | §7 L883、§16.4、§18.2 D5、§18.3、附录 B.1 | ✅ 已同步为裸名（旧名残留会直接与新规则矛盾） |
+| `IEventListener*` 构造参数 | §12、§14 | ✅ 参数本就 snake_case，合规（扫描器曾把多行参数续行误判为成员，已排除） |
 
-> 本次改名均为**纯机械重命名**，未改变任何行为、签名语义或调用顺序；全部由既有测试与新增测试锁定。
+**代码侧（`include/` `src/` `tests/`，批次 4 未改动，如实登记为待办）**
 
-#### 2.2.1.2 成员变量偏差清单与裁决结果（批次 3）
-
-批次 3 的函数改名完成后复核，发现成员变量仍存在以下偏差。**本节如实记录偏差本身**，
-并登记其裁决结果：**零代码改动，全部作为显式豁免写入 §2.2.1 规则表**。
-
-> 发现过程的教训：本小节初稿曾断言"全量扫描未发现非 `m_` 前缀的成员变量"，**该结论是错的**——
-> 当时扫描脚本的正则要求行内含 `(`，实际只匹配到函数声明，成员变量从未被检查过。
-> "脚本跑通且零输出"被误当成"检查通过"。现改用基于括号栈的作用域扫描重做，
-> 才得到下表。零命中必须先证明检测器能命中已知正例。
-
-**产品代码（2 个结构体，7 个字段）**
-
-| 位置 | 结构体 | 字段名 | 裁决 |
+| 类别 | 范围 | 数量 | 状态 |
 |---|---|---|---|
-| `include/libxcp/command_executor.hpp:35,38,41` | `CommandTimeouts` | `command_timeout`、`synch_timeout`、`max_retries` | **豁免**（纯值聚合参数对象）；§12 已改为与此一致的字段名 |
-| `src/udp_transport.cpp:157-161` | `UdpTransport::SocketImpl` | `winsock`、`handle`、`bound`、`remote` | **豁免**（`.cpp` 内私有 PIMPL，不进入公开 API） |
+| A 冲突 | §7 / §10 已改裸名的 6 个 struct：`UdpTransportConfig`、`PositiveResponse`、`NegativeResponse`、`EventPacket`、`ServicePacket`、`DtoPacket` | 18 字段 / 189 处引用 | ❌ **代码仍是 `m_<snake>_`，与文档当前处于矛盾状态**，待批次实施 |
+| B 待办 | 其余 9 个 struct：`ConnectResponse`、`GetStatusResponse`、`GetCommModeInfoResponse`、`SessionParameters`、`XcpAddress40`、`UdpHeader`、`UdpFrame`、`UdpFrameView`、`FaultInjection` | 39 字段 / 377 处引用 | ❌ 文档已合规，代码待改 |
+| class 合规 | 产品 class：`CommandExecutor` 17、`UdpTransport` 10、`Session` 4、`XcpException` 4、`XcpMaster` 3、`MemoryAccess` 1 | 39 字段 | ✅ `m_<snake>_` |
+| class 待办 | 测试 helper class 成员有 `m_` 前缀但**缺尾下划线**：`FakeSlave` 13、`MockXcpSlave` 13、`EventRecorder` 6、`ScriptedSlave` 5、`TransportObserver` 4、`RecordingEvents` 3 | 44 字段 | ❌ 既不合 class 规则也不合 struct 裸名，属批次 1 大小写不敏感替换脚本的残留，**独立一批处理** |
+| 夹具豁免 | `UdpTestSlaveCommands` 的 `slave_`、`ep_`、`ctr_`、`res_` | 4 字段 | ✅ 按 §2.2.1.1 唯一豁免合规 |
 
-> ⚠️ 必须如实指出：`CommandTimeouts` 被豁免后，成为公开头文件 `include/libxcp/` 中
-> **唯一**不遵循 `m_<snake>_` 的结构体——其余 7 个（`ConnectResponse`、`GetStatusResponse`、
-> `GetCommModeInfoResponse`、`SessionParameters`、`XcpAddress40`、`PositiveResponse` 及各
-> Packet、`UdpFrame`/`UdpHeader`、`UdpTransportConfig`）全部遵循。因此公开 API 内部存在
-> 一处已知、已登记的命名不一致。若日后要消除，成本极小（3 字段 × 各 2 处引用）。
-
-**测试设施（§2.2.1 明确把"测试设施"纳入规则适用范围）**
-
-| 位置 | 作用域 | 字段名 | 裁决 |
-|---|---|---|---|
-| `tests/udp_test_slave_test.cpp:314-317` | 夹具成员 | `slave_`、`ep_`、`ctr_`、`res_` | **豁免**（夹具成员用 `<snake>_`） |
-| `tests/xcp_master_integration_test.cpp:330-333` | `Rig` 成员 | `slave`、`transport_ptr`、`master` | **豁免**（同上） |
-| `tests/memory_access_test.cpp:275-276`、`tests/recovery_test.cpp:232-234` | 夹具成员 | `session`、`executor` | **豁免**（同上） |
-| `tests/udp_test_slave.cpp:88-90` | `UdpTestSlave::SocketImpl` | `winsock`、`handle` | **豁免**（私有 PIMPL） |
-| `tests/memory_access_test.cpp:346-349`、`tests/session_test.cpp:248-250`、`tests/xcp_master_integration_test.cpp:463-464` | 参数化测试 POD 数据载体 | `AgCase` / `Case` / `AgIntegrationCase` 的 `ag`、`max_cto`、`max_dto`、`short_upload_max`、`upload_max` | **豁免**（纯值聚合参数对象） |
-| `tests/mock_transport.hpp:65`、`tests/recovery_test.cpp:391`、`tests/session_test.cpp:406` 等 | 函数体内**局部变量** | `responder`、`upload_sends`、`workers`、`ip` | ✅ **本就合规**（按规则用 snake_case，非偏差；初版扫描曾误报） |
-
-**裁决口径**：采用"以代码现状为准，改设计文档"，**不做任何批量重命名**——
-与用户对本项的既有指示一致。上表三类豁免已提升为 §2.2.1 的正式规则行，
-今后新增代码按"规则 + 豁免表"判定，不再视为待办偏差。
+> ⚠️ 实施 A/B 时的硬性安全约束：**禁止全局文本替换**。实测 `m_error_code_` 同时是
+> `struct NegativeResponse`（要转裸名）与 `class XcpException`（必须保持 `m_`）的成员；
+> `m_data_` 同时属于 A 类的 3 个 struct 与 B 类的 `UdpFrame`。按全文替换会静默改掉
+> class 成员，而测试仍然全绿。必须按 struct 作用域精确改，改完复跑扫描器核对分类计数。
+> 统计与冲突检测用本地脚本 `tools_audit_rename_churn.py`（不入库，见 §2.2.1.2 末说明）。
 
 
 
@@ -496,37 +517,37 @@ namespace calmcar::xcp {
 
 /// @brief CONNECT 响应解析结果（COMM_MODE_BASIC 已拆解）
 struct ConnectResponse {
-    ResourceMask m_resource_mask_;                    ///< RESOURCE 字段
-    ByteOrder m_byte_order_;                          ///< COMM_MODE_BASIC 中的字节序
-    AddressGranularity m_address_granularity_;        ///< COMM_MODE_BASIC 中的 AG
-    bool m_slave_block_mode_supported_;               ///< COMM_MODE_BASIC 中的 Block Mode 位
-    bool m_optional_comm_mode_available_;             ///< COMM_MODE_BASIC 中的 Optional 信息可用位
-    std::uint8_t m_max_cto_;                          ///< MAX_CTO（0x08..0xFF）
-    std::uint16_t m_max_dto_;                         ///< MAX_DTO（0x0008..0xFFFF）
-    std::uint8_t m_protocol_layer_version_;           ///< Protocol Layer 主版本
-    std::uint8_t m_transport_layer_version_;          ///< Transport Layer 主版本
+    ResourceMask resource_mask;                    ///< RESOURCE 字段
+    ByteOrder byte_order;                          ///< COMM_MODE_BASIC 中的字节序
+    AddressGranularity address_granularity;        ///< COMM_MODE_BASIC 中的 AG
+    bool slave_block_mode_supported;               ///< COMM_MODE_BASIC 中的 Block Mode 位
+    bool optional_comm_mode_available;             ///< COMM_MODE_BASIC 中的 Optional 信息可用位
+    std::uint8_t max_cto;                          ///< MAX_CTO（0x08..0xFF）
+    std::uint16_t max_dto;                         ///< MAX_DTO（0x0008..0xFFFF）
+    std::uint8_t protocol_layer_version;           ///< Protocol Layer 主版本
+    std::uint8_t transport_layer_version;          ///< Transport Layer 主版本
 };
 
 /// @brief GET_STATUS 响应解析结果
 struct GetStatusResponse {
-    bool m_resume_;                         ///< bit7
-    bool m_daq_running_;                    ///< bit6
-    bool m_clear_daq_req_;                  ///< bit3
-    bool m_store_daq_req_;                  ///< bit2
-    bool m_store_cal_req_;                  ///< bit0
-    ResourceMask m_resource_protection_;    ///< 当前资源保护状态
-    std::uint8_t m_state_number_;           ///< ECU State 编号
-    std::uint16_t m_session_config_id_;     ///< Session Configuration ID
+    bool resume;                         ///< bit7
+    bool daq_running;                    ///< bit6
+    bool clear_daq_req;                  ///< bit3
+    bool store_daq_req;                  ///< bit2
+    bool store_cal_req;                  ///< bit0
+    ResourceMask resource_protection;    ///< 当前资源保护状态
+    std::uint8_t state_number;           ///< ECU State 编号
+    std::uint16_t session_config_id;     ///< Session Configuration ID
 };
 
 /// @brief GET_COMM_MODE_INFO 响应解析结果
 struct GetCommModeInfoResponse {
-    std::uint8_t m_comm_mode_optional_;       ///< Master Block Mode / Interleaved Mode 能力
-    std::uint8_t m_max_bs_;                    ///< Block Mode 最大块大小
-    std::uint8_t m_min_st_;                    ///< 最小分离时间（单位 100μs）
-    std::uint8_t m_queue_size_;                ///< Interleaved Mode 队列深度
-    std::uint8_t m_driver_version_major_;      ///< Driver Version 高 nibble
-    std::uint8_t m_driver_version_minor_;      ///< Driver Version 低 nibble
+    std::uint8_t comm_mode_optional;       ///< Master Block Mode / Interleaved Mode 能力
+    std::uint8_t max_bs;                    ///< Block Mode 最大块大小
+    std::uint8_t min_st;                    ///< 最小分离时间（单位 100μs）
+    std::uint8_t queue_size;                ///< Interleaved Mode 队列深度
+    std::uint8_t driver_version_major;      ///< Driver Version 高 nibble
+    std::uint8_t driver_version_minor;      ///< Driver Version 低 nibble
 };
 
 }  // namespace calmcar::xcp
@@ -539,8 +560,8 @@ namespace calmcar::xcp {
 
 /// @brief XCP 40 位地址（32-bit Address + 8-bit Extension）
 struct XcpAddress40 {
-    Address m_address_;                         ///< 32 位地址
-    AddressExtension m_extension_;              ///< 8 位地址扩展
+    Address address;                         ///< 32 位地址
+    AddressExtension extension;              ///< 8 位地址扩展
 
     /// @brief 地址前进指定元素数（按 AG 换算为字节数）
     /// @param elements 前进的元素数
@@ -564,10 +585,10 @@ namespace calmcar::xcp {
 
 /// @brief 完整 Session 参数快照（CONNECT + 后续查询的不可变结果）
 struct SessionParameters {
-    ConnectResponse m_connect_;                              ///< CONNECT 响应参数
-    std::optional<GetCommModeInfoResponse> m_comm_mode_info_;///< 仅在查询成功时存在
-    std::optional<GetStatusResponse> m_status_;              ///< 仅在查询成功时存在
-    bool m_short_upload_available_ = true;                   ///< SHORT_UPLOAD 是否可用
+    ConnectResponse connect;                              ///< CONNECT 响应参数
+    std::optional<GetCommModeInfoResponse> comm_mode_info;///< 仅在查询成功时存在
+    std::optional<GetStatusResponse> status;              ///< 仅在查询成功时存在
+    bool short_upload_available = true;                   ///< SHORT_UPLOAD 是否可用
 };
 
 }  // namespace calmcar::xcp
@@ -805,20 +826,20 @@ constexpr std::size_t kUdpMaxXcpPacket = kUdpMaxDatagramSize - kUdpHeaderSize;
 /// @brief 编码后的单个 XCP on Ethernet Frame（Header + 一个 XCP Packet）
 /// @details 一个 UDP Datagram 可以包含一个或多个此类 Frame；本项目发送方向默认一个 Datagram 只放一个 Frame。
 struct UdpFrame {
-    Bytes m_data_;  ///< LEN(u16le) + CTR(u16le) + XCP Packet
+    Bytes data;  ///< LEN(u16le) + CTR(u16le) + XCP Packet
 };
 
 /// @brief 解码后的 UDP Header 字段
 struct UdpHeader {
-    DatagramLen m_len_;  ///< 原始 XCP Packet 字节数
-    DatagramCtr m_ctr_;  ///< 该 XCP Frame 的独立计数器
+    DatagramLen len;  ///< 原始 XCP Packet 字节数
+    DatagramCtr ctr;  ///< 该 XCP Frame 的独立计数器
 };
 
 /// @brief Datagram 内单个 XCP Frame 的只读视图
-/// @note m_xcp_packet_ 的生命周期不超过传入 DecodeUdpDatagram() 的字节视图。
+/// @note xcp_packet 的生命周期不超过传入 DecodeUdpDatagram() 的字节视图。
 struct UdpFrameView {
-    UdpHeader m_header_;
-    BytesView m_xcp_packet_;
+    UdpHeader header;
+    BytesView xcp_packet;
 };
 
 /// @brief 编码一个 XCP on Ethernet Frame
@@ -857,33 +878,33 @@ namespace calmcar::xcp {
 /// @brief UDP Transport 配置参数
 struct UdpTransportConfig {
     /// @brief 远端 Slave IPv4 地址（如 "192.168.1.10" 或 "127.0.0.1"）
-    std::string m_remote_host_;
+    std::string remote_host;
 
     /// @brief 远端 Slave UDP 业务端口
-    std::uint16_t m_remote_port_ = 0;
+    std::uint16_t remote_port = 0;
 
     /// @brief 本地绑定 IPv4 地址（默认 "0.0.0.0"，Loopback 测试用 "127.0.0.1"）
-    std::string m_local_host_ = "0.0.0.0";
+    std::string local_host = "0.0.0.0";
 
     /// @brief 本地绑定端口（0 表示由 OS 分配临时端口）
-    std::uint16_t m_local_port_ = 0;
+    std::uint16_t local_port = 0;
 
     /// @brief 接收超时（毫秒），0 表示阻塞接收
     ///        实际用于内部线程的周期性检查，不影响上层命令超时
-    std::uint32_t m_receive_poll_interval_ms_ = 100;
+    std::uint32_t receive_poll_interval_ms = 100;
 
     /// @brief 最大允许的单个 XCP Frame 内原始 Packet 长度（字节）
     ///        默认 kUdpMaxXcpPacket (65503)；可设更小值以避免 IP 分片
-    std::size_t m_max_frame_packet_size_ = kUdpMaxXcpPacket;
+    std::size_t max_frame_packet_size = kUdpMaxXcpPacket;
 
     /// @brief 最大允许的 UDP Datagram Payload 长度（字节）
     ///        默认 kUdpMaxDatagramSize (65507)，限制连续打包 Frame 的总长度
-    std::size_t m_max_datagram_size_ = kUdpMaxDatagramSize;
+    std::size_t max_datagram_size = kUdpMaxDatagramSize;
 
-    /// @brief 是否严格匹配远端端口（true 时要求收到的包来自 m_remote_port_）
+    /// @brief 是否严格匹配远端端口（true 时要求收到的包来自 remote_port）
     /// @details 这是 Master 侧的项目安全策略，不是 XCP 1.1 Part 3 对 Slave
-    ///          连接绑定规则的复刻；设 false 时仅匹配 m_remote_host_。
-    bool m_strict_remote_port_ = true;
+    ///          连接绑定规则的复刻；设 false 时仅匹配 remote_host。
+    bool strict_remote_port = true;
 };
 
 }  // namespace calmcar::xcp
@@ -1127,32 +1148,34 @@ namespace calmcar::xcp {
 
 /// @brief Positive Response 内容（按命令区分）
 struct PositiveResponse {
-    CommandCode m_command_;  ///< 对应的命令码（由调用方传入或从上下文推断）
-    Bytes m_data_;           ///< RES 后的数据（不含 0xFF 前缀）
+    CommandCode command{};  ///< 对应的命令码（由调用方传入的期望命令）
+    Bytes data;             ///< RES 后的数据（不含 0xFF 前缀）
 };
 
 /// @brief Negative Response 内容
 struct NegativeResponse {
-    ErrorCode m_error_code_;          ///< ERR Packet 的 Byte 1
-    Bytes m_additional_info_;         ///< 可选附加信息（Byte 2..）
+    std::uint8_t raw_error_code{0};       ///< ERR Packet Byte 1 原始值（保留 Slave 返回的未知码）
+    std::optional<ErrorCode> error_code;  ///< 已识别的错误码；未知厂商码为 std::nullopt
+    Bytes additional_info;                ///< 可选附加信息（Byte 2..）
 };
 
 /// @brief Event Packet 内容
 struct EventPacket {
-    EventCode m_event_code_;          ///< EV Packet 的 Byte 1
-    Bytes m_info_;                    ///< 可选 Event 信息（Byte 2..）
+    std::uint8_t raw_event_code{0};          ///< EV Packet Byte 1 原始值（保留未知码）
+    std::optional<EventCode> event_code;     ///< 已识别的事件码；未知值为 std::nullopt
+    Bytes info;                              ///< 可选 Event 信息（Byte 2..）
 };
 
 /// @brief Service Request Packet 内容
 struct ServicePacket {
-    std::uint8_t m_service_code_;     ///< SERV Packet 的 Byte 1
-    Bytes m_data_;                    ///< 可选 Service 数据
+    std::uint8_t service_code;     ///< SERV Packet 的 Byte 1
+    Bytes data;                    ///< 可选 Service 数据
 };
 
 /// @brief DTO Packet（本阶段仅识别，不解析内容）
 struct DtoPacket {
-    std::uint8_t m_pid_;              ///< 原始 PID（0x00..0xFB）
-    Bytes m_data_;                    ///< DTO 数据
+    std::uint8_t pid;              ///< 原始 PID（0x00..0xFB）
+    Bytes data;                    ///< DTO 数据
 };
 
 /// @brief 解析后的 Packet 联合类型
@@ -1408,7 +1431,7 @@ struct CommandTimeouts {
 ///       `Bytes`，`RunCommand()` 内部返回 `ParsedPacket`。引入仅含单个字段的
 ///       `CommandResult` 包装并不会带来额外信息，故不落地。
 struct CommandResult {
-    ParsedPacket m_response_;  ///< 最终收到的响应（RES 或 ERR）
+    ParsedPacket response;  ///< 最终收到的响应（RES 或 ERR）
 };
 
 /// @brief 事件观察者接口（可选，用于上层接收异步 Event）
@@ -1862,26 +1885,26 @@ namespace calmcar::xcp::test {
 /// @brief 故障注入配置（N 为响应序号，从 1 开始）
 struct FaultInjection {
     /// @brief 丢弃第 N 个响应（用于验证 Timeout/SYNCH 恢复）
-    std::optional<std::size_t> m_drop_response_n_;
+    std::optional<std::size_t> drop_response_n;
 
     /// @brief 延迟第 N 个响应（毫秒）
-    std::optional<std::pair<std::size_t, std::uint32_t>> m_delay_response_n_;
+    std::optional<std::pair<std::size_t, std::uint32_t>> delay_response_n;
 
     /// @brief 对第 N 个响应使用错误 LEN（验证畸形 Datagram 丢弃）
-    std::optional<std::size_t> m_corrupt_len_n_;
+    std::optional<std::size_t> corrupt_len_n;
 
     /// @brief 对第 N 个响应使用跳号 CTR（固定 +5，验证缺口诊断）
-    std::optional<std::size_t> m_jump_ctr_n_;
+    std::optional<std::size_t> jump_ctr_n;
 
     /// @brief 对第 N 个响应复用上一个 CTR（验证重复丢弃）
-    std::optional<std::size_t> m_duplicate_ctr_n_;
+    std::optional<std::size_t> duplicate_ctr_n;
 
     /**
      * @brief 对第 N 个响应的 CTR 施加指定的有符号偏移（模 65536）
      * @details 批次 3 新增。跳号（+5）与重复（-1）都无法构造"与期望值恰好相差
      *          0x8000"的歧义 Frame（决策 D5），必须由发送侧直接指定偏移量。
      */
-    std::optional<std::pair<std::size_t, int>> m_ctr_offset_n_;
+    std::optional<std::pair<std::size_t, int>> ctr_offset_n;
 };
 
 /// @brief UDP 测试 Slave（Loopback）
@@ -2128,7 +2151,7 @@ WaitForResponse() 唤醒        |
 - `Close()` 可在用户线程调用，与接收线程并发安全。
 - `Close()` 可重复调用（幂等）；未打开时调用为空操作。
 - 唤醒阻塞中的 `recvfrom` 依赖 `Open()` 设置的 `SO_RCVTIMEO` 轮询
-  （`UdpTransportConfig::m_receive_poll_interval_ms_`），因此关闭延迟上限为一个轮询周期。
+  （`UdpTransportConfig::receive_poll_interval_ms`），因此关闭延迟上限为一个轮询周期。
 - 必须先 `join()` 再关 Socket。
 
 **为何不能先关 Socket（批次 3 修正的真实缺陷）**：
@@ -2279,7 +2302,7 @@ UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 | D8 | UdpTestSlave 连接后仅校验 CONNECT 来源 IP，响应始终发往原 CONNECT 来源 IP:port | XCP 1.1 Part 3 UDP/IP Connection Behavior | `UdpTestSlave::IsCurrentSessionSource()` | `SameIpDifferentPortStillServed`（并断言响应不发往变更后的端口） |
 
 > D5 说明（批次 3 更新）：批次 2 曾记录"缺少精确构造 0x8000 差值的用例"。本批次通过给
-> `FaultInjection` 增加 `m_ctr_offset_n_`（按模 65536 施加有符号偏移）关闭该缺口：
+> `FaultInjection` 增加 `ctr_offset_n`（按模 65536 施加有符号偏移）关闭该缺口：
 > 跳号注入固定 +5、重复注入固定 -1，两者都无法命中 0x8000，因此必须由发送侧直接指定偏移量。
 > 现在 0x7FFF / 0x8000 / 0x8001 三个相邻取值均有正向用例，边界归属被逐值锁定。
 
@@ -2288,7 +2311,7 @@ UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 | 预留项 | 批次 3 状态 |
 |---|---|
 | `IEventListener` 接口已定义，本阶段 DTO 只上报不解析 | ✅ 接口已落地并改名对齐 §2.2.1（`OnEvent`/`OnService`/`OnDto`）；`CommandExecutor` 在锁外回调，DTO 仅识别上报 |
-| `UdpTransportConfig::m_strict_remote_port_` 预留 NAT 兼容 | ✅ 已实现并有 `ForeignPortRejectedWhenStrict` 双向用例（严格拒绝 / 放宽接受） |
+| `UdpTransportConfig::strict_remote_port` 预留 NAT 兼容 | ✅ 已实现并有 `ForeignPortRejectedWhenStrict` 双向用例（严格拒绝 / 放宽接受） |
 | `Session::Fail()` 预留 Failed 状态 | ✅ 已实现并被真实使用：SYNCH 恢复失败、CONNECT 失败/响应非法/参数校验失败均转入 `Failed`；`RecoveryFailureMarksSessionFailed`、`session_test` 的状态机用例锁定"Failed 必须先 Reset 才能重连"。另提供 `FailReason()` 读取失败原因（该访问器为本批次补齐到文档，代码早已存在） |
 
 > 本节三项在本批次后均已不再是"仅预留"，而是有实现、有用例的既成行为；保留本节以便追溯原始范围划分。
@@ -2360,9 +2383,9 @@ using namespace calmcar::xcp;
 
 // 1. 创建 Transport
 UdpTransportConfig cfg;
-cfg.m_remote_host_ = "127.0.0.1";
-cfg.m_remote_port_ = slave_port;  // 从 UdpTestSlave 获取
-cfg.m_local_host_ = "127.0.0.1";
+cfg.remote_host = "127.0.0.1";
+cfg.remote_port = slave_port;  // 从 UdpTestSlave 获取
+cfg.local_host = "127.0.0.1";
 auto transport = std::make_unique<UdpTransport>(std::move(cfg));
 
 // 2. 创建 Master
@@ -2402,12 +2425,20 @@ master.Connect();
 
 ---
 
-> 本文档的接口定义已在批次 1~3 中全部落地并通过编译与测试验证（Release/Debug 双配置，253 项用例）。
-> 第 18.1 节的 6 个开放问题已全部关闭；§2.2.1.1 记录了命名规则的落地核对结果。
+> 本文档的接口定义已在批次 1~3 中全部落地并通过编译与测试验证（Release 配置，253 项用例）。
+> 第 18.1 节的 6 个开放问题已全部关闭；命名规则的落地核对结果见 **§2.2.1.3**。
 > 仍未闭环的是**外部互操作验证**：所有端到端测试均为自有 Master ↔ 自有 UdpTestSlave，
 > 未与第三方 ECU / CANape 抓包对照（计划文档 §11.4、验收标准 15）。
 >
-> 与本文档存在差异的实现细节，一律以代码为准，并已在对应章节就地标注"批次 3"说明。
+> **口径变更（批次 4）**：早先"与本文档存在差异处一律以代码为准"的口径**已收窄**。
+> 现在的规则是——
+> - **命名风格**（§2.2.1）：以**本文档为准**，代码分批跟进；当前代码与文档的差距已量化登记
+>   在 §2.2.1.3 的"代码侧"表中（A 冲突 18 字段 / 189 处，B 待办 39 字段 / 377 处，
+>   class 尾下划线缺失 44 处），这些是**已知的待办**，不是"以代码为准"的既成合规；
+> - **协议语义与实现细节**（字段布局、超时、状态机行为等）：仍以**代码为准**，
+>   差异就地标注批次号。
+>
+> 任何偏差都必须显式登记，禁止静默报告为已合规（批次 3 教训，见 §2.2.1.2 末）。
 
 
 
