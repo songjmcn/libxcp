@@ -10,7 +10,7 @@
 
 namespace calmcar::xcp {
 
-UdpFrame encodeUdpFrame(BytesView xcp_packet, DatagramCtr ctr) {
+UdpFrame EncodeUdpFrame(BytesView xcp_packet, DatagramCtr ctr) {
     if (xcp_packet.size() > kUdpMaxXcpPacket) {
         throw detail::MakeInvalidArgument(
             "XCP Packet 超过单个 Frame 上限 " +
@@ -39,7 +39,7 @@ UdpFrame encodeUdpFrame(BytesView xcp_packet, DatagramCtr ctr) {
     return frame;
 }
 
-std::optional<std::vector<UdpFrameView>> decodeUdpDatagram(
+std::optional<std::vector<UdpFrameView>> DecodeUdpDatagram(
     BytesView datagram) noexcept {
     // 空 Datagram 或不足一个 Header：无法解析
     if (datagram.size() < kUdpHeaderSize) {

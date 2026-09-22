@@ -92,7 +92,7 @@ std::optional<ParsedPacket> ResponseParser::Parse(
             }
             NegativeResponse err;
             err.m_raw_error_code_ = body[0];
-            err.m_error_code_ = toErrorCode(body[0]);
+            err.m_error_code_ = ToErrorCode(body[0]);
             const BytesView extra = body.subspan(1);
             err.m_additional_info_.assign(extra.begin(), extra.end());
             return ParsedPacket{err};
@@ -103,7 +103,7 @@ std::optional<ParsedPacket> ResponseParser::Parse(
             }
             EventPacket ev;
             ev.m_raw_event_code_ = body[0];
-            ev.m_event_code_ = toEventCode(body[0]);
+            ev.m_event_code_ = ToEventCode(body[0]);
             const BytesView extra = body.subspan(1);
             ev.m_info_.assign(extra.begin(), extra.end());
             return ParsedPacket{ev};
@@ -144,7 +144,7 @@ std::optional<ConnectResponse> ResponseParser::ParseConnectResponse(
 
     const auto ag_field = static_cast<std::uint8_t>(
         (comm_mode_basic >> kAddressGranularityShift) & 0x03U);
-    const auto ag = commModeBasicToAg(ag_field);
+    const auto ag = CommModeBasicToAg(ag_field);
     if (!ag) {
         // AG 位域为保留值 11：非法协商结果
         return std::nullopt;

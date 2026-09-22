@@ -36,29 +36,29 @@ Bytes RawFrame(std::uint16_t len, std::uint16_t ctr, BytesView packet) {
 
 TEST(UdpHeaderEncode, GoldenSingleFrame) {
     const Bytes packet = BytesOf({0xFF, 0x00});
-    const auto frame = encodeUdpFrame(packet, 0x0201);
+    const auto frame = EncodeUdpFrame(packet, 0x0201);
     // LEN=2(小端 02 00), CTR=0x0201(小端 01 02), 然后原样 Packet
     EXPECT_EQ(frame.m_data_, BytesOf({0x02, 0x00, 0x01, 0x02, 0xFF, 0x00}));
 }
 
 TEST(UdpHeaderEncode, CounterWrapsUseFullSixteenBits) {
     const Bytes packet = BytesOf({0xFD, 0x00});
-    const auto frame = encodeUdpFrame(packet, 0xFFFF);
+    const auto frame = EncodeUdpFrame(packet, 0xFFFF);
     EXPECT_EQ(frame.m_data_, BytesOf({0x02, 0x00, 0xFF, 0xFF, 0xFD, 0x00}));
 }
 
 TEST(UdpHeaderEncode, EmptyPacketProducesLenZeroButIsRejectedOnDecode) {
     // 编码器不禁止空 Packet（LEN=0），但解码器必须拒绝 LEN==0 的 Frame
-    const auto frame = encodeUdpFrame(BytesView{}, 0);
+    const auto frame = EncodeUdpFrame(BytesView{}, 0);
     EXPECT_EQ(frame.m_data_.size(), kUdpHeaderSize);
-    EXPECT_FALSE(decodeUdpDatagram(BytesView{frame.m_data_}).has_value());
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{frame.m_data_}).has_value());
 }
 
 TEST(UdpHeaderEncode, RejectsOversizedPacket) {
     Bytes huge(kUdpMaxXcpPacket + 1, 0x00);
-    EXPECT_THROW((void)encodeUdpFrame(BytesView{huge}, 0), XcpException);
+    EXPECT_THROW((void)EncodeUdpFrame(BytesView{huge}, 0), XcpException);
     try {
-        (void)encodeUdpFrame(BytesView{huge}, 0);
+        (void)EncodeUdpFrame(BytesView{huge}, 0);
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
     }
@@ -66,9 +66,9 @@ TEST(UdpHeaderEncode, RejectsOversizedPacket) {
 
 TEST(UdpHeaderEncode, MaxAllowedPacketAccepted) {
     Bytes big(kUdpMaxXcpPacket, 0xAB);
-    const auto frame = encodeUdpFrame(BytesView{big}, 7);
+    const auto frame = EncodeUdpFrame(BytesView{big}, 7);
     EXPECT_EQ(frame.m_data_.size(), kUdpMaxXcpPacket + kUdpHeaderSize);
-    const auto decoded = decodeUdpDatagram(BytesView{frame.m_data_});
+    const auto decoded = DecodeUdpDatagram(BytesView{frame.m_data_});
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 1U);
     EXPECT_EQ((*decoded)[0].m_header_.m_len_,
@@ -83,8 +83,8 @@ TEST(UdpHeaderEncode, MaxAllowedPacketAccepted) {
 TEST(UdpHeaderDecode, SingleFrameRoundTrip) {
     const Bytes packet =
         BytesOf({0xFF, 0x15, 0xC0, 0x08, 0x08, 0x00, 0x10, 0x10});
-    const auto frame = encodeUdpFrame(BytesView{packet}, 42);
-    const auto decoded = decodeUdpDatagram(BytesView{frame.m_data_});
+    const auto frame = EncodeUdpFrame(BytesView{packet}, 42);
+    const auto decoded = DecodeUdpDatagram(BytesView{frame.m_data_});
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 1U);
     EXPECT_EQ((*decoded)[0].m_header_.m_len_, 8);
@@ -94,13 +94,13 @@ TEST(UdpHeaderDecode, SingleFrameRoundTrip) {
 }
 
 TEST(UdpHeaderDecode, EmptyDatagramRejected) {
-    EXPECT_FALSE(decodeUdpDatagram(BytesView{}).has_value());
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{}).has_value());
 }
 
 TEST(UdpHeaderDecode, TruncatedHeadersRejected) {
     for (std::size_t n = 0; n < kUdpHeaderSize; ++n) {
         Bytes buf(4, 0x00);
-        EXPECT_FALSE(decodeUdpDatagram(BytesView{buf}.first(n)).has_value())
+        EXPECT_FALSE(DecodeUdpDatagram(BytesView{buf}.first(n)).has_value())
             << "长度 " << n;
     }
 }
@@ -109,12 +109,12 @@ TEST(UdpHeaderDecode, LenBeyondDatagramRejected) {
     // 声明 LEN=10 但实际只有 2 字节数据
     const Bytes packet = BytesOf({0xFF, 0x00});
     const Bytes bad = RawFrame(10, 0, BytesView{packet});
-    EXPECT_FALSE(decodeUdpDatagram(BytesView{bad}).has_value());
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{bad}).has_value());
 }
 
 TEST(UdpHeaderDecode, ZeroLenRejected) {
     const Bytes bad = RawFrame(0, 0, BytesView{});
-    EXPECT_FALSE(decodeUdpDatagram(BytesView{bad}).has_value());
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{bad}).has_value());
 }
 
 TEST(UdpHeaderDecode, TrailingResidueRejected) {
@@ -122,7 +122,7 @@ TEST(UdpHeaderDecode, TrailingResidueRejected) {
     const Bytes packet = BytesOf({0xFC, 0x00});
     Bytes bad = RawFrame(2, 0, BytesView{packet});
     bad.push_back(0xEE);
-    EXPECT_FALSE(decodeUdpDatagram(BytesView{bad}).has_value());
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{bad}).has_value());
 }
 
 TEST(UdpHeaderDecode, CorruptSecondFrameKillsWholeDatagram) {
@@ -132,7 +132,7 @@ TEST(UdpHeaderDecode, CorruptSecondFrameKillsWholeDatagram) {
     Bytes datagram = RawFrame(2, 0, BytesView{first});
     Bytes broken_second = RawFrame(99, 1, BytesView{second});  // LEN 越界
     datagram.insert(datagram.end(), broken_second.begin(), broken_second.end());
-    EXPECT_FALSE(decodeUdpDatagram(BytesView{datagram}).has_value());
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{datagram}).has_value());
 }
 
 // --------------------------------------------------------------------------
@@ -146,7 +146,7 @@ TEST(UdpHeaderDecode, TwoFramesParsedInOrder) {
     auto f2 = RawFrame(3, 101, BytesView{res});
     datagram.insert(datagram.end(), f2.begin(), f2.end());
 
-    const auto decoded = decodeUdpDatagram(BytesView{datagram});
+    const auto decoded = DecodeUdpDatagram(BytesView{datagram});
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 2U);
     EXPECT_EQ((*decoded)[0].m_header_.m_ctr_, 100);
@@ -169,7 +169,7 @@ TEST(UdpHeaderDecode, ThreeFramesWithVariedLengths) {
             RawFrame(static_cast<std::uint16_t>(p.size()), ctr++, BytesView{p});
         datagram.insert(datagram.end(), f.begin(), f.end());
     }
-    const auto decoded = decodeUdpDatagram(BytesView{datagram});
+    const auto decoded = DecodeUdpDatagram(BytesView{datagram});
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 3U);
     for (std::size_t i = 0; i < 3; ++i) {
@@ -188,8 +188,8 @@ TEST(UdpHeaderDecode, FrameMustNotCrossDatagramBoundary) {
     const Bytes whole = RawFrame(5, 0, BytesView{packet});
     const Bytes first_half = Bytes(whole.begin(), whole.begin() + 6);
     const Bytes second_half = Bytes(whole.begin() + 6, whole.end());
-    EXPECT_FALSE(decodeUdpDatagram(BytesView{first_half}).has_value());
-    EXPECT_FALSE(decodeUdpDatagram(BytesView{second_half}).has_value());
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{first_half}).has_value());
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{second_half}).has_value());
 }
 
 TEST(UdpHeaderConstants, LimitsMatchIpv4Udp) {

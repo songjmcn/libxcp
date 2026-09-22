@@ -9,7 +9,7 @@
 
 namespace calmcar::xcp {
 
-std::string_view errorCategoryName(ErrorCategory cat) noexcept {
+std::string_view ErrorCategoryName(ErrorCategory cat) noexcept {
     switch (cat) {
         case ErrorCategory::InvalidArgument:
             return "InvalidArgument";

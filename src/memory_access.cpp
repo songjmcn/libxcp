@@ -16,7 +16,7 @@ MemoryAccess::MemoryAccess(CommandExecutor& executor, Session& session)
 ElementCount MemoryAccess::MaxShortUploadElements() const {
     const auto max_cto = static_cast<ElementCount>(m_session_.MaxCto());
     const auto ag = static_cast<ElementCount>(
-        agToBytes(m_session_.GetAddressGranularity()));
+        AgToBytes(m_session_.GetAddressGranularity()));
     if (ag == 0U) {
         return 0U;
     }
@@ -38,13 +38,13 @@ void MemoryAccess::ValidateRead(Address address,
     }
     const auto ag = m_session_.GetAddressGranularity();
     const auto byte_count =
-        static_cast<std::uint64_t>(element_count) * agToBytes(ag);
+        static_cast<std::uint64_t>(element_count) * AgToBytes(ag);
     const auto end_exclusive = static_cast<std::uint64_t>(address) + byte_count;
     if (end_exclusive > 0x100000000ULL) {
         throw detail::MakeInvalidArgument(
             "读取范围导致 32 位地址溢出: address=0x" + std::to_string(address) +
             ", elements=" + std::to_string(element_count) +
-            ", AG=" + std::to_string(agToBytes(ag)));
+            ", AG=" + std::to_string(AgToBytes(ag)));
     }
 }
 
@@ -78,7 +78,7 @@ Bytes MemoryAccess::UploadChunked(Address address, AddressExtension extension,
 
     const auto ag = m_session_.GetAddressGranularity();
     Bytes result;
-    result.reserve(static_cast<std::size_t>(element_count) * agToBytes(ag));
+    result.reserve(static_cast<std::size_t>(element_count) * AgToBytes(ag));
 
     XcpAddress40 cursor{address, extension};
     ElementCount remaining = element_count;
@@ -107,7 +107,7 @@ Bytes MemoryAccess::UploadChunked(Address address, AddressExtension extension,
         if (remaining == 0U) {
             break;
         }
-        const auto next = cursor.advance(chunk, ag);
+        const auto next = cursor.Advance(chunk, ag);
         if (!next) {
             throw detail::MakeInvalidArgument(
                 "UPLOAD 分块推进时 32 位地址溢出");
@@ -141,7 +141,7 @@ Bytes MemoryAccess::ReadElements(Address address, AddressExtension extension,
 
 Bytes MemoryAccess::ReadBytes(Address address, AddressExtension extension,
                               ByteCount byte_count) {
-    const auto ag_bytes = agToBytes(m_session_.GetAddressGranularity());
+    const auto ag_bytes = AgToBytes(m_session_.GetAddressGranularity());
     if (byte_count == 0U) {
         throw detail::MakeInvalidArgument("读取字节数必须大于 0");
     }

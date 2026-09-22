@@ -55,18 +55,18 @@ TEST(XcpException, IsCatchableAsRuntimeError) {
 }
 
 TEST(ErrorCategoryName, CoversAllCategories) {
-    EXPECT_EQ(errorCategoryName(ErrorCategory::InvalidArgument),
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::InvalidArgument),
               "InvalidArgument");
-    EXPECT_EQ(errorCategoryName(ErrorCategory::InvalidState), "InvalidState");
-    EXPECT_EQ(errorCategoryName(ErrorCategory::TransportError),
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::InvalidState), "InvalidState");
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::TransportError),
               "TransportError");
-    EXPECT_EQ(errorCategoryName(ErrorCategory::Timeout), "Timeout");
-    EXPECT_EQ(errorCategoryName(ErrorCategory::MalformedPacket),
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::Timeout), "Timeout");
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::MalformedPacket),
               "MalformedPacket");
-    EXPECT_EQ(errorCategoryName(ErrorCategory::ProtocolError), "ProtocolError");
-    EXPECT_EQ(errorCategoryName(ErrorCategory::UnsupportedFeature),
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::ProtocolError), "ProtocolError");
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::UnsupportedFeature),
               "UnsupportedFeature");
-    EXPECT_EQ(errorCategoryName(ErrorCategory::RecoveryFailed),
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::RecoveryFailed),
               "RecoveryFailed");
 }
 

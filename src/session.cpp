@@ -29,7 +29,7 @@ void Session::ValidateConnectParams(const ConnectResponse& resp) const {
     }
 
     // AG 整除校验：MAX_CTO mod AG == 0
-    const auto ag_bytes = agToBytes(resp.m_address_granularity_);
+    const auto ag_bytes = AgToBytes(resp.m_address_granularity_);
     if (ag_bytes == 0U || (resp.m_max_cto_ % ag_bytes) != 0U) {
         throw detail::MakeInvalidArgument(
             "MAX_CTO 不能被 Address Granularity 整除: MAX_CTO=" +
@@ -70,7 +70,7 @@ void Session::BeginConnecting() {
     // 仅允许从 Disconnected 发起连接；Failed 必须先 reset()
     if (m_state_ != SessionState::Disconnected) {
         throw detail::MakeInvalidState(std::string("当前状态不允许发起连接: ") +
-                                       std::string(sessionStateName(m_state_)));
+                                       std::string(SessionStateName(m_state_)));
     }
     m_state_ = SessionState::Connecting;
     m_pending_command_.reset();
@@ -84,7 +84,7 @@ void Session::EstablishConnection(const ConnectResponse& connect_response) {
         if (m_state_ != SessionState::Connecting) {
             throw detail::MakeInvalidState(
                 std::string("CONNECT 响应到达时不在 Connecting 状态: ") +
-                std::string(sessionStateName(m_state_)));
+                std::string(SessionStateName(m_state_)));
         }
         ValidateConnectParams(connect_response);
 
@@ -101,7 +101,7 @@ void Session::BeginDisconnecting() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
     if (m_state_ != SessionState::Connected) {
         throw detail::MakeInvalidState(std::string("当前状态不允许断开: ") +
-                                       std::string(sessionStateName(m_state_)));
+                                       std::string(SessionStateName(m_state_)));
     }
     m_state_ = SessionState::Disconnecting;
 }
@@ -118,7 +118,7 @@ void Session::BeginRecovery() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
     if (m_state_ != SessionState::Connected) {
         throw detail::MakeInvalidState(std::string("当前状态不允许进入恢复: ") +
-                                       std::string(sessionStateName(m_state_)));
+                                       std::string(SessionStateName(m_state_)));
     }
     m_state_ = SessionState::Recovering;
 }
@@ -157,7 +157,7 @@ void Session::MarkCommandSent(CommandCode cmd) {
     if (m_state_ == SessionState::Failed ||
         m_state_ == SessionState::Disconnected) {
         throw detail::MakeInvalidState(std::string("当前状态不允许发送命令: ") +
-                                       std::string(sessionStateName(m_state_)));
+                                       std::string(SessionStateName(m_state_)));
     }
     m_pending_command_ = cmd;
 }

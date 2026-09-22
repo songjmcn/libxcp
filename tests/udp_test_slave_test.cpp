@@ -94,7 +94,7 @@ public:
     /// @brief 发送一个 XCP Packet（自动加 Header），目标为 dst_port
     void sendPacket(BytesView xcp_packet, std::uint16_t dst_port,
                     DatagramCtr ctr) {
-        const auto frame = encodeUdpFrame(xcp_packet, ctr);
+        const auto frame = EncodeUdpFrame(xcp_packet, ctr);
         sockaddr_in dst{};
         dst.sin_family = AF_INET;
         dst.sin_port = htons(dst_port);
@@ -104,12 +104,28 @@ public:
                  reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
     }
 
-    /**
-     * @brief 读取一个完整 Frame 的 XCP Packet
-     * @param[out] out_from_ip 实际来源 IP 文本
-     * @param[out] out_from_port 实际来源端口
-     * @return false 表示超时未收到
-     */
+    /// @brief 读取一个完整 Frame 的 XCP Packet（同时记录其 Header 中的 CTR）
+    bool recvPacketWithCtr(Bytes& out, DatagramCtr& out_ctr) {
+        std::uint8_t buffer[kUdpMaxDatagramSize];
+        sockaddr_in src{};
+        socklen_t src_len = sizeof(src);
+        const int received = ::recvfrom(
+            m_handle_, reinterpret_cast<char*>(buffer), sizeof(buffer), 0,
+            reinterpret_cast<sockaddr*>(&src), &src_len);
+        if (received <= 0) {
+            return false;
+        }
+        const auto frames = DecodeUdpDatagram(
+            BytesView{buffer, static_cast<std::size_t>(received)});
+        if (!frames || frames->empty()) {
+            return false;
+        }
+        out_ctr = (*frames)[0].m_header_.m_ctr_;
+        out.assign((*frames)[0].m_xcp_packet_.begin(),
+                   (*frames)[0].m_xcp_packet_.end());
+        return true;
+    }
+
     bool recvPacket(Bytes& out, std::string& out_from_ip,
                     std::uint16_t& out_from_port) {
         std::uint8_t buffer[kUdpMaxDatagramSize];
@@ -121,7 +137,7 @@ public:
         if (received <= 0) {
             return false;
         }
-        const auto frames = decodeUdpDatagram(
+        const auto frames = DecodeUdpDatagram(
             BytesView{buffer, static_cast<std::size_t>(received)});
         if (!frames || frames->empty()) {
             return false;
@@ -430,6 +446,35 @@ TEST(UdpTestSlaveFault, ResponseCounterStartsFreshAfterEachInjection) {
     ep.sendPacket(BytesView{BytesOf({0xFD, 0x00})}, slave.Port(), ctr++);
     EXPECT_TRUE(WaitUntil([&] { return ep.recvPacket(resp, ip, port); }))
         << "取消注入后应恢复应答";
+    slave.Stop();
+}
+
+TEST(UdpTestSlaveFault, CtrOffsetProducesExactHeaderCounter) {
+    // 锁定 m_ctr_offset_n_ 的语义：只改写实际发出的 Header CTR，
+    // 不改变 Slave 自身计数器的推进规律（Master 侧 D5 用例依赖该前提）。
+    UdpTestSlave slave;
+    slave.Start();
+    RawEndpoint ep(43151);
+    DatagramCtr ctr = 0;
+    Bytes resp;
+
+    ep.sendPacket(BytesView{BytesOf({0xFF, 0x00})}, slave.Port(), ctr++);
+    ASSERT_TRUE(ep.recvPacketWithCtr(resp, ctr));
+    EXPECT_EQ(ctr, 0) << "CONNECT 响应应使用 Slave 的首个 CTR";
+
+    FaultInjection fault;
+    // 对响应 #1 施加 +0x8000：本应发 1，实发 (1+32768) mod 65536 = 0x8001
+    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, 0x8000);
+    slave.SetFaultInjection(fault);
+    ASSERT_EQ(slave.NextSendCtr(), 1) << "注入不应改变待发送的 CTR";
+
+    ep.sendPacket(BytesView{BytesOf({0xFD, 0x00})}, slave.Port(), ctr++);
+    DatagramCtr received_ctr = 0;
+    ASSERT_TRUE(ep.recvPacketWithCtr(resp, received_ctr));
+    EXPECT_EQ(received_ctr, 0x8001) << "偏移后的 CTR 必须精确等于 0x8001";
+
+    // 计数器仍按正常序列推进：下一个响应使用 2
+    EXPECT_EQ(slave.NextSendCtr(), 2) << "精确偏移不得影响后续 CTR 推进";
     slave.Stop();
 }
 

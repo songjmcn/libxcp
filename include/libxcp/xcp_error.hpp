@@ -35,7 +35,7 @@ enum class ErrorCategory {
 };
 
 /// @brief 将错误分类转为字符串
-[[nodiscard]] std::string_view errorCategoryName(ErrorCategory cat) noexcept;
+[[nodiscard]] std::string_view ErrorCategoryName(ErrorCategory cat) noexcept;
 
 /**
  * @brief XCP 库统一异常类型

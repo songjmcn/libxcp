@@ -135,6 +135,18 @@ int ctrForwardDistance(DatagramCtr base, DatagramCtr value) noexcept {
         0xFFFFU);
 }
 
+/// @brief 将 CTR 格式化为 4 位十六进制（用于诊断文本，便于与 §8.1 条款对照）
+std::string ctrToHex(DatagramCtr value) {
+    constexpr char kDigits[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(6);
+    out += "0x";
+    for (int shift = 12; shift >= 0; shift -= 4) {
+        out.push_back(kDigits[(value >> shift) & 0x0FU]);
+    }
+    return out;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -146,7 +158,7 @@ struct UdpTransport::SocketImpl {
 #endif
     SocketHandle handle{kInvalidSocket};  ///< Socket 句柄
     bool bound{false};                    ///< 是否已成功绑定
-    sockaddr_in remote{};                 ///< open() 时解析并缓存的远端端点
+    sockaddr_in remote{};                 ///< Open() 时解析并缓存的远端端点
 };
 
 // ---------------------------------------------------------------------------
@@ -157,7 +169,7 @@ UdpTransport::UdpTransport(UdpTransportConfig config)
     : m_config_(std::move(config)) {}
 
 UdpTransport::~UdpTransport() {
-    // 析构路径不允许抛异常；close() 内部已吞掉回调异常
+    // 析构路径不允许抛异常；Close() 内部已吞掉回调异常
     try {
         Close();
     } catch (...) {
@@ -244,7 +256,7 @@ void UdpTransport::Open(IPacketListener& listener) {
                                           m_config_.m_remote_host_);
     }
 
-    // ---- 接收超时：使阻塞接收可周期性检查关闭标记，保证 close() 及时生效 ----
+    // ---- 接收超时：使阻塞接收可周期性检查关闭标记，保证 Close() 及时生效 ----
 #if defined(_WIN32)
     DWORD tv_ms = m_config_.m_receive_poll_interval_ms_;
     ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO,
@@ -262,7 +274,7 @@ void UdpTransport::Open(IPacketListener& listener) {
     m_socket_ = std::move(impl);
     m_listener_ = &listener;
 
-    // ---- CTR 复位（设计决策 D1：每次 open() 发送 CTR 置 0、清空接收基线）----
+    // ---- CTR 复位（设计决策 D1：每次 Open() 发送 CTR 置 0、清空接收基线）----
     m_send_ctr_.store(0, std::memory_order_relaxed);
     {
         const std::lock_guard<std::mutex> lock(m_recv_mutex_);
@@ -286,16 +298,20 @@ void UdpTransport::Close() {
     // 1. 通知接收线程退出
     m_running_.store(false, std::memory_order_release);
 
-    // 2. 关闭 Socket 唤醒可能阻塞在 recvfrom 的线程（POSIX 下依赖 RCVTIMEO
-    // 轮询）
+    // 2. 等待接收线程结束（其退出前负责回调 OnTransportClosed）。
+    //    唤醒依赖 Open() 设置的 SO_RCVTIMEO 轮询，因此不再需要先关 Socket；
+    //    反过来，若在 join 之前关闭 Socket，其句柄号会被 OS
+    //    立即回收并可能分配给 进程中其他新建的
+    //    Socket，而接收线程此刻仍可能在处理入站包并回调监听器，
+    //    迟到的操作就会命中被复用的句柄（跨会话/跨用例串扰）。
+    if (m_receive_thread_.joinable()) {
+        m_receive_thread_.join();
+    }
+
+    // 3. 线程已停，此处关闭 Socket 不再存在竞态
     if (m_socket_ && m_socket_->handle != kInvalidSocket) {
         closeSocket(m_socket_->handle);
         m_socket_->handle = kInvalidSocket;
-    }
-
-    // 3. 等待接收线程结束（其退出前负责回调 onTransportClosed）
-    if (m_receive_thread_.joinable()) {
-        m_receive_thread_.join();
     }
 
     m_socket_.reset();
@@ -329,7 +345,7 @@ void UdpTransport::Send(BytesView packet) {
 
     UdpFrame frame;
     try {
-        frame = encodeUdpFrame(packet, ctr);
+        frame = EncodeUdpFrame(packet, ctr);
     } catch (...) {
         // 编码失败不回退 CTR：保持"发送方向每 Frame 独立消耗一个
         // CTR"的可观察语义
@@ -417,7 +433,7 @@ void UdpTransport::ReceiveLoop() {
 
         // received < 0
         if (!m_running_.load(std::memory_order_acquire)) {
-            break;  // close() 触发，正常退出
+            break;  // Close() 触发，正常退出
         }
         if (isTimeoutError()) {
             continue;  // 轮询周期到，检查关闭标记
@@ -434,7 +450,7 @@ void UdpTransport::ReceiveLoop() {
 
     m_running_.store(false, std::memory_order_release);
 
-    // 退出前统一交付关闭事件；此后不再有 onPacketReceived 回调
+    // 退出前统一交付关闭事件；此后不再有 OnPacketReceived 回调
     if (listener != nullptr) {
         try {
             listener->OnTransportClosed(close_reason);
@@ -481,7 +497,7 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
     }
 
     const BytesView view{data, size};
-    auto frames = decodeUdpDatagram(view);
+    auto frames = DecodeUdpDatagram(view);
     if (!frames) {
         // 原子性策略：任一 Frame 非法则整个 Datagram 不交付（§8.1 第 7 条）
         if (listener != nullptr) {
@@ -546,6 +562,7 @@ bool UdpTransport::HandleFrame(const UdpFrameView& frame) {
     }
     if (delta_from_expected == 0x8000) {
         // 恰好相差 0x8000：方向歧义，丢弃（§8.1 第 6 条 / D5）
+        // 诊断文本中的差值使用十六进制，便于与 §8.1 条款和测试断言逐字对应。
         if (listener != nullptr) {
             listener->OnTransportWarning(
                 "CTR 与期望值差 0x8000，方向歧义，已丢弃: " +
@@ -557,8 +574,8 @@ bool UdpTransport::HandleFrame(const UdpFrameView& frame) {
         // 前向跳号：接收、报告缺口、推进（§8.1 第 4 条）
         if (listener != nullptr) {
             listener->OnTransportWarning(
-                "CTR 前向跳号，疑似缺包：期望 " + std::to_string(expected) +
-                "，实收 " + std::to_string(frame.m_header_.m_ctr_) + "，缺口 " +
+                "CTR 前向跳号，疑似缺包：期望 " + ctrToHex(expected) +
+                "，实收 " + ctrToHex(frame.m_header_.m_ctr_) + "，缺口 " +
                 std::to_string(delta_from_expected));
         }
         m_last_recv_ctr_ = frame.m_header_.m_ctr_;
@@ -569,8 +586,8 @@ bool UdpTransport::HandleFrame(const UdpFrameView& frame) {
     // 条）
     if (listener != nullptr) {
         listener->OnTransportWarning(
-            "丢弃重复/后向乱序 CTR: " + std::to_string(frame.m_header_.m_ctr_) +
-            "，最近值 " + std::to_string(previous));
+            "丢弃重复/后向乱序 CTR: " + ctrToHex(frame.m_header_.m_ctr_) +
+            "，最近值 " + ctrToHex(previous));
     }
     return false;
 }

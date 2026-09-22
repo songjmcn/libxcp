@@ -30,7 +30,7 @@ std::string protocolMessage(std::string_view prefix, CommandCode cmd,
     msg += toHex(static_cast<std::uint8_t>(cmd));
     msg += " 收到 ERR ";
     // 已识别的错误码用规范名称；未知码保留原始字节的十六进制表示（计划 §6.4）
-    msg += err.m_error_code_ ? std::string(errorCodeName(*err.m_error_code_))
+    msg += err.m_error_code_ ? std::string(ErrorCodeName(*err.m_error_code_))
                              : toHex(err.m_raw_error_code_);
     if (!err.m_additional_info_.empty()) {
         msg += "（附加信息 " + std::to_string(err.m_additional_info_.size()) +
@@ -155,11 +155,11 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
     if (m_event_listener_ != nullptr) {
         try {
             if (async_event) {
-                m_event_listener_->onEvent(*async_event);
+                m_event_listener_->OnEvent(*async_event);
             } else if (async_service) {
-                m_event_listener_->onService(*async_service);
+                m_event_listener_->OnService(*async_service);
             } else if (async_dto) {
-                m_event_listener_->onDto(*async_dto);
+                m_event_listener_->OnDto(*async_dto);
             }
         } catch (...) {
         }
@@ -269,7 +269,7 @@ ParsedPacket CommandExecutor::DispatchResponse(CommandCode cmd,
     if (const auto* res = std::get_if<PositiveResponse>(&response)) {
         return *res;
     }
-    // EV/SERV/DTO 不会进入此函数（已在 onPacketReceived 分流）
+    // EV/SERV/DTO 不会进入此函数（已在 OnPacketReceived 分流）
     throw detail::MakeMalformedPacket("等待最终响应时收到非预期 Packet 类型");
 }
 
@@ -277,7 +277,7 @@ void CommandExecutor::CheckResLength(CommandCode cmd,
                                      const PositiveResponse& res,
                                      ElementCount elements) {
     const auto ag = m_session_.GetAddressGranularity();
-    const auto expected = static_cast<std::size_t>(elements) * agToBytes(ag);
+    const auto expected = static_cast<std::size_t>(elements) * AgToBytes(ag);
     if (res.m_data_.size() != expected) {
         throw XcpException(
             ErrorCategory::MalformedPacket,
@@ -301,7 +301,7 @@ std::optional<ParsedPacket> CommandExecutor::PerformAttempt(
         m_session_.ClearPendingCommand();
         throw;
     }
-    const auto response = WaitForResponse(m_timeouts_.m_command_timeout_);
+    const auto response = WaitForResponse(m_timeouts_.command_timeout);
     m_session_.ClearPendingCommand();
     return response;  // nullopt 表示超时或 Transport 关闭
 }
@@ -365,7 +365,7 @@ bool CommandExecutor::SendSynch() {
 
         std::unique_lock<std::mutex> lock(m_mutex_);
         const auto deadline =
-            std::chrono::steady_clock::now() + m_timeouts_.m_synch_timeout_;
+            std::chrono::steady_clock::now() + m_timeouts_.synch_timeout;
         while (!m_synch_confirmed_ && !m_transport_closed_) {
             if (m_synch_cv_.wait_until(lock, deadline) ==
                 std::cv_status::timeout) {
@@ -418,7 +418,7 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
         }
 
         // 超时或 Transport 关闭：进入 SYNCH 恢复并有限重试（计划 §6.2）
-        if (retries >= m_timeouts_.m_max_retries_) {
+        if (retries >= m_timeouts_.max_retries) {
             throw XcpException(ErrorCategory::RecoveryFailed,
                                "命令超时且恢复重试已耗尽（" +
                                    std::to_string(retries) + " 次）",

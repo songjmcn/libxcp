@@ -7,7 +7,7 @@
 
 namespace calmcar::xcp {
 
-std::optional<PacketType> classifyPacket(std::uint8_t first_byte) noexcept {
+std::optional<PacketType> ClassifyPacket(std::uint8_t first_byte) noexcept {
     // Slave -> Master PID 空间：0xFC..0xFF 为 SERV/EV/ERR/RES，0x00..0xFB 为
     // DAQ DTO。
     switch (static_cast<PacketType>(first_byte)) {
@@ -22,7 +22,7 @@ std::optional<PacketType> classifyPacket(std::uint8_t first_byte) noexcept {
     }
 }
 
-std::string_view errorCodeName(ErrorCode code) noexcept {
+std::string_view ErrorCodeName(ErrorCode code) noexcept {
     switch (code) {
         case ErrorCode::CmdSynch:
             return "ERR_CMD_SYNCH";
@@ -69,7 +69,7 @@ std::string_view errorCodeName(ErrorCode code) noexcept {
     return "ERR_UNKNOWN";
 }
 
-std::optional<ErrorCode> toErrorCode(std::uint8_t raw) noexcept {
+std::optional<ErrorCode> ToErrorCode(std::uint8_t raw) noexcept {
     switch (static_cast<ErrorCode>(raw)) {
         case ErrorCode::CmdSynch:
         case ErrorCode::CmdBusy:
@@ -96,7 +96,7 @@ std::optional<ErrorCode> toErrorCode(std::uint8_t raw) noexcept {
     return std::nullopt;
 }
 
-std::string_view eventCodeName(EventCode code) noexcept {
+std::string_view EventCodeName(EventCode code) noexcept {
     switch (code) {
         case EventCode::ResumeMode:
             return "EV_RESUME_MODE";
@@ -130,7 +130,7 @@ std::string_view eventCodeName(EventCode code) noexcept {
     return "EV_UNKNOWN";
 }
 
-std::optional<EventCode> toEventCode(std::uint8_t raw) noexcept {
+std::optional<EventCode> ToEventCode(std::uint8_t raw) noexcept {
     switch (static_cast<EventCode>(raw)) {
         case EventCode::ResumeMode:
         case EventCode::ClearDaq:
@@ -151,7 +151,7 @@ std::optional<EventCode> toEventCode(std::uint8_t raw) noexcept {
     return std::nullopt;
 }
 
-std::optional<AddressGranularity> commModeBasicToAg(
+std::optional<AddressGranularity> CommModeBasicToAg(
     std::uint8_t field_value) noexcept {
     // COMM_MODE_BASIC bit1-2：00=BYTE, 01=WORD, 10=DWORD, 11=保留
     switch (field_value & 0x03U) {
@@ -166,7 +166,7 @@ std::optional<AddressGranularity> commModeBasicToAg(
     }
 }
 
-std::uint8_t agToCommModeBasicField(AddressGranularity ag) noexcept {
+std::uint8_t AgToCommModeBasicField(AddressGranularity ag) noexcept {
     switch (ag) {
         case AddressGranularity::Byte:
             return 0x00U;
@@ -179,7 +179,7 @@ std::uint8_t agToCommModeBasicField(AddressGranularity ag) noexcept {
     return 0x00U;
 }
 
-std::string_view sessionStateName(SessionState state) noexcept {
+std::string_view SessionStateName(SessionState state) noexcept {
     switch (state) {
         case SessionState::Disconnected:
             return "Disconnected";
@@ -197,11 +197,11 @@ std::string_view sessionStateName(SessionState state) noexcept {
     return "Unknown";
 }
 
-std::optional<XcpAddress40> XcpAddress40::advance(
+std::optional<XcpAddress40> XcpAddress40::Advance(
     ElementCount elements, AddressGranularity ag) const noexcept {
     // 先做乘法溢出检查（ElementCount * AG 字节数），再检查地址回绕
     const auto bytes = static_cast<std::uint64_t>(elements) *
-                       static_cast<std::uint64_t>(agToBytes(ag));
+                       static_cast<std::uint64_t>(AgToBytes(ag));
     const auto sum = static_cast<std::uint64_t>(m_address_) + bytes;
     if (sum > 0xFFFFFFFFULL) {
         return std::nullopt;

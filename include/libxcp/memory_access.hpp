@@ -62,11 +62,10 @@ private:
     [[nodiscard]] bool CanUseShortUpload(ElementCount element_count) const;
     [[nodiscard]] ElementCount MaxUploadElements() const;
     [[nodiscard]] ElementCount MaxShortUploadElements() const;
-    void ValidateRead(Address address, ElementCount element_count) const;
 
     /// @brief 校验读取参数（已连接、元素数非 0、地址不溢出）
     /// @throws XcpException(InvalidArgument)
-    void validateRead(Address address, ElementCount element_count) const;
+    void ValidateRead(Address address, ElementCount element_count) const;
 };
 
 }  // namespace calmcar::xcp

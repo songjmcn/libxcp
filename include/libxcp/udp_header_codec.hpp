@@ -50,7 +50,7 @@ struct UdpHeader {
 
 /**
  * @brief Datagram 内单个 XCP Frame 的只读视图
- * @note xcpPacket 指向 decodeUdpDatagram()
+ * @note xcpPacket 指向 DecodeUdpDatagram()
  * 入参的底层存储，生命周期不超过该视图。
  */
 struct UdpFrameView {
@@ -66,7 +66,7 @@ struct UdpFrameView {
  * @throws XcpException(InvalidArgument) xcp_packet.size() > kUdpMaxXcpPacket
  * (65503)
  */
-[[nodiscard]] UdpFrame encodeUdpFrame(BytesView xcp_packet, DatagramCtr ctr);
+[[nodiscard]] UdpFrame EncodeUdpFrame(BytesView xcp_packet, DatagramCtr ctr);
 
 /**
  * @brief 解码一个 UDP Datagram 中连续打包的全部 XCP Frame
@@ -77,7 +77,7 @@ struct UdpFrameView {
  * @note XCP 1.1 Part 3 允许一个 UDP Datagram 包含多个完整 Frame，
  *       但任何单个 Frame 都不得跨 Datagram 边界。
  */
-[[nodiscard]] std::optional<std::vector<UdpFrameView>> decodeUdpDatagram(
+[[nodiscard]] std::optional<std::vector<UdpFrameView>> DecodeUdpDatagram(
     BytesView datagram) noexcept;
 
 }  // namespace calmcar::xcp

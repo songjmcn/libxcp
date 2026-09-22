@@ -32,13 +32,13 @@ namespace calmcar::xcp {
  */
 struct CommandTimeouts {
     /// @brief 普通命令超时（毫秒）
-    std::chrono::milliseconds m_command_timeout_{1000};
+    std::chrono::milliseconds command_timeout{1000};
 
     /// @brief SYNCH 恢复超时（毫秒）
-    std::chrono::milliseconds m_synch_timeout_{1000};
+    std::chrono::milliseconds synch_timeout{1000};
 
     /// @brief 最大恢复重试次数（不含首次尝试，设计决策 D2）
-    int m_max_retries_ = 2;
+    int max_retries{2};
 };
 
 /**
@@ -52,13 +52,13 @@ public:
     virtual ~IEventListener() = default;
 
     /// @brief 收到异步 Event
-    virtual void onEvent(const EventPacket& event) = 0;
+    virtual void OnEvent(const EventPacket& event) = 0;
 
     /// @brief 收到异步 Service Request
-    virtual void onService(const ServicePacket& service) = 0;
+    virtual void OnService(const ServicePacket& service) = 0;
 
     /// @brief 收到 DTO（本阶段仅识别，不解析内容）
-    virtual void onDto(const DtoPacket& dto) = 0;
+    virtual void OnDto(const DtoPacket& dto) = 0;
 };
 
 /**
@@ -68,7 +68,7 @@ public:
  * 一个 Pending Command。Codec/Parser 在 CONNECT 协商出字节序后按该字节序创建。
  *
  * @par 死锁规避（设计 §16.3）
- *   onPacketReceived() 在工作线程执行，先在锁内取出响应/事件，释放锁后再回调
+ *   OnPacketReceived() 在工作线程执行，先在锁内取出响应/事件，释放锁后再回调
  *   IEventListener；不在持锁状态下回调外部监听器。
  */
 class CommandExecutor : public IPacketListener {

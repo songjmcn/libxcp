@@ -135,9 +135,9 @@ TEST(ParseConnectResponse, SpecExampleIntel) {
         BytesView{BytesOf({0x15, 0xC0, 0x08, 0x08, 0x00, 0x10, 0x10})});
     ASSERT_TRUE(resp.has_value());
     EXPECT_EQ(resp->m_resource_mask_, 0x15U);
-    EXPECT_TRUE(hasResource(resp->m_resource_mask_, Resource::CalPag));
-    EXPECT_TRUE(hasResource(resp->m_resource_mask_, Resource::Daq));
-    EXPECT_TRUE(hasResource(resp->m_resource_mask_, Resource::Pgm));
+    EXPECT_TRUE(HasResource(resp->m_resource_mask_, Resource::CalPag));
+    EXPECT_TRUE(HasResource(resp->m_resource_mask_, Resource::Daq));
+    EXPECT_TRUE(HasResource(resp->m_resource_mask_, Resource::Pgm));
     EXPECT_EQ(resp->m_byte_order_, ByteOrder::Intel);
     EXPECT_EQ(resp->m_address_granularity_, AddressGranularity::Byte);
     EXPECT_TRUE(resp->m_slave_block_mode_supported_);

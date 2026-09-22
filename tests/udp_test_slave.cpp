@@ -150,12 +150,16 @@ void UdpTestSlave::Start() {
 
 void UdpTestSlave::Stop() {
     m_running_.store(false, std::memory_order_release);
+    // 先 join 再关 Socket：接收线程可能仍在 sendto() 响应，若在 join 之前关闭
+    // Socket，其句柄号会被 OS 立即回收并分配给其他测试新建的 Socket，
+    // 导致这个迟到的 sendto 把包投递到别的端点（跨用例串扰）。
+    // recvfrom 带 SO_RCVTIMEO，最多阻塞一个轮询周期后即可看到停止标记。
+    if (m_receive_thread_.joinable()) {
+        m_receive_thread_.join();
+    }
     if (m_socket_ && m_socket_->handle != kInvalidSocket) {
         closeSocket(m_socket_->handle);
         m_socket_->handle = kInvalidSocket;
-    }
-    if (m_receive_thread_.joinable()) {
-        m_receive_thread_.join();
     }
 }
 
@@ -186,11 +190,16 @@ std::size_t UdpTestSlave::CommandCount() const {
     return m_command_count_;
 }
 
+DatagramCtr UdpTestSlave::NextSendCtr() const {
+    const std::lock_guard<std::mutex> lock(m_state_mutex_);
+    return m_send_ctr_;
+}
+
 // ---------------------------------------------------------------------------
 // 报文构造辅助
 // ---------------------------------------------------------------------------
 
-Bytes UdpTestSlave::makeRes(std::initializer_list<std::uint8_t> body) {
+Bytes UdpTestSlave::MakeRes(std::initializer_list<std::uint8_t> body) {
     Bytes packet;
     packet.reserve(1 + body.size());
     packet.push_back(static_cast<std::uint8_t>(PacketType::Res));
@@ -198,12 +207,12 @@ Bytes UdpTestSlave::makeRes(std::initializer_list<std::uint8_t> body) {
     return packet;
 }
 
-Bytes UdpTestSlave::makeErr(ErrorCode code) {
+Bytes UdpTestSlave::MakeErr(ErrorCode code) {
     return Bytes{static_cast<std::uint8_t>(PacketType::Err),
                  static_cast<std::uint8_t>(code)};
 }
 
-bool UdpTestSlave::advanceMta(ElementCount elements) {
+bool UdpTestSlave::AdvanceMta(ElementCount elements) {
     const auto bytes = static_cast<std::uint64_t>(elements) * kTestAgBytes;
     const auto sum = static_cast<std::uint64_t>(m_mta_) + bytes;
     if (sum > 0xFFFFFFFFULL) {
@@ -213,7 +222,7 @@ bool UdpTestSlave::advanceMta(ElementCount elements) {
     return true;
 }
 
-std::optional<Bytes> UdpTestSlave::readAtMta(ElementCount elements) {
+std::optional<Bytes> UdpTestSlave::ReadAtMta(ElementCount elements) {
     const auto want = static_cast<std::size_t>(elements) * kTestAgBytes;
     const std::lock_guard<std::mutex> lock(m_memory_mutex_);
     for (const auto& [base, content] : m_memory_) {
@@ -256,7 +265,7 @@ void UdpTestSlave::ReceiveLoop() {
         const std::uint16_t src_port = ntohs(src.sin_port);
 
         // 按 XCP 1.1：一个 Datagram 可能包含多个完整 Frame，逐个解析后依序处理
-        const auto frames = decodeUdpDatagram(
+        const auto frames = DecodeUdpDatagram(
             BytesView{buffer.data(), static_cast<std::size_t>(received)});
         if (!frames) {
             continue;  // 畸形 Datagram：测试 Slave 直接忽略
@@ -302,7 +311,7 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             // COMM_MODE_BASIC=0xC0(Intel/BYTE/Block/Optional), MAX_CTO=8,
             // MAX_DTO=8(小端), ProtoVer=0x10, TransportVer=0x10
             response =
-                makeRes({0x15, 0xC0, kTestMaxCto,
+                MakeRes({0x15, 0xC0, kTestMaxCto,
                          static_cast<std::uint8_t>(kTestMaxDto & 0xFFU),
                          static_cast<std::uint8_t>((kTestMaxDto >> 8) & 0xFFU),
                          0x10, 0x10});
@@ -312,30 +321,30 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             return;
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::Disconnect)) {
             m_connected_ = false;
-            response = makeRes({});
+            response = MakeRes({});
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::GetStatus)) {
             // Session Status=0x00, Protection=0x00, STATE_NUMBER=0x01,
             // ConfigID=0x0007(小端)
-            response = makeRes({0x00, 0x00, 0x01, 0x07, 0x00});
+            response = MakeRes({0x00, 0x00, 0x01, 0x07, 0x00});
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::Synch)) {
             // SYNCH 始终以 ERR_CMD_SYNCH 应答
-            response = makeErr(ErrorCode::CmdSynch);
+            response = MakeErr(ErrorCode::CmdSynch);
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd ==
                    static_cast<std::uint8_t>(CommandCode::GetCommModeInfo)) {
             // reserved, COMM_MODE_OPTIONAL, reserved, MAX_BS, MIN_ST,
             // QUEUE_SIZE, DRIVER_VER
-            response = makeRes({0x00, 0x0E, 0x00, 0x04, 0x02, 0x08, 0x13});
+            response = MakeRes({0x00, 0x0E, 0x00, 0x04, 0x02, 0x08, 0x13});
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::SetMta)) {
             if (xcp_packet.size() < 7U) {
-                response = makeErr(ErrorCode::CmdSyntax);
+                response = MakeErr(ErrorCode::CmdSyntax);
             } else {
                 m_mta_extension_ = xcp_packet[2];
                 // Address 按 Session Byte Order（测试 Slave 固定 Intel 小端）
@@ -343,19 +352,19 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
                          (static_cast<Address>(xcp_packet[4]) << 8) |
                          (static_cast<Address>(xcp_packet[5]) << 16) |
                          (static_cast<Address>(xcp_packet[6]) << 24);
-                response = makeRes({});
+                response = MakeRes({});
             }
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::Upload)) {
             if (xcp_packet.size() < 2U) {
-                response = makeErr(ErrorCode::CmdSyntax);
+                response = MakeErr(ErrorCode::CmdSyntax);
             } else {
                 const auto elements = static_cast<ElementCount>(xcp_packet[1]);
                 if (elements == 0U ||
                     elements + 1U > kTestMaxCto / kTestAgBytes) {
-                    response = makeErr(ErrorCode::OutOfRange);
-                } else if (auto data = readAtMta(elements)) {
+                    response = MakeErr(ErrorCode::OutOfRange);
+                } else if (auto data = ReadAtMta(elements)) {
                     // UPLOAD 的 RES 为 [FF][data...]，长度 ==
                     // elements*AG，不含计数字节 （依据
                     // docs/XCP_1.3.0_document.md §12.4 示例：UPLOAD(6) -> 6
@@ -364,16 +373,16 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
                     response.push_back(
                         static_cast<std::uint8_t>(PacketType::Res));
                     response.insert(response.end(), data->begin(), data->end());
-                    advanceMta(elements);
+                    AdvanceMta(elements);
                 } else {
-                    response = makeErr(ErrorCode::AccessDenied);
+                    response = MakeErr(ErrorCode::AccessDenied);
                 }
             }
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::ShortUpload)) {
             if (xcp_packet.size() < 8U) {
-                response = makeErr(ErrorCode::CmdSyntax);
+                response = MakeErr(ErrorCode::CmdSyntax);
             } else {
                 const auto elements = static_cast<ElementCount>(xcp_packet[1]);
                 const auto extension = xcp_packet[3];
@@ -383,13 +392,13 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
                     (static_cast<Address>(xcp_packet[6]) << 16) |
                     (static_cast<Address>(xcp_packet[7]) << 24);
                 if (elements == 0U || elements > kTestMaxCto / kTestAgBytes) {
-                    response = makeErr(ErrorCode::OutOfRange);
+                    response = MakeErr(ErrorCode::OutOfRange);
                 } else {
                     const Address saved_mta = m_mta_;
                     const AddressExtension saved_ext = m_mta_extension_;
                     m_mta_ = address;
                     m_mta_extension_ = extension;
-                    if (auto data = readAtMta(elements)) {
+                    if (auto data = ReadAtMta(elements)) {
                         // SHORT_UPLOAD 的 RES 同样为 [FF][data...]
                         // （依据 docs/XCP_1.3.0_document.md §12.5：size=4 -> 4
                         // 字节数据）
@@ -399,9 +408,9 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
                         response.insert(response.end(), data->begin(),
                                         data->end());
                         // SHORT_UPLOAD 之后 MTA 仍前进到数据块末尾之后
-                        advanceMta(elements);
+                        AdvanceMta(elements);
                     } else {
-                        response = makeErr(ErrorCode::AccessDenied);
+                        response = MakeErr(ErrorCode::AccessDenied);
                         m_mta_ = saved_mta;
                         m_mta_extension_ = saved_ext;
                     }
@@ -410,7 +419,7 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else {
-            response = makeErr(ErrorCode::CmdUnknown);
+            response = MakeErr(ErrorCode::CmdUnknown);
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         }
@@ -419,11 +428,11 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
     if (response.empty() || !destination) {
         return;
     }
-    sendResponseTo(BytesView{response}, destination->first,
+    SendResponseTo(BytesView{response}, destination->first,
                    destination->second);
 }
 
-void UdpTestSlave::sendResponse(BytesView xcp_packet) {
+void UdpTestSlave::SendResponse(BytesView xcp_packet) {
     std::string ip;
     std::uint16_t port = 0;
     {
@@ -435,10 +444,10 @@ void UdpTestSlave::sendResponse(BytesView xcp_packet) {
         ip = *m_connect_source_ip_;
         port = *m_connect_source_port_;
     }
-    sendResponseTo(xcp_packet, ip, port);
+    SendResponseTo(xcp_packet, ip, port);
 }
 
-void UdpTestSlave::sendResponseTo(BytesView xcp_packet, const std::string& ip,
+void UdpTestSlave::SendResponseTo(BytesView xcp_packet, const std::string& ip,
                                   std::uint16_t port) {
     DatagramCtr ctr = 0;
     FaultInjection fault;
@@ -447,6 +456,7 @@ void UdpTestSlave::sendResponseTo(BytesView xcp_packet, const std::string& ip,
     bool corrupt_len = false;
     bool jump_ctr = false;
     bool duplicate_ctr = false;
+    int ctr_offset = 0;
 
     {
         const std::lock_guard<std::mutex> lock(m_state_mutex_);
@@ -465,6 +475,10 @@ void UdpTestSlave::sendResponseTo(BytesView xcp_packet, const std::string& ip,
             fault.m_delay_response_n_->first == n) {
             delay_ms = fault.m_delay_response_n_->second;
         }
+        if (fault.m_ctr_offset_n_ && fault.m_ctr_offset_n_->first == n) {
+            // 精确偏移：按模 65536 施加有符号增量，可构造任意 CTR 差值（D5）
+            ctr_offset = fault.m_ctr_offset_n_->second;
+        }
         if (duplicate_ctr) {
             // 重复 CTR：本响应复用上一个响应的 CTR 值（计数器本身仍已递增，
             // 因此后续响应继续按正常序列推进，不会永久卡住）
@@ -481,6 +495,11 @@ void UdpTestSlave::sendResponseTo(BytesView xcp_packet, const std::string& ip,
     if (jump_ctr) {
         ctr = static_cast<DatagramCtr>(ctr + 5U);  // 制造缺口
     }
+    if (ctr_offset != 0) {
+        // 先加 65536 保证中间值为正，再取模，使负偏移也得到正确的回绕结果
+        ctr = static_cast<DatagramCtr>(
+            (static_cast<long>(ctr) + 65536L + ctr_offset) % 65536L);
+    }
 
     Bytes datagram;
     if (corrupt_len) {
@@ -495,7 +514,7 @@ void UdpTestSlave::sendResponseTo(BytesView xcp_packet, const std::string& ip,
         std::memcpy(datagram.data() + kUdpHeaderSize, xcp_packet.data(),
                     xcp_packet.size());
     } else {
-        datagram = encodeUdpFrame(xcp_packet, ctr).m_data_;
+        datagram = EncodeUdpFrame(xcp_packet, ctr).m_data_;
     }
 
     sockaddr_in dst{};
@@ -562,7 +581,7 @@ void UdpTestSlave::SendPackedFrames(std::span<const BytesView> xcp_packets) {
             // 每个 Frame 独立消耗一个 CTR（设计 §15.3 第 5 条）
             const auto ctr = m_send_ctr_;
             ++m_send_ctr_;
-            const auto frame = encodeUdpFrame(packet, ctr);
+            const auto frame = EncodeUdpFrame(packet, ctr);
             if (datagram.size() + frame.m_data_.size() > kUdpMaxDatagramSize) {
                 throw detail::MakeInvalidArgument(
                     "SendPackedFrames: Datagram 总长超过上限");

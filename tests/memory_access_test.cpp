@@ -35,7 +35,7 @@ Bytes ConnectResponseBytes(AddressGranularity ag, ByteOrder order,
     if (order == ByteOrder::Motorola) {
         comm_mode |= 0x01U;
     }
-    comm_mode |= static_cast<std::uint8_t>(agToCommModeBasicField(ag) << 1);
+    comm_mode |= static_cast<std::uint8_t>(AgToCommModeBasicField(ag) << 1);
     if (optional) {
         comm_mode |= 0x80U;
     }
@@ -184,7 +184,7 @@ private:
         const auto elements = static_cast<ElementCount>(packet[1]);
         if (elements == 0U ||
             elements + 1U >
-                static_cast<ElementCount>(m_max_cto / agToBytes(m_ag))) {
+                static_cast<ElementCount>(m_max_cto / AgToBytes(m_ag))) {
             return Err(ErrorCode::OutOfRange);
         }
         auto data = read(m_mta, elements);
@@ -194,7 +194,7 @@ private:
         // UPLOAD 的 RES 为 [FF][data...]，不含元素计数字节
         Bytes res{static_cast<std::uint8_t>(PacketType::Res)};
         res.insert(res.end(), data->begin(), data->end());
-        m_mta += static_cast<Address>(elements) * agToBytes(m_ag);
+        m_mta += static_cast<Address>(elements) * AgToBytes(m_ag);
         return res;
     }
 
@@ -207,7 +207,7 @@ private:
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
         if (elements == 0U ||
-            elements > static_cast<ElementCount>(m_max_cto / agToBytes(m_ag))) {
+            elements > static_cast<ElementCount>(m_max_cto / AgToBytes(m_ag))) {
             return Err(ErrorCode::OutOfRange);
         }
         const Address address = ParseShortUploadAddress(packet, m_order);
@@ -218,13 +218,13 @@ private:
         // SHORT_UPLOAD 的 RES 同样为 [FF][data...]
         Bytes res{static_cast<std::uint8_t>(PacketType::Res)};
         res.insert(res.end(), data->begin(), data->end());
-        m_mta = address + static_cast<Address>(elements) * agToBytes(m_ag);
+        m_mta = address + static_cast<Address>(elements) * AgToBytes(m_ag);
         return res;
     }
 
     std::optional<Bytes> read(Address address, ElementCount elements) {
         Bytes out;
-        const auto count = static_cast<std::size_t>(elements) * agToBytes(m_ag);
+        const auto count = static_cast<std::size_t>(elements) * AgToBytes(m_ag);
         for (std::size_t i = 0; i < count; ++i) {
             const auto it = m_memory.find(address + static_cast<Address>(i));
             if (it == m_memory.end()) {
@@ -353,7 +353,7 @@ class MemoryAccessAgTest : public ::testing::TestWithParam<AgCase> {};
 
 TEST_P(MemoryAccessAgTest, ChunkingSplitsAtUploadLimit) {
     const AgCase c = GetParam();
-    const auto ag_bytes = agToBytes(c.ag);
+    const auto ag_bytes = AgToBytes(c.ag);
 
     // 造一块比单块上限大得多的数据，强制多块 UPLOAD
     const ElementCount total = c.upload_max * 3 + 1;
@@ -381,7 +381,7 @@ TEST_P(MemoryAccessAgTest, ChunkingSplitsAtUploadLimit) {
 
 TEST_P(MemoryAccessAgTest, SingleShortUploadWithinLimit) {
     const AgCase c = GetParam();
-    const auto ag_bytes = agToBytes(c.ag);
+    const auto ag_bytes = AgToBytes(c.ag);
     const auto bytes = static_cast<std::size_t>(c.short_upload_max) * ag_bytes;
     Bytes content(bytes, 0x5AU);
 
@@ -397,7 +397,7 @@ TEST_P(MemoryAccessAgTest, SingleShortUploadWithinLimit) {
 
 TEST_P(MemoryAccessAgTest, BeyondShortUploadLimitFallsBackToChunked) {
     const AgCase c = GetParam();
-    const auto ag_bytes = agToBytes(c.ag);
+    const auto ag_bytes = AgToBytes(c.ag);
     // 超过 SHORT_UPLOAD 上限但不超 UPLOAD 分块能力
     const ElementCount total = c.short_upload_max + 1;
     const auto total_bytes = static_cast<std::size_t>(total) * ag_bytes;
@@ -417,7 +417,7 @@ TEST_P(MemoryAccessAgTest, BeyondShortUploadLimitFallsBackToChunked) {
 
 TEST_P(MemoryAccessAgTest, AddressAdvancesByAgBytes) {
     const AgCase c = GetParam();
-    const auto ag_bytes = agToBytes(c.ag);
+    const auto ag_bytes = AgToBytes(c.ag);
     const ElementCount total = c.upload_max * 2;  // 恰好两块
     const auto total_bytes = static_cast<std::size_t>(total) * ag_bytes;
     Bytes content(total_bytes);
@@ -444,7 +444,7 @@ INSTANTIATE_TEST_SUITE_P(
                       AgCase{AddressGranularity::Word, 0x10U, 8U, 7U},
                       AgCase{AddressGranularity::DWord, 0x20U, 8U, 7U}),
     [](const ::testing::TestParamInfo<AgCase>& info) {
-        return std::string("Ag") + std::to_string(agToBytes(info.param.ag)) +
+        return std::string("Ag") + std::to_string(AgToBytes(info.param.ag)) +
                "_MaxCto" + std::to_string(info.param.max_cto);
     });
 

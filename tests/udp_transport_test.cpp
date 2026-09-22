@@ -376,8 +376,8 @@ TEST(UdpTransportReceive, CorruptSecondFrameDropsWholeDatagram) {
     // 必须不交付
     const Bytes good = BytesOf({0xFD, 0x05});
     const Bytes bad_second = BytesOf({0xFF, 0xE0});
-    auto f1 = encodeUdpFrame(BytesView{good}, 300).m_data_;
-    auto f2 = encodeUdpFrame(BytesView{bad_second}, 301).m_data_;
+    auto f1 = EncodeUdpFrame(BytesView{good}, 300).m_data_;
+    auto f2 = EncodeUdpFrame(BytesView{bad_second}, 301).m_data_;
     f2[0] = 0xFF;  // LEN := 255，明显超出剩余字节
     Bytes datagram = f1;
     datagram.insert(datagram.end(), f2.begin(), f2.end());
@@ -506,7 +506,7 @@ TEST(UdpTransportReceive, IgnoresForeignSourceIp) {
     }
 
     const Bytes res = BytesOf({0xFF, 0x00});
-    const auto frame = encodeUdpFrame(BytesView{res}, 0);
+    const auto frame = EncodeUdpFrame(BytesView{res}, 0);
     RawSender sender(kFixedLocalPort);
     sender.send(
         BytesView{frame.m_data_});  // 来源为 127.0.0.1，与配置的远端 IP 不符
@@ -530,7 +530,7 @@ TEST(UdpTransportReceive, ForeignPortRejectedWhenStrict) {
     cfg.m_strict_remote_port_ = true;
 
     const Bytes res = BytesOf({0xFF, 0x00});
-    const auto frame = encodeUdpFrame(BytesView{res}, 0);
+    const auto frame = EncodeUdpFrame(BytesView{res}, 0);
 
     {
         UdpTransport transport(cfg);
@@ -589,9 +589,9 @@ TEST(UdpTransportReceive, DatagramOverMaxSizeDiscarded) {
     }
 
     const Bytes res = BytesOf({0xFF, 0x00});
-    const auto frame = encodeUdpFrame(BytesView{res}, 0);  // 6 字节：在限制内
+    const auto frame = EncodeUdpFrame(BytesView{res}, 0);  // 6 字节：在限制内
     const auto big =
-        encodeUdpFrame(BytesView{Bytes(20, 0x11)}, 1);  // 24 字节：超限
+        EncodeUdpFrame(BytesView{Bytes(20, 0x11)}, 1);  // 24 字节：超限
 
     RawSender sender(kFixedLocalPort);
     ASSERT_TRUE(sender.valid());
@@ -630,14 +630,14 @@ TEST(UdpTransportCtrSemantics, ReceiveCtrWrapsFromFfffToZero) {
 
     // 首个合法 Frame 建立基线 = 0xFFFF
     slave.SendRawPayloadTo(
-        BytesView{encodeUdpFrame(BytesView{a}, 0xFFFF).m_data_}, "127.0.0.1",
+        BytesView{EncodeUdpFrame(BytesView{a}, 0xFFFF).m_data_}, "127.0.0.1",
         kMasterPort);
     ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
     EXPECT_EQ(transport.LastReceiveCtr().value_or(0), 0xFFFF);
 
     // 下一个 Frame 的 CTR 回绕到 0x0000，恰为期望值 -> 应被接受
     slave.SendRawPayloadTo(
-        BytesView{encodeUdpFrame(BytesView{b}, 0x0000).m_data_}, "127.0.0.1",
+        BytesView{EncodeUdpFrame(BytesView{b}, 0x0000).m_data_}, "127.0.0.1",
         kMasterPort);
     ASSERT_TRUE(listener.WaitForPackets(2, std::chrono::seconds(2)));
     EXPECT_EQ(transport.LastReceiveCtr().value_or(0xFFFF), 0x0000);
@@ -664,12 +664,12 @@ TEST(UdpTransportCtrSemantics, BackwardCtrFrameDropped) {
 
     const Bytes pkt = BytesOf({0xFD, 0x01});
     slave.SendRawPayloadTo(
-        BytesView{encodeUdpFrame(BytesView{pkt}, 10).m_data_}, "127.0.0.1",
+        BytesView{EncodeUdpFrame(BytesView{pkt}, 10).m_data_}, "127.0.0.1",
         kMasterPort);
     ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
 
     // 后向乱序（10 -> 5）：相对期望值 11 的前向距离极大 -> 判为迟到/乱序，丢弃
-    slave.SendRawPayloadTo(BytesView{encodeUdpFrame(BytesView{pkt}, 5).m_data_},
+    slave.SendRawPayloadTo(BytesView{EncodeUdpFrame(BytesView{pkt}, 5).m_data_},
                            "127.0.0.1", kMasterPort);
     EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -706,6 +706,120 @@ TEST(UdpTransportCtrSemantics, TruncatedDatagramDiscarded) {
     EXPECT_TRUE(listener.Packets().empty());
     EXPECT_FALSE(transport.LastReceiveCtr().has_value())
         << "截断包不得建立接收基线";
+    transport.Close();
+    slave.Stop();
+}
+
+TEST(UdpTransportCtrSemantics, AmbiguousCtrOffsetIsDropped) {
+    // 设计决策 D5 / §8.1 第 6 条：CTR 与期望值恰好相差 0x8000 时方向歧义，
+    // 必须丢弃且不得推进接收基线。
+    //
+    // 精确构造方法（批次 2 记录 §9 限制 3）：
+    //   Slave 正常响应 CONNECT 时使用其自身 CTR=0，Master 以此建立基线；
+    //   随后 Master 发送 GET_STATUS，Slave 的下一个响应本应使用 CTR=1，
+    //   施加 +0x8000 偏移后实发 (1+32768) mod 65536 = 0x8001，
+    //   而 Master 的期望值为 1，前向距离恰为 0x8000。
+    test::UdpTestSlave slave;
+    slave.Start();
+    UdpTransport transport(MakeConfig(slave.Port()));
+    RecordingListener listener;
+    transport.Open(listener);
+
+    const Bytes connect = BytesOf({0xFF, 0x00});
+    transport.Send(BytesView{connect});
+    ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
+    EXPECT_EQ(transport.LastReceiveCtr().value_or(0xFFFF), 0);
+    const std::size_t baseline = listener.Packets().size();
+
+    test::FaultInjection fault;
+    // 施加 +0x8000：本应发 CTR=1，实发 (1+32768) mod 65536 = 32769 = 0x8001，
+    // 相对期望值 1 的前向距离恰为 0x8000（歧义点）。
+    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, 0x8000);
+    slave.SetFaultInjection(fault);
+
+    const Bytes get_status = BytesOf({0xFD, 0x00});
+    transport.Send(BytesView{get_status});
+
+    EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(listener.Packets().size(), baseline)
+        << "0x8000 歧义 Frame 不得交付上层";
+    EXPECT_EQ(transport.LastReceiveCtr().value_or(0xFFFF), 0)
+        << "被丢弃的 Frame 不得推进接收 CTR";
+
+    bool ambiguity_reported = false;
+    for (const auto& w : listener.Warnings()) {
+        if (w.find("0x8000") != std::string::npos) {
+            ambiguity_reported = true;
+        }
+    }
+    EXPECT_TRUE(ambiguity_reported) << "未观察到 0x8000 歧义诊断";
+    transport.Close();
+    slave.Stop();
+}
+
+TEST(UdpTransportCtrSemantics, JustBelowAmbiguousBoundaryIsAccepted) {
+    // 相邻区间对照：差值 0x7FFF 仍属前向跳号（§8.1 第 4
+    // 条），必须接收并报告缺口。 与 AmbiguousCtrOffsetIsDropped 一起锁定 0x7FFF
+    // / 0x8000 的边界归属。
+    test::UdpTestSlave slave;
+    slave.Start();
+    UdpTransport transport(MakeConfig(slave.Port()));
+    RecordingListener listener;
+    transport.Open(listener);
+
+    const Bytes connect = BytesOf({0xFF, 0x00});
+    transport.Send(BytesView{connect});
+    ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
+    const std::size_t baseline = listener.Packets().size();
+
+    test::FaultInjection fault;
+    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, 0x7FFE);
+    slave.SetFaultInjection(fault);
+
+    const Bytes get_status = BytesOf({0xFD, 0x00});
+    transport.Send(BytesView{get_status});
+
+    EXPECT_TRUE(listener.WaitForPackets(baseline + 1, std::chrono::seconds(2)));
+    bool gap_reported = false;
+    for (const auto& w : listener.Warnings()) {
+        if (w.find("跳号") != std::string::npos) {
+            gap_reported = true;
+        }
+    }
+    EXPECT_TRUE(gap_reported) << "0x7FFF 差值应按前向跳号处理";
+    EXPECT_EQ(transport.LastReceiveCtr().value_or(0),
+              static_cast<DatagramCtr>(32767))
+        << "跳号 Frame 应推进接收 CTR";
+    transport.Close();
+    slave.Stop();
+}
+
+TEST(UdpTransportCtrSemantics, JustAboveAmbiguousBoundaryIsDropped) {
+    // 相邻区间对照：差值 0x8001 落在后向侧（§8.1 第 5 条），按迟到乱序丢弃。
+    test::UdpTestSlave slave;
+    slave.Start();
+    UdpTransport transport(MakeConfig(slave.Port()));
+    RecordingListener listener;
+    transport.Open(listener);
+
+    const Bytes connect = BytesOf({0xFF, 0x00});
+    transport.Send(BytesView{connect});
+    ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
+    const std::size_t baseline = listener.Packets().size();
+
+    test::FaultInjection fault;
+    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, -0x7FFE);
+    slave.SetFaultInjection(fault);
+
+    const Bytes get_status = BytesOf({0xFD, 0x00});
+    transport.Send(BytesView{get_status});
+
+    EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(listener.Packets().size(), baseline)
+        << "差值 0x8001 属后向乱序，不得交付";
+    EXPECT_EQ(transport.LastReceiveCtr().value_or(0xFFFF), 0);
     transport.Close();
     slave.Stop();
 }

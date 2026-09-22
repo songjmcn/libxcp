@@ -42,6 +42,14 @@ struct FaultInjection {
 
     /// @brief 对第 N 个响应使用重复 CTR（验证重复丢弃）
     std::optional<std::size_t> m_duplicate_ctr_n_;
+
+    /**
+     * @brief 对第 N 个响应的 CTR 施加指定的有符号偏移（模 65536）
+     * @details 用于精确构造设计决策 D5 / §8.1 第 6 条要求的"与期望值恰好相差
+     *          0x8000"歧义 Frame —— 该差值无法由跳号（前向 +5）或重复（后向
+     * -1） 注入得到，必须由发送侧直接指定偏移量。
+     */
+    std::optional<std::pair<std::size_t, int>> m_ctr_offset_n_;
 };
 
 /**
@@ -88,6 +96,13 @@ public:
 
     /// @brief 获取已处理的 XCP 命令计数
     [[nodiscard]] std::size_t CommandCount() const;
+
+    /**
+     * @brief 获取下一个 Slave→Master Frame 将使用的 CTR 值
+     * @details 故障注入（跳号/重复/精确偏移）只改写实际发出的 Header，
+     *          不改变本计数器的推进规律；测试据此验证注入后的真实 CTR。
+     */
+    [[nodiscard]] DatagramCtr NextSendCtr() const;
 
     /// @brief 是否已建立模拟 XCP Session（诊断用）
     [[nodiscard]] bool IsConnected() const;
@@ -145,27 +160,27 @@ private:
         const std::string& source_ip) const;
 
     /// @brief 发送响应到 CONNECT 时记录的来源 IP:port
-    void sendResponse(BytesView xcp_packet);
+    void SendResponse(BytesView xcp_packet);
 
     /**
      * @brief 把单个 XCP Packet 编码为一个 Frame 并发送到指定端点（含故障注入）
      * @param ip 目的 IPv4 文本
      * @param port 目的 UDP 端口
      */
-    void sendResponseTo(BytesView xcp_packet, const std::string& ip,
+    void SendResponseTo(BytesView xcp_packet, const std::string& ip,
                         std::uint16_t port);
 
     /// @brief 生成 RES 前缀（0xFF + 数据）
-    static Bytes makeRes(std::initializer_list<std::uint8_t> body);
+    static Bytes MakeRes(std::initializer_list<std::uint8_t> body);
 
     /// @brief 生成 ERR 报文
-    static Bytes makeErr(ErrorCode code);
+    static Bytes MakeErr(ErrorCode code);
 
     /// @brief 按当前 MTA 读取指定元素数的模拟内存；越界返回 nullopt
-    [[nodiscard]] std::optional<Bytes> readAtMta(ElementCount elements);
+    [[nodiscard]] std::optional<Bytes> ReadAtMta(ElementCount elements);
 
     /// @brief 把 MTA 前进指定元素数；溢出返回 false
-    bool advanceMta(ElementCount elements);
+    bool AdvanceMta(ElementCount elements);
 
     /// @brief 测试 Socket 私有实现声明
     struct SocketImpl;

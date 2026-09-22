@@ -49,15 +49,15 @@ private:
 /// @brief 记录 IEventListener 回调，供断言使用
 class RecordingEvents : public IEventListener {
 public:
-    void onEvent(const EventPacket& event) override {
+    void OnEvent(const EventPacket& event) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         m_events.push_back(event);
     }
-    void onService(const ServicePacket& service) override {
+    void OnService(const ServicePacket& service) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         m_services.push_back(service);
     }
-    void onDto(const DtoPacket& dto) override {
+    void OnDto(const DtoPacket& dto) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         m_dtos.push_back(dto);
     }
@@ -98,7 +98,7 @@ Bytes MakeConnectResponse(AddressGranularity ag = AddressGranularity::Byte,
                           std::uint8_t max_cto = 8U, std::uint16_t max_dto = 8U,
                           bool optional = true) {
     std::uint8_t comm_mode =
-        static_cast<std::uint8_t>(agToCommModeBasicField(ag) << 1);
+        static_cast<std::uint8_t>(AgToCommModeBasicField(ag) << 1);
     if (order == ByteOrder::Motorola) {
         comm_mode |= 0x01U;
     }
@@ -342,7 +342,7 @@ TEST(RecoveryTimeout, TransportClosedPreventsSynch) {
     } catch (const XcpException& e) {
         EXPECT_TRUE(e.Category() == ErrorCategory::RecoveryFailed ||
                     e.Category() == ErrorCategory::TransportError)
-            << "实际分类: " << errorCategoryName(e.Category());
+            << "实际分类: " << ErrorCategoryName(e.Category());
     }
     EXPECT_EQ(f.slave.Count(CommandCode::Synch), 0)
         << "Transport 断开时不得发送 SYNCH";

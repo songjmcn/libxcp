@@ -47,49 +47,51 @@ public:
 
     /**
      * @brief 建立 XCP 连接
-     * @details Transport.open -> CONNECT -> [GET_COMM_MODE_INFO] -> GET_STATUS
+     * @details Transport.Open -> CONNECT -> [GET_COMM_MODE_INFO] -> GET_STATUS
      * @throws XcpException 连接失败（失败时已关闭通道并清理本地状态）
      */
-    void connect();
+    void Connect();
 
     /**
      * @brief 断开 XCP 连接
-     * @details DISCONNECT -> Transport.close。即使 DISCONNECT
+     * @details DISCONNECT -> Transport.Close。即使 DISCONNECT
      * 失败也释放本地资源， 并向调用方抛出原始错误；重复断开在本地幂等。
      */
-    void disconnect();
+    void Disconnect();
 
     /// @brief 是否已连接
-    [[nodiscard]] bool isConnected() const;
+    [[nodiscard]] bool IsConnected() const;
 
     // ---- 内存读取 ----
 
     /**
      * @brief 读取内存（以字节为单位）
+     * @param address 32 位地址
+     * @param extension 地址扩展
      * @param byte_count 字节数（必须可被 AG 整除）
      */
-    [[nodiscard]] Bytes readMemory(Address address, AddressExtension extension,
-                                   ByteCount byte_count);
+    [[nodiscard]] Bytes ReadMemoryBytes(Address address,
+                                        AddressExtension extension,
+                                        ByteCount byte_count);
 
     /**
      * @brief 读取内存（以元素为单位，按 AG 计数）
-     * @details 与字节重载分开命名：ByteCount 与 ElementCount 同为 uint32_t
-     * 别名， 若共用 readMemory 名称会导致字面量调用产生重载歧义。
+     * @details 与字节版本分开命名：ByteCount 与 ElementCount 同为 uint32_t
+     * 别名， 若共用 ReadMemory 名称会导致字面量调用产生重载歧义。
      */
-    [[nodiscard]] Bytes readMemoryElements(Address address,
-                                           AddressExtension extension,
-                                           ElementCount element_count);
+    [[nodiscard]] Bytes ReadMemory(Address address, AddressExtension extension,
+                                   ElementCount element_count);
 
     // ---- 状态查询 ----
 
     /// @brief 获取 Session 参数快照
-    [[nodiscard]] SessionParameters sessionParameters() const;
+    [[nodiscard]] SessionParameters GetSessionParameters() const;
 
     /// @brief 获取当前 Session 状态
-    [[nodiscard]] SessionState sessionState() const;
+    [[nodiscard]] SessionState GetSessionState() const;
 
     /// @brief 手动查询 GET_STATUS 并更新 Session
-    [[nodiscard]] GetStatusResponse queryStatus();
+    [[nodiscard]] GetStatusResponse QueryStatus();
 
 private:
     std::unique_ptr<IXcpTransport> m_transport_;  ///< 拥有的 Transport

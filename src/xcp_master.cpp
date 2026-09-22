@@ -39,14 +39,14 @@ XcpMaster::~XcpMaster() {
     m_executor_.reset();
 }
 
-void XcpMaster::connect() {
+void XcpMaster::Connect() {
     // 已连接时拒绝重复连接（避免在活跃会话上重放 CONNECT）
     if (m_session_.IsConnected()) {
         throw detail::MakeInvalidState("Session 已处于 Connected 状态");
     }
     m_session_.Reset();  // 清理 Failed/残留状态
 
-    // Transport.open 的监听器即 CommandExecutor；open 之后接收线程立即开始回调
+    // Transport.Open 的监听器即 CommandExecutor；Open 之后接收线程立即开始回调
     m_transport_->Open(m_executor_->AsListener());
 
     auto cleanup_on_failure = [this] {
@@ -63,7 +63,7 @@ void XcpMaster::connect() {
         const ConnectResponse connect = m_executor_->ExecuteConnect(0x00);
 
         // 仅在 CONNECT 表明 Optional 信息可用时才查询扩展通信模式；
-        // Slave 返回 ERR_CMD_UNKNOWN 时 executeGetCommModeInfo 内部降级为
+        // Slave 返回 ERR_CMD_UNKNOWN 时 ExecuteGetCommModeInfo 内部降级为
         // nullopt。
         if (connect.m_optional_comm_mode_available_) {
             (void)m_executor_->ExecuteGetCommModeInfo();
@@ -80,7 +80,7 @@ void XcpMaster::connect() {
     }
 }
 
-void XcpMaster::disconnect() {
+void XcpMaster::Disconnect() {
     // 未连接：本地幂等，仅确保通道关闭
     if (m_session_.State() == SessionState::Disconnected) {
         m_transport_->Close();
@@ -110,25 +110,25 @@ void XcpMaster::disconnect() {
     }
 }
 
-bool XcpMaster::isConnected() const { return m_session_.IsConnected(); }
+bool XcpMaster::IsConnected() const { return m_session_.IsConnected(); }
 
-Bytes XcpMaster::readMemory(Address address, AddressExtension extension,
-                            ByteCount byte_count) {
+Bytes XcpMaster::ReadMemoryBytes(Address address, AddressExtension extension,
+                                 ByteCount byte_count) {
     return m_memory_access_->ReadBytes(address, extension, byte_count);
 }
 
-Bytes XcpMaster::readMemoryElements(Address address, AddressExtension extension,
-                                    ElementCount element_count) {
+Bytes XcpMaster::ReadMemory(Address address, AddressExtension extension,
+                            ElementCount element_count) {
     return m_memory_access_->ReadElements(address, extension, element_count);
 }
 
-SessionParameters XcpMaster::sessionParameters() const {
+SessionParameters XcpMaster::GetSessionParameters() const {
     return m_session_.Parameters();
 }
 
-SessionState XcpMaster::sessionState() const { return m_session_.State(); }
+SessionState XcpMaster::GetSessionState() const { return m_session_.State(); }
 
-GetStatusResponse XcpMaster::queryStatus() {
+GetStatusResponse XcpMaster::QueryStatus() {
     return m_executor_->ExecuteGetStatus();
 }
 

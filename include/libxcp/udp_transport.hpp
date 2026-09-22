@@ -37,7 +37,7 @@ namespace calmcar::xcp {
  *   6. 恰好相差 0x8000 → 歧义，丢弃该 Frame，报告诊断。
  *   7. Datagram 内任一 Frame 的 Header/LEN 越界或有尾部残留 → 整体丢弃该
  * Datagram。
- *   8. open() 时发送 CTR 置 0、清空接收基线；XCP Session reconnect 不单独重置。
+ *   8. Open() 时发送 CTR 置 0、清空接收基线；XCP Session 重连不单独重置。
  *   9. 不在 Transport 层重排或重传 Frame；命令超时与恢复由 CommandExecutor
  * 负责。
  */

@@ -148,9 +148,80 @@ namespace calmcar::xcp::detail {
 | 布尔变量 | 仍按所属作用域前缀，不额外添加 `b` | `m_connected_`、`is_open`、`has_pending_command` |
 | 智能指针/容器 | 不添加类型缩写，仅遵循作用域前缀 | `m_transport_`、`m_pending_response_`、`xcp_packets` |
 
-> 说明：本项目的“匈牙利命名”采用**作用域前缀形式**，即成员变量统一使用 `m_<snake_case>_`。不使用 `str`、`u16`、`p` 等类型前缀，避免类型变化导致名称失真；类型信息由 C++ 类型系统表达。
+**显式豁免（批次 3 裁决登记，以下三类不要求 `m_<snake>_` 前缀）**：
+
+| 类别 | 采用形式 | 豁免理由 | 现有实例 |
+|---|---|---|---|
+| 纯值语义聚合参数对象 | 裸 `snake_case` | 无成员函数，字段以位置初始化列表/直接赋值方式使用，前缀只增噪音 | `CommandTimeouts::{command_timeout, synch_timeout, max_retries}`；测试中 `AgCase`、`AgIntegrationCase`、局部 `Case` |
+| `.cpp` 内私有 PIMPL | 裸 `snake_case` | 不出现在公开头文件，不对外承诺；字段由宿主类独占访问 | `UdpTransport::SocketImpl::{winsock, handle, bound, remote}`、`UdpTestSlave::SocketImpl::{winsock, handle}` |
+| GoogleTest 夹具成员 | `<snake>_`（仅尾下划线） | 夹具成员在每个 `TEST_F` 体内被大量直接引用，`m_` 前缀显著降低可读性；尾下划线已足以区分于局部变量 | `slave_`、`ep_`、`ctr_`、`res_`、`slave`、`transport_ptr`、`master`、`session`、`executor` |
+
+> ⚠️ 豁免的**已知代价**（如实记录，不粉饰）：`CommandTimeouts` 因此成为公开头文件
+> `include/libxcp/` 中唯一不遵循 `m_<snake>_` 的结构体（其余 7 个均遵循），
+> 造成公开 API 内部的命名不一致。该代价已由用户知情接受；若日后要消除，
+> 改动量很小（3 个字段 × 各 2 处引用，纯机械），届时需同步回收本条豁免。
+
+> 说明：本项目的“匈牙利命名”采用**作用域前缀形式**，即成员变量统一使用 `m_<snake_case>_`，**上表三类豁免除外**。不使用 `str`、`u16`、`p` 等类型前缀，避免类型变化导致名称失真；类型信息由 C++ 类型系统表达。
 >
-> 本文后续展示的接口原型均应在实现时按本节规则落地：函数名改为大驼峰，参数使用小写蛇形，成员变量使用 `m_<snake_case>_`。协议报文中定义的字段名称仅在注释、报文图和标准术语说明中保留原始大写拼写。
+> 本文后续展示的接口原型均应在实现时按本节规则落地：函数名改为大驼峰，参数使用小写蛇形，成员变量使用 `m_<snake_case>_`（豁免类按上表）。协议报文中定义的字段名称仅在注释、报文图和标准术语说明中保留原始大写拼写。
+
+#### 2.2.1.1 落地状态核对（批次 3）
+
+函数命名已按本节规则统一；成员变量的命名偏差**已复核并裁决为显式豁免**（见下表与 §2.2.1.2）。
+证据：Release `/W4` 零警告构建 + 基于括号栈的全量扫描脚本（按类体作用域判定，
+排除函数体内局部变量与多行参数声明续行）。
+
+| 类别 | 状态 | 说明 |
+|---|---|---|
+| 成员变量 `m_<snake>_` | ✅ 在**规则适用范围内**符合；范围外偏差已登记为豁免 | 批次 1 记录 §2 第 1 项遗留的 `<snake>_` 偏差已在 commit `92e8b5c` 消除；`protocol_types.hpp`、`response_parser.hpp`、`udp_header_codec.hpp`、`udp_transport_config.hpp`、`session.hpp`、`xcp_master.hpp`、`xcp_error.hpp` 的全部结构体字段均为 `m_<snake>_`。仅 `CommandTimeouts` 与私有 `SocketImpl` 及测试夹具按 §2.2.1 豁免表保留裸名/尾下划线 |
+| 静态成员 `s_<snake>_` | ✅ 已符合 | `WinsockSession::s_ref_count_` / `s_ok_`（平台适配层内部） |
+| 类型/枚举值 PascalCase | ✅ 已符合 | `CommandCode::Connect`、`Resource::CalPag`、`ByteOrder::Intel` 等 |
+| 自由函数 PascalCase | ✅ 批次 3 修正 | 原实现为 camelCase（`encodeUdpFrame`、`decodeUdpDatagram`、`errorCategoryName`、`classifyPacket`、`errorCodeName`、`toErrorCode`、`eventCodeName`、`toEventCode`、`agToBytes`、`commModeBasicToAg`、`agToCommModeBasicField`、`hasResource`、`sessionStateName`），已全部改为大驼峰 |
+| 成员函数 PascalCase | ✅ 批次 3 修正 | `XcpMaster::connect/disconnect/isConnected/readMemory*/sessionParameters/sessionState/queryStatus` → `Connect/Disconnect/IsConnected/ReadMemory*/GetSessionParameters/GetSessionState/QueryStatus`；`IEventListener::onEvent/onService/onDto` → `OnEvent/OnService/OnDto`；`XcpAddress40::advance` → `Advance`；`UdpTestSlave` 私有辅助 `sendResponse*/makeRes/makeErr/readAtMta/advanceMta` → 大驼峰 |
+| 匿名命名空间内部实现函数 | ⚠️ 保留 snake_case | `udp_transport.cpp` 的 `parseIpv4()`、`lastSocketError()`、`isTimeoutError()`、`ctrForwardDistance()` 等，以及 `command_executor.cpp` 的 `toHex()`、`protocolMessage()`。这些是 `.cpp` 内部链接的实现细节，不属于对外承诺的接口；保留小写以与"公开 API 大驼峰"形成视觉区分。**如需一并统一，属独立机械改动，不在本批次范围** |
+| 死声明 | ✅ 批次 3 删除 | `memory_access.hpp` 同时声明了 `ValidateRead` 与 `validateRead`（同签名重复），后者无定义无引用，已删除 |
+
+> 本次改名均为**纯机械重命名**，未改变任何行为、签名语义或调用顺序；全部由既有测试与新增测试锁定。
+
+#### 2.2.1.2 成员变量偏差清单与裁决结果（批次 3）
+
+批次 3 的函数改名完成后复核，发现成员变量仍存在以下偏差。**本节如实记录偏差本身**，
+并登记其裁决结果：**零代码改动，全部作为显式豁免写入 §2.2.1 规则表**。
+
+> 发现过程的教训：本小节初稿曾断言"全量扫描未发现非 `m_` 前缀的成员变量"，**该结论是错的**——
+> 当时扫描脚本的正则要求行内含 `(`，实际只匹配到函数声明，成员变量从未被检查过。
+> "脚本跑通且零输出"被误当成"检查通过"。现改用基于括号栈的作用域扫描重做，
+> 才得到下表。零命中必须先证明检测器能命中已知正例。
+
+**产品代码（2 个结构体，7 个字段）**
+
+| 位置 | 结构体 | 字段名 | 裁决 |
+|---|---|---|---|
+| `include/libxcp/command_executor.hpp:35,38,41` | `CommandTimeouts` | `command_timeout`、`synch_timeout`、`max_retries` | **豁免**（纯值聚合参数对象）；§12 已改为与此一致的字段名 |
+| `src/udp_transport.cpp:157-161` | `UdpTransport::SocketImpl` | `winsock`、`handle`、`bound`、`remote` | **豁免**（`.cpp` 内私有 PIMPL，不进入公开 API） |
+
+> ⚠️ 必须如实指出：`CommandTimeouts` 被豁免后，成为公开头文件 `include/libxcp/` 中
+> **唯一**不遵循 `m_<snake>_` 的结构体——其余 7 个（`ConnectResponse`、`GetStatusResponse`、
+> `GetCommModeInfoResponse`、`SessionParameters`、`XcpAddress40`、`PositiveResponse` 及各
+> Packet、`UdpFrame`/`UdpHeader`、`UdpTransportConfig`）全部遵循。因此公开 API 内部存在
+> 一处已知、已登记的命名不一致。若日后要消除，成本极小（3 字段 × 各 2 处引用）。
+
+**测试设施（§2.2.1 明确把"测试设施"纳入规则适用范围）**
+
+| 位置 | 作用域 | 字段名 | 裁决 |
+|---|---|---|---|
+| `tests/udp_test_slave_test.cpp:314-317` | 夹具成员 | `slave_`、`ep_`、`ctr_`、`res_` | **豁免**（夹具成员用 `<snake>_`） |
+| `tests/xcp_master_integration_test.cpp:330-333` | `Rig` 成员 | `slave`、`transport_ptr`、`master` | **豁免**（同上） |
+| `tests/memory_access_test.cpp:275-276`、`tests/recovery_test.cpp:232-234` | 夹具成员 | `session`、`executor` | **豁免**（同上） |
+| `tests/udp_test_slave.cpp:88-90` | `UdpTestSlave::SocketImpl` | `winsock`、`handle` | **豁免**（私有 PIMPL） |
+| `tests/memory_access_test.cpp:346-349`、`tests/session_test.cpp:248-250`、`tests/xcp_master_integration_test.cpp:463-464` | 参数化测试 POD 数据载体 | `AgCase` / `Case` / `AgIntegrationCase` 的 `ag`、`max_cto`、`max_dto`、`short_upload_max`、`upload_max` | **豁免**（纯值聚合参数对象） |
+| `tests/mock_transport.hpp:65`、`tests/recovery_test.cpp:391`、`tests/session_test.cpp:406` 等 | 函数体内**局部变量** | `responder`、`upload_sends`、`workers`、`ip` | ✅ **本就合规**（按规则用 snake_case，非偏差；初版扫描曾误报） |
+
+**裁决口径**：采用"以代码现状为准，改设计文档"，**不做任何批量重命名**——
+与用户对本项的既有指示一致。上表三类豁免已提升为 §2.2.1 的正式规则行，
+今后新增代码按"规则 + 豁免表"判定，不再视为待办偏差。
+
+
 
 ### 2.3 目录结构（与计划文档一致）
 
@@ -1126,11 +1197,22 @@ public:
 private:
     ByteOrder m_byte_order_;
 
-    /// @brief 按字节序读取 16 位值
-    [[nodiscard]] std::uint16_t ReadU16(BytesView data, std::size_t offset) const;
+    /// @brief 按字节序读取 16 位值；越界返回 nullopt
+    /// @note 批次 1 修正：原设计返回裸 `std::uint16_t`，但越界时无合法返回值可用，
+    ///       返回 `std::optional` 才能真正保证"畸形包不越界读"。
+    [[nodiscard]] std::optional<std::uint16_t> ReadU16(
+        BytesView data, std::size_t offset) const;
+
+    /// @brief 读取单字节；越界返回 nullopt（批次 1 新增）
+    [[nodiscard]] static std::optional<std::uint8_t> ReadU8(
+        BytesView data, std::size_t offset) noexcept;
 
     /// @brief 按字节序读取 32 位值
-    [[nodiscard]] std::uint32_t ReadU32(BytesView data, std::size_t offset) const;
+    /// @note 批次 3 说明：本最小子集需要解析的多字节字段（MAX_DTO、Session
+    ///       Configuration ID）均为 WORD，`ReadU32()` 无调用点，故**未实现**。
+    ///       需要时按上面 `ReadU16()` 的模式（返回 `std::optional`、越界安全）补充。
+    // [[nodiscard]] std::optional<std::uint32_t> ReadU32(
+    //     BytesView data, std::size_t offset) const;
 };
 
 }  // namespace calmcar::xcp
@@ -1218,6 +1300,14 @@ public:
     /// @param reason 失败原因
     void Fail(std::string_view reason);
 
+    /**
+     * @brief 最近一次 Fail() 的原因文本（批次 3 补齐到文档，代码早已实现）
+     * @return 失败原因；未发生过 Fail() 时为空串
+     * @details 供上层在 `SessionState::Failed` 下向用户展示诊断信息。
+     *          `Reset()` / `BeginConnecting()` 会清空该原因。
+     */
+    [[nodiscard]] std::string FailReason() const;
+
     /// @brief 重置到 Disconnected（用于强制清理）
     void Reset();
 
@@ -1296,23 +1386,34 @@ private:
 namespace calmcar::xcp {
 
 /// @brief 命令超时配置
+/// @note 批次 3 裁决：本结构的字段名**保持代码现状**（裸 snake_case），不改名为
+///       `m_<snake>_`。理由与影响见 §2.2.1.2：它是纯值语义的聚合参数对象、无成员函数，
+///       字段以 `CommandTimeouts{std::chrono::milliseconds(400), ..., 2}` 位置初始化方式使用。
+///       ⚠️ 代价：它是公开头文件中唯一不遵循 §2.2.1 成员规则的结构体（其余 7 个均为
+///       `m_<snake>_`），该不一致为**已知并接受**。本节字段名以代码为准。
 struct CommandTimeouts {
     /// @brief 普通命令超时（毫秒）
-    std::chrono::milliseconds m_command_timeout_{1000};
+    std::chrono::milliseconds command_timeout{1000};
 
     /// @brief SYNCH 恢复超时（毫秒）
-    std::chrono::milliseconds m_synch_timeout_{1000};
+    std::chrono::milliseconds synch_timeout{1000};
 
-    /// @brief 最大恢复重试次数（不含首次尝试）
-    int m_max_retries_ = 2;
+    /// @brief 最大恢复重试次数（不含首次尝试，设计决策 D2）
+    int max_retries{2};
 };
 
 /// @brief 命令执行结果
+/// @note 批次 3 说明：`CommandResult` **未实现**。实现中 `Execute*()` 系列直接返回
+///       已解析的具体响应类型（如 `ConnectResponse`、`GetStatusResponse`）或
+///       `Bytes`，`RunCommand()` 内部返回 `ParsedPacket`。引入仅含单个字段的
+///       `CommandResult` 包装并不会带来额外信息，故不落地。
 struct CommandResult {
     ParsedPacket m_response_;  ///< 最终收到的响应（RES 或 ERR）
 };
 
 /// @brief 事件观察者接口（可选，用于上层接收异步 Event）
+/// @note 回调在 Transport 工作线程执行；实现者不得在其中阻塞等待命令响应，
+///       否则会与单 Outstanding Command 模型自锁（设计 §16.3）。
 class IEventListener {
 public:
     virtual ~IEventListener() = default;
@@ -1401,17 +1502,39 @@ private:
     /// @param encoded_packet 已编码的 CTO
     /// @return 解析后的响应
     /// @throws XcpException 超时或协议错误
-    [[nodiscard]] ParsedPacket ExecuteCommand(CommandCode cmd, BytesView encoded_packet);
+    /// @note 实现命名为 `RunCommand()`（批次 1 落地时定名），语义与本节所述流程一致。
+    [[nodiscard]] ParsedPacket RunCommand(CommandCode cmd, const Bytes& encoded_packet);
+
+    /// @brief 单次发送尝试：发送 + 等待最终响应（不含恢复重试）
+    /// @return 响应；超时或 Transport 关闭返回 nullopt
+    /// @note 批次 2 修正：原实现把该逻辑内联在 `RunCommand()` 中，导致 Pending 清理
+    ///       路径不一致；现抽出为独立函数并统一清理 Pending。
+    [[nodiscard]] std::optional<ParsedPacket> PerformAttempt(
+        CommandCode cmd, BytesView encoded_packet);
 
     /// @brief 等待当前 Pending Command 的响应
     /// @param timeout 超时时长
     /// @return 收到的响应；超时返回 nullopt
     [[nodiscard]] std::optional<ParsedPacket> WaitForResponse(std::chrono::milliseconds timeout);
 
+    /// @brief 按 ErrorCode 分派 RES/ERR（含计划 §6.4 错误策略）
+    [[nodiscard]] ParsedPacket DispatchResponse(CommandCode cmd,
+                                                ParsedPacket response);
+
     /// @brief 超时恢复流程：SYNCH → 等待 ERR_CMD_SYNCH → 恢复隐含状态
     /// @param cmd 原命令码
     /// @throws XcpException 恢复失败
     void PerformRecovery(CommandCode cmd);
+
+    /// @brief UPLOAD 重试前重建 MTA（计划 §6.2 第 3 条）
+    void RestoreUploadMta();
+
+    /// @brief 按 Session 字节序按需创建 Codec/Parser
+    void EnsureCodec(ByteOrder byte_order);
+
+    /// @brief 校验 RES 数据长度是否等于 elements*AG
+    void CheckResLength(CommandCode cmd, const PositiveResponse& res,
+                        ElementCount elements);
 
     // 依赖
     IXcpTransport& m_transport_;
@@ -1426,39 +1549,56 @@ private:
     // 同步
     mutable std::mutex m_mutex_;
     std::condition_variable m_response_cv_;
+    std::condition_variable m_synch_cv_;
     std::optional<ParsedPacket> m_pending_response_;
+    bool m_response_ready_ = false;
+    bool m_synch_confirmed_ = false;
+    bool m_in_recovery_ = false;
     bool m_transport_closed_ = false;
     std::string m_transport_close_reason_;
 
     // EV_CMD_PENDING 计时
     bool m_cmd_pending_received_ = false;
+
+    // 隐含状态恢复（批次 2 新增）
+    std::optional<XcpAddress40> m_last_mta_;
 };
 
 }  // namespace calmcar::xcp
 ```
 
-### 12.1 ExecuteCommand 内部流程
+### 12.1 RunCommand 内部流程
 
 ```text
-ExecuteCommand(cmd, encoded_packet):
-  1. m_session_.MarkCommandSent(cmd)      // 检查无 Pending，设置 Pending
-  2. m_transport_.Send(encoded_packet)
-  3. wait for m_response_cv_ with timeout
-     - OnPacketReceived 回调中：
-       * RES/ERR → 唤醒 WaitForResponse
-       * EV(CMD_PENDING) → 重启 Timer，不唤醒
-       * EV(其他) → event_listener->OnEvent()，不唤醒
-       * SERV → event_listener->OnService()
-       * DTO → event_listener->OnDto()
-  4. 若超时:
-       PerformRecovery(cmd)
-       重试原命令（最多 m_max_retries_ 次）
-  5. 若收到 RES → 返回 PositiveResponse
-  6. 若收到 ERR:
+RunCommand(cmd, encoded_packet):
+  0. 若已有 Pending Command → throw InvalidState（拒绝并发发送）
+  1. PerformAttempt(cmd, encoded_packet):
+       m_session_.MarkCommandSent(cmd)     // 检查无 Pending，设置 Pending
+       m_transport_.Send(encoded_packet)   // 失败则清理 Pending 后抛出
+       WaitForResponse(m_timeouts_.command_timeout) // 阻塞在 m_response_cv_
+       m_session_.ClearPendingCommand()
+       → nullopt 表示超时或 Transport 已关闭
+  2. OnPacketReceived 回调（Transport 工作线程）：
+       * RES/ERR      → 填充 m_pending_response_，唤醒 WaitForResponse
+                        槽位已占用则丢弃并上报畸形（绝不覆盖，批次 2 修正）
+       * ERR_CMD_SYNCH 且 m_in_recovery_ → 置 m_synch_confirmed_，仅此场景视为成功
+       * EV(CMD_PENDING) → 重启计时标记；**事件仍照常上报**（批次 2 修正）
+       * EV(其他)     → event_listener->OnEvent()，不唤醒
+       * SERV        → event_listener->OnService()
+       * DTO         → event_listener->OnDto()
+       所有 listener 回调均在**释放 m_mutex_ 之后**执行（设计 §16.3 死锁规避）
+  3. 若 nullopt（超时）且重试未耗尽:
+       PerformRecovery(cmd)               // Transport 已关闭则不执行 SYNCH
+         → SendSynch() + 等待 ERR_CMD_SYNCH（m_timeouts_.synch_timeout）
+         → 成功则 m_session_.CompleteRecovery()，失败则 m_session_.Fail()
+       若原命令为 UPLOAD → RestoreUploadMta()  // 批次 2 修正：重试前必须重发 SET_MTA
+       重试原命令，最多 m_timeouts_.max_retries 次（不含首次）
+  4. DispatchResponse(cmd, response):
+       - RES → 校验长度后返回 PositiveResponse
        - ERR_CMD_SYNCH 仅在 Recovery 中视为成功
        - ERR_ACCESS_LOCKED → throw UnsupportedFeature
        - ERR_CMD_UNKNOWN(GET_COMM_MODE_INFO/SHORT_UPLOAD) → 返回给调用方降级
-       - 其他 → throw ProtocolError
+       - 其他 → throw ProtocolError（未知错误码保留原始十六进制值）
 ```
 
 ---
@@ -1599,15 +1739,18 @@ public:
     /// @param extension 地址扩展
     /// @param byte_count 字节数（必须可被 AG 整除）
     /// @return 读取到的原始字节
-    [[nodiscard]] Bytes ReadMemory(Address address,
-                                    AddressExtension extension,
-                                    ByteCount byte_count);
+    [[nodiscard]] Bytes ReadMemoryBytes(Address address,
+                                        AddressExtension extension,
+                                        ByteCount byte_count);
 
     /// @brief 读取内存（以元素为单位）
     /// @param address 32 位地址
     /// @param extension 地址扩展
     /// @param element_count 元素数（以 AG 为单位）
     /// @return 读取到的原始字节
+    /// @note 原设计的两个 `ReadMemory` 重载未采用：`ByteCount` 与 `ElementCount`
+    ///       均为 `std::uint32_t` 别名，同名重载会使字面量调用产生歧义。
+    ///       故按实现拆为 `ReadMemoryBytes` / `ReadMemory` 两个明确名称。
     [[nodiscard]] Bytes ReadMemory(Address address,
                                     AddressExtension extension,
                                     ElementCount element_count);
@@ -1623,7 +1766,6 @@ public:
     /// @brief 手动查询 GET_STATUS 并更新 Session
     /// @return GET_STATUS 响应
     [[nodiscard]] GetStatusResponse QueryStatus();
-
 private:
     std::unique_ptr<IXcpTransport> m_transport_;
     Session m_session_;
@@ -1717,22 +1859,29 @@ private:
 
 namespace calmcar::xcp::test {
 
-/// @brief 故障注入配置
+/// @brief 故障注入配置（N 为响应序号，从 1 开始）
 struct FaultInjection {
-    /// @brief 丢弃第 N 个响应（0 表示不丢弃）
+    /// @brief 丢弃第 N 个响应（用于验证 Timeout/SYNCH 恢复）
     std::optional<std::size_t> m_drop_response_n_;
 
     /// @brief 延迟第 N 个响应（毫秒）
     std::optional<std::pair<std::size_t, std::uint32_t>> m_delay_response_n_;
 
-    /// @brief 对第 N 个响应使用错误 LEN
+    /// @brief 对第 N 个响应使用错误 LEN（验证畸形 Datagram 丢弃）
     std::optional<std::size_t> m_corrupt_len_n_;
 
-    /// @brief 对第 N 个响应使用跳号 CTR
+    /// @brief 对第 N 个响应使用跳号 CTR（固定 +5，验证缺口诊断）
     std::optional<std::size_t> m_jump_ctr_n_;
 
-    /// @brief 对第 N 个响应使用重复 CTR
+    /// @brief 对第 N 个响应复用上一个 CTR（验证重复丢弃）
     std::optional<std::size_t> m_duplicate_ctr_n_;
+
+    /**
+     * @brief 对第 N 个响应的 CTR 施加指定的有符号偏移（模 65536）
+     * @details 批次 3 新增。跳号（+5）与重复（-1）都无法构造"与期望值恰好相差
+     *          0x8000"的歧义 Frame（决策 D5），必须由发送侧直接指定偏移量。
+     */
+    std::optional<std::pair<std::size_t, int>> m_ctr_offset_n_;
 };
 
 /// @brief UDP 测试 Slave（Loopback）
@@ -1772,12 +1921,44 @@ public:
     /// @brief 获取收到的命令计数
     [[nodiscard]] std::size_t CommandCount() const;
 
+    /**
+     * @brief 获取下一个 Slave→Master Frame 将使用的 CTR 值（批次 3 新增）
+     * @details 故障注入只改写实际发出的 Header，不改变本计数器的推进规律；
+     *          测试据此验证精确偏移注入后的真实 CTR。
+     */
+    [[nodiscard]] DatagramCtr NextSendCtr() const;
+
+    /// @brief 是否已建立模拟 XCP Session（批次 3 新增，诊断用）
+    [[nodiscard]] bool IsConnected() const;
+
     /// @brief 向已连接 Master 发送一个包含多个 XCP Frame 的 UDP Datagram
     /// @param xcp_packets 要按顺序打包的原始 XCP Packet 列表
     /// @throws XcpException(InvalidState) 尚未记录 CONNECT 来源端点
     /// @throws XcpException(InvalidArgument) Frame 或 Datagram 超过允许长度
     /// @details 仅用于验证 Master 接收端对 XCP 1.1 多 Frame UDP 打包的解析能力。
     void SendPackedFrames(std::span<const BytesView> xcp_packets);
+
+    /**
+     * @brief 原样发送一段已构造好的 UDP Payload 到 CONNECT 来源端点（批次 3 新增）
+     * @param payload 完整 UDP Payload（自行负责 LEN/CTR Header 与畸形注入）
+     * @throws XcpException(InvalidState) 尚未记录 CONNECT 来源端点
+     * @details 测试专用。只有 Slave 自身的 Socket 能从"配置的远端端口"发出报文，
+     *          因此注入畸形 Datagram（错误 LEN、残留字节等）必须走本入口，
+     *          否则会被 Master 的来源过滤先拦掉。
+     */
+    void SendRawPayload(BytesView payload);
+
+    /**
+     * @brief 原样发送一段 UDP Payload 到指定端点（无需先建立 CONNECT 会话）
+     * @param payload 完整 UDP Payload
+     * @param dst_ip 目的 IPv4 文本
+     * @param dst_port 目的 UDP 端口
+     * @details 测试专用。报文仍从 Slave 自身的 Socket 发出，因此源端口等于
+     *          Slave 端口，可通过 Master 的"严格匹配远端端口"过滤。用于在 Master
+     *          未建立 XCP 会话时精确注入指定 CTR 或畸形结构。
+     */
+    void SendRawPayloadTo(BytesView payload, const std::string& dst_ip,
+                          std::uint16_t dst_port);
 
 private:
     /// @brief 接收线程主循环
@@ -1799,6 +1980,22 @@ private:
 
     /// @brief 发送响应到 CONNECT 时记录的来源 IP:port
     void SendResponse(BytesView xcp_packet);
+
+    /// @brief 把单个 XCP Packet 编码为一个 Frame 并发送到指定端点（含故障注入）
+    void SendResponseTo(BytesView xcp_packet, const std::string& ip,
+                        std::uint16_t port);
+
+    /// @brief 生成 RES 前缀（0xFF + 数据）
+    static Bytes MakeRes(std::initializer_list<std::uint8_t> body);
+
+    /// @brief 生成 ERR 报文
+    static Bytes MakeErr(ErrorCode code);
+
+    /// @brief 按当前 MTA 读取指定元素数的模拟内存；越界返回 nullopt
+    [[nodiscard]] std::optional<Bytes> ReadAtMta(ElementCount elements);
+
+    /// @brief 把 MTA 前进指定元素数；溢出返回 false
+    bool AdvanceMta(ElementCount elements);
 
     /// @brief 测试 Socket 私有实现声明
     struct SocketImpl;
@@ -1847,6 +2044,9 @@ private:
 
     /// @brief 当前故障注入配置
     FaultInjection m_fault_;
+
+    /// @brief 已生成的响应计数（故障注入按序号定位；SetFaultInjection() 会重置）
+    std::size_t m_response_count_ = 0;
 };
 
 }  // namespace calmcar::xcp::test
@@ -1916,10 +2116,39 @@ WaitForResponse() 唤醒        |
 
 ### 16.4 关闭语义
 
-- `UdpTransport::Close()` 设置 `m_running_ = false`，关闭 Socket，`join()` 接收线程。
-- 接收线程退出前调用 `m_listener_->OnTransportClosed()`。
+`UdpTransport::Close()` 的正确步骤顺序（批次 3 修正，见下方"为何不能先关 Socket"）：
+
+1. 设置 `m_running_ = false`；
+2. `join()` 接收线程（接收线程退出前调用 `m_listener_->OnTransportClosed()`）；
+3. 关闭 Socket，置句柄为非法值；
+4. 释放 Socket 资源、清空 `m_listener_`。
+
+约束：
+
 - `Close()` 可在用户线程调用，与接收线程并发安全。
-- `Close()` 可重复调用（幂等）。
+- `Close()` 可重复调用（幂等）；未打开时调用为空操作。
+- 唤醒阻塞中的 `recvfrom` 依赖 `Open()` 设置的 `SO_RCVTIMEO` 轮询
+  （`UdpTransportConfig::m_receive_poll_interval_ms_`），因此关闭延迟上限为一个轮询周期。
+- 必须先 `join()` 再关 Socket。
+
+**为何不能先关 Socket（批次 3 修正的真实缺陷）**：
+
+早期实现在 `join()` 之前就 `closeSocket()`，理由是"关闭 Socket 可立即唤醒阻塞的 `recvfrom`"。
+这在功能上确实能唤醒，但引入了一个跨会话/跨用例串扰的窗口：
+
+1. Socket 一旦关闭，其**句柄号立即被 OS 回收**，并可能分配给进程中其他新建的 Socket；
+2. 此时接收线程可能仍处于"已从内核取出报文、正在处理并回调监听器"的中间状态；
+3. 迟到的操作就会命中**被复用的句柄**，把数据投递到无关的端点上。
+
+该缺陷在 UDP 测试中表现为偶发失败（`UdpTestSlaveFault.ResponseCounterStartsFreshAfterEachInjection`
+在满负载全量运行时间歇性失败，单独运行或轻负载复跑 60 次均通过），属于典型的
+"仅在 Socket 高频率创建/销毁时暴露"的竞态。修正为先 `join()` 再关 Socket 后，
+全量套件连续复跑 15 次、单用例复跑 40 次均稳定通过。
+
+> 代价说明：由于不再依赖"关 Socket 唤醒"，`Close()` 的返回延迟由 `SO_RCVTIMEO`
+> 轮询周期决定。`CloseWhileBlockedReturnsPromptly` 用例特意把轮询周期放大到 1000 ms
+> 并断言 `Close()` 在 1000 ms 内返回，锁定该延迟上限。若后续要提高关闭实时性，
+> 应改用"自管道/事件对象唤醒"而非回退到"先关 Socket"。
 
 ---
 
@@ -1993,16 +2222,17 @@ UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 
 每个 Frame 都有独立的 LEN 和 CTR；任一 Frame 不得跨 UDP Datagram 边界。本项目发送方向为简单且确定的策略：一次 `IXcpTransport::Send()` 生成一个 Frame 并独占一个 UDP Datagram；接收方向必须能解析连续打包的多个 Frame。
 
-### 17.6 COMM_MODE_BASIC 位定义（待官方规范确认）
+### 17.6 COMM_MODE_BASIC 位定义（已校核）
 
-> **重要**：以下位定义是当前依据译文的推断。实际编码前必须对照 ASAM 官方规范确认。
+> 批次 1 已完成校核、批次 3 复核：以下位定义与本地规范文档及第三方实现一致，**不再是待确认项**。
 
-| Bit | 含义 | 推断值 |
+| Bit | 含义 | 取值 |
 |---|---|---|
 | 0 | BYTE_ORDER | 0=Intel, 1=Motorola |
-| 1-2 | ADDRESS_GRANULARITY | 00=BYTE, 01=WORD, 10=DWORD |
-| 6 | Slave Block Mode Supported | 0/1 |
-| 7 | Optional Comm Mode Available | 0/1 |
+| 1-2 | ADDRESS_GRANULARITY | 00=BYTE, 01=WORD, 10=DWORD, **11=保留（非法）** |
+| 3-5 | 未使用 | 实现按 0 处理，不解释语义 |
+| 6 | SLAVE_BLOCK_MODE_SUPPORTED | 0/1 |
+| 7 | OPTIONAL_COMM_MODE_AVAILABLE | 0/1（决定是否调用 GET_COMM_MODE_INFO） |
 
 示例 `0xC0` = `1100_0000`：
 - bit0=0 → Intel
@@ -2010,7 +2240,13 @@ UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 - bit6=1 → Slave Block Mode supported
 - bit7=1 → Optional available
 
-> **此推断与官方规范的吻合度待第 18 节开放问题解决后确认。**
+**校核证据**：
+
+1. `docs/XCP_1.3.0_document.md` §12.4 建立 Session 示例（第 3065 行）`← FF 15 C0 08 08 00 10 10`，其自解释为 "Intel Byte Order / AG = BYTE / Slave Block Mode supported"，与 `0xC0` 逐位吻合；同节明确 `MAX_CTO = 8`、`MAX_DTO = 8`。
+2. `docs/XCP_1.3.0_document.md` §7.5.1.1（第 1751-1757 行）给出 `BYTE_ORDER=0/1` 与 `AG=BYTE/WORD/DWORD` 的语义。
+3. 第三方实现交叉验证：[robotjatek/XCP](https://github.com/robotjatek/XCP/blob/master/XCPLib/ConnectPositivePacket.h) 中 `BYTE_ORDER=0x1`、`ADDRESS_GRANULARITY_0=0x2`、`ADDRESS_GRANULARITY_1=0x4`、`SLAVE_BLOCK_MODE=0x40`、`OPTIONAL=0x80`，即 bit0 / bit1-2 / bit6 / bit7。
+4. 代码落点：`src/response_parser.cpp` 的 `kAddressGranularityShift = 1`、`kOptionalMask = 0x80`，以及 `CommModeBasicToAg()` / `AgToCommModeBasicField()` 往返；`bit1-2 == 11` 由 `CommModeBasicToAg()` 返回 `nullopt` 拒绝，并有 `response_parser_test` / `protocol_types_test` 用例锁定。
+
 
 ---
 
@@ -2018,33 +2254,45 @@ UDP Datagram = Frame_1 || Frame_2 || ... || Frame_N
 
 ### 18.1 必须在编码前确认的问题
 
-| 编号 | 问题 | 影响 | 当前状态 |
+| 编号 | 问题 | 影响 | 当前状态（批次 3 收口） |
 |---|---|---|---|
-| Q1 | COMM_MODE_BASIC 的精确 bit 定义 | `ParseConnectResponse` 实现 | 依据译文推断，需对照官方规范确认 |
-| Q2 | CONNECT 响应中 MAX_DTO 是 1 字节还是 2 字节 | `ConnectResponse` 字段类型 | 示例 `FF 15 C0 08 08 00 10 10` 中 MAX_DTO=0x0008，看起来是 2 字节；但 MAX_CTO 后直接跟 MAX_DTO 两字节，再跟版本。需确认 |
-| Q3 | SET_MTA 中 address 字段的确切字节序 | `EncodeSetMta` 实现 | 译文说"按 Session Byte Order"，但 SET_MTA 在 CONNECT 之前不能用，所以 CONNECT 后字节序已确定。确认 SET_MTA 的 address 确实用 Session Byte Order |
-| Q4 | SYNCH 命令是否需要特殊编码 | `EncodeSynch` | 译文说 SYNCH 始终以 ERR_CMD_SYNCH 应答，命令本身格式 `[FC][00]`，需确认 |
-| Q5 | CMake 构建系统和测试框架选择 | 工程基线 | 当前仓库无 CMakeLists.txt，需确认使用 GoogleTest 还是其他 |
-| Q6 | `.clang-format` 文件是否存在 | 代码格式 | AGENTS.md 提到参考 .clang-format，需确认仓库中是否有此文件 |
+| Q1 | COMM_MODE_BASIC 的精确 bit 定义 | `ParseConnectResponse` 实现 | ✅ **已确认，与设计推断一致**：bit0=BYTE_ORDER、bit1-2=AG（11 保留）、bit6=SLAVE_BLOCK_MODE、bit7=OPTIONAL。证据见 §17.6；代码由 `protocol_types_test` / `response_parser_test` 逐位锁定 |
+| Q2 | CONNECT 响应中 MAX_DTO 是 1 字节还是 2 字节 | `ConnectResponse` 字段类型 | ✅ **确认为 2 字节 WORD**，位于 RES Byte 4-5，按 Session Byte Order。依据：`docs/ASAM_XCP_Part3_..._1.1.md` §1.4「MAX_DTO: Parameter WORD, 0x0008-0xFFFF」+ §12.4 示例 `FF 15 C0 08 08 00 10 10`（Byte 4-5 = `08 00` → 8）。第三方实现注释亦为 `MAX_DTO = 3, //2 bytes long!` |
+| Q3 | SET_MTA 中 address 字段的确切字节序 | `EncodeSetMta` 实现 | ✅ **确认按 Session Byte Order**。SET_MTA 只能在 CONNECT 之后使用，届时字节序已协商完成；`command_codec_test` 有 Intel/Motorola 双黄金报文锁定，`memory_access_test` 有 Motorola 端到端用例 |
+| Q4 | SYNCH 命令是否需要特殊编码 | `EncodeSynch` | ✅ **确认无需特殊编码**：命令即 `[FC][00]` 2 字节；其"始终以 ERR_CMD_SYNCH 应答"是恢复语义，已由 `CommandExecutor::PerformRecovery()` 实现并只在恢复窗口内接受该错误码（计划 §6.2 第 1 条），`recovery_test` 覆盖正反两例 |
+| Q5 | CMake 构建系统和测试框架选择 | 工程基线 | ✅ **已定**：CMake ≥ 3.24 + GoogleTest v1.15.2（FetchContent，支持 `.deps-cache/` 离线源）；库目标 `libxcp` / 别名 `libxcp::libxcp` |
+| Q6 | `.clang-format` 文件是否存在 | 代码格式 | ✅ **存在**（用户提供，Google 基础风格）；本批次全部改动经 `clang-format --dry-run --Werror -style=file` 校验通过 |
+
+> 至此设计阶段的 6 个开放问题全部关闭。仍存在的**外部验证缺口**不属于本节范围：尚未与第三方真实 ECU / CANape 做互操作抓包对照（见计划文档 §11.4 与验收标准 15）。
 
 ### 18.2 设计中标记为"项目策略"的决策
 
-| 编号 | 决策 | 依据 |
-|---|---|---|
-| D1 | CTR 初值为 0，Open() 时复位 | 计划文档 4.7 |
-| D2 | 原命令最多 2 次恢复重试 | 计划文档 6.2 |
-| D3 | Master 侧默认严格匹配远端 IP+端口（可配置为仅匹配 IP） | 本项目安全策略；不等同于标准对 Slave 的连接绑定规则 |
-| D4 | UDP 不重排、不重传 Frame | 计划文档 4.7 |
-| D5 | 恰好相差 0x8000 的 CTR 视为歧义丢弃 | 计划文档 4.7 |
-| D6 | 默认单 Frame Packet 上限为 65503，Datagram 上限为 65507 | IPv4 UDP 理论上限与 XCP Header 长度 |
-| D7 | 发送方向每个 Datagram 只包含一个 Frame；接收方向支持多 Frame 打包 | XCP 1.1 Part 3 允许的子集发送策略与完整接收兼容性 |
-| D8 | UdpTestSlave 连接后仅校验 CONNECT 来源 IP，响应始终发往原 CONNECT 来源 IP:port | XCP 1.1 Part 3 UDP/IP Connection Behavior |
+| 编号 | 决策 | 依据 | 实现落点 | 验证用例 |
+|---|---|---|---|---|
+| D1 | CTR 初值为 0，`Open()` 时复位 | 计划文档 §4.7 | `UdpTransport::Open()` | `ReopenResetsSendCtrAndReceiveBaseline` |
+| D2 | 原命令最多 2 次恢复重试 | 计划文档 §6.2 | `CommandTimeouts::max_retries = 2`（经 `CommandExecutor::m_timeouts_` 读取） | `RetryExhaustionReportsRecoveryFailed`（断言 Upload×3、Synch×2）、`ZeroRetriesFailsImmediately` |
+| D3 | Master 侧默认严格匹配远端 IP+端口（可配置为仅匹配 IP） | 本项目安全策略；不等同于标准对 Slave 的连接绑定规则 | `UdpTransport::IsRemoteMatch()` | `ForeignPortRejectedWhenStrict`、`IgnoresForeignSourceIp` |
+| D4 | UDP 不重排、不重传 Frame | 计划文档 §4.7 | 接收路径无重排/重传逻辑 | `BackwardCtrFrameDropped`、`DuplicateCtrIsDropped` |
+| D5 | 恰好相差 0x8000 的 CTR 视为歧义丢弃 | 计划文档 §4.7 | `UdpTransport::HandleFrame()` | ✅ **批次 3 已补齐精确构造用例**：`AmbiguousCtrOffsetIsDropped`（差值恰 0x8000 → 丢弃 + 诊断 + 基线不推进）、`JustBelowAmbiguousBoundaryIsAccepted`（0x7FFF → 前向跳号接收）、`JustAboveAmbiguousBoundaryIsDropped`（0x8001 → 后向丢弃）、端到端 `AmbiguousCtrFrameDroppedAndSessionContinues`。夹具语义由 `CtrOffsetProducesExactHeaderCounter` 锁定 |
+| D6 | 默认单 Frame Packet 上限为 65503，Datagram 上限为 65507 | IPv4 UDP 理论上限与 XCP Header 长度 | `kUdpMaxXcpPacket` / `kUdpMaxDatagramSize` | `LimitsMatchIpv4Udp`、`RejectsOversizedPacket`、`MaxAllowedPacketAccepted`、`DatagramOverMaxSizeDiscarded` |
+| D7 | 发送方向每个 Datagram 只包含一个 Frame；接收方向支持多 Frame 打包 | XCP 1.1 Part 3 允许的子集发送策略与完整接收兼容性 | `EncodeUdpFrame()` + `HandleDatagram()` | `EachSendProducesOneFrameWithIncrementingCtr`、`MultipleFramesInOneDatagramDeliveredInOrder` |
+| D8 | UdpTestSlave 连接后仅校验 CONNECT 来源 IP，响应始终发往原 CONNECT 来源 IP:port | XCP 1.1 Part 3 UDP/IP Connection Behavior | `UdpTestSlave::IsCurrentSessionSource()` | `SameIpDifferentPortStillServed`（并断言响应不发往变更后的端口） |
+
+> D5 说明（批次 3 更新）：批次 2 曾记录"缺少精确构造 0x8000 差值的用例"。本批次通过给
+> `FaultInjection` 增加 `m_ctr_offset_n_`（按模 65536 施加有符号偏移）关闭该缺口：
+> 跳号注入固定 +5、重复注入固定 -1，两者都无法命中 0x8000，因此必须由发送侧直接指定偏移量。
+> 现在 0x7FFF / 0x8000 / 0x8001 三个相邻取值均有正向用例，边界归属被逐值锁定。
 
 ### 18.3 可选增强（本阶段不实现，但接口预留）
 
-- `IEventListener` 接口已定义，本阶段 DTO 只上报不解析。
-- `UdpTransportConfig::m_strict_remote_port_` 预留 NAT 兼容。
-- `Session::Fail()` 预留 Failed 状态。
+| 预留项 | 批次 3 状态 |
+|---|---|
+| `IEventListener` 接口已定义，本阶段 DTO 只上报不解析 | ✅ 接口已落地并改名对齐 §2.2.1（`OnEvent`/`OnService`/`OnDto`）；`CommandExecutor` 在锁外回调，DTO 仅识别上报 |
+| `UdpTransportConfig::m_strict_remote_port_` 预留 NAT 兼容 | ✅ 已实现并有 `ForeignPortRejectedWhenStrict` 双向用例（严格拒绝 / 放宽接受） |
+| `Session::Fail()` 预留 Failed 状态 | ✅ 已实现并被真实使用：SYNCH 恢复失败、CONNECT 失败/响应非法/参数校验失败均转入 `Failed`；`RecoveryFailureMarksSessionFailed`、`session_test` 的状态机用例锁定"Failed 必须先 Reset 才能重连"。另提供 `FailReason()` 读取失败原因（该访问器为本批次补齐到文档，代码早已存在） |
+
+> 本节三项在本批次后均已不再是"仅预留"，而是有实现、有用例的既成行为；保留本节以便追溯原始范围划分。
+
 
 ---
 
@@ -2123,12 +2371,16 @@ XcpMaster master(std::move(transport));
 // 3. 连接
 master.Connect();  // CONNECT → GET_COMM_MODE_INFO → GET_STATUS
 
-// 4. 读取内存
-auto data = master.ReadMemory(0x70012340, 0x00, 4);  // 读 4 字节
+// 4. 读取内存（AG=BYTE，故 4 元素 == 4 字节）
+auto data = master.ReadMemory(0x70012340, 0x00, 4);
 
 // 5. 断开
 master.Disconnect();
 ```
+
+> 注意单位：`ReadMemory()` 的第三个参数是**元素数（按 AG 计数）**；需要按字节读取时
+> 使用 `ReadMemoryBytes()`。二者刻意不同名，因为 `ByteCount` 与 `ElementCount`
+> 同为 `std::uint32_t` 别名，同名重载会让字面量调用产生歧义（见 §14）。
 
 ### B.2 Mock Transport 测试
 
@@ -2150,7 +2402,12 @@ master.Connect();
 
 ---
 
-> 本文档到此结束。所有接口定义均为设计阶段产物，未经编译验证。开始编码前需解决第 18 节中的开放问题。
+> 本文档的接口定义已在批次 1~3 中全部落地并通过编译与测试验证（Release/Debug 双配置，253 项用例）。
+> 第 18.1 节的 6 个开放问题已全部关闭；§2.2.1.1 记录了命名规则的落地核对结果。
+> 仍未闭环的是**外部互操作验证**：所有端到端测试均为自有 Master ↔ 自有 UdpTestSlave，
+> 未与第三方 ECU / CANape 抓包对照（计划文档 §11.4、验收标准 15）。
+>
+> 与本文档存在差异的实现细节，一律以代码为准，并已在对应章节就地标注"批次 3"说明。
 
 
 

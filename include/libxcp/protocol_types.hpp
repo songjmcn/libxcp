@@ -96,7 +96,7 @@ enum class PacketType : std::uint8_t {
  * std::nullopt
  * @note 返回 nullopt 表示该包是 DAQ DTO，调用方应按 DTO 路径处理。
  */
-[[nodiscard]] std::optional<PacketType> classifyPacket(
+[[nodiscard]] std::optional<PacketType> ClassifyPacket(
     std::uint8_t first_byte) noexcept;
 
 /**
@@ -128,10 +128,10 @@ enum class ErrorCode : std::uint8_t {
 };
 
 /// @brief 将错误码转换为字符串名称（用于诊断和日志）
-[[nodiscard]] std::string_view errorCodeName(ErrorCode code) noexcept;
+[[nodiscard]] std::string_view ErrorCodeName(ErrorCode code) noexcept;
 
 /// @brief 将原始错误码字节安全转为 ErrorCode；未知值返回 std::nullopt
-[[nodiscard]] std::optional<ErrorCode> toErrorCode(std::uint8_t raw) noexcept;
+[[nodiscard]] std::optional<ErrorCode> ToErrorCode(std::uint8_t raw) noexcept;
 
 /**
  * @brief XCP 事件码（EV Packet 的 Byte 1）
@@ -154,10 +154,10 @@ enum class EventCode : std::uint8_t {
 };
 
 /// @brief 将事件码转换为字符串名称
-[[nodiscard]] std::string_view eventCodeName(EventCode code) noexcept;
+[[nodiscard]] std::string_view EventCodeName(EventCode code) noexcept;
 
 /// @brief 将原始事件码字节安全转为 EventCode；未知值返回 std::nullopt
-[[nodiscard]] std::optional<EventCode> toEventCode(std::uint8_t raw) noexcept;
+[[nodiscard]] std::optional<EventCode> ToEventCode(std::uint8_t raw) noexcept;
 
 /**
  * @brief XCP 字节序（来自 COMM_MODE_BASIC bit0）
@@ -179,18 +179,18 @@ enum class AddressGranularity : std::uint8_t {
 };
 
 /// @brief 将 AG 转为字节数
-[[nodiscard]] constexpr std::uint8_t agToBytes(AddressGranularity ag) noexcept;
+[[nodiscard]] constexpr std::uint8_t AgToBytes(AddressGranularity ag) noexcept;
 
 /**
  * @brief 将 COMM_MODE_BASIC 的 AG 位域编码（bit1-2）转为 AG
  * @param field_value 取自 COMM_MODE_BASIC 的 bit1-2（00/01/10 有效，11 保留）
  * @return 合法时返回对应 AG；11（保留值）返回 std::nullopt
  */
-[[nodiscard]] std::optional<AddressGranularity> commModeBasicToAg(
+[[nodiscard]] std::optional<AddressGranularity> CommModeBasicToAg(
     std::uint8_t field_value) noexcept;
 
 /// @brief 将 COMM_MODE_BASIC 的 AG 位域还原为 bit1-2 编码值
-[[nodiscard]] std::uint8_t agToCommModeBasicField(
+[[nodiscard]] std::uint8_t AgToCommModeBasicField(
     AddressGranularity ag) noexcept;
 
 /**
@@ -210,7 +210,7 @@ enum class Resource : std::uint8_t {
 using ResourceMask = std::underlying_type_t<Resource>;
 
 /// @brief 检查掩码中是否包含指定资源
-[[nodiscard]] constexpr bool hasResource(ResourceMask mask,
+[[nodiscard]] constexpr bool HasResource(ResourceMask mask,
                                          Resource res) noexcept;
 
 /// @brief 合并资源位
@@ -230,7 +230,7 @@ enum class SessionState {
 };
 
 /// @brief 将 Session 状态转为字符串
-[[nodiscard]] std::string_view sessionStateName(SessionState state) noexcept;
+[[nodiscard]] std::string_view SessionStateName(SessionState state) noexcept;
 
 /**
  * @brief CONNECT 响应解析结果（COMM_MODE_BASIC 已拆解）
@@ -289,7 +289,7 @@ struct XcpAddress40 {
      * @return 前进后的新地址；32 位地址部分溢出时返回 std::nullopt
      * @note 地址扩展不参与本次进位（跨扩展边界的处理属于后续 SEGMENT 功能）。
      */
-    [[nodiscard]] std::optional<XcpAddress40> advance(
+    [[nodiscard]] std::optional<XcpAddress40> Advance(
         ElementCount elements, AddressGranularity ag) const noexcept;
 };
 
@@ -312,11 +312,11 @@ struct SessionParameters {
 // constexpr 工具函数实现（声明见上方）
 // ---------------------------------------------------------------------------
 
-constexpr std::uint8_t agToBytes(AddressGranularity ag) noexcept {
+constexpr std::uint8_t AgToBytes(AddressGranularity ag) noexcept {
     return static_cast<std::uint8_t>(ag);
 }
 
-constexpr bool hasResource(ResourceMask mask, Resource res) noexcept {
+constexpr bool HasResource(ResourceMask mask, Resource res) noexcept {
     return (mask & static_cast<ResourceMask>(res)) != 0;
 }
 

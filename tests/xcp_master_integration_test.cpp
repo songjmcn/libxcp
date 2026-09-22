@@ -48,7 +48,7 @@ private:
 /// @brief 记录 Master 侧事件，用于断言 EV/SERV/DTO 分流
 class EventRecorder : public IEventListener {
 public:
-    void onEvent(const EventPacket& event) override {
+    void OnEvent(const EventPacket& event) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         ++m_events;
         if (event.m_event_code_ &&
@@ -56,11 +56,11 @@ public:
             ++m_cmd_pending;
         }
     }
-    void onService(const ServicePacket&) override {
+    void OnService(const ServicePacket&) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         ++m_services;
     }
-    void onDto(const DtoPacket&) override {
+    void OnDto(const DtoPacket&) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         ++m_dtos;
     }
@@ -216,7 +216,7 @@ private:
     Bytes connectResponse() {
         m_connected = true;
         std::uint8_t comm_mode =
-            static_cast<std::uint8_t>(agToCommModeBasicField(m_ag) << 1);
+            static_cast<std::uint8_t>(AgToCommModeBasicField(m_ag) << 1);
         if (m_order == ByteOrder::Motorola) {
             comm_mode |= 0x01U;
         }
@@ -243,7 +243,7 @@ private:
         const auto elements = static_cast<ElementCount>(packet[1]);
         if (elements == 0U ||
             elements + 1U >
-                static_cast<ElementCount>(m_max_cto / agToBytes(m_ag))) {
+                static_cast<ElementCount>(m_max_cto / AgToBytes(m_ag))) {
             return Err(ErrorCode::OutOfRange);
         }
         auto data = read(m_mta, elements);
@@ -254,7 +254,7 @@ private:
         // （docs/XCP_1.3.0_document.md §12.4：UPLOAD(6) -> 6 字节）
         std::vector<std::uint8_t> body;
         body.insert(body.end(), data->begin(), data->end());
-        m_mta += static_cast<Address>(elements) * agToBytes(m_ag);
+        m_mta += static_cast<Address>(elements) * AgToBytes(m_ag);
         return Res(body);
     }
 
@@ -267,7 +267,7 @@ private:
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
         if (elements == 0U ||
-            elements > static_cast<ElementCount>(m_max_cto / agToBytes(m_ag))) {
+            elements > static_cast<ElementCount>(m_max_cto / AgToBytes(m_ag))) {
             return Err(ErrorCode::OutOfRange);
         }
         const Address address = decodeAddress(packet.subspan(4, 4));
@@ -280,13 +280,13 @@ private:
         std::vector<std::uint8_t> body;
         body.insert(body.end(), data->begin(), data->end());
         // SHORT_UPLOAD 之后 MTA 前进到数据块末尾之后
-        m_mta = address + static_cast<Address>(elements) * agToBytes(m_ag);
+        m_mta = address + static_cast<Address>(elements) * AgToBytes(m_ag);
         return Res(body);
     }
 
     std::optional<Bytes> read(Address address, ElementCount elements) {
         Bytes out;
-        const auto count = static_cast<std::size_t>(elements) * agToBytes(m_ag);
+        const auto count = static_cast<std::size_t>(elements) * AgToBytes(m_ag);
         for (std::size_t i = 0; i < count; ++i) {
             const auto it = m_memory.find(address + static_cast<Address>(i));
             if (it == m_memory.end()) {
@@ -343,31 +343,31 @@ TEST(XcpMasterIntegration, FullHappyPathSequence) {
     const Bytes content = BytesOf({0xDE, 0xAD, 0xBE, 0xEF});
     rig.slave.SetMemory(0x70012340, content);
 
-    rig.master->connect();
-    EXPECT_TRUE(rig.master->isConnected());
-    EXPECT_EQ(rig.master->sessionState(), SessionState::Connected);
+    rig.master->Connect();
+    EXPECT_TRUE(rig.master->IsConnected());
+    EXPECT_EQ(rig.master->GetSessionState(), SessionState::Connected);
 
-    const auto params = rig.master->sessionParameters();
+    const auto params = rig.master->GetSessionParameters();
     EXPECT_EQ(params.m_connect_.m_max_cto_, 8U);
     EXPECT_EQ(params.m_connect_.m_max_dto_, 8U);
     EXPECT_TRUE(params.m_comm_mode_info_.has_value());
     EXPECT_TRUE(params.m_status_.has_value());
     EXPECT_TRUE(params.m_short_upload_available_);
 
-    const Bytes got = rig.master->readMemory(0x70012340, 0x00, 4);
+    const Bytes got = rig.master->ReadMemoryBytes(0x70012340, 0x00, 4);
     EXPECT_EQ(got, content);
 
-    const GetStatusResponse status = rig.master->queryStatus();
+    const GetStatusResponse status = rig.master->QueryStatus();
     EXPECT_EQ(status.m_state_number_, 0x01U);
 
-    rig.master->disconnect();
-    EXPECT_FALSE(rig.master->isConnected());
+    rig.master->Disconnect();
+    EXPECT_FALSE(rig.master->IsConnected());
 
     // 命令顺序应符合连接编排（计划 §5.1）
     EXPECT_EQ(rig.slave.Count(CommandCode::Connect), 1);
     EXPECT_EQ(rig.slave.Count(CommandCode::GetCommModeInfo), 1);
     EXPECT_EQ(rig.slave.Count(CommandCode::GetStatus),
-              2);  // connect 内 1 次 + queryStatus 1 次
+              2);  // Connect 内 1 次 + QueryStatus 1 次
     EXPECT_EQ(rig.slave.Count(CommandCode::ShortUpload), 1);
     EXPECT_EQ(rig.slave.Count(CommandCode::Disconnect), 1);
 }
@@ -375,26 +375,27 @@ TEST(XcpMasterIntegration, FullHappyPathSequence) {
 TEST(XcpMasterIntegration, OptionalUnavailableSkipsCommModeInfo) {
     Rig rig(MockXcpSlave(AddressGranularity::Byte, ByteOrder::Intel, 8U, 8U,
                          false));
-    rig.master->connect();
-    EXPECT_TRUE(rig.master->isConnected());
+    rig.master->Connect();
+    EXPECT_TRUE(rig.master->IsConnected());
     EXPECT_EQ(rig.slave.Count(CommandCode::GetCommModeInfo), 0)
         << "OPTIONAL 位为 0 时不应查询 GET_COMM_MODE_INFO";
-    EXPECT_FALSE(rig.master->sessionParameters().m_comm_mode_info_.has_value());
+    EXPECT_FALSE(
+        rig.master->GetSessionParameters().m_comm_mode_info_.has_value());
 }
 
 TEST(XcpMasterIntegration, DisconnectClosesTransport) {
     Rig rig;
-    rig.master->connect();
+    rig.master->Connect();
     ASSERT_TRUE(rig.transport_ptr->IsOpen());
-    rig.master->disconnect();
+    rig.master->Disconnect();
     EXPECT_FALSE(rig.transport_ptr->IsOpen());
-    EXPECT_NO_THROW(rig.master->disconnect());  // 幂等
+    EXPECT_NO_THROW(rig.master->Disconnect());  // 幂等
 }
 
 TEST(XcpMasterIntegration, DestructorDisconnectsAndReleasesResources) {
     Rig rig;
-    rig.master->connect();
-    ASSERT_TRUE(rig.master->isConnected());
+    rig.master->Connect();
+    ASSERT_TRUE(rig.master->IsConnected());
     // 注意：transport 由 master 拥有，reset() 后 transport_ptr
     // 即悬空，不可再解引用。 因此改用仍存活的 MockSlave 断言析构确实发送了
     // DISCONNECT。
@@ -410,9 +411,10 @@ TEST(XcpMasterIntegration, DestructorDisconnectsAndReleasesResources) {
 TEST(XcpMasterIntegration, CommModeInfoUnknownDegradesAndConnectSucceeds) {
     Rig rig;
     rig.slave.SetError(CommandCode::GetCommModeInfo, ErrorCode::CmdUnknown);
-    EXPECT_NO_THROW(rig.master->connect());
-    EXPECT_TRUE(rig.master->isConnected());
-    EXPECT_FALSE(rig.master->sessionParameters().m_comm_mode_info_.has_value());
+    EXPECT_NO_THROW(rig.master->Connect());
+    EXPECT_TRUE(rig.master->IsConnected());
+    EXPECT_FALSE(
+        rig.master->GetSessionParameters().m_comm_mode_info_.has_value());
 }
 
 TEST(XcpMasterIntegration, ShortUploadUnknownDegradesToChunkedUpload) {
@@ -421,11 +423,11 @@ TEST(XcpMasterIntegration, ShortUploadUnknownDegradesToChunkedUpload) {
     rig.slave.SetMemory(0x8000, content);
     rig.slave.SetShortUploadUnsupported();
 
-    rig.master->connect();
-    const Bytes got = rig.master->readMemory(0x8000, 0x00, 6);
+    rig.master->Connect();
+    const Bytes got = rig.master->ReadMemoryBytes(0x8000, 0x00, 6);
 
     EXPECT_EQ(got, content);
-    EXPECT_FALSE(rig.master->sessionParameters().m_short_upload_available_);
+    EXPECT_FALSE(rig.master->GetSessionParameters().m_short_upload_available_);
     EXPECT_GE(rig.slave.Count(CommandCode::SetMta), 1);
     EXPECT_GE(rig.slave.Count(CommandCode::Upload), 1);
 }
@@ -433,8 +435,8 @@ TEST(XcpMasterIntegration, ShortUploadUnknownDegradesToChunkedUpload) {
 TEST(XcpMasterIntegration, ConnectFailsWhenStatusUnavailable) {
     Rig rig;
     rig.slave.SetError(CommandCode::GetStatus, ErrorCode::CmdBusy);
-    EXPECT_THROW(rig.master->connect(), XcpException);
-    EXPECT_FALSE(rig.master->isConnected());
+    EXPECT_THROW(rig.master->Connect(), XcpException);
+    EXPECT_FALSE(rig.master->IsConnected());
     // 失败清理：通道必须被关闭（计划 §5.1）
     EXPECT_FALSE(rig.transport_ptr->IsOpen());
 }
@@ -448,8 +450,8 @@ TEST(XcpMasterIntegration, ConnectFailsOnMalformedConnectResponse) {
         }
         return rig.slave(p);
     });
-    EXPECT_THROW(rig.master->connect(), XcpException);
-    EXPECT_FALSE(rig.master->isConnected());
+    EXPECT_THROW(rig.master->Connect(), XcpException);
+    EXPECT_FALSE(rig.master->IsConnected());
     EXPECT_FALSE(rig.transport_ptr->IsOpen());
 }
 
@@ -467,7 +469,7 @@ class XcpMasterAgTest : public ::testing::TestWithParam<AgIntegrationCase> {};
 TEST_P(XcpMasterAgTest, MultiChunkReadMatchesMockMemory) {
     const auto ag = GetParam().ag;
     const auto max_cto = GetParam().max_cto;
-    const auto ag_bytes = agToBytes(ag);
+    const auto ag_bytes = AgToBytes(ag);
 
     Rig rig(MockXcpSlave(ag, ByteOrder::Intel, max_cto, 0x0100U));
     const ElementCount total =
@@ -479,20 +481,21 @@ TEST_P(XcpMasterAgTest, MultiChunkReadMatchesMockMemory) {
     }
     rig.slave.SetMemory(0x10000, content);
 
-    rig.master->connect();
-    const Bytes got = rig.master->readMemoryElements(0x10000, 0x00, total);
+    rig.master->Connect();
+    const Bytes got = rig.master->ReadMemory(0x10000, 0x00, total);
     EXPECT_EQ(got, content);
     EXPECT_GT(rig.slave.Count(CommandCode::Upload), 1) << "应发生多块 UPLOAD";
 }
 
 TEST_P(XcpMasterAgTest, ByteApiRequiresMultipleOfAg) {
     const auto ag = GetParam().ag;
-    if (agToBytes(ag) == 1U) {
+    if (AgToBytes(ag) == 1U) {
         GTEST_SKIP() << "AG=BYTE 时任意字节数都合法";
     }
     Rig rig(MockXcpSlave(ag, ByteOrder::Intel, GetParam().max_cto, 0x0100U));
-    rig.master->connect();
-    EXPECT_THROW((void)rig.master->readMemory(0x1000, 0x00, 1), XcpException);
+    rig.master->Connect();
+    EXPECT_THROW((void)rig.master->ReadMemoryBytes(0x1000, 0x00, 1),
+                 XcpException);
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -502,7 +505,7 @@ INSTANTIATE_TEST_SUITE_P(
                       AgIntegrationCase{AddressGranularity::DWord, 0x08U},
                       AgIntegrationCase{AddressGranularity::DWord, 0x20U}),
     [](const ::testing::TestParamInfo<AgIntegrationCase>& info) {
-        return std::string("Ag") + std::to_string(agToBytes(info.param.ag)) +
+        return std::string("Ag") + std::to_string(AgToBytes(info.param.ag)) +
                "_Cto" + std::to_string(info.param.max_cto);
     });
 
@@ -515,7 +518,7 @@ TEST(XcpMasterIntegration, EventsDuringReadDoNotBreakMatching) {
     Rig rig(MockXcpSlave{}, CommandTimeouts{}, &recorder);
     const Bytes content = BytesOf({0xAA, 0xBB, 0xCC, 0xDD});
     rig.slave.SetMemory(0x5000, content);
-    rig.master->connect();
+    rig.master->Connect();
 
     // SHORT_UPLOAD 期间先注入 EV 与 SERV，再给最终 RES
     rig.transport_ptr->SetResponse([&rig](BytesView p) -> Bytes {
@@ -529,7 +532,7 @@ TEST(XcpMasterIntegration, EventsDuringReadDoNotBreakMatching) {
         return rig.slave(p);
     });
 
-    const Bytes got = rig.master->readMemory(0x5000, 0x00, 4);
+    const Bytes got = rig.master->ReadMemoryBytes(0x5000, 0x00, 4);
     EXPECT_EQ(got, content);
     EXPECT_GE(recorder.events(), 1);
     EXPECT_EQ(recorder.services(), 1);
@@ -547,7 +550,7 @@ TEST(XcpMasterIntegration, MultipleCmdPendingThenFinalResponse) {
             &recorder);
     const Bytes content = BytesOf({0x01, 0x02, 0x03, 0x04});
     rig.slave.SetMemory(0x6000, content);
-    rig.master->connect();
+    rig.master->Connect();
 
     // SHORT_UPLOAD 的 send 不直接回响应，完全依赖注入序列
     rig.transport_ptr->SetResponse([&rig](BytesView p) -> Bytes {
@@ -574,7 +577,7 @@ TEST(XcpMasterIntegration, MultipleCmdPendingThenFinalResponse) {
     });
     ThreadJoiner joiner(injector);
 
-    const Bytes got = rig.master->readMemory(0x6000, 0x00, 4);
+    const Bytes got = rig.master->ReadMemoryBytes(0x6000, 0x00, 4);
     injector.join();
 
     EXPECT_EQ(got, content);
@@ -598,8 +601,8 @@ TEST(XcpMasterIntegration, ChunkTimeoutRecoversViaSynchAndSetMta) {
     rig.slave.SetMemory(0x20000, content);
     rig.slave.DropCommandTimes(CommandCode::Upload, 1);  // 第 1 次 UPLOAD 丢包
 
-    rig.master->connect();
-    const Bytes got = rig.master->readMemoryElements(0x20000, 0x00, total);
+    rig.master->Connect();
+    const Bytes got = rig.master->ReadMemory(0x20000, 0x00, total);
 
     EXPECT_EQ(got, content) << "超时恢复后应读出完整数据";
     EXPECT_GE(rig.slave.Count(CommandCode::Synch), 1);
@@ -616,9 +619,9 @@ TEST(XcpMasterIntegration, UnrecoverableTimeoutReportsRecoveryFailed) {
     rig.slave.SetMemory(0x30000, Bytes(total, 0x5AU));
     rig.slave.DropCommand(CommandCode::Upload);
 
-    rig.master->connect();
+    rig.master->Connect();
     try {
-        (void)rig.master->readMemoryElements(0x30000, 0x00, total);
+        (void)rig.master->ReadMemory(0x30000, 0x00, total);
         FAIL() << "应报 RecoveryFailed";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::RecoveryFailed);
@@ -633,9 +636,9 @@ TEST(XcpMasterIntegration, AccessLockedSurfacesUnsupportedFeature) {
     Rig rig;
     rig.slave.SetMemory(0x4000, BytesOf({0x01, 0x02, 0x03, 0x04}));
     rig.slave.SetError(CommandCode::ShortUpload, ErrorCode::AccessLocked);
-    rig.master->connect();
+    rig.master->Connect();
     try {
-        (void)rig.master->readMemory(0x4000, 0x00, 4);
+        (void)rig.master->ReadMemoryBytes(0x4000, 0x00, 4);
         FAIL() << "ERR_ACCESS_LOCKED 应映射为 UnsupportedFeature";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::UnsupportedFeature);
@@ -644,9 +647,9 @@ TEST(XcpMasterIntegration, AccessLockedSurfacesUnsupportedFeature) {
 
 TEST(XcpMasterIntegration, AccessDeniedSurfacesProtocolError) {
     Rig rig;
-    rig.master->connect();  // 未配置内存 -> Slave 回 ERR_ACCESS_DENIED
+    rig.master->Connect();  // 未配置内存 -> Slave 回 ERR_ACCESS_DENIED
     try {
-        (void)rig.master->readMemory(0x9000, 0x00, 4);
+        (void)rig.master->ReadMemoryBytes(0x9000, 0x00, 4);
         FAIL() << "ERR_ACCESS_DENIED 应映射为 ProtocolError";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
@@ -657,7 +660,7 @@ TEST(XcpMasterIntegration, AccessDeniedSurfacesProtocolError) {
 
 TEST(XcpMasterIntegration, MalformedResponseLengthRejected) {
     Rig rig;
-    rig.master->connect();
+    rig.master->Connect();
     rig.transport_ptr->SetResponse([&rig](BytesView p) -> Bytes {
         if (static_cast<CommandCode>(p[0]) == CommandCode::ShortUpload) {
             return Bytes{static_cast<std::uint8_t>(PacketType::Res),
@@ -666,7 +669,7 @@ TEST(XcpMasterIntegration, MalformedResponseLengthRejected) {
         return rig.slave(p);
     });
     try {
-        (void)rig.master->readMemory(0x1000, 0x00, 4);
+        (void)rig.master->ReadMemoryBytes(0x1000, 0x00, 4);
         FAIL() << "响应长度不符应报 MalformedPacket";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::MalformedPacket);
@@ -675,10 +678,10 @@ TEST(XcpMasterIntegration, MalformedResponseLengthRejected) {
 
 TEST(XcpMasterIntegration, TransportSendFailureClassified) {
     Rig rig;
-    rig.master->connect();
+    rig.master->Connect();
     rig.transport_ptr->FailNextSend();
     try {
-        (void)rig.master->queryStatus();
+        (void)rig.master->QueryStatus();
         FAIL() << "发送失败应报 TransportError";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::TransportError);
@@ -688,7 +691,7 @@ TEST(XcpMasterIntegration, TransportSendFailureClassified) {
 TEST(XcpMasterIntegration, ReadBeforeConnectIsInvalidState) {
     Rig rig;
     try {
-        (void)rig.master->readMemory(0x1000, 0x00, 4);
+        (void)rig.master->ReadMemoryBytes(0x1000, 0x00, 4);
         FAIL() << "未连接读取应报 InvalidState";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::InvalidState);
@@ -697,9 +700,9 @@ TEST(XcpMasterIntegration, ReadBeforeConnectIsInvalidState) {
 
 TEST(XcpMasterIntegration, ConnectTwiceIsRejected) {
     Rig rig;
-    rig.master->connect();
-    EXPECT_THROW(rig.master->connect(), XcpException);
-    EXPECT_TRUE(rig.master->isConnected());
+    rig.master->Connect();
+    EXPECT_THROW(rig.master->Connect(), XcpException);
+    EXPECT_TRUE(rig.master->IsConnected());
 }
 
 TEST(XcpMasterIntegration, NullTransportRejected) {

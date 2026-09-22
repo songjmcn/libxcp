@@ -122,7 +122,7 @@ std::unique_ptr<XcpMaster> MakeMaster(
 /// @brief 记录 EV 的监听器
 class EventRecorder : public IEventListener {
 public:
-    void onEvent(const EventPacket& event) override {
+    void OnEvent(const EventPacket& event) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         if (event.m_event_code_ &&
             *event.m_event_code_ == EventCode::CmdPending) {
@@ -130,8 +130,8 @@ public:
         }
         ++m_events;
     }
-    void onService(const ServicePacket&) override {}
-    void onDto(const DtoPacket&) override {}
+    void OnService(const ServicePacket&) override {}
+    void OnDto(const DtoPacket&) override {}
 
     [[nodiscard]] int cmdPending() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
@@ -172,16 +172,16 @@ TEST(UdpLoopback, FullSessionConnectReadDisconnect) {
     slave.SetMemory(0x70012340, content);
 
     auto master = MakeMaster(slave.Port());
-    master->connect();
-    EXPECT_TRUE(master->isConnected());
-    EXPECT_EQ(master->sessionParameters().m_connect_.m_max_cto_, 8U);
-    EXPECT_EQ(master->sessionParameters().m_connect_.m_max_dto_, 8U);
+    master->Connect();
+    EXPECT_TRUE(master->IsConnected());
+    EXPECT_EQ(master->GetSessionParameters().m_connect_.m_max_cto_, 8U);
+    EXPECT_EQ(master->GetSessionParameters().m_connect_.m_max_dto_, 8U);
 
-    const Bytes got = master->readMemory(0x70012340, 0x00, 4);
+    const Bytes got = master->ReadMemoryBytes(0x70012340, 0x00, 4);
     EXPECT_EQ(got, content);
 
-    master->disconnect();
-    EXPECT_FALSE(master->isConnected());
+    master->Disconnect();
+    EXPECT_FALSE(master->IsConnected());
     EXPECT_FALSE(slave.IsConnected());
     slave.Stop();
 }
@@ -190,9 +190,9 @@ TEST(UdpLoopback, GetStatusAndCommModeInfoParsed) {
     test::UdpTestSlave slave;
     slave.Start();
     auto master = MakeMaster(slave.Port());
-    master->connect();
+    master->Connect();
 
-    const auto params = master->sessionParameters();
+    const auto params = master->GetSessionParameters();
     ASSERT_TRUE(params.m_status_.has_value());
     EXPECT_EQ(params.m_status_->m_state_number_, 0x01U);
     EXPECT_EQ(params.m_status_->m_session_config_id_, 0x0007U);
@@ -200,9 +200,9 @@ TEST(UdpLoopback, GetStatusAndCommModeInfoParsed) {
     EXPECT_EQ(params.m_comm_mode_info_->m_max_bs_, 0x04U);
     EXPECT_EQ(params.m_comm_mode_info_->m_min_st_, 0x02U);
 
-    const GetStatusResponse status = master->queryStatus();
+    const GetStatusResponse status = master->QueryStatus();
     EXPECT_EQ(status.m_state_number_, 0x01U);
-    master->disconnect();
+    master->Disconnect();
     slave.Stop();
 }
 
@@ -285,12 +285,12 @@ TEST(UdpLoopback, SetMtaWithMultipleUploadChunks) {
     slave.SetMemory(0x2000, content);
 
     auto master = MakeMaster(slave.Port());
-    master->connect();
-    const Bytes got = master->readMemoryElements(0x2000, 0x00, 20);
+    master->Connect();
+    const Bytes got = master->ReadMemory(0x2000, 0x00, 20);
 
     ASSERT_EQ(got.size(), content.size());
     EXPECT_EQ(got, content) << "Transport Header 不得混入协议数据";
-    master->disconnect();
+    master->Disconnect();
     slave.Stop();
 }
 
@@ -306,7 +306,7 @@ TEST(UdpLoopback, DroppedResponseTriggersSynchRecovery) {
     auto master = MakeMaster(
         slave.Port(), CommandTimeouts{std::chrono::milliseconds(200),
                                       std::chrono::milliseconds(200), 2});
-    master->connect();
+    master->Connect();
     const std::size_t commands_after_connect = slave.CommandCount();
 
     // 丢弃下一个响应（即 SHORT_UPLOAD 的响应）-> 触发 SYNCH 恢复后重试
@@ -314,12 +314,12 @@ TEST(UdpLoopback, DroppedResponseTriggersSynchRecovery) {
     fault.m_drop_response_n_ = 1;
     slave.SetFaultInjection(fault);
 
-    const Bytes got = master->readMemory(0x3000, 0x00, 4);
+    const Bytes got = master->ReadMemoryBytes(0x3000, 0x00, 4);
     EXPECT_EQ(got, BytesOf({0xAA, 0xBB, 0xCC, 0xDD})) << "恢复后应读出正确数据";
     // 期间应发生超过 1 条 Slave 命令（原命令 + SYNCH + 重试）
     EXPECT_GT(slave.CommandCount(), commands_after_connect + 1);
 
-    master->disconnect();
+    master->Disconnect();
     slave.Stop();
 }
 
@@ -333,19 +333,19 @@ TEST(UdpLoopback, CmdPendingDoesNotResendOriginalCommand) {
                              CommandTimeouts{std::chrono::milliseconds(600),
                                              std::chrono::milliseconds(200), 2},
                              &recorder);
-    master->connect();
+    master->Connect();
     const std::size_t after_connect = slave.CommandCount();
 
     // 用一个手工 Transport 才能注入 EV；这里改为验证 XcpMaster+UdpTransport
     // 路径下 读命令只发送一次（无 EV 时也必须有确定计数），EV_CMD_PENDING
     // 的分支已由 recovery_test.cpp 与 xcp_master_integration_test.cpp 用
     // MockTransport 精确覆盖。
-    const Bytes got = master->readMemory(0x4000, 0x00, 4);
+    const Bytes got = master->ReadMemoryBytes(0x4000, 0x00, 4);
     EXPECT_EQ(got, BytesOf({0x01, 0x02, 0x03, 0x04}));
     // 一次读取应恰好产生一条 Slave 命令（SHORT_UPLOAD）
     EXPECT_EQ(slave.CommandCount(), after_connect + 1);
 
-    master->disconnect();
+    master->Disconnect();
     slave.Stop();
 }
 
@@ -357,7 +357,7 @@ TEST(UdpLoopback, DelayedResponseWithinTimeoutSucceeds) {
     auto master = MakeMaster(
         slave.Port(), CommandTimeouts{std::chrono::milliseconds(800),
                                       std::chrono::milliseconds(200), 2});
-    master->connect();
+    master->Connect();
 
     // 让 SHORT_UPLOAD 的响应延迟 150ms（仍在超时内）
     test::FaultInjection fault;
@@ -365,10 +365,10 @@ TEST(UdpLoopback, DelayedResponseWithinTimeoutSucceeds) {
         std::make_pair<std::size_t, std::uint32_t>(1, 150);
     slave.SetFaultInjection(fault);
 
-    const Bytes got = master->readMemory(0x5000, 0x00, 4);
+    const Bytes got = master->ReadMemoryBytes(0x5000, 0x00, 4);
     EXPECT_EQ(got, BytesOf({0x11, 0x22, 0x33, 0x44}))
         << "超时内延迟不应导致失败";
-    master->disconnect();
+    master->Disconnect();
     slave.Stop();
 }
 
@@ -464,6 +464,58 @@ TEST(UdpLoopback, DuplicateCtrFrameDropped) {
 }
 
 // --------------------------------------------------------------------------
+// 设计决策 D5（0x8000 歧义 CTR）端到端收口：真实 Datagram 上验证丢弃与诊断，
+// 并确认 Session 在歧义 Frame 之后仍可继续正常工作。
+// --------------------------------------------------------------------------
+
+TEST(UdpLoopback, AmbiguousCtrFrameDroppedAndSessionContinues) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    slave.SetMemory(0x9000, BytesOf({0xA1, 0xB2, 0xC3, 0xD4}));
+
+    auto transport = std::make_unique<UdpTransport>(MakeConfig(slave.Port()));
+    TransportObserver observer;
+    transport->Open(observer);
+
+    // CONNECT 的响应使用 Slave CTR=0，为 Master 建立接收基线
+    transport->Send(BytesView{BytesOf({0xFF, 0x00})});
+    ASSERT_TRUE(observer.waitFor(1, std::chrono::seconds(2)));
+    const std::size_t baseline = observer.packetCount();
+
+    // GET_STATUS 的响应本应使用 CTR=1；施加 +0x8000 后实发 0x8001，
+    // 相对期望值 1 的前向距离恰为 0x8000 -> 方向歧义
+    test::FaultInjection fault;
+    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, 0x8000);
+    slave.SetFaultInjection(fault);
+    transport->Send(BytesView{BytesOf({0xFD, 0x00})});
+
+    EXPECT_TRUE(observer.waitForWarning(1, std::chrono::seconds(2)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    EXPECT_EQ(observer.packetCount(), baseline)
+        << "0x8000 歧义 Frame 不得交付协议层";
+
+    bool ambiguity_reported = false;
+    for (const auto& w : observer.warnings()) {
+        if (w.find("0x8000") != std::string::npos) {
+            ambiguity_reported = true;
+        }
+    }
+    EXPECT_TRUE(ambiguity_reported) << "未观察到 0x8000 歧义诊断";
+    EXPECT_EQ(transport->LastReceiveCtr().value_or(0xFFFF), 0)
+        << "被丢弃的 Frame 不得推进接收 CTR";
+
+    // 关闭注入后，同一传输通道必须能继续正常收发（策略只丢单帧，不禁用会话）
+    test::FaultInjection cleared;
+    slave.SetFaultInjection(cleared);
+    transport->Send(BytesView{BytesOf({0xFD, 0x00})});
+    EXPECT_TRUE(observer.waitFor(baseline + 1, std::chrono::seconds(2)))
+        << "歧义丢弃后后续 Frame 应正常交付";
+
+    transport->Close();
+    slave.Stop();
+}
+
+// --------------------------------------------------------------------------
 // §15.3 第 3 条：Slave 端点绑定规则（通过真实 Master/Slave 交互验证）
 // --------------------------------------------------------------------------
 
@@ -473,14 +525,14 @@ TEST(UdpLoopback, SlaveAnswersConnectThenServesSameSourceIp) {
     slave.SetMemory(0x8000, BytesOf({0x55, 0x66, 0x77, 0x88}));
 
     auto master = MakeMaster(slave.Port());
-    master->connect();
+    master->Connect();
     EXPECT_TRUE(slave.IsConnected());
 
     // 同一 Master 实例继续发命令：来源 IP 相同（本地端口不变），应正常服务
-    const Bytes got = master->readMemory(0x8000, 0x00, 4);
+    const Bytes got = master->ReadMemoryBytes(0x8000, 0x00, 4);
     EXPECT_EQ(got, BytesOf({0x55, 0x66, 0x77, 0x88}));
 
-    master->disconnect();
+    master->Disconnect();
     slave.Stop();
 }
 
@@ -489,15 +541,15 @@ TEST(UdpLoopback, SecondMasterSessionReplacesEndpoint) {
     slave.Start();
 
     auto master_a = MakeMaster(slave.Port());
-    master_a->connect();
+    master_a->Connect();
     EXPECT_TRUE(slave.IsConnected());
-    master_a->disconnect();
+    master_a->Disconnect();
 
     // 新建一个 Master（新的本地临时端口）重新 CONNECT：应建立新会话
     auto master_b = MakeMaster(slave.Port());
-    master_b->connect();
+    master_b->Connect();
     EXPECT_TRUE(slave.IsConnected());
-    master_b->disconnect();
+    master_b->Disconnect();
     slave.Stop();
 }
 
@@ -586,10 +638,10 @@ TEST(UdpLoopback, MasterDisconnectReleasesTransport) {
 
     {
         auto master = MakeMaster(slave.Port());
-        master->connect();
-        EXPECT_TRUE(master->isConnected());
-        master->disconnect();
-        EXPECT_FALSE(master->isConnected());
+        master->Connect();
+        EXPECT_TRUE(master->IsConnected());
+        master->Disconnect();
+        EXPECT_FALSE(master->IsConnected());
     }  // 析构
 
     // Slave 会话应已被 DISCONNECT 关闭
@@ -602,7 +654,7 @@ TEST(UdpLoopback, MasterDestructionWithoutDisconnectStillReleases) {
     slave.Start();
     {
         auto master = MakeMaster(slave.Port());
-        master->connect();
+        master->Connect();
         // 不显式 disconnect，直接析构
     }
     EXPECT_FALSE(slave.IsConnected()) << "析构应尽力发送 DISCONNECT";
@@ -620,11 +672,11 @@ TEST(UdpLoopback, RepeatedSessionsRemainStable) {
 
     for (int i = 0; i < 5; ++i) {
         auto master = MakeMaster(slave.Port());
-        master->connect();
-        const Bytes got = master->readMemory(0x9000, 0x00, 4);
+        master->Connect();
+        const Bytes got = master->ReadMemoryBytes(0x9000, 0x00, 4);
         EXPECT_EQ(got, BytesOf({0x0A, 0x0B, 0x0C, 0x0D}))
             << "第 " << i << " 轮读取失败";
-        master->disconnect();
+        master->Disconnect();
     }
     slave.Stop();
 }

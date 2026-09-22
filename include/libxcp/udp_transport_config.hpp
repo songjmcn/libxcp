@@ -27,7 +27,7 @@ struct UdpTransportConfig {
     /// @brief 远端 Slave IPv4 地址（如 "192.168.1.10" 或 "127.0.0.1"）
     std::string m_remote_host_;
 
-    /// @brief 远端 Slave UDP 业务端口（0 为非法值，open() 时校验）
+    /// @brief 远端 Slave UDP 业务端口（0 为非法值，Open() 时校验）
     std::uint16_t m_remote_port_ = 0;
 
     /// @brief 本地绑定 IPv4 地址（默认 "0.0.0.0"，Loopback 测试用 "127.0.0.1"）
