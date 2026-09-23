@@ -22,40 +22,40 @@ namespace calmcar::xcp {
 
 /// @brief Positive Response 内容（按命令区分）
 struct PositiveResponse {
-    CommandCode m_command_{};  ///< 对应的命令码（由调用方传入的期望命令）
-    Bytes m_data_;             ///< RES 后的数据（不含 0xFF 前缀）
+    CommandCode command{};  ///< 对应的命令码（由调用方传入的期望命令）
+    Bytes data;             ///< RES 后的数据（不含 0xFF 前缀）
 };
 
 /// @brief Negative Response 内容
 struct NegativeResponse {
     /// @brief 错误码原始字节（保留未知值，不丢失 Slave 返回的原码）
-    std::uint8_t m_raw_error_code_{0};
+    std::uint8_t raw_error_code{0};
     /// @brief 已识别的错误码；未知厂商码为 std::nullopt
-    std::optional<ErrorCode> m_error_code_;
+    std::optional<ErrorCode> error_code;
     /// @brief 可选附加信息（Byte 2..）
-    Bytes m_additional_info_;
+    Bytes additional_info;
 };
 
 /// @brief Event Packet 内容
 struct EventPacket {
     /// @brief 事件码原始字节（保留未知值）
-    std::uint8_t m_raw_event_code_{0};
+    std::uint8_t raw_event_code{0};
     /// @brief 已识别的事件码；未知值为 std::nullopt
-    std::optional<EventCode> m_event_code_;
+    std::optional<EventCode> event_code;
     /// @brief 可选 Event 信息（Byte 2..）
-    Bytes m_info_;
+    Bytes info;
 };
 
 /// @brief Service Request Packet 内容
 struct ServicePacket {
-    std::uint8_t m_service_code_{0};  ///< SERV Packet 的 Byte 1
-    Bytes m_data_;                    ///< 可选 Service 数据
+    std::uint8_t service_code{0};  ///< SERV Packet 的 Byte 1
+    Bytes data;                    ///< 可选 Service 数据
 };
 
 /// @brief DTO Packet（本阶段仅识别，不解析内容）
 struct DtoPacket {
-    std::uint8_t m_pid_{0};  ///< 原始 PID（0x00..0xFB）
-    Bytes m_data_;           ///< DTO 数据（PID 之后的全部字节）
+    std::uint8_t pid{0};  ///< 原始 PID（0x00..0xFB）
+    Bytes data;           ///< DTO 数据（PID 之后的全部字节）
 };
 
 /// @brief 解析后的 Packet 联合类型
@@ -83,7 +83,7 @@ public:
      * @brief 解析一个完整的 XCP Packet
      * @param packet 完整 XCP Packet 字节（不含 Transport Header）
      * @param expected_command 调用方期望的命令码（用于
-     * PositiveResponse.m_command_）
+     * PositiveResponse.command）
      * @return 解析结果；空包等畸形输入返回 std::nullopt
      */
     [[nodiscard]] std::optional<ParsedPacket> Parse(

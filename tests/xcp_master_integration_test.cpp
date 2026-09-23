@@ -32,17 +32,17 @@ Bytes BytesOf(std::initializer_list<std::uint8_t> init) {
 /// terminate）
 class ThreadJoiner {
 public:
-    explicit ThreadJoiner(std::thread& thread) : m_thread(thread) {}
+    explicit ThreadJoiner(std::thread& thread) : m_thread_(thread) {}
     ~ThreadJoiner() {
-        if (m_thread.joinable()) {
-            m_thread.join();
+        if (m_thread_.joinable()) {
+            m_thread_.join();
         }
     }
     ThreadJoiner(const ThreadJoiner&) = delete;
     ThreadJoiner& operator=(const ThreadJoiner&) = delete;
 
 private:
-    std::thread& m_thread;
+    std::thread& m_thread_;
 };
 
 /// @brief 记录 Master 侧事件，用于断言 EV/SERV/DTO 分流
@@ -50,44 +50,43 @@ class EventRecorder : public IEventListener {
 public:
     void OnEvent(const EventPacket& event) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        ++m_events;
-        if (event.m_event_code_ &&
-            *event.m_event_code_ == EventCode::CmdPending) {
-            ++m_cmd_pending;
+        ++m_events_;
+        if (event.event_code && *event.event_code == EventCode::CmdPending) {
+            ++m_cmd_pending_;
         }
     }
     void OnService(const ServicePacket&) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        ++m_services;
+        ++m_services_;
     }
     void OnDto(const DtoPacket&) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        ++m_dtos;
+        ++m_dtos_;
     }
 
     [[nodiscard]] int events() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_events;
+        return m_events_;
     }
     [[nodiscard]] int cmdPending() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_cmd_pending;
+        return m_cmd_pending_;
     }
     [[nodiscard]] int services() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_services;
+        return m_services_;
     }
     [[nodiscard]] int dtos() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_dtos;
+        return m_dtos_;
     }
 
 private:
     mutable std::mutex m_mutex_;
-    int m_events{0};
-    int m_cmd_pending{0};
-    int m_services{0};
-    int m_dtos{0};
+    int m_events_{0};
+    int m_cmd_pending_{0};
+    int m_services_{0};
+    int m_dtos_{0};
 };
 
 /**
@@ -101,37 +100,37 @@ public:
     MockXcpSlave(AddressGranularity ag = AddressGranularity::Byte,
                  ByteOrder order = ByteOrder::Intel, std::uint8_t max_cto = 8U,
                  std::uint16_t max_dto = 8U, bool optional = true)
-        : m_ag(ag),
-          m_order(order),
-          m_max_cto(max_cto),
-          m_max_dto(max_dto),
-          m_optional(optional) {}
+        : m_ag_(ag),
+          m_order_(order),
+          m_max_cto_(max_cto),
+          m_max_dto_(max_dto),
+          m_optional_(optional) {}
 
     /// @brief 写入模拟 ECU 内存
     void SetMemory(Address address, const Bytes& data) {
         for (std::size_t i = 0; i < data.size(); ++i) {
-            m_memory[address + static_cast<Address>(i)] = data[i];
+            m_memory_[address + static_cast<Address>(i)] = data[i];
         }
     }
 
     /// @brief 让指定命令持续返回错误
-    void SetError(CommandCode cmd, ErrorCode code) { m_errors[cmd] = code; }
+    void SetError(CommandCode cmd, ErrorCode code) { m_errors_[cmd] = code; }
 
     /// @brief 让指定命令始终不响应（模拟持续丢包）
-    void DropCommand(CommandCode cmd) { m_dropped.insert(cmd); }
+    void DropCommand(CommandCode cmd) { m_dropped_.insert(cmd); }
 
     /// @brief 让指定命令丢 N 次后恢复
     void DropCommandTimes(CommandCode cmd, int times) {
-        m_drop_times[cmd] = times;
+        m_drop_times_[cmd] = times;
     }
 
     /// @brief 令 SHORT_UPLOAD 返回 ERR_CMD_UNKNOWN
-    void SetShortUploadUnsupported() { m_short_upload_unsupported = true; }
+    void SetShortUploadUnsupported() { m_short_upload_unsupported_ = true; }
 
     /// @brief 某个命令被调用的次数
     [[nodiscard]] int Count(CommandCode cmd) const {
-        const auto it = m_counts.find(cmd);
-        return it == m_counts.end() ? 0 : it->second;
+        const auto it = m_counts_.find(cmd);
+        return it == m_counts_.end() ? 0 : it->second;
     }
 
     /// @brief MockTransport 的响应脚本入口
@@ -140,18 +139,18 @@ public:
             return {};
         }
         const auto cmd = static_cast<CommandCode>(packet[0]);
-        ++m_counts[cmd];
+        ++m_counts_[cmd];
 
-        if (m_dropped.count(cmd) > 0) {
+        if (m_dropped_.count(cmd) > 0) {
             return {};
         }
-        const auto drop_it = m_drop_times.find(cmd);
-        if (drop_it != m_drop_times.end() && drop_it->second > 0) {
+        const auto drop_it = m_drop_times_.find(cmd);
+        if (drop_it != m_drop_times_.end() && drop_it->second > 0) {
             --drop_it->second;
             return {};
         }
-        const auto err_it = m_errors.find(cmd);
-        if (err_it != m_errors.end()) {
+        const auto err_it = m_errors_.find(cmd);
+        if (err_it != m_errors_.end()) {
             return Err(err_it->second);
         }
 
@@ -159,7 +158,7 @@ public:
             case CommandCode::Connect:
                 return connectResponse();
             case CommandCode::Disconnect:
-                m_connected = false;
+                m_connected_ = false;
                 return Res({});
             case CommandCode::GetStatus:
                 return Res({0x00, 0x00, 0x01, 0x07, 0x00});
@@ -172,7 +171,7 @@ public:
                 if (packet.size() < 7U) {
                     return Err(ErrorCode::CmdSyntax);
                 }
-                m_mta = decodeAddress(packet.subspan(3, 4));
+                m_mta_ = decodeAddress(packet.subspan(3, 4));
                 return Res({});
             case CommandCode::Upload:
                 return upload(packet);
@@ -201,7 +200,7 @@ private:
 
     /// @brief 按 Session 字节序解出 4 字节地址
     Address decodeAddress(BytesView four) const {
-        if (m_order == ByteOrder::Intel) {
+        if (m_order_ == ByteOrder::Intel) {
             return static_cast<Address>(four[0]) |
                    (static_cast<Address>(four[1]) << 8) |
                    (static_cast<Address>(four[2]) << 16) |
@@ -214,22 +213,24 @@ private:
     }
 
     Bytes connectResponse() {
-        m_connected = true;
+        m_connected_ = true;
         std::uint8_t comm_mode =
-            static_cast<std::uint8_t>(AgToCommModeBasicField(m_ag) << 1);
-        if (m_order == ByteOrder::Motorola) {
+            static_cast<std::uint8_t>(AgToCommModeBasicField(m_ag_) << 1);
+        if (m_order_ == ByteOrder::Motorola) {
             comm_mode |= 0x01U;
         }
-        if (m_optional) {
+        if (m_optional_) {
             comm_mode |= 0x80U;
         }
-        std::vector<std::uint8_t> body{0x15, comm_mode, m_max_cto};
-        if (m_order == ByteOrder::Intel) {
-            body.push_back(static_cast<std::uint8_t>(m_max_dto & 0xFFU));
-            body.push_back(static_cast<std::uint8_t>((m_max_dto >> 8) & 0xFFU));
+        std::vector<std::uint8_t> body{0x15, comm_mode, m_max_cto_};
+        if (m_order_ == ByteOrder::Intel) {
+            body.push_back(static_cast<std::uint8_t>(m_max_dto_ & 0xFFU));
+            body.push_back(
+                static_cast<std::uint8_t>((m_max_dto_ >> 8) & 0xFFU));
         } else {
-            body.push_back(static_cast<std::uint8_t>((m_max_dto >> 8) & 0xFFU));
-            body.push_back(static_cast<std::uint8_t>(m_max_dto & 0xFFU));
+            body.push_back(
+                static_cast<std::uint8_t>((m_max_dto_ >> 8) & 0xFFU));
+            body.push_back(static_cast<std::uint8_t>(m_max_dto_ & 0xFFU));
         }
         body.push_back(0x10U);
         body.push_back(0x10U);
@@ -243,10 +244,10 @@ private:
         const auto elements = static_cast<ElementCount>(packet[1]);
         if (elements == 0U ||
             elements + 1U >
-                static_cast<ElementCount>(m_max_cto / AgToBytes(m_ag))) {
+                static_cast<ElementCount>(m_max_cto_ / AgToBytes(m_ag_))) {
             return Err(ErrorCode::OutOfRange);
         }
-        auto data = read(m_mta, elements);
+        auto data = read(m_mta_, elements);
         if (!data) {
             return Err(ErrorCode::AccessDenied);
         }
@@ -254,20 +255,20 @@ private:
         // （docs/XCP_1.3.0_document.md §12.4：UPLOAD(6) -> 6 字节）
         std::vector<std::uint8_t> body;
         body.insert(body.end(), data->begin(), data->end());
-        m_mta += static_cast<Address>(elements) * AgToBytes(m_ag);
+        m_mta_ += static_cast<Address>(elements) * AgToBytes(m_ag_);
         return Res(body);
     }
 
     Bytes shortUpload(BytesView packet) {
-        if (m_short_upload_unsupported) {
+        if (m_short_upload_unsupported_) {
             return Err(ErrorCode::CmdUnknown);
         }
         if (packet.size() < 8U) {
             return Err(ErrorCode::CmdSyntax);
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
-        if (elements == 0U ||
-            elements > static_cast<ElementCount>(m_max_cto / AgToBytes(m_ag))) {
+        if (elements == 0U || elements > static_cast<ElementCount>(
+                                             m_max_cto_ / AgToBytes(m_ag_))) {
             return Err(ErrorCode::OutOfRange);
         }
         const Address address = decodeAddress(packet.subspan(4, 4));
@@ -280,16 +281,17 @@ private:
         std::vector<std::uint8_t> body;
         body.insert(body.end(), data->begin(), data->end());
         // SHORT_UPLOAD 之后 MTA 前进到数据块末尾之后
-        m_mta = address + static_cast<Address>(elements) * AgToBytes(m_ag);
+        m_mta_ = address + static_cast<Address>(elements) * AgToBytes(m_ag_);
         return Res(body);
     }
 
     std::optional<Bytes> read(Address address, ElementCount elements) {
         Bytes out;
-        const auto count = static_cast<std::size_t>(elements) * AgToBytes(m_ag);
+        const auto count =
+            static_cast<std::size_t>(elements) * AgToBytes(m_ag_);
         for (std::size_t i = 0; i < count; ++i) {
-            const auto it = m_memory.find(address + static_cast<Address>(i));
-            if (it == m_memory.end()) {
+            const auto it = m_memory_.find(address + static_cast<Address>(i));
+            if (it == m_memory_.end()) {
                 return std::nullopt;
             }
             out.push_back(it->second);
@@ -297,19 +299,19 @@ private:
         return out;
     }
 
-    AddressGranularity m_ag;
-    ByteOrder m_order;
-    std::uint8_t m_max_cto;
-    std::uint16_t m_max_dto;
-    bool m_optional{true};
-    bool m_connected{false};
-    bool m_short_upload_unsupported{false};
-    Address m_mta{0};
-    std::map<Address, std::uint8_t> m_memory;
-    std::map<CommandCode, ErrorCode> m_errors;
-    std::set<CommandCode> m_dropped;
-    std::map<CommandCode, int> m_drop_times;
-    std::map<CommandCode, int> m_counts;
+    AddressGranularity m_ag_;
+    ByteOrder m_order_;
+    std::uint8_t m_max_cto_;
+    std::uint16_t m_max_dto_;
+    bool m_optional_{true};
+    bool m_connected_{false};
+    bool m_short_upload_unsupported_{false};
+    Address m_mta_{0};
+    std::map<Address, std::uint8_t> m_memory_;
+    std::map<CommandCode, ErrorCode> m_errors_;
+    std::set<CommandCode> m_dropped_;
+    std::map<CommandCode, int> m_drop_times_;
+    std::map<CommandCode, int> m_counts_;
 };
 
 /// @brief Master + MockTransport + MockSlave 的组合脚手架
@@ -348,17 +350,17 @@ TEST(XcpMasterIntegration, FullHappyPathSequence) {
     EXPECT_EQ(rig.master->GetSessionState(), SessionState::Connected);
 
     const auto params = rig.master->GetSessionParameters();
-    EXPECT_EQ(params.m_connect_.m_max_cto_, 8U);
-    EXPECT_EQ(params.m_connect_.m_max_dto_, 8U);
-    EXPECT_TRUE(params.m_comm_mode_info_.has_value());
-    EXPECT_TRUE(params.m_status_.has_value());
-    EXPECT_TRUE(params.m_short_upload_available_);
+    EXPECT_EQ(params.connect.max_cto, 8U);
+    EXPECT_EQ(params.connect.max_dto, 8U);
+    EXPECT_TRUE(params.comm_mode_info.has_value());
+    EXPECT_TRUE(params.status.has_value());
+    EXPECT_TRUE(params.short_upload_available);
 
     const Bytes got = rig.master->ReadMemoryBytes(0x70012340, 0x00, 4);
     EXPECT_EQ(got, content);
 
     const GetStatusResponse status = rig.master->QueryStatus();
-    EXPECT_EQ(status.m_state_number_, 0x01U);
+    EXPECT_EQ(status.state_number, 0x01U);
 
     rig.master->Disconnect();
     EXPECT_FALSE(rig.master->IsConnected());
@@ -379,8 +381,7 @@ TEST(XcpMasterIntegration, OptionalUnavailableSkipsCommModeInfo) {
     EXPECT_TRUE(rig.master->IsConnected());
     EXPECT_EQ(rig.slave.Count(CommandCode::GetCommModeInfo), 0)
         << "OPTIONAL 位为 0 时不应查询 GET_COMM_MODE_INFO";
-    EXPECT_FALSE(
-        rig.master->GetSessionParameters().m_comm_mode_info_.has_value());
+    EXPECT_FALSE(rig.master->GetSessionParameters().comm_mode_info.has_value());
 }
 
 TEST(XcpMasterIntegration, DisconnectClosesTransport) {
@@ -413,8 +414,7 @@ TEST(XcpMasterIntegration, CommModeInfoUnknownDegradesAndConnectSucceeds) {
     rig.slave.SetError(CommandCode::GetCommModeInfo, ErrorCode::CmdUnknown);
     EXPECT_NO_THROW(rig.master->Connect());
     EXPECT_TRUE(rig.master->IsConnected());
-    EXPECT_FALSE(
-        rig.master->GetSessionParameters().m_comm_mode_info_.has_value());
+    EXPECT_FALSE(rig.master->GetSessionParameters().comm_mode_info.has_value());
 }
 
 TEST(XcpMasterIntegration, ShortUploadUnknownDegradesToChunkedUpload) {
@@ -427,7 +427,7 @@ TEST(XcpMasterIntegration, ShortUploadUnknownDegradesToChunkedUpload) {
     const Bytes got = rig.master->ReadMemoryBytes(0x8000, 0x00, 6);
 
     EXPECT_EQ(got, content);
-    EXPECT_FALSE(rig.master->GetSessionParameters().m_short_upload_available_);
+    EXPECT_FALSE(rig.master->GetSessionParameters().short_upload_available);
     EXPECT_GE(rig.slave.Count(CommandCode::SetMta), 1);
     EXPECT_GE(rig.slave.Count(CommandCode::Upload), 1);
 }

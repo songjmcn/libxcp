@@ -30,10 +30,10 @@ std::string protocolMessage(std::string_view prefix, CommandCode cmd,
     msg += toHex(static_cast<std::uint8_t>(cmd));
     msg += " 收到 ERR ";
     // 已识别的错误码用规范名称；未知码保留原始字节的十六进制表示（计划 §6.4）
-    msg += err.m_error_code_ ? std::string(ErrorCodeName(*err.m_error_code_))
-                             : toHex(err.m_raw_error_code_);
-    if (!err.m_additional_info_.empty()) {
-        msg += "（附加信息 " + std::to_string(err.m_additional_info_.size()) +
+    msg += err.error_code ? std::string(ErrorCodeName(*err.error_code))
+                          : toHex(err.raw_error_code);
+    if (!err.additional_info.empty()) {
+        msg += "（附加信息 " + std::to_string(err.additional_info.size()) +
                " 字节）";
     }
     return msg;
@@ -114,8 +114,8 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
                 notify_response = true;
             }
         } else if (const auto* err = std::get_if<NegativeResponse>(&*parsed)) {
-            if (m_in_recovery_ && err->m_error_code_ &&
-                *err->m_error_code_ == ErrorCode::CmdSynch) {
+            if (m_in_recovery_ && err->error_code &&
+                *err->error_code == ErrorCode::CmdSynch) {
                 // ERR_CMD_SYNCH 仅在 Recovery 中视为成功确认（计划 §6.2 第 1
                 // 条）
                 m_synch_confirmed_ = true;
@@ -128,8 +128,7 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
                 notify_response = true;
             }
         } else if (const auto* ev = std::get_if<EventPacket>(&*parsed)) {
-            if (ev->m_event_code_ &&
-                *ev->m_event_code_ == EventCode::CmdPending) {
+            if (ev->event_code && *ev->event_code == EventCode::CmdPending) {
                 // EV_CMD_PENDING：重启当前命令 Timer，不重发原命令（计划
                 // §6.3）。
                 // 只置标记并唤醒等待循环，不占用响应槽位；事件本身仍需上报。
@@ -233,13 +232,13 @@ ParsedPacket CommandExecutor::DispatchResponse(CommandCode cmd,
         // 顶替， 以免让上层误判为已识别的标准错误码。
         const std::string message =
             protocolMessage("Slave 返回负响应", cmd, *err);
-        if (!err->m_error_code_) {
-            throw XcpException(ErrorCategory::ProtocolError,
-                               message + "（未知错误码 " +
-                                   toHex(err->m_raw_error_code_) + "）",
-                               cmd, std::nullopt);
+        if (!err->error_code) {
+            throw XcpException(
+                ErrorCategory::ProtocolError,
+                message + "（未知错误码 " + toHex(err->raw_error_code) + "）",
+                cmd, std::nullopt);
         }
-        const ErrorCode code = *err->m_error_code_;
+        const ErrorCode code = *err->error_code;
 
         // GET_COMM_MODE_INFO / SHORT_UPLOAD 遇 ERR_CMD_UNKNOWN：按替代路径降级
         if (code == ErrorCode::CmdUnknown) {
@@ -278,11 +277,11 @@ void CommandExecutor::CheckResLength(CommandCode cmd,
                                      ElementCount elements) {
     const auto ag = m_session_.GetAddressGranularity();
     const auto expected = static_cast<std::size_t>(elements) * AgToBytes(ag);
-    if (res.m_data_.size() != expected) {
+    if (res.data.size() != expected) {
         throw XcpException(
             ErrorCategory::MalformedPacket,
             "命令 " + std::to_string(static_cast<int>(cmd)) + " 响应数据长度 " +
-                std::to_string(res.m_data_.size()) +
+                std::to_string(res.data.size()) +
                 " 不等于期望的 elements*AG = " + std::to_string(expected),
             cmd);
     }
@@ -317,8 +316,7 @@ void CommandExecutor::RestoreUploadMta() {
     }
 
     EnsureCodec(m_session_.GetByteOrder());
-    const Bytes encoded =
-        m_codec_->EncodeSetMta(mta->m_extension_, mta->m_address_);
+    const Bytes encoded = m_codec_->EncodeSetMta(mta->extension, mta->address);
     const auto response = PerformAttempt(CommandCode::SetMta, encoded);
     if (!response) {
         // SET_MTA 自身也失败：不再掩盖，交由随后的 UPLOAD 重试把错误暴露出来
@@ -458,27 +456,27 @@ ConnectResponse CommandExecutor::ExecuteConnect(std::uint8_t mode) {
     }
 
     const auto& res = std::get<PositiveResponse>(response);
-    if (res.m_data_.size() < 2U) {
+    if (res.data.size() < 2U) {
         m_session_.Fail("CONNECT 响应格式非法");
         throw detail::MakeMalformedPacket(
             "CONNECT 响应过短，无法读取 COMM_MODE_BASIC（RES 数据 " +
-            std::to_string(res.m_data_.size()) + " 字节）");
+            std::to_string(res.data.size()) + " 字节）");
     }
     // COMM_MODE_BASIC 是单字节字段，其位置与字节序无关；先据此确定 Session
     // 字节序， 再用该字节序解析 MAX_DTO 等多字节字段（设计文档 §17.2：MAX_DTO
     // 按 Session Byte Order）。
-    const std::uint8_t comm_mode_basic = res.m_data_[1];
+    const std::uint8_t comm_mode_basic = res.data[1];
     const ByteOrder negotiated_order = ((comm_mode_basic & 0x01U) != 0U)
                                            ? ByteOrder::Motorola
                                            : ByteOrder::Intel;
 
     ResponseParser connect_parser(negotiated_order);
-    auto connect = connect_parser.ParseConnectResponse(BytesView{res.m_data_});
+    auto connect = connect_parser.ParseConnectResponse(BytesView{res.data});
     if (!connect) {
         m_session_.Fail("CONNECT 响应格式非法");
         throw detail::MakeMalformedPacket(
             "CONNECT 响应长度或字段非法（RES 数据 " +
-            std::to_string(res.m_data_.size()) + " 字节）");
+            std::to_string(res.data.size()) + " 字节）");
     }
     try {
         m_session_.EstablishConnection(*connect);
@@ -487,7 +485,7 @@ ConnectResponse CommandExecutor::ExecuteConnect(std::uint8_t mode) {
         throw;
     }
     // 协商出的字节序立即生效
-    EnsureCodec(connect->m_byte_order_);
+    EnsureCodec(connect->byte_order);
     return *connect;
 }
 
@@ -516,10 +514,10 @@ GetStatusResponse CommandExecutor::ExecuteGetStatus() {
     const Bytes encoded = m_codec_->EncodeGetStatus();
     auto response = RunCommand(CommandCode::GetStatus, encoded);
     const auto& res = std::get<PositiveResponse>(response);
-    auto parsed = m_parser_->ParseGetStatusResponse(BytesView{res.m_data_});
+    auto parsed = m_parser_->ParseGetStatusResponse(BytesView{res.data});
     if (!parsed) {
         throw detail::MakeMalformedPacket("GET_STATUS 响应长度不足（RES 数据 " +
-                                          std::to_string(res.m_data_.size()) +
+                                          std::to_string(res.data.size()) +
                                           " 字节）");
     }
     m_session_.UpdateStatus(*parsed);
@@ -544,12 +542,11 @@ CommandExecutor::ExecuteGetCommModeInfo() {
     }
 
     const auto& res = std::get<PositiveResponse>(response);
-    auto parsed =
-        m_parser_->ParseGetCommModeInfoResponse(BytesView{res.m_data_});
+    auto parsed = m_parser_->ParseGetCommModeInfoResponse(BytesView{res.data});
     if (!parsed) {
         throw detail::MakeMalformedPacket(
             "GET_COMM_MODE_INFO 响应长度不足（RES 数据 " +
-            std::to_string(res.m_data_.size()) + " 字节）");
+            std::to_string(res.data.size()) + " 字节）");
     }
     m_session_.UpdateCommModeInfo(*parsed);
     return parsed;
@@ -573,7 +570,7 @@ Bytes CommandExecutor::ExecuteUpload(ElementCount number_of_elements) {
     auto response = RunCommand(CommandCode::Upload, encoded);
     auto& res = std::get<PositiveResponse>(response);
     CheckResLength(CommandCode::Upload, res, number_of_elements);
-    return std::move(res.m_data_);
+    return std::move(res.data);
 }
 
 Bytes CommandExecutor::ExecuteShortUpload(ElementCount number_of_elements,
@@ -585,7 +582,7 @@ Bytes CommandExecutor::ExecuteShortUpload(ElementCount number_of_elements,
     auto response = RunCommand(CommandCode::ShortUpload, encoded);
     auto& res = std::get<PositiveResponse>(response);
     CheckResLength(CommandCode::ShortUpload, res, number_of_elements);
-    return std::move(res.m_data_);
+    return std::move(res.data);
 }
 
 }  // namespace calmcar::xcp

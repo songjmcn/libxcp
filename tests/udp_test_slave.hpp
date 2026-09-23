@@ -29,19 +29,19 @@ namespace calmcar::xcp::test {
 /// @brief 故障注入配置（N 为响应序号，从 1 开始；0 表示不启用）
 struct FaultInjection {
     /// @brief 丢弃第 N 个响应（用于验证 Timeout/SYNCH 恢复）
-    std::optional<std::size_t> m_drop_response_n_;
+    std::optional<std::size_t> drop_response_n;
 
     /// @brief 延迟第 N 个响应（毫秒）
-    std::optional<std::pair<std::size_t, std::uint32_t>> m_delay_response_n_;
+    std::optional<std::pair<std::size_t, std::uint32_t>> delay_response_n;
 
     /// @brief 对第 N 个响应使用错误 LEN（验证畸形 Datagram 丢弃）
-    std::optional<std::size_t> m_corrupt_len_n_;
+    std::optional<std::size_t> corrupt_len_n;
 
     /// @brief 对第 N 个响应使用跳号 CTR（验证缺口诊断）
-    std::optional<std::size_t> m_jump_ctr_n_;
+    std::optional<std::size_t> jump_ctr_n;
 
     /// @brief 对第 N 个响应使用重复 CTR（验证重复丢弃）
-    std::optional<std::size_t> m_duplicate_ctr_n_;
+    std::optional<std::size_t> duplicate_ctr_n;
 
     /**
      * @brief 对第 N 个响应的 CTR 施加指定的有符号偏移（模 65536）
@@ -49,7 +49,7 @@ struct FaultInjection {
      *          0x8000"歧义 Frame —— 该差值无法由跳号（前向 +5）或重复（后向
      * -1） 注入得到，必须由发送侧直接指定偏移量。
      */
-    std::optional<std::pair<std::size_t, int>> m_ctr_offset_n_;
+    std::optional<std::pair<std::size_t, int>> ctr_offset_n;
 };
 
 /**

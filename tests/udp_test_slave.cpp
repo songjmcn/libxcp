@@ -271,7 +271,7 @@ void UdpTestSlave::ReceiveLoop() {
             continue;  // 畸形 Datagram：测试 Slave 直接忽略
         }
         for (const auto& frame : *frames) {
-            HandleCommand(frame.m_xcp_packet_, src_ip, src_port);
+            HandleCommand(frame.xcp_packet, src_ip, src_port);
         }
     }
 }
@@ -466,18 +466,16 @@ void UdpTestSlave::SendResponseTo(BytesView xcp_packet, const std::string& ip,
         fault = m_fault_;
         const std::size_t n = m_response_count_;
 
-        drop = fault.m_drop_response_n_ && *fault.m_drop_response_n_ == n;
-        corrupt_len = fault.m_corrupt_len_n_ && *fault.m_corrupt_len_n_ == n;
-        jump_ctr = fault.m_jump_ctr_n_ && *fault.m_jump_ctr_n_ == n;
-        duplicate_ctr =
-            fault.m_duplicate_ctr_n_ && *fault.m_duplicate_ctr_n_ == n;
-        if (fault.m_delay_response_n_ &&
-            fault.m_delay_response_n_->first == n) {
-            delay_ms = fault.m_delay_response_n_->second;
+        drop = fault.drop_response_n && *fault.drop_response_n == n;
+        corrupt_len = fault.corrupt_len_n && *fault.corrupt_len_n == n;
+        jump_ctr = fault.jump_ctr_n && *fault.jump_ctr_n == n;
+        duplicate_ctr = fault.duplicate_ctr_n && *fault.duplicate_ctr_n == n;
+        if (fault.delay_response_n && fault.delay_response_n->first == n) {
+            delay_ms = fault.delay_response_n->second;
         }
-        if (fault.m_ctr_offset_n_ && fault.m_ctr_offset_n_->first == n) {
+        if (fault.ctr_offset_n && fault.ctr_offset_n->first == n) {
             // 精确偏移：按模 65536 施加有符号增量，可构造任意 CTR 差值（D5）
-            ctr_offset = fault.m_ctr_offset_n_->second;
+            ctr_offset = fault.ctr_offset_n->second;
         }
         if (duplicate_ctr) {
             // 重复 CTR：本响应复用上一个响应的 CTR 值（计数器本身仍已递增，
@@ -514,7 +512,7 @@ void UdpTestSlave::SendResponseTo(BytesView xcp_packet, const std::string& ip,
         std::memcpy(datagram.data() + kUdpHeaderSize, xcp_packet.data(),
                     xcp_packet.size());
     } else {
-        datagram = EncodeUdpFrame(xcp_packet, ctr).m_data_;
+        datagram = EncodeUdpFrame(xcp_packet, ctr).data;
     }
 
     sockaddr_in dst{};
@@ -582,12 +580,12 @@ void UdpTestSlave::SendPackedFrames(std::span<const BytesView> xcp_packets) {
             const auto ctr = m_send_ctr_;
             ++m_send_ctr_;
             const auto frame = EncodeUdpFrame(packet, ctr);
-            if (datagram.size() + frame.m_data_.size() > kUdpMaxDatagramSize) {
+            if (datagram.size() + frame.data.size() > kUdpMaxDatagramSize) {
                 throw detail::MakeInvalidArgument(
                     "SendPackedFrames: Datagram 总长超过上限");
             }
-            datagram.insert(datagram.end(), frame.m_data_.begin(),
-                            frame.m_data_.end());
+            datagram.insert(datagram.end(), frame.data.begin(),
+                            frame.data.end());
         }
     }
 

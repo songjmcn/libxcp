@@ -33,17 +33,17 @@ Bytes BytesOf(std::initializer_list<std::uint8_t> init) {
 /// terminate）
 class ThreadJoiner {
 public:
-    explicit ThreadJoiner(std::thread& thread) : m_thread(thread) {}
+    explicit ThreadJoiner(std::thread& thread) : m_thread_(thread) {}
     ~ThreadJoiner() {
-        if (m_thread.joinable()) {
-            m_thread.join();
+        if (m_thread_.joinable()) {
+            m_thread_.join();
         }
     }
     ThreadJoiner(const ThreadJoiner&) = delete;
     ThreadJoiner& operator=(const ThreadJoiner&) = delete;
 
 private:
-    std::thread& m_thread;
+    std::thread& m_thread_;
 };
 
 /// @brief 记录 IEventListener 回调，供断言使用
@@ -51,33 +51,33 @@ class RecordingEvents : public IEventListener {
 public:
     void OnEvent(const EventPacket& event) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        m_events.push_back(event);
+        m_events_.push_back(event);
     }
     void OnService(const ServicePacket& service) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        m_services.push_back(service);
+        m_services_.push_back(service);
     }
     void OnDto(const DtoPacket& dto) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        m_dtos.push_back(dto);
+        m_dtos_.push_back(dto);
     }
 
     [[nodiscard]] std::size_t eventCount() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_events.size();
+        return m_events_.size();
     }
     [[nodiscard]] std::size_t serviceCount() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_services.size();
+        return m_services_.size();
     }
     [[nodiscard]] std::size_t dtoCount() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_dtos.size();
+        return m_dtos_.size();
     }
     [[nodiscard]] bool hasEvent(EventCode code) const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        for (const auto& e : m_events) {
-            if (e.m_event_code_ && *e.m_event_code_ == code) {
+        for (const auto& e : m_events_) {
+            if (e.event_code && *e.event_code == code) {
                 return true;
             }
         }
@@ -86,9 +86,9 @@ public:
 
 private:
     mutable std::mutex m_mutex_;
-    std::vector<EventPacket> m_events;
-    std::vector<ServicePacket> m_services;
-    std::vector<DtoPacket> m_dtos;
+    std::vector<EventPacket> m_events_;
+    std::vector<ServicePacket> m_services_;
+    std::vector<DtoPacket> m_dtos_;
 };
 
 /// @brief 组装 CONNECT 响应报文（避免与 calmcar::xcp::ConnectResponse
@@ -137,32 +137,32 @@ class ScriptedSlave {
 public:
     /// @brief 设置某个命令的持续响应
     void SetResponse(CommandCode cmd, Bytes response) {
-        m_responses[cmd] = std::move(response);
+        m_responses_[cmd] = std::move(response);
     }
 
     /// @brief 设置某个命令的一次性响应（消费后回退到持续响应）
     void SetOnceResponse(CommandCode cmd, Bytes response) {
-        m_once[cmd] = std::move(response);
+        m_once_[cmd] = std::move(response);
     }
 
     /// @brief 令某个命令的第 n 次调用（1 起）不产生响应
-    void DropNthCall(CommandCode cmd, std::size_t n) { m_drop[cmd] = n; }
+    void DropNthCall(CommandCode cmd, std::size_t n) { m_drop_[cmd] = n; }
 
     /// @brief 令某个命令的前 n 次调用都不产生响应
     void DropFirstCalls(CommandCode cmd, std::size_t n) {
-        m_drop_first[cmd] = n;
+        m_drop_first_[cmd] = n;
     }
 
     [[nodiscard]] int Count(CommandCode cmd) const {
-        const auto it = m_counts.find(cmd);
-        return it == m_counts.end() ? 0 : it->second;
+        const auto it = m_counts_.find(cmd);
+        return it == m_counts_.end() ? 0 : it->second;
     }
     [[nodiscard]] const std::vector<CommandCode>& Order() const {
-        return m_order;
+        return m_order_;
     }
     void ResetCounts() {
-        m_counts.clear();
-        m_order.clear();
+        m_counts_.clear();
+        m_order_.clear();
     }
 
     Bytes operator()(BytesView packet) {
@@ -170,27 +170,27 @@ public:
             return {};
         }
         const auto cmd = static_cast<CommandCode>(packet[0]);
-        ++m_counts[cmd];
-        m_order.push_back(cmd);
+        ++m_counts_[cmd];
+        m_order_.push_back(cmd);
 
-        const auto drop_it = m_drop.find(cmd);
-        if (drop_it != m_drop.end() &&
-            static_cast<std::size_t>(m_counts[cmd]) == drop_it->second) {
+        const auto drop_it = m_drop_.find(cmd);
+        if (drop_it != m_drop_.end() &&
+            static_cast<std::size_t>(m_counts_[cmd]) == drop_it->second) {
             return {};  // 该次调用不回响应
         }
-        const auto first_it = m_drop_first.find(cmd);
-        if (first_it != m_drop_first.end() &&
-            static_cast<std::size_t>(m_counts[cmd]) <= first_it->second) {
+        const auto first_it = m_drop_first_.find(cmd);
+        if (first_it != m_drop_first_.end() &&
+            static_cast<std::size_t>(m_counts_[cmd]) <= first_it->second) {
             return {};
         }
 
-        const auto once_it = m_once.find(cmd);
-        if (once_it != m_once.end() &&
-            static_cast<std::size_t>(m_counts[cmd]) == 1) {
+        const auto once_it = m_once_.find(cmd);
+        if (once_it != m_once_.end() &&
+            static_cast<std::size_t>(m_counts_[cmd]) == 1) {
             return once_it->second;
         }
-        const auto it = m_responses.find(cmd);
-        if (it != m_responses.end()) {
+        const auto it = m_responses_.find(cmd);
+        if (it != m_responses_.end()) {
             return it->second;
         }
         // 默认：Positive Response
@@ -198,12 +198,12 @@ public:
     }
 
 private:
-    std::map<CommandCode, Bytes> m_responses;
-    std::map<CommandCode, Bytes> m_once;
-    std::map<CommandCode, std::size_t> m_drop;
-    std::map<CommandCode, std::size_t> m_drop_first;
-    std::map<CommandCode, int> m_counts;
-    std::vector<CommandCode> m_order;
+    std::map<CommandCode, Bytes> m_responses_;
+    std::map<CommandCode, Bytes> m_once_;
+    std::map<CommandCode, std::size_t> m_drop_;
+    std::map<CommandCode, std::size_t> m_drop_first_;
+    std::map<CommandCode, int> m_counts_;
+    std::vector<CommandCode> m_order_;
 };
 
 /// @brief 构造短超时的执行器脚手架
@@ -356,7 +356,7 @@ TEST(RecoveryTimeout, ZeroRetriesFailsImmediately) {
 
     try {
         (void)f.executor.ExecuteUpload(1);
-        FAIL() << "maxRetries=0 时应立即失败";
+        FAIL() << "max_retries=0 时应立即失败";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::RecoveryFailed);
     }
@@ -462,8 +462,8 @@ TEST(EventDispatch, AsyncPacketsDoNotDisturbResponseMatching) {
     });
 
     const GetStatusResponse status = f.executor.ExecuteGetStatus();
-    EXPECT_EQ(status.m_state_number_, 0x02U);
-    EXPECT_EQ(status.m_session_config_id_, 0x0009U);
+    EXPECT_EQ(status.state_number, 0x02U);
+    EXPECT_EQ(status.session_config_id, 0x0009U);
     EXPECT_TRUE(f.events.hasEvent(EventCode::ResumeMode));
     EXPECT_EQ(f.events.serviceCount(), 1U);
     EXPECT_EQ(f.events.dtoCount(), 1U) << "DTO 本阶段仅识别并上报";
@@ -542,7 +542,7 @@ TEST(ErrorDispatch, ErrAdditionalInfoPreserved) {
     ASSERT_TRUE(parsed.has_value());
     const auto* err = std::get_if<NegativeResponse>(&*parsed);
     ASSERT_NE(err, nullptr);
-    EXPECT_EQ(err->m_additional_info_, BytesOf({0x01, 0x02, 0x03}));
+    EXPECT_EQ(err->additional_info, BytesOf({0x01, 0x02, 0x03}));
 }
 
 // --------------------------------------------------------------------------
@@ -565,11 +565,11 @@ TEST(Degradation, GetCommModeInfoSuccessUpdatesSession) {
     f.Connect();
     const auto info = f.executor.ExecuteGetCommModeInfo();
     ASSERT_TRUE(info.has_value());
-    EXPECT_EQ(info->m_max_bs_, 0x04U);
-    EXPECT_EQ(info->m_min_st_, 0x02U);
-    EXPECT_EQ(info->m_driver_version_major_, 1U);
-    EXPECT_EQ(info->m_driver_version_minor_, 3U);
-    EXPECT_TRUE(f.session.Parameters().m_comm_mode_info_.has_value());
+    EXPECT_EQ(info->max_bs, 0x04U);
+    EXPECT_EQ(info->min_st, 0x02U);
+    EXPECT_EQ(info->driver_version_major, 1U);
+    EXPECT_EQ(info->driver_version_minor, 3U);
+    EXPECT_TRUE(f.session.Parameters().comm_mode_info.has_value());
 }
 
 TEST(Degradation, ShortUploadUnknownMarksSessionDegraded) {
@@ -580,7 +580,7 @@ TEST(Degradation, ShortUploadUnknownMarksSessionDegraded) {
 
     EXPECT_THROW((void)f.executor.ExecuteShortUpload(1, 0x00, 0x1000),
                  XcpException);
-    EXPECT_FALSE(f.session.Parameters().m_short_upload_available_)
+    EXPECT_FALSE(f.session.Parameters().short_upload_available)
         << "ERR_CMD_UNKNOWN 应标记 SHORT_UPLOAD 不可用";
 }
 
@@ -629,7 +629,7 @@ TEST(ExecutorGuards, ResponseSlotOccupiedDoesNotCorruptNextResponse) {
     });
 
     const GetStatusResponse status = f.executor.ExecuteGetStatus();
-    EXPECT_EQ(status.m_state_number_, 0x11U) << "多余 RES 不得覆盖已收到的响应";
+    EXPECT_EQ(status.state_number, 0x11U) << "多余 RES 不得覆盖已收到的响应";
 }
 
 TEST(ExecutorGuards, CommandsRejectedAfterTransportClosed) {
@@ -658,10 +658,10 @@ TEST(ConnectFlow, ConnectParsesNegotiatedParameters) {
                             0x20U, 0x0040U));
     const ConnectResponse connect = f.executor.ExecuteConnect(0x00);
 
-    EXPECT_EQ(connect.m_address_granularity_, AddressGranularity::DWord);
-    EXPECT_EQ(connect.m_byte_order_, ByteOrder::Motorola);
-    EXPECT_EQ(connect.m_max_cto_, 0x20U);
-    EXPECT_EQ(connect.m_max_dto_, 0x0040U);
+    EXPECT_EQ(connect.address_granularity, AddressGranularity::DWord);
+    EXPECT_EQ(connect.byte_order, ByteOrder::Motorola);
+    EXPECT_EQ(connect.max_cto, 0x20U);
+    EXPECT_EQ(connect.max_dto, 0x0040U);
     EXPECT_EQ(f.session.State(), SessionState::Connected);
     EXPECT_EQ(f.session.GetByteOrder(), ByteOrder::Motorola);
 }
@@ -738,10 +738,10 @@ TEST(ExecutorGuards, ConcurrentCommandRejectedWhilePending) {
 
     // 手工把 Session 置为 Connected 并占用 Pending
     ConnectResponse negotiated;
-    negotiated.m_max_cto_ = 0x08U;
-    negotiated.m_max_dto_ = 0x0008U;
-    negotiated.m_address_granularity_ = AddressGranularity::Byte;
-    negotiated.m_byte_order_ = ByteOrder::Intel;
+    negotiated.max_cto = 0x08U;
+    negotiated.max_dto = 0x0008U;
+    negotiated.address_granularity = AddressGranularity::Byte;
+    negotiated.byte_order = ByteOrder::Intel;
     session.BeginConnecting();
     session.EstablishConnection(negotiated);
     session.MarkCommandSent(CommandCode::Upload);

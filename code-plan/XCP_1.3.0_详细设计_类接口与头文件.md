@@ -163,7 +163,7 @@ namespace calmcar::xcp::detail {
 
 | 要点 | 说明 |
 |---|---|
-| 为什么可以只看关键字 | 实测产品代码（`include/` + `src/`）的 struct 中**只有 `XcpAddress40` 一个带成员函数**（`Advance()`，见 `protocol_types.hpp:292`；同文件 `ConnectResponse` L239-248、`GetStatusResponse` L255-263、`GetCommModeInfoResponse` L270-275 均无成员函数）；`UdpFrame`、`UdpHeader`、`UdpFrameView` 的编解码是**自由函数**（`EncodeUdpFrame` / `DecodeUdpDatagram`，`udp_header_codec.hpp`），不是成员函数。`tests/` 里的 `Fixture`（`recovery_test.cpp:210`）、`Harness`（`memory_access_test.cpp:260`）、`Rig`（`xcp_master_integration_test.cpp:316`）确实也带成员函数，但其成员**本就是裸 `snake_case`**，按关键字判定与按语义判定结果一致。故两种判法在本项目结论相同，而只有前者可被自动校验——后者会永久留下需要人工判断的分歧面 |
+| 为什么可以只看关键字 | 实测产品代码（`include/` + `src/`）的 struct 中**只有 `XcpAddress40` 一个带成员函数**（`XcpAddress40::Advance()`，`protocol_types.hpp`；同文件的 `ConnectResponse`、`GetStatusResponse`、`GetCommModeInfoResponse`、`SessionParameters` 均无成员函数）；`UdpFrame`、`UdpHeader`、`UdpFrameView` 的编解码是**自由函数**（`EncodeUdpFrame` / `DecodeUdpDatagram`，`udp_header_codec.hpp`），不是成员函数。`tests/` 里的 `Fixture`（`recovery_test.cpp`）、`Harness`（`memory_access_test.cpp`）、`Rig`（`xcp_master_integration_test.cpp`）确实也带成员函数，但其成员**本就是裸 `snake_case`**，按关键字判定与按语义判定结果一致。故两种判法在本项目结论相同，而只有前者可被自动校验——后者会永久留下需要人工判断的分歧面 |
 | 有意接受的后果 | `XcpAddress40` 的成员函数照常 public，其字段仍按 struct 规则用裸名。C++ 中 `struct` 与 `class` 的差别本就是默认访问级别，以关键字作判据与语言语义一致 |
 | `class` 侧不变 | 所有 `class`（接口类 `IXcpTransport`、产品类 `UdpTransport`/`CommandExecutor`/`Session`/`XcpException`/`MemoryAccess`/`XcpMaster`/`CommandCodec`/`ResponseParser`，以及测试类 `MockTransport`/`UdpTestSlave`/`FakeSlave`/`MockXcpSlave`/`EventRecorder`/`ScriptedSlave`/`RecordingEvents`/`TransportObserver`）成员一律 `m_<snake>_` |
 | 唯一豁免 | **GoogleTest 夹具类的成员**用 `<snake>_`（仅尾下划线），例 `slave_`、`ep_`、`ctr_`、`res_`。理由：夹具成员在每个 `TEST_F` 体内被大量直接引用，`m_` 前缀显著降低可读性，而尾下划线已足以与局部变量区分。**该豁免只覆盖夹具类本身**，夹具内外定义在 `tests/` 的 helper class（如 `FakeSlave`、`MockXcpSlave`、`EventRecorder`）**不享有豁免**，仍须 `m_<snake>_` |
@@ -196,51 +196,102 @@ namespace calmcar::xcp::detail {
 > ⚠️ **工具可得性说明（重要）**：本批次使用的审计脚本位于工作副本 `scripts/`，
 > 而 `.gitignore` 已包含 `scripts` 条目，故**这些脚本不入库**——新克隆的仓库中它们不存在。
 > 本节及 §2.2.1.3 给出的计数结论（文档侧 struct 64 字段全裸名、`m_<snake>_` 归零、
-> class 侧 59 字段全 `m_<snake>_`）是**当次本地实测结果**，他人复核需按下列要点重建工具，
-> 或改为逐条人工核对（代码侧锚点为各 struct 的**声明行**：
-> `protocol_types.hpp` — `ConnectResponse:238`、`GetStatusResponse:254`、
-> `GetCommModeInfoResponse:269`、`XcpAddress40:281`、`SessionParameters:303`；
-> `response_parser.hpp` — `PositiveResponse:24`、`NegativeResponse:30`、`EventPacket:40`、
-> `ServicePacket:50`、`DtoPacket:56`；
-> `udp_header_codec.hpp` — `UdpFrame:41`、`UdpHeader:46`、`UdpFrameView:56`；
-> `udp_transport_config.hpp` — `UdpTransportConfig:26`）。
+> class 侧 66 字段全 `m_<snake>_`）是**当次本地实测结果**，他人复核需按下列要点重建工具，
+> 或改为逐条人工核对（**按符号名定位，不用行号**——行号会随每次格式化漂移，
+> 本项目已在批次 5 实测到 4 处锚点各偏移 1 行、2 处偏移 2~4 行）：
+> `protocol_types.hpp` 的 `ConnectResponse` / `GetStatusResponse` / `GetCommModeInfoResponse` /
+> `XcpAddress40` / `SessionParameters`；`response_parser.hpp` 的 `PositiveResponse` /
+> `NegativeResponse` / `EventPacket` / `ServicePacket` / `DtoPacket`；
+> `udp_header_codec.hpp` 的 `UdpFrame` / `UdpHeader` / `UdpFrameView`；
+> `udp_transport_config.hpp` 的 `UdpTransportConfig`）。
 >
 > | 本地脚本（不入库） | 用途 | 关键设计要求 |
 > |---|---|---|
-> | `scripts/tools_audit_member_naming.py` | struct/class 成员风格分布 | 作用域栈解析 + **5 条已知正例自检**，自检不过则结论作废 |
+> | `scripts/tools_audit_member_naming.py` | struct/class 成员风格分布 | 作用域栈解析；**自检 A：9 条合成用例**（覆盖访问说明符粘连、预处理行粘连、`decltype` 类型、括号内默认参数、`const`/`override` 尾限定符、位域等正反例）+ **自检 B：语料锚点**；任一失败即 exit 1，结论作废 |
 > | `scripts/tools_audit_rename_churn.py` | 改名引用面 / 跨类同名 / 新名撞名 | 一律由扫描器供数据，禁止手写字段清单 |
 > | `scripts/tools_audit_diff.py` | 文档 vs 代码字段集合比对 | 按 `m_` 前后缀归一后比较，区分"仅命名差异"与"字段集合差异" |
+> | `scripts/verify_rename_baseline.py` | **改动前快照 vs 现状逐条映射核对** | 必须自带**灵敏度自测**（注入 class 误改裸名 / struct 漏改 / 成员消失 / 新旧名并存 / 凭空新增，五种错误都要报出）；改名类改动的**最终裁判是它，不是改后重跑检测器**——因为改名脚本与检测器同源，盲区会同时污染两者 |
 
 #### 2.2.1.3 落地状态核对（批次 4）
 
 函数命名沿用批次 3 结论（已统一）；成员变量自批次 4 起按 **struct / class 分流**重新核对，
-核对手段为可复跑扫描器 `tools_audit_member_naming.py`（内置 5 条已知正例自检；
-该脚本按 §2.2.1.2 末"工具可得性说明"**不入库**，复核时需自备）。
+核对手段为可复跑扫描器 `tools_audit_member_naming.py`（内置"合成用例 + 语料锚点"两级自检，
+任一失败即退出码 1、结论作废；该脚本按 §2.2.1.2 末"工具可得性说明"**不入库**，复核时需自备），
+并以 `verify_rename_baseline.py` 对**改动前快照**逐条核对映射（见下方"检测器修正"）。
 
 **设计文档侧（本文件内 ```cpp 原型）**
 
 | 对象 | 数量 | 状态 |
 |---|---|---|
 | `struct` 成员 | 17 个 struct / 64 字段 | ✅ 全部裸 `snake_case`（批次 4：§3.9、§3.10、§3.11、§6、§12、§15.2 共 41 字段由 `m_<snake>_` 转入；§7、§10 的 21 字段在批次 4 前置改动中已完成；另补入 `raw_error_code` / `raw_event_code` 2 字段使 §10 与代码字段集合一致） |
-| `class` 成员 | 8 个 class / 59 字段 | ✅ 全部 `m_<snake>_`，未受本轮改动影响 |
-| 散文/表格/示例中的字段引用 | §7 L883、§16.4、§18.2 D5、§18.3、附录 B.1 | ✅ 已同步为裸名（旧名残留会直接与新规则矛盾） |
+| `class` 成员 | 10 个 class / 66 字段 | ✅ 全部 `m_<snake>_`（修正扫描器盲区后由 59 增至 66：`CommandCodec`、`ResponseParser` 各 1 条及 `XcpException`/`Session`/`XcpMaster`/`MemoryAccess` 各 1 条首成员曾被粘连吞掉） |
+| 散文/表格/示例中的字段引用 | §7 配置项注释、§16.4 关闭语义、§18.2 D5、§18.3、附录 B.1 | ✅ 已同步为裸名（旧名残留会直接与新规则矛盾） |
 | `IEventListener*` 构造参数 | §12、§14 | ✅ 参数本就 snake_case，合规（扫描器曾把多行参数续行误判为成员，已排除） |
 
-**代码侧（`include/` `src/` `tests/`，批次 4 未改动，如实登记为待办）**
+**代码侧（`include/` `src/` `tests/`，批次 5 实施完毕）**
 
 | 类别 | 范围 | 数量 | 状态 |
 |---|---|---|---|
-| A 冲突 | §7 / §10 已改裸名的 6 个 struct：`UdpTransportConfig`、`PositiveResponse`、`NegativeResponse`、`EventPacket`、`ServicePacket`、`DtoPacket` | 18 字段 / 189 处引用 | ❌ **代码仍是 `m_<snake>_`，与文档当前处于矛盾状态**，待批次实施 |
-| B 待办 | 其余 9 个 struct：`ConnectResponse`、`GetStatusResponse`、`GetCommModeInfoResponse`、`SessionParameters`、`XcpAddress40`、`UdpHeader`、`UdpFrame`、`UdpFrameView`、`FaultInjection` | 39 字段 / 377 处引用 | ❌ 文档已合规，代码待改 |
-| class 合规 | 产品 class：`CommandExecutor` 17、`UdpTransport` 10、`Session` 4、`XcpException` 4、`XcpMaster` 3、`MemoryAccess` 1 | 39 字段 | ✅ `m_<snake>_` |
-| class 待办 | 测试 helper class 成员有 `m_` 前缀但**缺尾下划线**：`FakeSlave` 13、`MockXcpSlave` 13、`EventRecorder` 6、`ScriptedSlave` 5、`TransportObserver` 4、`RecordingEvents` 3 | 44 字段 | ❌ 既不合 class 规则也不合 struct 裸名，属批次 1 大小写不敏感替换脚本的残留，**独立一批处理** |
-| 夹具豁免 | `UdpTestSlaveCommands` 的 `slave_`、`ep_`、`ctr_`、`res_` | 4 字段 | ✅ 按 §2.2.1.1 唯一豁免合规 |
+| A 冲突（原） | `UdpTransportConfig`、`PositiveResponse`、`NegativeResponse`、`EventPacket`、`ServicePacket`、`DtoPacket` | 18 字段 / 189 处引用 | ✅ 已转裸 `snake_case` |
+| B 待办（原） | `ConnectResponse`、`GetStatusResponse`、`GetCommModeInfoResponse`、`SessionParameters`、`XcpAddress40`、`UdpHeader`、`UdpFrame`、`UdpFrameView`、`FaultInjection` | 39 字段 / 377 处引用 | ✅ 已转裸 `snake_case` |
+| class 合规 | 产品 class：`CommandExecutor` 17、`UdpTransport` 10、`Session` 5、`XcpException` 5、`XcpMaster` 4、`MemoryAccess` 2、`CommandCodec` 1、`ResponseParser` 1 | 45 字段 | ✅ 全程保持 `m_<snake>_`（`CommandCodec`/`ResponseParser` 各 1 条曾被误改成裸名，见下方"检测器修正"，已回退） |
+| class 修复 | 测试 helper class 补尾下划线：`FakeSlave` 13、`MockXcpSlave` 13、`ScriptedSlave` 6、`EventRecorder` 4×**两个同名类**、`TransportObserver` 4、`RecordingEvents` 3、`ThreadJoiner` 1×**两个同名类** | **47 条声明 / 44 个唯一 (类, 成员) 组合** | ✅ 已全部补为 `m_<snake>_`；差额 3 条来自跨文件同名类（`ThreadJoiner`、`EventRecorder` 的两个成员各出现两次） |
+| 此前不可见的 class 成员 | `RawSender` 4、`RawEndpoint` 3、`UdpTestSlave` 16、`RecordingListener` 6 | 29 字段 | ✅ 本就合规，但**旧扫描器因盲区 ①③ 整条漏记**，修正后才进入统计 |
+| 夹具豁免 | `UdpTestSlaveCommands` 的 `slave_`、`ep_`、`ctr_`、`res_` | 4 字段 | ✅ 按 §2.2.1.1 保持豁免，**未改** |
+| 静态成员 | `WinsockSession` 的 `s_<snake>_` | 4 | ✅ 合规则未动（旧扫描器漏记 1 条，故先前记为 3） |
 
-> ⚠️ 实施 A/B 时的硬性安全约束：**禁止全局文本替换**。实测 `m_error_code_` 同时是
-> `struct NegativeResponse`（要转裸名）与 `class XcpException`（必须保持 `m_`）的成员；
-> `m_data_` 同时属于 A 类的 3 个 struct 与 B 类的 `UdpFrame`。按全文替换会静默改掉
-> class 成员，而测试仍然全绿。必须按 struct 作用域精确改，改完复跑扫描器核对分类计数。
-> 统计与冲突检测用本地脚本 `tools_audit_rename_churn.py`（不入库，见 §2.2.1.2 末说明）。
+代码侧最终风格分布（**改前基线 230 条 = 改后 230 条**，成员总数不变，即改名过程无成员被吞掉或新增）：
+
+```
+                     改前(快照基线)   改后
+class  m_snake_            85    ->    132   （补尾下划线 +47）
+class  s_snake_             4    ->      4   （静态成员，合规未动）
+class  snake_               4    ->      4   （夹具成员，§2.2.1.1 唯一豁免）
+struct bare_snake          30    ->     90   （转裸名 +60）
+struct m_snake_            60    ->      0   ← 归零
+class  m_snake_noTail      47    ->      0   ← 归零
+class  bare_snake           0    ->      0   （见下方"检测器修正"，曾一度为 2）
+```
+
+> ⚠️ **检测器自身的修正（本批次最重要的教训）**：上表的"改前/改后"是用**修正后**的扫描器
+> 重测的。修正前的扫描器只报 207 条，**漏记 23 条成员声明**，源于四个盲区：
+> ① `private:` / `public:` 后的**首条**成员声明与访问说明符粘连而被整条丢弃；
+> ② `#if defined(_WIN32)` 的圆括号粘进紧随其后的声明，被误判为函数；
+> ③ `decltype(::socket(...)) m_handle_{}` 这类"类型含括号"的数据成员被当成函数；
+> ④ `#endif` 会产生一个名叫 `endif` 的假成员（多报）。
+>
+> 致命之处在于：**改名脚本与审计脚本共用同一个解析器**。因盲区 ① 从未进入"该标识符的全部持有者"
+> 判定的 `class CommandCodec::m_byte_order_` 与 `class ResponseParser::m_byte_order_`，
+> 被误判为"只属于待改名 struct"而连带改成裸名——声明与引用同步改掉，**编译器完全发现不了**。
+> 修正办法不是只重跑改后的检测器，而是**引入改动前快照做基线**，逐条核对每个成员的前后映射
+> （`verify_rename_baseline.py`，含 6 项灵敏度自测：注入"class 被改成裸名 / struct 漏改 /
+> 本应保留的成员消失 / 新旧名并存 / 凭空新增"五种错误都必须被报出）。
+> 该核对现已全绿：222 个唯一 (类别, 类型, 成员) 三元组，**每一条改动都落在规则允许的四种映射之内**。
+
+文档↔代码字段一致性（`tools_audit_diff.py`）：**16 / 16 个两侧同名 struct 字段名完全一致，仅命名待改 0，字段集合真实差异 0**。`CommandResult` 仍仅存在于文档（§12 未实现）。
+
+**验证**：Release 构建 exit 0 且无 error / 无 warning C；`ctest` **253/253 通过**（1 项按设计跳过）；`clang-format --dry-run --Werror` 全部 37 个源文件 **0 不合规**（改名改变行宽后曾致 15 个文件不合规，已用 `clang-format -i` 修复并重新构建 + 复测）；`verify_rename_baseline.py` 灵敏度自测 **6/6 通过**，222 个 (类别, 类型, 成员) 三元组**全部落在规则允许的四种映射之内**，违规成员 **0**。
+
+> ⚠️ 本批次实际执行的**安全约束**（后续同类改动仍须遵守）：**禁止按字段名全局文本替换**。
+> 实施时按"标识符的全部持有者是否都属于待改名 struct"分流：57 个标识符中判定 56 个 SAFE。
+> **但该判定当时只有 55 个成立** —— `m_byte_order_` 同时是 `struct ConnectResponse`（待转裸名）与
+> `class CommandCodec` / `class ResponseParser`（必须保持 `m_`）的成员，本应是第 2 个 CONFLICT；
+> 因后两者的声明正好是 `private:` 后的首条而被当时共用的解析器漏记，"全部持有者"检查**空洞地通过**，
+> 于是 class 侧被连带改成裸名。详见下方"检测器修正"。
+> 由此得到一条更强的约束：**"全部持有者"判定的可信度等于解析器的完备度，而改名脚本与审计脚本
+> 一旦同源，盲区会同时污染两者**；因此改名类改动的最终裁判必须是**改动前基线逐条映射核对**
+> （`verify_rename_baseline.py`），而不是改后重跑同一个检测器。
+> 当时被正确识别的 CONFLICT 是 `m_error_code_` —— 同时是 `struct NegativeResponse`（转裸名）与
+> `class XcpException`（必须保持 `m_`）的成员。该标识符在 `include/`+`src/`+`tests/` 共 **13 处**出现，
+> 逐点判定接收者类型后改掉 `NegativeResponse` 侧 **10 处**（分布在 9 行，其中
+> `protocolMessage()` 内一行两处），保留 `XcpException` 侧 **3 处**
+> （`xcp_error.hpp` 成员声明、`xcp_error.cpp` 构造初始化列表、`XcpException::GetErrorCode()`）。
+> `m_data_` 虽分属 4 个 struct，但 4 者都是待改名 struct，故属 SAFE。
+> 另需一道防呆：确认改名后**同一 struct 内不出现重名字段**（曾检出 `max_cto`/`max_dto`
+> 与测试侧 `AgCase` 既有裸名字段趋同，因不同作用域而无害，但必须显式确认而非默认放行）。
+> 统计、冲突检测与执行脚本均为本地工具（`tools_audit_rename_churn.py`、
+> `rename_struct_fields.py`、`rename_class_members.py`，及收尾用的 `fix_batch5_regressions.py`；
+> 三个一次性改写脚本已随改动完成删除），按 §2.2.1.2 末说明**不入库**。
 
 
 
@@ -2430,11 +2481,15 @@ master.Connect();
 > 仍未闭环的是**外部互操作验证**：所有端到端测试均为自有 Master ↔ 自有 UdpTestSlave，
 > 未与第三方 ECU / CANape 抓包对照（计划文档 §11.4、验收标准 15）。
 >
-> **口径变更（批次 4）**：早先"与本文档存在差异处一律以代码为准"的口径**已收窄**。
-> 现在的规则是——
-> - **命名风格**（§2.2.1）：以**本文档为准**，代码分批跟进；当前代码与文档的差距已量化登记
->   在 §2.2.1.3 的"代码侧"表中（A 冲突 18 字段 / 189 处，B 待办 39 字段 / 377 处，
->   class 尾下划线缺失 44 处），这些是**已知的待办**，不是"以代码为准"的既成合规；
+> **口径变更（批次 4 提出，批次 5 完成闭环）**：早先"与本文档存在差异处一律以代码为准"的口径
+> **已收窄**为二分——
+> - **命名风格**（§2.2.1 的 struct / class 分流）：以**本文档为准**，代码分批跟进。
+>   该跟进**已于批次 5 完成**：原登记的 A 冲突（18 字段 / 189 处）、B 待办（39 字段 / 377 处）、
+>   class 尾下划线缺失（**47 条声明**，旧扫描器只看见 44 条）三项**全部归零**，代码与本文档的
+>   struct/class 成员命名现已完全一致（实测数据见 §2.2.1.3 末）；
+>   批次 5 收尾复查中发现并回退了 2 处**由共用盲区的改名脚本造成的 class 成员误改**
+>   （`CommandCodec`/`ResponseParser` 的 `m_byte_order_` 曾被改成裸名），
+>   该两文件现已与批次 5 之前逐字节一致；
 > - **协议语义与实现细节**（字段布局、超时、状态机行为等）：仍以**代码为准**，
 >   差异就地标注批次号。
 >

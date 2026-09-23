@@ -184,20 +184,20 @@ void UdpTransport::Open(IPacketListener& listener) {
     Close();  // 幂等：允许在已打开的实例上重新打开
 
     // ---- 配置校验（设计文档 §7 / 计划文档 §4.8）----
-    if (m_config_.m_remote_port_ == 0U) {
+    if (m_config_.remote_port == 0U) {
         throw detail::MakeInvalidArgument(
-            "UdpTransportConfig::remotePort 不能为 0");
+            "UdpTransportConfig::remote_port 不能为 0");
     }
-    if (m_config_.m_max_frame_packet_size_ == 0U ||
-        m_config_.m_max_frame_packet_size_ > kUdpMaxXcpPacket) {
-        throw detail::MakeInvalidArgument("maxFramePacketSize 必须在 1.." +
+    if (m_config_.max_frame_packet_size == 0U ||
+        m_config_.max_frame_packet_size > kUdpMaxXcpPacket) {
+        throw detail::MakeInvalidArgument("max_frame_packet_size 必须在 1.." +
                                           std::to_string(kUdpMaxXcpPacket) +
                                           " 之间");
     }
-    if (m_config_.m_max_datagram_size_ < kUdpHeaderSize + 1 ||
-        m_config_.m_max_datagram_size_ > kUdpMaxDatagramSize) {
+    if (m_config_.max_datagram_size < kUdpHeaderSize + 1 ||
+        m_config_.max_datagram_size > kUdpMaxDatagramSize) {
         throw detail::MakeInvalidArgument(
-            "maxDatagramSize 必须在 " + std::to_string(kUdpHeaderSize + 1) +
+            "max_datagram_size 必须在 " + std::to_string(kUdpHeaderSize + 1) +
             ".." + std::to_string(kUdpMaxDatagramSize) + " 之间");
     }
 
@@ -218,20 +218,20 @@ void UdpTransport::Open(IPacketListener& listener) {
     // ---- 绑定本地端点 ----
     sockaddr_in local{};
     local.sin_family = AF_INET;
-    local.sin_port = htons(m_config_.m_local_port_);
-    if (!parseIpv4(m_config_.m_local_host_.empty() ? std::string("0.0.0.0")
-                                                   : m_config_.m_local_host_,
+    local.sin_port = htons(m_config_.local_port);
+    if (!parseIpv4(m_config_.local_host.empty() ? std::string("0.0.0.0")
+                                                : m_config_.local_host,
                    &local.sin_addr)) {
         closeSocket(impl->handle);
         throw detail::MakeInvalidArgument("无法解析本地绑定地址: " +
-                                          m_config_.m_local_host_);
+                                          m_config_.local_host);
     }
     if (::bind(impl->handle, reinterpret_cast<sockaddr*>(&local),
                sizeof(local)) != 0) {
         closeSocket(impl->handle);
         throw detail::MakeTransportError(
-            "绑定本地端点失败: " + m_config_.m_local_host_ + ":" +
-                std::to_string(m_config_.m_local_port_),
+            "绑定本地端点失败: " + m_config_.local_host + ":" +
+                std::to_string(m_config_.local_port),
             lastSocketError());
     }
     impl->bound = true;
@@ -241,30 +241,30 @@ void UdpTransport::Open(IPacketListener& listener) {
     socklen_t actual_len = sizeof(actual_local);
     if (::getsockname(impl->handle, reinterpret_cast<sockaddr*>(&actual_local),
                       &actual_len) == 0) {
-        if (m_config_.m_local_port_ == 0U) {
-            m_config_.m_local_port_ = ntohs(actual_local.sin_port);
+        if (m_config_.local_port == 0U) {
+            m_config_.local_port = ntohs(actual_local.sin_port);
         }
     }
 
     // ---- 远端端点 ----
     sockaddr_in remote{};
     remote.sin_family = AF_INET;
-    remote.sin_port = htons(m_config_.m_remote_port_);
-    if (!parseIpv4(m_config_.m_remote_host_, &remote.sin_addr)) {
+    remote.sin_port = htons(m_config_.remote_port);
+    if (!parseIpv4(m_config_.remote_host, &remote.sin_addr)) {
         closeSocket(impl->handle);
         throw detail::MakeInvalidArgument("无法解析远端地址: " +
-                                          m_config_.m_remote_host_);
+                                          m_config_.remote_host);
     }
 
     // ---- 接收超时：使阻塞接收可周期性检查关闭标记，保证 Close() 及时生效 ----
 #if defined(_WIN32)
-    DWORD tv_ms = m_config_.m_receive_poll_interval_ms_;
+    DWORD tv_ms = m_config_.receive_poll_interval_ms;
     ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO,
                  reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
 #else
     timeval tv{};
-    tv.tv_sec = m_config_.m_receive_poll_interval_ms_ / 1000U;
-    tv.tv_usec = (m_config_.m_receive_poll_interval_ms_ % 1000U) * 1000U;
+    tv.tv_sec = m_config_.receive_poll_interval_ms / 1000U;
+    tv.tv_usec = (m_config_.receive_poll_interval_ms % 1000U) * 1000U;
     ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 
@@ -331,11 +331,11 @@ void UdpTransport::Send(BytesView packet) {
     if (packet.empty()) {
         throw detail::MakeInvalidArgument("XCP Packet 不能为空");
     }
-    if (packet.size() > m_config_.m_max_frame_packet_size_) {
+    if (packet.size() > m_config_.max_frame_packet_size) {
         throw detail::MakeInvalidArgument(
             "XCP Packet 长度 " + std::to_string(packet.size()) +
-            " 超过配置上限 maxFramePacketSize=" +
-            std::to_string(m_config_.m_max_frame_packet_size_));
+            " 超过配置上限 max_frame_packet_size=" +
+            std::to_string(m_config_.max_frame_packet_size));
     }
 
     // 取 CTR 并按模 65536 递增（每个 XCP Frame 消耗一个值，而非每个 Datagram）
@@ -352,26 +352,26 @@ void UdpTransport::Send(BytesView packet) {
         throw;
     }
 
-    if (frame.m_data_.size() > m_config_.m_max_datagram_size_) {
+    if (frame.data.size() > m_config_.max_datagram_size) {
         throw detail::MakeInvalidArgument(
-            "编码后 Datagram 长度 " + std::to_string(frame.m_data_.size()) +
-            " 超过配置上限 maxDatagramSize=" +
-            std::to_string(m_config_.m_max_datagram_size_));
+            "编码后 Datagram 长度 " + std::to_string(frame.data.size()) +
+            " 超过配置上限 max_datagram_size=" +
+            std::to_string(m_config_.max_datagram_size));
     }
 
     const int sent = ::sendto(
-        m_socket_->handle, reinterpret_cast<const char*>(frame.m_data_.data()),
-        static_cast<int>(frame.m_data_.size()), 0,
+        m_socket_->handle, reinterpret_cast<const char*>(frame.data.data()),
+        static_cast<int>(frame.data.size()), 0,
         reinterpret_cast<const sockaddr*>(&m_socket_->remote),
         sizeof(m_socket_->remote));
     if (sent < 0) {
         throw detail::MakeTransportError("发送 UDP Datagram 失败",
                                          lastSocketError());
     }
-    if (static_cast<std::size_t>(sent) != frame.m_data_.size()) {
+    if (static_cast<std::size_t>(sent) != frame.data.size()) {
         throw detail::MakeTransportError(
             "UDP Datagram 部分发送: " + std::to_string(sent) + "/" +
-            std::to_string(frame.m_data_.size()));
+            std::to_string(frame.data.size()));
     }
 }
 
@@ -462,11 +462,10 @@ void UdpTransport::ReceiveLoop() {
 
 bool UdpTransport::IsRemoteMatch(const std::string& src_ip,
                                  std::uint16_t src_port) const {
-    if (src_ip != m_config_.m_remote_host_) {
+    if (src_ip != m_config_.remote_host) {
         return false;
     }
-    if (m_config_.m_strict_remote_port_ &&
-        src_port != m_config_.m_remote_port_) {
+    if (m_config_.strict_remote_port && src_port != m_config_.remote_port) {
         return false;
     }
     return true;
@@ -487,7 +486,7 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
         return true;
     }
 
-    if (size > m_config_.m_max_datagram_size_) {
+    if (size > m_config_.max_datagram_size) {
         if (listener != nullptr) {
             listener->OnTransportWarning("Datagram 长度 " +
                                          std::to_string(size) +
@@ -508,12 +507,11 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
     }
 
     for (const auto& frame : *frames) {
-        if (frame.m_header_.m_len_ > m_config_.m_max_frame_packet_size_) {
+        if (frame.header.len > m_config_.max_frame_packet_size) {
             if (listener != nullptr) {
-                listener->OnTransportWarning(
-                    "Frame 内 XCP Packet 长度 " +
-                    std::to_string(frame.m_header_.m_len_) +
-                    " 超过配置上限，该 Frame 已丢弃");
+                listener->OnTransportWarning("Frame 内 XCP Packet 长度 " +
+                                             std::to_string(frame.header.len) +
+                                             " 超过配置上限，该 Frame 已丢弃");
             }
             continue;
         }
@@ -522,7 +520,7 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
         }
         if (listener != nullptr) {
             try {
-                listener->OnPacketReceived(frame.m_xcp_packet_);
+                listener->OnPacketReceived(frame.xcp_packet);
             } catch (...) {
                 // 上层回调异常不得终止接收线程
             }
@@ -538,26 +536,26 @@ bool UdpTransport::HandleFrame(const UdpFrameView& frame) {
     if (!m_recv_baseline_established_) {
         // 首个合法 Frame 建立基线（§8.1 第 2 条）
         m_recv_baseline_established_ = true;
-        m_last_recv_ctr_ = frame.m_header_.m_ctr_;
+        m_last_recv_ctr_ = frame.header.ctr;
         return true;
     }
 
     const DatagramCtr previous = m_last_recv_ctr_.value_or(0U);
     const DatagramCtr expected = static_cast<DatagramCtr>(previous + 1U);
 
-    if (frame.m_header_.m_ctr_ == expected) {
-        m_last_recv_ctr_ = frame.m_header_.m_ctr_;  // §8.1 第 3 条
+    if (frame.header.ctr == expected) {
+        m_last_recv_ctr_ = frame.header.ctr;  // §8.1 第 3 条
         return true;
     }
 
     // 以期望值为基准计算前向距离：0 表示重复，1..32767 表示前向跳号（缺包），
     // >= 32768 表示后向乱序或方向歧义。
     const int delta_from_expected =
-        ctrForwardDistance(expected, frame.m_header_.m_ctr_);
+        ctrForwardDistance(expected, frame.header.ctr);
 
     if (delta_from_expected == 0) {
         // 与期望值相同不可能走到这里（上面已判等），保留为防御分支
-        m_last_recv_ctr_ = frame.m_header_.m_ctr_;
+        m_last_recv_ctr_ = frame.header.ctr;
         return true;
     }
     if (delta_from_expected == 0x8000) {
@@ -566,7 +564,7 @@ bool UdpTransport::HandleFrame(const UdpFrameView& frame) {
         if (listener != nullptr) {
             listener->OnTransportWarning(
                 "CTR 与期望值差 0x8000，方向歧义，已丢弃: " +
-                std::to_string(frame.m_header_.m_ctr_));
+                std::to_string(frame.header.ctr));
         }
         return false;
     }
@@ -575,10 +573,10 @@ bool UdpTransport::HandleFrame(const UdpFrameView& frame) {
         if (listener != nullptr) {
             listener->OnTransportWarning(
                 "CTR 前向跳号，疑似缺包：期望 " + ctrToHex(expected) +
-                "，实收 " + ctrToHex(frame.m_header_.m_ctr_) + "，缺口 " +
+                "，实收 " + ctrToHex(frame.header.ctr) + "，缺口 " +
                 std::to_string(delta_from_expected));
         }
-        m_last_recv_ctr_ = frame.m_header_.m_ctr_;
+        m_last_recv_ctr_ = frame.header.ctr;
         return true;
     }
 
@@ -586,7 +584,7 @@ bool UdpTransport::HandleFrame(const UdpFrameView& frame) {
     // 条）
     if (listener != nullptr) {
         listener->OnTransportWarning(
-            "丢弃重复/后向乱序 CTR: " + ctrToHex(frame.m_header_.m_ctr_) +
+            "丢弃重复/后向乱序 CTR: " + ctrToHex(frame.header.ctr) +
             "，最近值 " + ctrToHex(previous));
     }
     return false;

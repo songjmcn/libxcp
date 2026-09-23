@@ -38,22 +38,22 @@ public:
     void OnPacketReceived(BytesView packet) override {
         {
             const std::lock_guard<std::mutex> lock(m_mutex_);
-            m_packets.emplace_back(packet.begin(), packet.end());
+            m_packets_.emplace_back(packet.begin(), packet.end());
         }
         m_cv_.notify_all();
     }
     void OnTransportClosed(std::string_view reason) override {
         {
             const std::lock_guard<std::mutex> lock(m_mutex_);
-            m_closed = true;
-            m_close_reason = std::string(reason);
+            m_closed_ = true;
+            m_close_reason_ = std::string(reason);
         }
         m_cv_.notify_all();
     }
     void OnTransportWarning(std::string_view message) override {
         {
             const std::lock_guard<std::mutex> lock(m_mutex_);
-            m_warnings.emplace_back(message);
+            m_warnings_.emplace_back(message);
         }
         m_cv_.notify_all();
     }
@@ -61,52 +61,52 @@ public:
     bool waitFor(std::size_t packets, std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(m_mutex_);
         return m_cv_.wait_for(lock, timeout, [&] {
-            return m_packets.size() >= packets || m_closed;
+            return m_packets_.size() >= packets || m_closed_;
         });
     }
     bool waitForWarning(std::size_t count, std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(m_mutex_);
         return m_cv_.wait_for(lock, timeout,
-                              [&] { return m_warnings.size() >= count; });
+                              [&] { return m_warnings_.size() >= count; });
     }
     [[nodiscard]] std::size_t packetCount() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_packets.size();
+        return m_packets_.size();
     }
     /// @brief 获取已接收 Packet 的副本
     [[nodiscard]] std::vector<Bytes> packets() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_packets;
+        return m_packets_;
     }
     /// @brief 等待第 index 个（0 起）Packet 到达
     bool waitForPacketAt(std::size_t index, std::chrono::milliseconds timeout) {
         std::unique_lock<std::mutex> lock(m_mutex_);
         return m_cv_.wait_for(lock, timeout, [&] {
-            return m_packets.size() > index || m_closed;
+            return m_packets_.size() > index || m_closed_;
         });
     }
     [[nodiscard]] std::vector<std::string> warnings() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_warnings;
+        return m_warnings_;
     }
 
 private:
     mutable std::mutex m_mutex_;
     std::condition_variable m_cv_;
-    std::vector<Bytes> m_packets;
-    std::vector<std::string> m_warnings;
-    bool m_closed{false};
-    std::string m_close_reason;
+    std::vector<Bytes> m_packets_;
+    std::vector<std::string> m_warnings_;
+    bool m_closed_{false};
+    std::string m_close_reason_;
 };
 
 /// @brief 构造指向测试 Slave 的 Transport 配置
 UdpTransportConfig MakeConfig(std::uint16_t slave_port) {
     UdpTransportConfig cfg;
-    cfg.m_remote_host_ = "127.0.0.1";
-    cfg.m_remote_port_ = slave_port;
-    cfg.m_local_host_ = "127.0.0.1";
-    cfg.m_local_port_ = 0;
-    cfg.m_receive_poll_interval_ms_ = 20;
+    cfg.remote_host = "127.0.0.1";
+    cfg.remote_port = slave_port;
+    cfg.local_host = "127.0.0.1";
+    cfg.local_port = 0;
+    cfg.receive_poll_interval_ms = 20;
     return cfg;
 }
 
@@ -124,28 +124,27 @@ class EventRecorder : public IEventListener {
 public:
     void OnEvent(const EventPacket& event) override {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        if (event.m_event_code_ &&
-            *event.m_event_code_ == EventCode::CmdPending) {
-            ++m_cmd_pending;
+        if (event.event_code && *event.event_code == EventCode::CmdPending) {
+            ++m_cmd_pending_;
         }
-        ++m_events;
+        ++m_events_;
     }
     void OnService(const ServicePacket&) override {}
     void OnDto(const DtoPacket&) override {}
 
     [[nodiscard]] int cmdPending() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_cmd_pending;
+        return m_cmd_pending_;
     }
     [[nodiscard]] int events() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
-        return m_events;
+        return m_events_;
     }
 
 private:
     mutable std::mutex m_mutex_;
-    int m_cmd_pending{0};
-    int m_events{0};
+    int m_cmd_pending_{0};
+    int m_events_{0};
 };
 
 // --------------------------------------------------------------------------
@@ -174,8 +173,8 @@ TEST(UdpLoopback, FullSessionConnectReadDisconnect) {
     auto master = MakeMaster(slave.Port());
     master->Connect();
     EXPECT_TRUE(master->IsConnected());
-    EXPECT_EQ(master->GetSessionParameters().m_connect_.m_max_cto_, 8U);
-    EXPECT_EQ(master->GetSessionParameters().m_connect_.m_max_dto_, 8U);
+    EXPECT_EQ(master->GetSessionParameters().connect.max_cto, 8U);
+    EXPECT_EQ(master->GetSessionParameters().connect.max_dto, 8U);
 
     const Bytes got = master->ReadMemoryBytes(0x70012340, 0x00, 4);
     EXPECT_EQ(got, content);
@@ -193,15 +192,15 @@ TEST(UdpLoopback, GetStatusAndCommModeInfoParsed) {
     master->Connect();
 
     const auto params = master->GetSessionParameters();
-    ASSERT_TRUE(params.m_status_.has_value());
-    EXPECT_EQ(params.m_status_->m_state_number_, 0x01U);
-    EXPECT_EQ(params.m_status_->m_session_config_id_, 0x0007U);
-    ASSERT_TRUE(params.m_comm_mode_info_.has_value());
-    EXPECT_EQ(params.m_comm_mode_info_->m_max_bs_, 0x04U);
-    EXPECT_EQ(params.m_comm_mode_info_->m_min_st_, 0x02U);
+    ASSERT_TRUE(params.status.has_value());
+    EXPECT_EQ(params.status->state_number, 0x01U);
+    EXPECT_EQ(params.status->session_config_id, 0x0007U);
+    ASSERT_TRUE(params.comm_mode_info.has_value());
+    EXPECT_EQ(params.comm_mode_info->max_bs, 0x04U);
+    EXPECT_EQ(params.comm_mode_info->min_st, 0x02U);
 
     const GetStatusResponse status = master->QueryStatus();
-    EXPECT_EQ(status.m_state_number_, 0x01U);
+    EXPECT_EQ(status.state_number, 0x01U);
     master->Disconnect();
     slave.Stop();
 }
@@ -311,7 +310,7 @@ TEST(UdpLoopback, DroppedResponseTriggersSynchRecovery) {
 
     // 丢弃下一个响应（即 SHORT_UPLOAD 的响应）-> 触发 SYNCH 恢复后重试
     test::FaultInjection fault;
-    fault.m_drop_response_n_ = 1;
+    fault.drop_response_n = 1;
     slave.SetFaultInjection(fault);
 
     const Bytes got = master->ReadMemoryBytes(0x3000, 0x00, 4);
@@ -361,8 +360,7 @@ TEST(UdpLoopback, DelayedResponseWithinTimeoutSucceeds) {
 
     // 让 SHORT_UPLOAD 的响应延迟 150ms（仍在超时内）
     test::FaultInjection fault;
-    fault.m_delay_response_n_ =
-        std::make_pair<std::size_t, std::uint32_t>(1, 150);
+    fault.delay_response_n = std::make_pair<std::size_t, std::uint32_t>(1, 150);
     slave.SetFaultInjection(fault);
 
     const Bytes got = master->ReadMemoryBytes(0x5000, 0x00, 4);
@@ -392,7 +390,7 @@ TEST(UdpLoopback, CorruptLenIsDiscardedWithWarning) {
 
     // 响应 #1（setFaultInjection 会重置计数）使用错误 LEN
     test::FaultInjection fault;
-    fault.m_corrupt_len_n_ = 1;
+    fault.corrupt_len_n = 1;
     slave.SetFaultInjection(fault);
     transport->Send(BytesView{BytesOf({0xFD, 0x00})});
 
@@ -419,7 +417,7 @@ TEST(UdpLoopback, JumpedCtrAcceptedWithGapDiagnostic) {
     const std::size_t baseline = observer.packetCount();
 
     test::FaultInjection fault;
-    fault.m_jump_ctr_n_ = 1;  // 响应 #1（计数已重置）的 CTR 前跳
+    fault.jump_ctr_n = 1;  // 响应 #1（计数已重置）的 CTR 前跳
     slave.SetFaultInjection(fault);
     transport->Send(BytesView{BytesOf({0xFD, 0x00})});
 
@@ -451,7 +449,7 @@ TEST(UdpLoopback, DuplicateCtrFrameDropped) {
     const std::size_t baseline = observer.packetCount();
 
     test::FaultInjection fault;
-    fault.m_duplicate_ctr_n_ = 1;  // 响应 #1（计数已重置）重复上一个 CTR
+    fault.duplicate_ctr_n = 1;  // 响应 #1（计数已重置）重复上一个 CTR
     slave.SetFaultInjection(fault);
     transport->Send(BytesView{BytesOf({0xFD, 0x00})});
 
@@ -485,7 +483,7 @@ TEST(UdpLoopback, AmbiguousCtrFrameDroppedAndSessionContinues) {
     // GET_STATUS 的响应本应使用 CTR=1；施加 +0x8000 后实发 0x8001，
     // 相对期望值 1 的前向距离恰为 0x8000 -> 方向歧义
     test::FaultInjection fault;
-    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, 0x8000);
+    fault.ctr_offset_n = std::make_pair<std::size_t, int>(1U, 0x8000);
     slave.SetFaultInjection(fault);
     transport->Send(BytesView{BytesOf({0xFD, 0x00})});
 
@@ -605,7 +603,7 @@ TEST(UdpLoopback, CloseReleasesThreadAndPortPromptly) {
     // 绑定固定本地端口，验证 close() 后该端口可立即被重新绑定（资源确实释放）
     constexpr std::uint16_t kFixedLocalPort = 41600;
     UdpTransportConfig cfg = MakeConfig(slave.Port());
-    cfg.m_local_port_ = kFixedLocalPort;
+    cfg.local_port = kFixedLocalPort;
 
     TransportObserver observer;
     {

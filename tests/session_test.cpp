@@ -22,16 +22,16 @@ ConnectResponse ValidConnect(std::uint8_t max_cto = 0x08,
                              AddressGranularity ag = AddressGranularity::Byte,
                              ByteOrder byte_order = ByteOrder::Intel) {
     ConnectResponse resp;
-    resp.m_resource_mask_ = 0x15U;
-    resp.m_byte_order_ = byte_order;
-    resp.m_address_granularity_ = ag;
-    resp.m_slave_block_mode_supported_ = true;
-    resp.m_optional_comm_mode_available_ = true;
-    resp.m_max_cto_ = max_cto;
-    resp.m_max_dto_ = max_dto;
-    resp.m_protocol_layer_version_ = 0x10;
-    resp.m_transport_layer_version_ = 0x10;
-    resp.m_transport_layer_version_ = 0x10;
+    resp.resource_mask = 0x15U;
+    resp.byte_order = byte_order;
+    resp.address_granularity = ag;
+    resp.slave_block_mode_supported = true;
+    resp.optional_comm_mode_available = true;
+    resp.max_cto = max_cto;
+    resp.max_dto = max_dto;
+    resp.protocol_layer_version = 0x10;
+    resp.transport_layer_version = 0x10;
+    resp.transport_layer_version = 0x10;
     return resp;
 }
 
@@ -56,9 +56,9 @@ TEST(SessionInitial, StartsDisconnectedWithDefaults) {
     EXPECT_EQ(session.GetAddressGranularity(), AddressGranularity::Byte);
     EXPECT_TRUE(session.FailReason().empty());
     // 未连接时不应认为 SHORT_UPLOAD 已被验证可用，但字段保持默认值不影响流程
-    EXPECT_TRUE(session.Parameters().m_short_upload_available_);
-    EXPECT_FALSE(session.Parameters().m_comm_mode_info_.has_value());
-    EXPECT_FALSE(session.Parameters().m_status_.has_value());
+    EXPECT_TRUE(session.Parameters().short_upload_available);
+    EXPECT_FALSE(session.Parameters().comm_mode_info.has_value());
+    EXPECT_FALSE(session.Parameters().status.has_value());
 }
 
 // --------------------------------------------------------------------------
@@ -80,18 +80,17 @@ TEST(SessionLifecycle, ConnectEstablishesParameters) {
     EXPECT_EQ(session.MaxDto(), 0x0020U);
     EXPECT_EQ(session.GetByteOrder(), ByteOrder::Motorola);
     EXPECT_EQ(session.GetAddressGranularity(), AddressGranularity::DWord);
-    EXPECT_EQ(session.Parameters().m_connect_.m_resource_mask_, 0x15U);
-    EXPECT_TRUE(
-        session.Parameters().m_connect_.m_optional_comm_mode_available_);
+    EXPECT_EQ(session.Parameters().connect.resource_mask, 0x15U);
+    EXPECT_TRUE(session.Parameters().connect.optional_comm_mode_available);
 }
 
 TEST(SessionLifecycle, DisconnectClearsNegotiatedParameters) {
     Session session;
     Connect(session);
     GetStatusResponse status;
-    status.m_state_number_ = 7;
+    status.state_number = 7;
     session.UpdateStatus(status);
-    ASSERT_TRUE(session.Parameters().m_status_.has_value());
+    ASSERT_TRUE(session.Parameters().status.has_value());
 
     session.BeginDisconnecting();
     EXPECT_EQ(session.State(), SessionState::Disconnecting);
@@ -101,7 +100,7 @@ TEST(SessionLifecycle, DisconnectClearsNegotiatedParameters) {
     EXPECT_FALSE(session.IsConnected());
     EXPECT_EQ(session.MaxCto(), 0U);
     EXPECT_EQ(session.MaxDto(), 0U);
-    EXPECT_FALSE(session.Parameters().m_status_.has_value());
+    EXPECT_FALSE(session.Parameters().status.has_value());
     EXPECT_FALSE(session.HasPendingCommand());
 }
 
@@ -349,50 +348,50 @@ TEST(SessionParameters, OptionalQueryResultsAreAdditive) {
     Connect(session);
 
     GetCommModeInfoResponse info;
-    info.m_max_bs_ = 4;
-    info.m_min_st_ = 2;
-    info.m_queue_size_ = 8;
-    info.m_driver_version_major_ = 1;
-    info.m_driver_version_minor_ = 3;
+    info.max_bs = 4;
+    info.min_st = 2;
+    info.queue_size = 8;
+    info.driver_version_major = 1;
+    info.driver_version_minor = 3;
     session.UpdateCommModeInfo(info);
 
     GetStatusResponse status;
-    status.m_daq_running_ = true;
-    status.m_resource_protection_ = 0x15U;
+    status.daq_running = true;
+    status.resource_protection = 0x15U;
     session.UpdateStatus(status);
 
     const auto params = session.Parameters();
-    ASSERT_TRUE(params.m_comm_mode_info_.has_value());
-    EXPECT_EQ(params.m_comm_mode_info_->m_max_bs_, 4U);
-    ASSERT_TRUE(params.m_status_.has_value());
-    EXPECT_TRUE(params.m_status_->m_daq_running_);
+    ASSERT_TRUE(params.comm_mode_info.has_value());
+    EXPECT_EQ(params.comm_mode_info->max_bs, 4U);
+    ASSERT_TRUE(params.status.has_value());
+    EXPECT_TRUE(params.status->daq_running);
     // 快照为拷贝，修改返回值不影响内部状态
-    EXPECT_TRUE(params.m_connect_.m_slave_block_mode_supported_);
+    EXPECT_TRUE(params.connect.slave_block_mode_supported);
 }
 
 TEST(SessionParameters, DisableShortUploadPersistsAcrossQueries) {
     Session session;
     Connect(session);
-    EXPECT_TRUE(session.Parameters().m_short_upload_available_);
+    EXPECT_TRUE(session.Parameters().short_upload_available);
     session.DisableShortUpload();
-    EXPECT_FALSE(session.Parameters().m_short_upload_available_);
+    EXPECT_FALSE(session.Parameters().short_upload_available);
 
     // 后续 GET_STATUS 更新不应意外恢复 SHORT_UPLOAD 能力
     session.UpdateStatus(GetStatusResponse{});
-    EXPECT_FALSE(session.Parameters().m_short_upload_available_);
+    EXPECT_FALSE(session.Parameters().short_upload_available);
 
     // 只有重新建立连接才恢复能力判定
     session.BeginDisconnecting();
     session.CompleteDisconnection();
     Connect(session);
-    EXPECT_TRUE(session.Parameters().m_short_upload_available_);
+    EXPECT_TRUE(session.Parameters().short_upload_available);
 }
 
 TEST(SessionParameters, ReturnedSnapshotIsImmutableCopy) {
     Session session;
     Connect(session);
     SessionParameters copy = session.Parameters();
-    copy.m_connect_.m_max_cto_ = 0xEE;
+    copy.connect.max_cto = 0xEE;
     EXPECT_EQ(session.MaxCto(), 0x08U);
 }
 
@@ -409,8 +408,7 @@ TEST(SessionThreadSafety, ConcurrentReadersAndWritersDoNotDeadlock) {
             for (int n = 0; n < 500; ++n) {
                 if (i % 2 == 0) {
                     GetStatusResponse status;
-                    status.m_state_number_ =
-                        static_cast<std::uint8_t>(n & 0xFF);
+                    status.state_number = static_cast<std::uint8_t>(n & 0xFF);
                     session.UpdateStatus(status);
                 } else {
                     volatile auto s = session.State();

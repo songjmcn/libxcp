@@ -15,33 +15,31 @@ namespace calmcar::xcp {
 
 void Session::ValidateConnectParams(const ConnectResponse& resp) const {
     // MAX_CTO 范围校验
-    if (resp.m_max_cto_ < kMaxCtoMinimum) {
+    if (resp.max_cto < kMaxCtoMinimum) {
         throw detail::MakeInvalidArgument(
             "CONNECT 返回的 MAX_CTO 小于协议下限 0x08: " +
-            std::to_string(resp.m_max_cto_));
+            std::to_string(resp.max_cto));
     }
 
     // MAX_DTO 范围校验
-    if (resp.m_max_dto_ < kMaxDtoMinimum) {
+    if (resp.max_dto < kMaxDtoMinimum) {
         throw detail::MakeInvalidArgument(
             "CONNECT 返回的 MAX_DTO 小于协议下限 0x0008: " +
-            std::to_string(resp.m_max_dto_));
+            std::to_string(resp.max_dto));
     }
 
     // AG 整除校验：MAX_CTO mod AG == 0
-    const auto ag_bytes = AgToBytes(resp.m_address_granularity_);
-    if (ag_bytes == 0U || (resp.m_max_cto_ % ag_bytes) != 0U) {
+    const auto ag_bytes = AgToBytes(resp.address_granularity);
+    if (ag_bytes == 0U || (resp.max_cto % ag_bytes) != 0U) {
         throw detail::MakeInvalidArgument(
             "MAX_CTO 不能被 Address Granularity 整除: MAX_CTO=" +
-            std::to_string(resp.m_max_cto_) +
-            ", AG=" + std::to_string(ag_bytes));
+            std::to_string(resp.max_cto) + ", AG=" + std::to_string(ag_bytes));
     }
     // AG 整除校验：MAX_DTO mod AG == 0
-    if ((resp.m_max_dto_ % ag_bytes) != 0U) {
+    if ((resp.max_dto % ag_bytes) != 0U) {
         throw detail::MakeInvalidArgument(
             "MAX_DTO 不能被 Address Granularity 整除: MAX_DTO=" +
-            std::to_string(resp.m_max_dto_) +
-            ", AG=" + std::to_string(ag_bytes));
+            std::to_string(resp.max_dto) + ", AG=" + std::to_string(ag_bytes));
     }
 }
 
@@ -89,8 +87,8 @@ void Session::EstablishConnection(const ConnectResponse& connect_response) {
         ValidateConnectParams(connect_response);
 
         m_params_ = SessionParameters{};
-        m_params_.m_connect_ = connect_response;
-        m_params_.m_short_upload_available_ = true;
+        m_params_.connect = connect_response;
+        m_params_.short_upload_available = true;
         m_state_ = SessionState::Connected;
         m_pending_command_.reset();
         m_fail_reason_.clear();
@@ -179,37 +177,37 @@ SessionParameters Session::Parameters() const {
 
 void Session::UpdateCommModeInfo(const GetCommModeInfoResponse& info) {
     const std::lock_guard<std::mutex> lock(m_mutex_);
-    m_params_.m_comm_mode_info_ = info;
+    m_params_.comm_mode_info = info;
 }
 
 void Session::UpdateStatus(const GetStatusResponse& status) {
     const std::lock_guard<std::mutex> lock(m_mutex_);
-    m_params_.m_status_ = status;
+    m_params_.status = status;
 }
 
 void Session::DisableShortUpload() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
-    m_params_.m_short_upload_available_ = false;
+    m_params_.short_upload_available = false;
 }
 
 ByteOrder Session::GetByteOrder() const {
     const std::lock_guard<std::mutex> lock(m_mutex_);
-    return m_params_.m_connect_.m_byte_order_;
+    return m_params_.connect.byte_order;
 }
 
 AddressGranularity Session::GetAddressGranularity() const {
     const std::lock_guard<std::mutex> lock(m_mutex_);
-    return m_params_.m_connect_.m_address_granularity_;
+    return m_params_.connect.address_granularity;
 }
 
 std::uint8_t Session::MaxCto() const {
     const std::lock_guard<std::mutex> lock(m_mutex_);
-    return m_params_.m_connect_.m_max_cto_;
+    return m_params_.connect.max_cto;
 }
 
 std::uint16_t Session::MaxDto() const {
     const std::lock_guard<std::mutex> lock(m_mutex_);
-    return m_params_.m_connect_.m_max_dto_;
+    return m_params_.connect.max_dto;
 }
 
 }  // namespace calmcar::xcp

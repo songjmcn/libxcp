@@ -121,11 +121,11 @@ private:
 /// @brief 构造指向测试 Slave 的配置（Loopback + OS 分配本地端口）
 UdpTransportConfig MakeConfig(std::uint16_t slave_port) {
     UdpTransportConfig cfg;
-    cfg.m_remote_host_ = "127.0.0.1";
-    cfg.m_remote_port_ = slave_port;
-    cfg.m_local_host_ = "127.0.0.1";
-    cfg.m_local_port_ = 0;
-    cfg.m_receive_poll_interval_ms_ = 20;
+    cfg.remote_host = "127.0.0.1";
+    cfg.remote_port = slave_port;
+    cfg.local_host = "127.0.0.1";
+    cfg.local_port = 0;
+    cfg.receive_poll_interval_ms = 20;
     return cfg;
 }
 
@@ -239,31 +239,31 @@ TEST(UdpTransportConfigValidation, RejectsBadConfigs) {
     RecordingListener listener;
 
     {
-        auto cfg = MakeConfig(0);  // remotePort == 0
+        auto cfg = MakeConfig(0);  // remote_port == 0
         UdpTransport t(cfg);
         EXPECT_THROW(t.Open(listener), XcpException);
     }
     {
         auto cfg = MakeConfig(40000);
-        cfg.m_max_frame_packet_size_ = 0;
+        cfg.max_frame_packet_size = 0;
         UdpTransport t(cfg);
         EXPECT_THROW(t.Open(listener), XcpException);
     }
     {
         auto cfg = MakeConfig(40000);
-        cfg.m_max_datagram_size_ = 3;  // 小于 Header + 1
+        cfg.max_datagram_size = 3;  // 小于 Header + 1
         UdpTransport t(cfg);
         EXPECT_THROW(t.Open(listener), XcpException);
     }
     {
         auto cfg = MakeConfig(40000);
-        cfg.m_remote_host_ = "not-an-ip";
+        cfg.remote_host = "not-an-ip";
         UdpTransport t(cfg);
         EXPECT_THROW(t.Open(listener), XcpException);
     }
     {
         auto cfg = MakeConfig(40000);
-        cfg.m_local_host_ = "999.1.1.1";
+        cfg.local_host = "999.1.1.1";
         UdpTransport t(cfg);
         EXPECT_THROW(t.Open(listener), XcpException);
     }
@@ -312,7 +312,7 @@ TEST(UdpTransportSend, EnforcesMaxFramePacketSize) {
     test::UdpTestSlave slave;
     slave.Start();
     auto cfg = MakeConfig(slave.Port());
-    cfg.m_max_frame_packet_size_ = 4;
+    cfg.max_frame_packet_size = 4;
     UdpTransport transport(cfg);
     RecordingListener listener;
     transport.Open(listener);
@@ -376,8 +376,8 @@ TEST(UdpTransportReceive, CorruptSecondFrameDropsWholeDatagram) {
     // 必须不交付
     const Bytes good = BytesOf({0xFD, 0x05});
     const Bytes bad_second = BytesOf({0xFF, 0xE0});
-    auto f1 = EncodeUdpFrame(BytesView{good}, 300).m_data_;
-    auto f2 = EncodeUdpFrame(BytesView{bad_second}, 301).m_data_;
+    auto f1 = EncodeUdpFrame(BytesView{good}, 300).data;
+    auto f2 = EncodeUdpFrame(BytesView{bad_second}, 301).data;
     f2[0] = 0xFF;  // LEN := 255，明显超出剩余字节
     Bytes datagram = f1;
     datagram.insert(datagram.end(), f2.begin(), f2.end());
@@ -413,7 +413,7 @@ TEST(UdpTransportReceive, LenCorruptionDiscardsDatagram) {
     // 第 1 个响应（setFaultInjection 会重置计数）使用错误
     // LEN：该响应不得交付上层，并产生警告
     test::FaultInjection fault;
-    fault.m_corrupt_len_n_ = 1;
+    fault.corrupt_len_n = 1;
     slave.SetFaultInjection(fault);
 
     const std::size_t baseline = listener.Packets().size();
@@ -440,7 +440,7 @@ TEST(UdpTransportReceive, ForwardJumpIsAcceptedWithGapWarning) {
     ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
 
     test::FaultInjection fault;
-    fault.m_jump_ctr_n_ = 1;  // 第 1 个响应（计数已重置）的 CTR 前跳
+    fault.jump_ctr_n = 1;  // 第 1 个响应（计数已重置）的 CTR 前跳
     slave.SetFaultInjection(fault);
 
     const std::size_t baseline = listener.Packets().size();
@@ -475,7 +475,7 @@ TEST(UdpTransportReceive, DuplicateCtrIsDropped) {
     ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
 
     test::FaultInjection fault;
-    fault.m_duplicate_ctr_n_ = 1;  // 第 1 个响应（计数已重置）重复上一个 CTR
+    fault.duplicate_ctr_n = 1;  // 第 1 个响应（计数已重置）重复上一个 CTR
     slave.SetFaultInjection(fault);
 
     const std::size_t baseline = listener.Packets().size();
@@ -495,8 +495,8 @@ TEST(UdpTransportReceive, IgnoresForeignSourceIp) {
     // 都必须被丢弃并诊断。
     constexpr std::uint16_t kFixedLocalPort = 41520;
     auto cfg = MakeConfig(41999);
-    cfg.m_remote_host_ = "10.255.255.255";  // 非 Loopback，永不匹配
-    cfg.m_local_port_ = kFixedLocalPort;
+    cfg.remote_host = "10.255.255.255";  // 非 Loopback，永不匹配
+    cfg.local_port = kFixedLocalPort;
     UdpTransport transport(cfg);
     RecordingListener listener;
     try {
@@ -509,7 +509,7 @@ TEST(UdpTransportReceive, IgnoresForeignSourceIp) {
     const auto frame = EncodeUdpFrame(BytesView{res}, 0);
     RawSender sender(kFixedLocalPort);
     sender.send(
-        BytesView{frame.m_data_});  // 来源为 127.0.0.1，与配置的远端 IP 不符
+        BytesView{frame.data});  // 来源为 127.0.0.1，与配置的远端 IP 不符
 
     EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -526,8 +526,8 @@ TEST(UdpTransportReceive, ForeignPortRejectedWhenStrict) {
     slave.Start();
 
     auto cfg = MakeConfig(slave.Port());
-    cfg.m_local_port_ = kFixedLocalPort;
-    cfg.m_strict_remote_port_ = true;
+    cfg.local_port = kFixedLocalPort;
+    cfg.strict_remote_port = true;
 
     const Bytes res = BytesOf({0xFF, 0x00});
     const auto frame = EncodeUdpFrame(BytesView{res}, 0);
@@ -542,10 +542,10 @@ TEST(UdpTransportReceive, ForeignPortRejectedWhenStrict) {
         }
         ASSERT_TRUE(transport.IsOpen());
 
-        // 从非 remotePort 的来源发出 -> 严格模式应丢弃
+        // 从非 remote_port 的来源发出 -> 严格模式应丢弃
         RawSender sender(kFixedLocalPort);
         ASSERT_TRUE(sender.valid());
-        sender.sendFrom(BytesView{frame.m_data_}, kForeignPort);
+        sender.sendFrom(BytesView{frame.data}, kForeignPort);
 
         EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -554,7 +554,7 @@ TEST(UdpTransportReceive, ForeignPortRejectedWhenStrict) {
     }
 
     // 放宽为仅匹配 IP 后，同一来源端口的包应被接受
-    cfg.m_strict_remote_port_ = false;
+    cfg.strict_remote_port = false;
     UdpTransport lenient(cfg);
     RecordingListener lenient_listener;
     try {
@@ -564,7 +564,7 @@ TEST(UdpTransportReceive, ForeignPortRejectedWhenStrict) {
     }
     RawSender sender2(kFixedLocalPort);
     ASSERT_TRUE(sender2.valid());
-    sender2.sendFrom(BytesView{frame.m_data_}, kForeignPort);
+    sender2.sendFrom(BytesView{frame.data}, kForeignPort);
     EXPECT_TRUE(lenient_listener.WaitForPackets(1, std::chrono::seconds(2)));
     EXPECT_EQ(lenient_listener.Packets().size(), 1U);
     lenient.Close();
@@ -575,11 +575,11 @@ TEST(UdpTransportReceive, DatagramOverMaxSizeDiscarded) {
     // Master 绑定固定本地端口；放宽端口匹配以便 RawSender 能通过来源过滤
     constexpr std::uint16_t kFixedLocalPort = 41530;
     auto cfg = MakeConfig(41999);
-    cfg.m_remote_host_ = "127.0.0.1";
-    cfg.m_local_port_ = kFixedLocalPort;
-    cfg.m_strict_remote_port_ =
-        false;  // 仅匹配 IP，便于用任意源端口的原始 Socket 注入
-    cfg.m_max_datagram_size_ = 8;  // 只允许极小的 Datagram
+    cfg.remote_host = "127.0.0.1";
+    cfg.local_port = kFixedLocalPort;
+    cfg.strict_remote_port =
+        false;                  // 仅匹配 IP，便于用任意源端口的原始 Socket 注入
+    cfg.max_datagram_size = 8;  // 只允许极小的 Datagram
     UdpTransport transport(cfg);
     RecordingListener listener;
     try {
@@ -595,12 +595,12 @@ TEST(UdpTransportReceive, DatagramOverMaxSizeDiscarded) {
 
     RawSender sender(kFixedLocalPort);
     ASSERT_TRUE(sender.valid());
-    sender.send(BytesView{big.m_data_});
+    sender.send(BytesView{big.data});
     EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
     EXPECT_TRUE(listener.Packets().empty()) << "超限 Datagram 不得交付";
 
-    sender.send(BytesView{frame.m_data_});
+    sender.send(BytesView{frame.data});
     EXPECT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
     EXPECT_EQ(listener.Packets().size(), 1U);
     transport.Close();
@@ -616,7 +616,7 @@ TEST(UdpTransportCtrSemantics, ReceiveCtrWrapsFromFfffToZero) {
     slave.Start();
 
     auto cfg = MakeConfig(slave.Port());
-    cfg.m_local_port_ = kMasterPort;
+    cfg.local_port = kMasterPort;
     UdpTransport transport(cfg);
     RecordingListener listener;
     try {
@@ -629,16 +629,14 @@ TEST(UdpTransportCtrSemantics, ReceiveCtrWrapsFromFfffToZero) {
     const Bytes b = BytesOf({0xFD, 0x02});
 
     // 首个合法 Frame 建立基线 = 0xFFFF
-    slave.SendRawPayloadTo(
-        BytesView{EncodeUdpFrame(BytesView{a}, 0xFFFF).m_data_}, "127.0.0.1",
-        kMasterPort);
+    slave.SendRawPayloadTo(BytesView{EncodeUdpFrame(BytesView{a}, 0xFFFF).data},
+                           "127.0.0.1", kMasterPort);
     ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
     EXPECT_EQ(transport.LastReceiveCtr().value_or(0), 0xFFFF);
 
     // 下一个 Frame 的 CTR 回绕到 0x0000，恰为期望值 -> 应被接受
-    slave.SendRawPayloadTo(
-        BytesView{EncodeUdpFrame(BytesView{b}, 0x0000).m_data_}, "127.0.0.1",
-        kMasterPort);
+    slave.SendRawPayloadTo(BytesView{EncodeUdpFrame(BytesView{b}, 0x0000).data},
+                           "127.0.0.1", kMasterPort);
     ASSERT_TRUE(listener.WaitForPackets(2, std::chrono::seconds(2)));
     EXPECT_EQ(transport.LastReceiveCtr().value_or(0xFFFF), 0x0000);
     EXPECT_EQ(listener.Packets().size(), 2U)
@@ -653,7 +651,7 @@ TEST(UdpTransportCtrSemantics, BackwardCtrFrameDropped) {
     slave.Start();
 
     auto cfg = MakeConfig(slave.Port());
-    cfg.m_local_port_ = kMasterPort;
+    cfg.local_port = kMasterPort;
     UdpTransport transport(cfg);
     RecordingListener listener;
     try {
@@ -663,13 +661,12 @@ TEST(UdpTransportCtrSemantics, BackwardCtrFrameDropped) {
     }
 
     const Bytes pkt = BytesOf({0xFD, 0x01});
-    slave.SendRawPayloadTo(
-        BytesView{EncodeUdpFrame(BytesView{pkt}, 10).m_data_}, "127.0.0.1",
-        kMasterPort);
+    slave.SendRawPayloadTo(BytesView{EncodeUdpFrame(BytesView{pkt}, 10).data},
+                           "127.0.0.1", kMasterPort);
     ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
 
     // 后向乱序（10 -> 5）：相对期望值 11 的前向距离极大 -> 判为迟到/乱序，丢弃
-    slave.SendRawPayloadTo(BytesView{EncodeUdpFrame(BytesView{pkt}, 5).m_data_},
+    slave.SendRawPayloadTo(BytesView{EncodeUdpFrame(BytesView{pkt}, 5).data},
                            "127.0.0.1", kMasterPort);
     EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -686,7 +683,7 @@ TEST(UdpTransportCtrSemantics, TruncatedDatagramDiscarded) {
     slave.Start();
 
     auto cfg = MakeConfig(slave.Port());
-    cfg.m_local_port_ = kMasterPort;
+    cfg.local_port = kMasterPort;
     UdpTransport transport(cfg);
     RecordingListener listener;
     try {
@@ -734,7 +731,7 @@ TEST(UdpTransportCtrSemantics, AmbiguousCtrOffsetIsDropped) {
     test::FaultInjection fault;
     // 施加 +0x8000：本应发 CTR=1，实发 (1+32768) mod 65536 = 32769 = 0x8001，
     // 相对期望值 1 的前向距离恰为 0x8000（歧义点）。
-    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, 0x8000);
+    fault.ctr_offset_n = std::make_pair<std::size_t, int>(1U, 0x8000);
     slave.SetFaultInjection(fault);
 
     const Bytes get_status = BytesOf({0xFD, 0x00});
@@ -774,7 +771,7 @@ TEST(UdpTransportCtrSemantics, JustBelowAmbiguousBoundaryIsAccepted) {
     const std::size_t baseline = listener.Packets().size();
 
     test::FaultInjection fault;
-    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, 0x7FFE);
+    fault.ctr_offset_n = std::make_pair<std::size_t, int>(1U, 0x7FFE);
     slave.SetFaultInjection(fault);
 
     const Bytes get_status = BytesOf({0xFD, 0x00});
@@ -809,7 +806,7 @@ TEST(UdpTransportCtrSemantics, JustAboveAmbiguousBoundaryIsDropped) {
     const std::size_t baseline = listener.Packets().size();
 
     test::FaultInjection fault;
-    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, -0x7FFE);
+    fault.ctr_offset_n = std::make_pair<std::size_t, int>(1U, -0x7FFE);
     slave.SetFaultInjection(fault);
 
     const Bytes get_status = BytesOf({0xFD, 0x00});
@@ -830,7 +827,7 @@ TEST(UdpTransportConfigValidation, BindFailureReportedAsTransportError) {
 
     // 绑定到已被 Slave 占用的端口：应报 TransportError
     auto cfg = MakeConfig(slave.Port());
-    cfg.m_local_port_ = slave.Port();
+    cfg.local_port = slave.Port();
     UdpTransport transport(cfg);
     RecordingListener listener;
     try {
@@ -851,7 +848,7 @@ TEST(UdpTransportClose, CloseWhileBlockedReturnsPromptly) {
     test::UdpTestSlave slave;
     slave.Start();
     auto cfg = MakeConfig(slave.Port());
-    cfg.m_receive_poll_interval_ms_ =
+    cfg.receive_poll_interval_ms =
         1000;  // 故意放大轮询周期，验证不依赖轮询也能及时退出
     UdpTransport transport(cfg);
     RecordingListener listener;

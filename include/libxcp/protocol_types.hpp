@@ -236,51 +236,50 @@ enum class SessionState {
  * @brief CONNECT 响应解析结果（COMM_MODE_BASIC 已拆解）
  */
 struct ConnectResponse {
-    ResourceMask m_resource_mask_{};            ///< RESOURCE 字段
-    ByteOrder m_byte_order_{ByteOrder::Intel};  ///< COMM_MODE_BASIC 中的字节序
-    AddressGranularity m_address_granularity_{
-        AddressGranularity::Byte};                ///< COMM_MODE_BASIC 中的 AG
-    bool m_slave_block_mode_supported_{false};    ///< COMM_MODE_BASIC bit6
-    bool m_optional_comm_mode_available_{false};  ///< COMM_MODE_BASIC bit7
-    std::uint8_t m_max_cto_{0};   ///< MAX_CTO（有效范围 0x08..0xFF）
-    std::uint16_t m_max_dto_{0};  ///< MAX_DTO（有效范围 0x0008..0xFFFF）
-    std::uint8_t m_protocol_layer_version_{0};   ///< Protocol Layer 主版本
-    std::uint8_t m_transport_layer_version_{0};  ///< Transport Layer 主版本
+    ResourceMask resource_mask{};            ///< RESOURCE 字段
+    ByteOrder byte_order{ByteOrder::Intel};  ///< COMM_MODE_BASIC 中的字节序
+    AddressGranularity address_granularity{
+        AddressGranularity::Byte};             ///< COMM_MODE_BASIC 中的 AG
+    bool slave_block_mode_supported{false};    ///< COMM_MODE_BASIC bit6
+    bool optional_comm_mode_available{false};  ///< COMM_MODE_BASIC bit7
+    std::uint8_t max_cto{0};   ///< MAX_CTO（有效范围 0x08..0xFF）
+    std::uint16_t max_dto{0};  ///< MAX_DTO（有效范围 0x0008..0xFFFF）
+    std::uint8_t protocol_layer_version{0};   ///< Protocol Layer 主版本
+    std::uint8_t transport_layer_version{0};  ///< Transport Layer 主版本
 };
 
 /**
  * @brief GET_STATUS 响应解析结果
  */
 struct GetStatusResponse {
-    bool m_resume_{false};         ///< Current Session Status bit7
-    bool m_daq_running_{false};    ///< Current Session Status bit6
-    bool m_clear_daq_req_{false};  ///< Current Session Status bit3
-    bool m_store_daq_req_{false};  ///< Current Session Status bit2
-    bool m_store_cal_req_{false};  ///< Current Session Status bit0
-    ResourceMask
-        m_resource_protection_{};     ///< Current Resource Protection Status
-    std::uint8_t m_state_number_{0};  ///< STATE_NUMBER
-    std::uint16_t m_session_config_id_{0};  ///< Session Configuration ID
+    bool resume{false};                  ///< Current Session Status bit7
+    bool daq_running{false};             ///< Current Session Status bit6
+    bool clear_daq_req{false};           ///< Current Session Status bit3
+    bool store_daq_req{false};           ///< Current Session Status bit2
+    bool store_cal_req{false};           ///< Current Session Status bit0
+    ResourceMask resource_protection{};  ///< Current Resource Protection Status
+    std::uint8_t state_number{0};        ///< STATE_NUMBER
+    std::uint16_t session_config_id{0};  ///< Session Configuration ID
 };
 
 /**
  * @brief GET_COMM_MODE_INFO 响应解析结果
  */
 struct GetCommModeInfoResponse {
-    std::uint8_t m_comm_mode_optional_{0};    ///< COMM_MODE_OPTIONAL 原始字节
-    std::uint8_t m_max_bs_{0};                ///< Block Mode 最大块大小
-    std::uint8_t m_min_st_{0};                ///< 最小分离时间（单位 100μs）
-    std::uint8_t m_queue_size_{0};            ///< Interleaved Mode 队列深度
-    std::uint8_t m_driver_version_major_{0};  ///< Driver Version 高 nibble
-    std::uint8_t m_driver_version_minor_{0};  ///< Driver Version 低 nibble
+    std::uint8_t comm_mode_optional{0};    ///< COMM_MODE_OPTIONAL 原始字节
+    std::uint8_t max_bs{0};                ///< Block Mode 最大块大小
+    std::uint8_t min_st{0};                ///< 最小分离时间（单位 100μs）
+    std::uint8_t queue_size{0};            ///< Interleaved Mode 队列深度
+    std::uint8_t driver_version_major{0};  ///< Driver Version 高 nibble
+    std::uint8_t driver_version_minor{0};  ///< Driver Version 低 nibble
 };
 
 /**
  * @brief XCP 40 位地址（32-bit Address + 8-bit Extension）
  */
 struct XcpAddress40 {
-    Address m_address_{};             ///< 32 位地址
-    AddressExtension m_extension_{};  ///< 8 位地址扩展
+    Address address{};             ///< 32 位地址
+    AddressExtension extension{};  ///< 8 位地址扩展
 
     /**
      * @brief 地址前进指定元素数（按 AG 换算为字节数）
@@ -301,11 +300,11 @@ struct XcpAddress40 {
  * @brief 完整 Session 参数快照（CONNECT + 后续查询的不可变结果）
  */
 struct SessionParameters {
-    ConnectResponse m_connect_;  ///< CONNECT 协商结果
+    ConnectResponse connect;  ///< CONNECT 协商结果
     std::optional<GetCommModeInfoResponse>
-        m_comm_mode_info_;                       ///< 仅在查询成功时存在
-    std::optional<GetStatusResponse> m_status_;  ///< 仅在查询成功时存在
-    bool m_short_upload_available_{true};        ///< SHORT_UPLOAD 是否可用
+        comm_mode_info;                       ///< 仅在查询成功时存在
+    std::optional<GetStatusResponse> status;  ///< 仅在查询成功时存在
+    bool short_upload_available{true};        ///< SHORT_UPLOAD 是否可用
 };
 
 // ---------------------------------------------------------------------------

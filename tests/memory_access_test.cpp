@@ -103,43 +103,46 @@ class FakeSlave {
 public:
     FakeSlave(AddressGranularity ag, ByteOrder order, std::uint8_t max_cto,
               std::uint16_t max_dto)
-        : m_ag(ag), m_order(order), m_max_cto(max_cto), m_max_dto(max_dto) {}
+        : m_ag_(ag),
+          m_order_(order),
+          m_max_cto_(max_cto),
+          m_max_dto_(max_dto) {}
 
     void SetMemory(Address address, const Bytes& data) {
         for (std::size_t i = 0; i < data.size(); ++i) {
-            m_memory[address + static_cast<Address>(i)] = data[i];
+            m_memory_[address + static_cast<Address>(i)] = data[i];
         }
     }
 
     /// @brief 令 SHORT_UPLOAD 始终返回 ERR_CMD_UNKNOWN
-    void RejectShortUpload() { m_reject_short_upload = true; }
+    void RejectShortUpload() { m_reject_short_upload_ = true; }
 
     /// @brief 令第 n 次 UPLOAD（1 起）不响应（模拟超时）
-    void SetTimeoutUploadAt(std::size_t n) { m_timeout_upload_n = n; }
+    void SetTimeoutUploadAt(std::size_t n) { m_timeout_upload_n_ = n; }
 
     /// @brief 令所有 UPLOAD 都不响应（模拟持续丢包，用于验证重试耗尽）
-    void SetTimeoutAllUploads() { m_timeout_all_uploads = true; }
+    void SetTimeoutAllUploads() { m_timeout_all_uploads_ = true; }
 
     /// @brief 收到命令总数 / 各类命令计数
     [[nodiscard]] int count(CommandCode code) const {
-        const auto it = m_counts.find(code);
-        return it == m_counts.end() ? 0 : it->second;
+        const auto it = m_counts_.find(code);
+        return it == m_counts_.end() ? 0 : it->second;
     }
-    [[nodiscard]] int totalCommands() const { return m_total; }
+    [[nodiscard]] int totalCommands() const { return m_total_; }
 
     /// @brief MockTransport 的响应脚本
     Bytes operator()(BytesView packet) {
-        ++m_total;
+        ++m_total_;
         if (packet.empty()) {
             return {};
         }
         const auto cmd = static_cast<CommandCode>(packet[0]);
-        ++m_counts[cmd];
+        ++m_counts_[cmd];
 
         switch (cmd) {
             case CommandCode::Connect:
-                return ConnectResponseBytes(m_ag, m_order, m_max_cto,
-                                            m_max_dto);
+                return ConnectResponseBytes(m_ag_, m_order_, m_max_cto_,
+                                            m_max_dto_);
             case CommandCode::GetStatus:
                 return GetStatusResponseBytes();
             case CommandCode::GetCommModeInfo:
@@ -157,8 +160,8 @@ public:
             case CommandCode::Disconnect:
                 return Bytes{static_cast<std::uint8_t>(PacketType::Res)};
             case CommandCode::SetMta:
-                m_mta = ParseSetMtaAddress(packet, m_order);
-                m_mta_ext = packet[2];
+                m_mta_ = ParseSetMtaAddress(packet, m_order_);
+                m_mta_ext_ = packet[2];
                 return Bytes{static_cast<std::uint8_t>(PacketType::Res)};
             case CommandCode::Upload:
                 return handleUpload(packet);
@@ -172,10 +175,10 @@ public:
 
 private:
     Bytes handleUpload(BytesView packet) {
-        if (m_timeout_all_uploads) {
+        if (m_timeout_all_uploads_) {
             return {};  // 模拟持续丢包/超时
         }
-        if (++m_upload_seen == m_timeout_upload_n) {
+        if (++m_upload_seen_ == m_timeout_upload_n_) {
             return {};  // 模拟丢包/超时
         }
         if (packet.size() < 2U) {
@@ -184,33 +187,33 @@ private:
         const auto elements = static_cast<ElementCount>(packet[1]);
         if (elements == 0U ||
             elements + 1U >
-                static_cast<ElementCount>(m_max_cto / AgToBytes(m_ag))) {
+                static_cast<ElementCount>(m_max_cto_ / AgToBytes(m_ag_))) {
             return Err(ErrorCode::OutOfRange);
         }
-        auto data = read(m_mta, elements);
+        auto data = read(m_mta_, elements);
         if (!data) {
             return Err(ErrorCode::AccessDenied);
         }
         // UPLOAD 的 RES 为 [FF][data...]，不含元素计数字节
         Bytes res{static_cast<std::uint8_t>(PacketType::Res)};
         res.insert(res.end(), data->begin(), data->end());
-        m_mta += static_cast<Address>(elements) * AgToBytes(m_ag);
+        m_mta_ += static_cast<Address>(elements) * AgToBytes(m_ag_);
         return res;
     }
 
     Bytes handleShortUpload(BytesView packet) {
-        if (m_reject_short_upload) {
+        if (m_reject_short_upload_) {
             return Err(ErrorCode::CmdUnknown);
         }
         if (packet.size() < 8U) {
             return Err(ErrorCode::CmdSyntax);
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
-        if (elements == 0U ||
-            elements > static_cast<ElementCount>(m_max_cto / AgToBytes(m_ag))) {
+        if (elements == 0U || elements > static_cast<ElementCount>(
+                                             m_max_cto_ / AgToBytes(m_ag_))) {
             return Err(ErrorCode::OutOfRange);
         }
-        const Address address = ParseShortUploadAddress(packet, m_order);
+        const Address address = ParseShortUploadAddress(packet, m_order_);
         auto data = read(address, elements);
         if (!data) {
             return Err(ErrorCode::AccessDenied);
@@ -218,16 +221,17 @@ private:
         // SHORT_UPLOAD 的 RES 同样为 [FF][data...]
         Bytes res{static_cast<std::uint8_t>(PacketType::Res)};
         res.insert(res.end(), data->begin(), data->end());
-        m_mta = address + static_cast<Address>(elements) * AgToBytes(m_ag);
+        m_mta_ = address + static_cast<Address>(elements) * AgToBytes(m_ag_);
         return res;
     }
 
     std::optional<Bytes> read(Address address, ElementCount elements) {
         Bytes out;
-        const auto count = static_cast<std::size_t>(elements) * AgToBytes(m_ag);
+        const auto count =
+            static_cast<std::size_t>(elements) * AgToBytes(m_ag_);
         for (std::size_t i = 0; i < count; ++i) {
-            const auto it = m_memory.find(address + static_cast<Address>(i));
-            if (it == m_memory.end()) {
+            const auto it = m_memory_.find(address + static_cast<Address>(i));
+            if (it == m_memory_.end()) {
                 return std::nullopt;
             }
             out.push_back(it->second);
@@ -240,19 +244,19 @@ private:
                      static_cast<std::uint8_t>(code)};
     }
 
-    AddressGranularity m_ag;
-    ByteOrder m_order;
-    std::uint8_t m_max_cto;
-    std::uint16_t m_max_dto;
-    MemoryImage m_memory;
-    Address m_mta{0};
-    AddressExtension m_mta_ext{0};
-    bool m_reject_short_upload{false};
-    std::size_t m_timeout_upload_n{0};
-    bool m_timeout_all_uploads{false};
-    std::size_t m_upload_seen{0};
-    int m_total{0};
-    std::map<CommandCode, int> m_counts;
+    AddressGranularity m_ag_;
+    ByteOrder m_order_;
+    std::uint8_t m_max_cto_;
+    std::uint16_t m_max_dto_;
+    MemoryImage m_memory_;
+    Address m_mta_{0};
+    AddressExtension m_mta_ext_{0};
+    bool m_reject_short_upload_{false};
+    std::size_t m_timeout_upload_n_{0};
+    bool m_timeout_all_uploads_{false};
+    std::size_t m_upload_seen_{0};
+    int m_total_{0};
+    std::map<CommandCode, int> m_counts_;
 };
 
 /// @brief 一次完整的 Master 脚手架：MockTransport + Session + Executor +
@@ -462,7 +466,7 @@ TEST(MemoryAccessFallback, ErrCmdUnknownDisablesShortUploadForSession) {
     const Bytes got = access.ReadElements(0x1100, 0x00, 3);
 
     EXPECT_EQ(got, content) << "降级后仍应读出正确数据";
-    EXPECT_FALSE(h.session.Parameters().m_short_upload_available_)
+    EXPECT_FALSE(h.session.Parameters().short_upload_available)
         << "应标记 SHORT_UPLOAD 不可用";
     EXPECT_EQ(h.slave.count(CommandCode::ShortUpload), 1)
         << "只应尝试一次 SHORT_UPLOAD";

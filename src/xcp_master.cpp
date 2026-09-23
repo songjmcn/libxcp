@@ -65,7 +65,7 @@ void XcpMaster::Connect() {
         // 仅在 CONNECT 表明 Optional 信息可用时才查询扩展通信模式；
         // Slave 返回 ERR_CMD_UNKNOWN 时 ExecuteGetCommModeInfo 内部降级为
         // nullopt。
-        if (connect.m_optional_comm_mode_available_) {
+        if (connect.optional_comm_mode_available) {
             (void)m_executor_->ExecuteGetCommModeInfo();
         }
 

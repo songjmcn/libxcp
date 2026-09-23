@@ -38,20 +38,20 @@ TEST(UdpHeaderEncode, GoldenSingleFrame) {
     const Bytes packet = BytesOf({0xFF, 0x00});
     const auto frame = EncodeUdpFrame(packet, 0x0201);
     // LEN=2(小端 02 00), CTR=0x0201(小端 01 02), 然后原样 Packet
-    EXPECT_EQ(frame.m_data_, BytesOf({0x02, 0x00, 0x01, 0x02, 0xFF, 0x00}));
+    EXPECT_EQ(frame.data, BytesOf({0x02, 0x00, 0x01, 0x02, 0xFF, 0x00}));
 }
 
 TEST(UdpHeaderEncode, CounterWrapsUseFullSixteenBits) {
     const Bytes packet = BytesOf({0xFD, 0x00});
     const auto frame = EncodeUdpFrame(packet, 0xFFFF);
-    EXPECT_EQ(frame.m_data_, BytesOf({0x02, 0x00, 0xFF, 0xFF, 0xFD, 0x00}));
+    EXPECT_EQ(frame.data, BytesOf({0x02, 0x00, 0xFF, 0xFF, 0xFD, 0x00}));
 }
 
 TEST(UdpHeaderEncode, EmptyPacketProducesLenZeroButIsRejectedOnDecode) {
     // 编码器不禁止空 Packet（LEN=0），但解码器必须拒绝 LEN==0 的 Frame
     const auto frame = EncodeUdpFrame(BytesView{}, 0);
-    EXPECT_EQ(frame.m_data_.size(), kUdpHeaderSize);
-    EXPECT_FALSE(DecodeUdpDatagram(BytesView{frame.m_data_}).has_value());
+    EXPECT_EQ(frame.data.size(), kUdpHeaderSize);
+    EXPECT_FALSE(DecodeUdpDatagram(BytesView{frame.data}).has_value());
 }
 
 TEST(UdpHeaderEncode, RejectsOversizedPacket) {
@@ -67,13 +67,13 @@ TEST(UdpHeaderEncode, RejectsOversizedPacket) {
 TEST(UdpHeaderEncode, MaxAllowedPacketAccepted) {
     Bytes big(kUdpMaxXcpPacket, 0xAB);
     const auto frame = EncodeUdpFrame(BytesView{big}, 7);
-    EXPECT_EQ(frame.m_data_.size(), kUdpMaxXcpPacket + kUdpHeaderSize);
-    const auto decoded = DecodeUdpDatagram(BytesView{frame.m_data_});
+    EXPECT_EQ(frame.data.size(), kUdpMaxXcpPacket + kUdpHeaderSize);
+    const auto decoded = DecodeUdpDatagram(BytesView{frame.data});
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 1U);
-    EXPECT_EQ((*decoded)[0].m_header_.m_len_,
+    EXPECT_EQ((*decoded)[0].header.len,
               static_cast<DatagramLen>(kUdpMaxXcpPacket));
-    EXPECT_EQ((*decoded)[0].m_xcp_packet_.size(), kUdpMaxXcpPacket);
+    EXPECT_EQ((*decoded)[0].xcp_packet.size(), kUdpMaxXcpPacket);
 }
 
 // --------------------------------------------------------------------------
@@ -84,13 +84,13 @@ TEST(UdpHeaderDecode, SingleFrameRoundTrip) {
     const Bytes packet =
         BytesOf({0xFF, 0x15, 0xC0, 0x08, 0x08, 0x00, 0x10, 0x10});
     const auto frame = EncodeUdpFrame(BytesView{packet}, 42);
-    const auto decoded = DecodeUdpDatagram(BytesView{frame.m_data_});
+    const auto decoded = DecodeUdpDatagram(BytesView{frame.data});
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 1U);
-    EXPECT_EQ((*decoded)[0].m_header_.m_len_, 8);
-    EXPECT_EQ((*decoded)[0].m_header_.m_ctr_, 42);
+    EXPECT_EQ((*decoded)[0].header.len, 8);
+    EXPECT_EQ((*decoded)[0].header.ctr, 42);
     EXPECT_TRUE(std::equal(packet.begin(), packet.end(),
-                           (*decoded)[0].m_xcp_packet_.begin()));
+                           (*decoded)[0].xcp_packet.begin()));
 }
 
 TEST(UdpHeaderDecode, EmptyDatagramRejected) {
@@ -149,14 +149,14 @@ TEST(UdpHeaderDecode, TwoFramesParsedInOrder) {
     const auto decoded = DecodeUdpDatagram(BytesView{datagram});
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 2U);
-    EXPECT_EQ((*decoded)[0].m_header_.m_ctr_, 100);
-    EXPECT_EQ((*decoded)[0].m_header_.m_len_, 2);
+    EXPECT_EQ((*decoded)[0].header.ctr, 100);
+    EXPECT_EQ((*decoded)[0].header.len, 2);
     EXPECT_TRUE(
-        std::equal(ev.begin(), ev.end(), (*decoded)[0].m_xcp_packet_.begin()));
-    EXPECT_EQ((*decoded)[1].m_header_.m_ctr_, 101);
-    EXPECT_EQ((*decoded)[1].m_header_.m_len_, 3);
-    EXPECT_TRUE(std::equal(res.begin(), res.end(),
-                           (*decoded)[1].m_xcp_packet_.begin()));
+        std::equal(ev.begin(), ev.end(), (*decoded)[0].xcp_packet.begin()));
+    EXPECT_EQ((*decoded)[1].header.ctr, 101);
+    EXPECT_EQ((*decoded)[1].header.len, 3);
+    EXPECT_TRUE(
+        std::equal(res.begin(), res.end(), (*decoded)[1].xcp_packet.begin()));
 }
 
 TEST(UdpHeaderDecode, ThreeFramesWithVariedLengths) {
@@ -173,13 +173,13 @@ TEST(UdpHeaderDecode, ThreeFramesWithVariedLengths) {
     ASSERT_TRUE(decoded.has_value());
     ASSERT_EQ(decoded->size(), 3U);
     for (std::size_t i = 0; i < 3; ++i) {
-        EXPECT_EQ((*decoded)[i].m_xcp_packet_.size(), packets[i].size());
+        EXPECT_EQ((*decoded)[i].xcp_packet.size(), packets[i].size());
         EXPECT_TRUE(std::equal(packets[i].begin(), packets[i].end(),
-                               (*decoded)[i].m_xcp_packet_.begin()))
+                               (*decoded)[i].xcp_packet.begin()))
             << "第 " << i << " 个 Frame 内容不符";
     }
     // CTR 回绕在连续 Frame 中正确工作
-    EXPECT_EQ((*decoded)[2].m_header_.m_ctr_, static_cast<DatagramCtr>(65535U));
+    EXPECT_EQ((*decoded)[2].header.ctr, static_cast<DatagramCtr>(65535U));
 }
 
 TEST(UdpHeaderDecode, FrameMustNotCrossDatagramBoundary) {

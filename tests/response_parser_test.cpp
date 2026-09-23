@@ -28,10 +28,9 @@ TEST(ResponseParserClassify, PositiveResponseKeepsBodyWithoutPid) {
     ASSERT_TRUE(parsed.has_value());
     const auto* res = std::get_if<PositiveResponse>(&*parsed);
     ASSERT_NE(res, nullptr);
-    EXPECT_EQ(res->m_command_, CommandCode::Connect);
+    EXPECT_EQ(res->command, CommandCode::Connect);
     // data 不含 0xFF 前缀
-    EXPECT_EQ(res->m_data_,
-              BytesOf({0x15, 0xC0, 0x08, 0x08, 0x00, 0x10, 0x10}));
+    EXPECT_EQ(res->data, BytesOf({0x15, 0xC0, 0x08, 0x08, 0x00, 0x10, 0x10}));
 }
 
 TEST(ResponseParserClassify, NegativeResponseWithAdditionalInfo) {
@@ -41,11 +40,11 @@ TEST(ResponseParserClassify, NegativeResponseWithAdditionalInfo) {
     ASSERT_TRUE(parsed.has_value());
     const auto* err = std::get_if<NegativeResponse>(&*parsed);
     ASSERT_NE(err, nullptr);
-    EXPECT_EQ(err->m_raw_error_code_, 0x25U);
-    EXPECT_EQ(err->m_error_code_,
+    EXPECT_EQ(err->raw_error_code, 0x25U);
+    EXPECT_EQ(err->error_code,
               std::optional<ErrorCode>(ErrorCode::AccessLocked));
     // 附加信息必须保留，不能丢弃
-    EXPECT_EQ(err->m_additional_info_, BytesOf({0xAA, 0xBB}));
+    EXPECT_EQ(err->additional_info, BytesOf({0xAA, 0xBB}));
 }
 
 TEST(ResponseParserClassify, UnknownErrorCodePreservesRawValue) {
@@ -55,9 +54,9 @@ TEST(ResponseParserClassify, UnknownErrorCodePreservesRawValue) {
     ASSERT_TRUE(parsed.has_value());
     const auto* err = std::get_if<NegativeResponse>(&*parsed);
     ASSERT_NE(err, nullptr);
-    EXPECT_EQ(err->m_raw_error_code_, 0x99U);
-    EXPECT_FALSE(err->m_error_code_.has_value());
-    EXPECT_TRUE(err->m_additional_info_.empty());
+    EXPECT_EQ(err->raw_error_code, 0x99U);
+    EXPECT_FALSE(err->error_code.has_value());
+    EXPECT_TRUE(err->additional_info.empty());
 }
 
 TEST(ResponseParserClassify, EventPacket) {
@@ -67,9 +66,8 @@ TEST(ResponseParserClassify, EventPacket) {
     ASSERT_TRUE(parsed.has_value());
     const auto* ev = std::get_if<EventPacket>(&*parsed);
     ASSERT_NE(ev, nullptr);
-    EXPECT_EQ(ev->m_event_code_,
-              std::optional<EventCode>(EventCode::CmdPending));
-    EXPECT_EQ(ev->m_info_, BytesOf({0x01}));
+    EXPECT_EQ(ev->event_code, std::optional<EventCode>(EventCode::CmdPending));
+    EXPECT_EQ(ev->info, BytesOf({0x01}));
 }
 
 TEST(ResponseParserClassify, ServicePacket) {
@@ -79,8 +77,8 @@ TEST(ResponseParserClassify, ServicePacket) {
     ASSERT_TRUE(parsed.has_value());
     const auto* serv = std::get_if<ServicePacket>(&*parsed);
     ASSERT_NE(serv, nullptr);
-    EXPECT_EQ(serv->m_service_code_, 0x03U);
-    EXPECT_EQ(serv->m_data_, BytesOf({0x11}));
+    EXPECT_EQ(serv->service_code, 0x03U);
+    EXPECT_EQ(serv->data, BytesOf({0x11}));
 }
 
 TEST(ResponseParserClassify, DtoOnlyIdentifiedNotDecoded) {
@@ -93,8 +91,8 @@ TEST(ResponseParserClassify, DtoOnlyIdentifiedNotDecoded) {
         ASSERT_TRUE(parsed.has_value());
         const auto* dto = std::get_if<DtoPacket>(&*parsed);
         ASSERT_NE(dto, nullptr);
-        EXPECT_EQ(dto->m_pid_, pid);
-        EXPECT_EQ(dto->m_data_, BytesOf({0xDE, 0xAD}));
+        EXPECT_EQ(dto->pid, pid);
+        EXPECT_EQ(dto->data, BytesOf({0xDE, 0xAD}));
     }
 }
 
@@ -122,7 +120,7 @@ TEST(ResponseParserMalformed, BareResIsLegalButBodyEmpty) {
     const ResponseParser parser(ByteOrder::Intel);
     const auto parsed = parser.Parse(BytesOf({0xFF}), CommandCode::GetStatus);
     ASSERT_TRUE(parsed.has_value());
-    EXPECT_TRUE(std::get<PositiveResponse>(*parsed).m_data_.empty());
+    EXPECT_TRUE(std::get<PositiveResponse>(*parsed).data.empty());
 }
 
 // --------------------------------------------------------------------------
@@ -134,18 +132,18 @@ TEST(ParseConnectResponse, SpecExampleIntel) {
     const auto resp = parser.ParseConnectResponse(
         BytesView{BytesOf({0x15, 0xC0, 0x08, 0x08, 0x00, 0x10, 0x10})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_EQ(resp->m_resource_mask_, 0x15U);
-    EXPECT_TRUE(HasResource(resp->m_resource_mask_, Resource::CalPag));
-    EXPECT_TRUE(HasResource(resp->m_resource_mask_, Resource::Daq));
-    EXPECT_TRUE(HasResource(resp->m_resource_mask_, Resource::Pgm));
-    EXPECT_EQ(resp->m_byte_order_, ByteOrder::Intel);
-    EXPECT_EQ(resp->m_address_granularity_, AddressGranularity::Byte);
-    EXPECT_TRUE(resp->m_slave_block_mode_supported_);
-    EXPECT_TRUE(resp->m_optional_comm_mode_available_);
-    EXPECT_EQ(resp->m_max_cto_, 8U);
-    EXPECT_EQ(resp->m_max_dto_, 8U);
-    EXPECT_EQ(resp->m_protocol_layer_version_, 0x10U);
-    EXPECT_EQ(resp->m_transport_layer_version_, 0x10U);
+    EXPECT_EQ(resp->resource_mask, 0x15U);
+    EXPECT_TRUE(HasResource(resp->resource_mask, Resource::CalPag));
+    EXPECT_TRUE(HasResource(resp->resource_mask, Resource::Daq));
+    EXPECT_TRUE(HasResource(resp->resource_mask, Resource::Pgm));
+    EXPECT_EQ(resp->byte_order, ByteOrder::Intel);
+    EXPECT_EQ(resp->address_granularity, AddressGranularity::Byte);
+    EXPECT_TRUE(resp->slave_block_mode_supported);
+    EXPECT_TRUE(resp->optional_comm_mode_available);
+    EXPECT_EQ(resp->max_cto, 8U);
+    EXPECT_EQ(resp->max_dto, 8U);
+    EXPECT_EQ(resp->protocol_layer_version, 0x10U);
+    EXPECT_EQ(resp->transport_layer_version, 0x10U);
 }
 
 TEST(ParseConnectResponse, MotorolaByteOrderAndDwordAg) {
@@ -155,14 +153,14 @@ TEST(ParseConnectResponse, MotorolaByteOrderAndDwordAg) {
     const auto resp = parser.ParseConnectResponse(
         BytesView{BytesOf({0x00, 0xA5, 0x10, 0x00, 0x10, 0x11, 0x01})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_EQ(resp->m_byte_order_, ByteOrder::Motorola);
-    EXPECT_EQ(resp->m_address_granularity_, AddressGranularity::DWord);
-    EXPECT_FALSE(resp->m_slave_block_mode_supported_);
-    EXPECT_TRUE(resp->m_optional_comm_mode_available_);
-    EXPECT_EQ(resp->m_max_cto_, 0x10U);
-    EXPECT_EQ(resp->m_max_dto_, 0x0010U);
-    EXPECT_EQ(resp->m_protocol_layer_version_, 0x11U);
-    EXPECT_EQ(resp->m_transport_layer_version_, 0x01U);
+    EXPECT_EQ(resp->byte_order, ByteOrder::Motorola);
+    EXPECT_EQ(resp->address_granularity, AddressGranularity::DWord);
+    EXPECT_FALSE(resp->slave_block_mode_supported);
+    EXPECT_TRUE(resp->optional_comm_mode_available);
+    EXPECT_EQ(resp->max_cto, 0x10U);
+    EXPECT_EQ(resp->max_dto, 0x0010U);
+    EXPECT_EQ(resp->protocol_layer_version, 0x11U);
+    EXPECT_EQ(resp->transport_layer_version, 0x01U);
 }
 
 TEST(ParseConnectResponse, WordAgFromSpecBits) {
@@ -171,7 +169,7 @@ TEST(ParseConnectResponse, WordAgFromSpecBits) {
     const auto resp = parser.ParseConnectResponse(
         BytesView{BytesOf({0x00, 0x02, 0x08, 0x08, 0x00, 0x10, 0x10})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_EQ(resp->m_address_granularity_, AddressGranularity::Word);
+    EXPECT_EQ(resp->address_granularity, AddressGranularity::Word);
 }
 
 TEST(ParseConnectResponse, ReservedAgBitsRejected) {
@@ -198,7 +196,7 @@ TEST(ParseConnectResponse, LongerThanMinimumAccepted) {
     const auto resp = parser.ParseConnectResponse(BytesView{
         BytesOf({0x15, 0xC0, 0x08, 0x08, 0x00, 0x10, 0x10, 0xFF, 0xFF})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_EQ(resp->m_max_cto_, 8U);
+    EXPECT_EQ(resp->max_cto, 8U);
 }
 
 // --------------------------------------------------------------------------
@@ -213,14 +211,14 @@ TEST(ParseGetStatusResponse, DecodesAllStatusBits) {
     const auto resp = parser.ParseGetStatusResponse(
         BytesView{BytesOf({0xCA, 0x15, 0x04, 0x34, 0x12})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_TRUE(resp->m_resume_);
-    EXPECT_TRUE(resp->m_daq_running_);
-    EXPECT_TRUE(resp->m_clear_daq_req_);
-    EXPECT_TRUE(resp->m_store_daq_req_);
-    EXPECT_FALSE(resp->m_store_cal_req_);
-    EXPECT_EQ(resp->m_resource_protection_, 0x15U);
-    EXPECT_EQ(resp->m_state_number_, 0x04U);
-    EXPECT_EQ(resp->m_session_config_id_, 0x1234U);
+    EXPECT_TRUE(resp->resume);
+    EXPECT_TRUE(resp->daq_running);
+    EXPECT_TRUE(resp->clear_daq_req);
+    EXPECT_TRUE(resp->store_daq_req);
+    EXPECT_FALSE(resp->store_cal_req);
+    EXPECT_EQ(resp->resource_protection, 0x15U);
+    EXPECT_EQ(resp->state_number, 0x04U);
+    EXPECT_EQ(resp->session_config_id, 0x1234U);
 }
 
 TEST(ParseGetStatusResponse, StoreCalReqBit0) {
@@ -228,9 +226,9 @@ TEST(ParseGetStatusResponse, StoreCalReqBit0) {
     const auto resp = parser.ParseGetStatusResponse(
         BytesView{BytesOf({0x01, 0x00, 0x00, 0x00, 0x00})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_TRUE(resp->m_store_cal_req_);
-    EXPECT_FALSE(resp->m_resume_);
-    EXPECT_FALSE(resp->m_daq_running_);
+    EXPECT_TRUE(resp->store_cal_req);
+    EXPECT_FALSE(resp->resume);
+    EXPECT_FALSE(resp->daq_running);
 }
 
 TEST(ParseGetStatusResponse, RespectsSessionByteOrder) {
@@ -238,7 +236,7 @@ TEST(ParseGetStatusResponse, RespectsSessionByteOrder) {
     const auto resp = parser.ParseGetStatusResponse(
         BytesView{BytesOf({0x00, 0x00, 0x00, 0x12, 0x34})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_EQ(resp->m_session_config_id_, 0x1234U);
+    EXPECT_EQ(resp->session_config_id, 0x1234U);
 }
 
 TEST(ParseGetStatusResponse, TruncatedRejected) {
@@ -258,12 +256,12 @@ TEST(ParseGetCommModeInfoResponse, DecodesFieldsAndDriverVersion) {
     const auto resp = parser.ParseGetCommModeInfoResponse(
         BytesView{BytesOf({0x00, 0x2A, 0x00, 0x04, 0x02, 0x08, 0x13})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_EQ(resp->m_comm_mode_optional_, 0x2AU);
-    EXPECT_EQ(resp->m_max_bs_, 0x04U);
-    EXPECT_EQ(resp->m_min_st_, 0x02U);
-    EXPECT_EQ(resp->m_queue_size_, 0x08U);
-    EXPECT_EQ(resp->m_driver_version_major_, 1U);
-    EXPECT_EQ(resp->m_driver_version_minor_, 3U);
+    EXPECT_EQ(resp->comm_mode_optional, 0x2AU);
+    EXPECT_EQ(resp->max_bs, 0x04U);
+    EXPECT_EQ(resp->min_st, 0x02U);
+    EXPECT_EQ(resp->queue_size, 0x08U);
+    EXPECT_EQ(resp->driver_version_major, 1U);
+    EXPECT_EQ(resp->driver_version_minor, 3U);
 }
 
 TEST(ParseGetCommModeInfoResponse, DriverVersionNibbles) {
@@ -271,8 +269,8 @@ TEST(ParseGetCommModeInfoResponse, DriverVersionNibbles) {
     const auto resp = parser.ParseGetCommModeInfoResponse(
         BytesView{BytesOf({0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF0})});
     ASSERT_TRUE(resp.has_value());
-    EXPECT_EQ(resp->m_driver_version_major_, 0x0FU);
-    EXPECT_EQ(resp->m_driver_version_minor_, 0x00U);
+    EXPECT_EQ(resp->driver_version_major, 0x0FU);
+    EXPECT_EQ(resp->driver_version_minor, 0x00U);
 }
 
 TEST(ParseGetCommModeInfoResponse, TruncatedRejected) {

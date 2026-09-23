@@ -39,23 +39,23 @@ constexpr std::size_t kUdpMaxXcpPacket = kUdpMaxDatagramSize - kUdpHeaderSize;
 
 /// @brief 编码后的单个 XCP on Ethernet Frame（Header + 一个 XCP Packet）
 struct UdpFrame {
-    Bytes m_data_;  ///< LEN(u16le) + CTR(u16le) + XCP Packet
+    Bytes data;  ///< LEN(u16le) + CTR(u16le) + XCP Packet
 };
 
 /// @brief 解码后的 UDP Header 字段
 struct UdpHeader {
-    DatagramLen m_len_{};  ///< 原始 XCP Packet 字节数
-    DatagramCtr m_ctr_{};  ///< 该 XCP Frame 的独立计数器
+    DatagramLen len{};  ///< 原始 XCP Packet 字节数
+    DatagramCtr ctr{};  ///< 该 XCP Frame 的独立计数器
 };
 
 /**
  * @brief Datagram 内单个 XCP Frame 的只读视图
- * @note xcpPacket 指向 DecodeUdpDatagram()
+ * @note xcp_packet 指向 DecodeUdpDatagram()
  * 入参的底层存储，生命周期不超过该视图。
  */
 struct UdpFrameView {
-    UdpHeader m_header_;
-    BytesView m_xcp_packet_;
+    UdpHeader header;
+    BytesView xcp_packet;
 };
 
 /**

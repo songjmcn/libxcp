@@ -81,8 +81,8 @@ std::optional<ParsedPacket> ResponseParser::Parse(
     switch (pid) {
         case static_cast<std::uint8_t>(PacketType::Res): {
             PositiveResponse res;
-            res.m_command_ = expected_command;
-            res.m_data_.assign(body.begin(), body.end());
+            res.command = expected_command;
+            res.data.assign(body.begin(), body.end());
             return ParsedPacket{res};
         }
         case static_cast<std::uint8_t>(PacketType::Err): {
@@ -91,10 +91,10 @@ std::optional<ParsedPacket> ResponseParser::Parse(
                 return std::nullopt;
             }
             NegativeResponse err;
-            err.m_raw_error_code_ = body[0];
-            err.m_error_code_ = ToErrorCode(body[0]);
+            err.raw_error_code = body[0];
+            err.error_code = ToErrorCode(body[0]);
             const BytesView extra = body.subspan(1);
-            err.m_additional_info_.assign(extra.begin(), extra.end());
+            err.additional_info.assign(extra.begin(), extra.end());
             return ParsedPacket{err};
         }
         case static_cast<std::uint8_t>(PacketType::Ev): {
@@ -102,10 +102,10 @@ std::optional<ParsedPacket> ResponseParser::Parse(
                 return std::nullopt;
             }
             EventPacket ev;
-            ev.m_raw_event_code_ = body[0];
-            ev.m_event_code_ = ToEventCode(body[0]);
+            ev.raw_event_code = body[0];
+            ev.event_code = ToEventCode(body[0]);
             const BytesView extra = body.subspan(1);
-            ev.m_info_.assign(extra.begin(), extra.end());
+            ev.info.assign(extra.begin(), extra.end());
             return ParsedPacket{ev};
         }
         case static_cast<std::uint8_t>(PacketType::Serv): {
@@ -113,16 +113,16 @@ std::optional<ParsedPacket> ResponseParser::Parse(
                 return std::nullopt;
             }
             ServicePacket serv;
-            serv.m_service_code_ = body[0];
+            serv.service_code = body[0];
             const BytesView extra = body.subspan(1);
-            serv.m_data_.assign(extra.begin(), extra.end());
+            serv.data.assign(extra.begin(), extra.end());
             return ParsedPacket{serv};
         }
         default: {
             // 0x00..0xFB：DAQ DTO，本阶段仅识别不解析
             DtoPacket dto;
-            dto.m_pid_ = pid;
-            dto.m_data_.assign(body.begin(), body.end());
+            dto.pid = pid;
+            dto.data.assign(body.begin(), body.end());
             return ParsedPacket{dto};
         }
     }
@@ -135,12 +135,12 @@ std::optional<ConnectResponse> ResponseParser::ParseConnectResponse(
     }
 
     ConnectResponse resp;
-    resp.m_resource_mask_ = res_data[0];
+    resp.resource_mask = res_data[0];
 
     const std::uint8_t comm_mode_basic = res_data[1];
-    resp.m_byte_order_ = ((comm_mode_basic & kByteOrderMask) != 0U)
-                             ? ByteOrder::Motorola
-                             : ByteOrder::Intel;
+    resp.byte_order = ((comm_mode_basic & kByteOrderMask) != 0U)
+                          ? ByteOrder::Motorola
+                          : ByteOrder::Intel;
 
     const auto ag_field = static_cast<std::uint8_t>(
         (comm_mode_basic >> kAddressGranularityShift) & 0x03U);
@@ -149,20 +149,19 @@ std::optional<ConnectResponse> ResponseParser::ParseConnectResponse(
         // AG 位域为保留值 11：非法协商结果
         return std::nullopt;
     }
-    resp.m_address_granularity_ = *ag;
-    resp.m_slave_block_mode_supported_ =
+    resp.address_granularity = *ag;
+    resp.slave_block_mode_supported =
         (comm_mode_basic & kSlaveBlockModeMask) != 0U;
-    resp.m_optional_comm_mode_available_ =
-        (comm_mode_basic & kOptionalMask) != 0U;
+    resp.optional_comm_mode_available = (comm_mode_basic & kOptionalMask) != 0U;
 
-    resp.m_max_cto_ = res_data[2];
+    resp.max_cto = res_data[2];
     const auto max_dto = ReadU16(res_data, 3);
     if (!max_dto) {
         return std::nullopt;
     }
-    resp.m_max_dto_ = *max_dto;
-    resp.m_protocol_layer_version_ = res_data[5];
-    resp.m_transport_layer_version_ = res_data[6];
+    resp.max_dto = *max_dto;
+    resp.protocol_layer_version = res_data[5];
+    resp.transport_layer_version = res_data[6];
     return resp;
 }
 
@@ -174,18 +173,18 @@ std::optional<GetStatusResponse> ResponseParser::ParseGetStatusResponse(
 
     GetStatusResponse resp;
     const std::uint8_t session_status = res_data[0];
-    resp.m_resume_ = (session_status & kResumeMask) != 0U;
-    resp.m_daq_running_ = (session_status & kDaqRunningMask) != 0U;
-    resp.m_clear_daq_req_ = (session_status & kClearDaqReqMask) != 0U;
-    resp.m_store_daq_req_ = (session_status & kStoreDaqReqMask) != 0U;
-    resp.m_store_cal_req_ = (session_status & kStoreCalReqMask) != 0U;
-    resp.m_resource_protection_ = res_data[1];
-    resp.m_state_number_ = res_data[2];
+    resp.resume = (session_status & kResumeMask) != 0U;
+    resp.daq_running = (session_status & kDaqRunningMask) != 0U;
+    resp.clear_daq_req = (session_status & kClearDaqReqMask) != 0U;
+    resp.store_daq_req = (session_status & kStoreDaqReqMask) != 0U;
+    resp.store_cal_req = (session_status & kStoreCalReqMask) != 0U;
+    resp.resource_protection = res_data[1];
+    resp.state_number = res_data[2];
     const auto config_id = ReadU16(res_data, 3);
     if (!config_id) {
         return std::nullopt;
     }
-    resp.m_session_config_id_ = *config_id;
+    resp.session_config_id = *config_id;
     return resp;
 }
 
@@ -196,14 +195,14 @@ ResponseParser::ParseGetCommModeInfoResponse(BytesView res_data) const {
     }
 
     GetCommModeInfoResponse resp;
-    resp.m_comm_mode_optional_ = res_data[1];
-    resp.m_max_bs_ = res_data[3];
-    resp.m_min_st_ = res_data[4];
-    resp.m_queue_size_ = res_data[5];
+    resp.comm_mode_optional = res_data[1];
+    resp.max_bs = res_data[3];
+    resp.min_st = res_data[4];
+    resp.queue_size = res_data[5];
     const std::uint8_t driver_version = res_data[6];
-    resp.m_driver_version_major_ =
+    resp.driver_version_major =
         static_cast<std::uint8_t>((driver_version >> 4) & 0x0FU);
-    resp.m_driver_version_minor_ =
+    resp.driver_version_minor =
         static_cast<std::uint8_t>(driver_version & 0x0FU);
     return resp;
 }

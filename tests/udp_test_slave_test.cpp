@@ -99,8 +99,8 @@ public:
         dst.sin_family = AF_INET;
         dst.sin_port = htons(dst_port);
         dst.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        ::sendto(m_handle_, reinterpret_cast<const char*>(frame.m_data_.data()),
-                 static_cast<int>(frame.m_data_.size()), 0,
+        ::sendto(m_handle_, reinterpret_cast<const char*>(frame.data.data()),
+                 static_cast<int>(frame.data.size()), 0,
                  reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
     }
 
@@ -120,9 +120,9 @@ public:
         if (!frames || frames->empty()) {
             return false;
         }
-        out_ctr = (*frames)[0].m_header_.m_ctr_;
-        out.assign((*frames)[0].m_xcp_packet_.begin(),
-                   (*frames)[0].m_xcp_packet_.end());
+        out_ctr = (*frames)[0].header.ctr;
+        out.assign((*frames)[0].xcp_packet.begin(),
+                   (*frames)[0].xcp_packet.end());
         return true;
     }
 
@@ -142,8 +142,8 @@ public:
         if (!frames || frames->empty()) {
             return false;
         }
-        out.assign((*frames)[0].m_xcp_packet_.begin(),
-                   (*frames)[0].m_xcp_packet_.end());
+        out.assign((*frames)[0].xcp_packet.begin(),
+                   (*frames)[0].xcp_packet.end());
         char ip[INET_ADDRSTRLEN] = {0};
         ::inet_ntop(AF_INET, &src.sin_addr, ip, INET_ADDRSTRLEN);
         out_from_ip = ip;
@@ -436,7 +436,7 @@ TEST(UdpTestSlaveFault, ResponseCounterStartsFreshAfterEachInjection) {
     ASSERT_TRUE(ep.recvPacket(resp, ip, port));  // 响应 #1
 
     FaultInjection fault;
-    fault.m_drop_response_n_ =
+    fault.drop_response_n =
         1;  // setFaultInjection 会重置计数，故此次丢弃的是新的 #1
     slave.SetFaultInjection(fault);
     ep.sendPacket(BytesView{BytesOf({0xFD, 0x00})}, slave.Port(), ctr++);
@@ -450,7 +450,7 @@ TEST(UdpTestSlaveFault, ResponseCounterStartsFreshAfterEachInjection) {
 }
 
 TEST(UdpTestSlaveFault, CtrOffsetProducesExactHeaderCounter) {
-    // 锁定 m_ctr_offset_n_ 的语义：只改写实际发出的 Header CTR，
+    // 锁定 ctr_offset_n 的语义：只改写实际发出的 Header CTR，
     // 不改变 Slave 自身计数器的推进规律（Master 侧 D5 用例依赖该前提）。
     UdpTestSlave slave;
     slave.Start();
@@ -464,7 +464,7 @@ TEST(UdpTestSlaveFault, CtrOffsetProducesExactHeaderCounter) {
 
     FaultInjection fault;
     // 对响应 #1 施加 +0x8000：本应发 1，实发 (1+32768) mod 65536 = 0x8001
-    fault.m_ctr_offset_n_ = std::make_pair<std::size_t, int>(1U, 0x8000);
+    fault.ctr_offset_n = std::make_pair<std::size_t, int>(1U, 0x8000);
     slave.SetFaultInjection(fault);
     ASSERT_EQ(slave.NextSendCtr(), 1) << "注入不应改变待发送的 CTR";
 

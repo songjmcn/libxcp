@@ -49,7 +49,7 @@ void MemoryAccess::ValidateRead(Address address,
 }
 
 bool MemoryAccess::CanUseShortUpload(ElementCount element_count) const {
-    if (!m_session_.Parameters().m_short_upload_available_) {
+    if (!m_session_.Parameters().short_upload_available) {
         return false;
     }
     return element_count <= MaxShortUploadElements();
@@ -88,7 +88,7 @@ Bytes MemoryAccess::UploadChunked(Address address, AddressExtension extension,
         const auto chunk = (remaining < chunk_limit) ? remaining : chunk_limit;
 
         try {
-            m_executor_.ExecuteSetMta(cursor.m_extension_, cursor.m_address_);
+            m_executor_.ExecuteSetMta(cursor.extension, cursor.address);
             const Bytes part = m_executor_.ExecuteUpload(chunk);
             result.insert(result.end(), part.begin(), part.end());
         } catch (const XcpException& e) {
