@@ -22,6 +22,11 @@ void ExpectBytes(const Bytes& actual,
     EXPECT_EQ(actual, Bytes(expected.begin(), expected.end()));
 }
 
+/// @brief 由初始化列表构造 Bytes（Seed&Key 报文构造用）
+Bytes BytesOf(std::initializer_list<std::uint8_t> init) {
+    return Bytes(init.begin(), init.end());
+}
+
 // --------------------------------------------------------------------------
 // 2 字节命令：reserved 必须为 0
 // --------------------------------------------------------------------------
@@ -111,6 +116,66 @@ TEST(CommandCodecBoundary, ShortUploadRejectsZeroAndOverOneByte) {
     const CommandCodec codec(ByteOrder::Intel);
     EXPECT_THROW((void)codec.EncodeShortUpload(0, 0x00, 0x0U), XcpException);
     EXPECT_THROW((void)codec.EncodeShortUpload(256, 0x00, 0x0U), XcpException);
+}
+
+// --------------------------------------------------------------------------
+// GET_SEED / UNLOCK（Seed&Key，批次 7）
+// --------------------------------------------------------------------------
+
+TEST(CommandCodecGolden, GetSeedFirstModeGolden) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // 报文为 [F8][mode][resource]：Mode 在前、Resource 在后（双源交叉验证）
+    ExpectBytes(codec.EncodeGetSeed(Resource::CalPag, SeedMode::First),
+                {0xF8, 0x00, 0x01});
+}
+
+TEST(CommandCodecGolden, GetSeedRemainderModeAllResources) {
+    const CommandCodec codec(ByteOrder::Intel);
+    ExpectBytes(codec.EncodeGetSeed(Resource::CalPag, SeedMode::Remainder),
+                {0xF8, 0x01, 0x01});
+    ExpectBytes(codec.EncodeGetSeed(Resource::Daq, SeedMode::Remainder),
+                {0xF8, 0x01, 0x04});
+    ExpectBytes(codec.EncodeGetSeed(Resource::Stim, SeedMode::Remainder),
+                {0xF8, 0x01, 0x08});
+    ExpectBytes(codec.EncodeGetSeed(Resource::Pgm, SeedMode::First),
+                {0xF8, 0x00, 0x10});
+}
+
+TEST(CommandCodecGolden, SeedKeyCommandsAreByteOrderIndependent) {
+    // GET_SEED/UNLOCK 全部为单字节字段：Motorola 会话下报文必须与 Intel
+    // 完全一致（与 Session Byte Order 解耦）
+    const CommandCodec intel(ByteOrder::Intel);
+    const CommandCodec motorola(ByteOrder::Motorola);
+    ExpectBytes(motorola.EncodeGetSeed(Resource::Daq, SeedMode::First),
+                intel.EncodeGetSeed(Resource::Daq, SeedMode::First));
+    ExpectBytes(motorola.EncodeUnlock(0x02, BytesOf({0xAA, 0xBB})),
+                intel.EncodeUnlock(0x02, BytesOf({0xAA, 0xBB})));
+}
+
+TEST(CommandCodecGolden, UnlockFirstFrameCarriesTotalLength) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // 首帧：Length=Key 总长（10），本帧携带 6 字节（MAX_CTO-2）
+    ExpectBytes(
+        codec.EncodeUnlock(10, BytesOf({0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5})),
+        {0xF7, 0x0A, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5});
+}
+
+TEST(CommandCodecGolden, UnlockFollowFrameCarriesRemainingLength) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // 后续帧：Length=剩余长度（4），本帧携带全部剩余 4 字节
+    ExpectBytes(codec.EncodeUnlock(4, BytesOf({0xB0, 0xB1, 0xB2, 0xB3})),
+                {0xF7, 0x04, 0xB0, 0xB1, 0xB2, 0xB3});
+}
+
+TEST(CommandCodecBoundary, UnlockRejectsLengthSmallerThanSegment) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // Length 字段声明的剩余量不可能小于本帧携带量
+    try {
+        (void)codec.EncodeUnlock(2, BytesOf({0x01, 0x02, 0x03}));
+        FAIL() << "Length < 本帧字节数应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
 }
 
 // --------------------------------------------------------------------------

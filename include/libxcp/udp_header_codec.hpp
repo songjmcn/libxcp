@@ -54,8 +54,8 @@ struct UdpHeader {
  * 入参的底层存储，生命周期不超过该视图。
  */
 struct UdpFrameView {
-    UdpHeader header;
-    BytesView xcp_packet;
+    UdpHeader header;      ///< Frame 的 Transport Header
+    BytesView xcp_packet;  ///< Frame 内的 XCP Packet（不拥有存储）
 };
 
 /**

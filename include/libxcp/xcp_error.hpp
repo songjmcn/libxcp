@@ -30,7 +30,7 @@ enum class ErrorCategory {
     Timeout,             ///< 规定时间内没有最终响应
     MalformedPacket,     ///< PID、长度、对齐或字段非法
     ProtocolError,       ///< Slave 返回 ERR
-    UnsupportedFeature,  ///< 本阶段不支持的功能（如 Seed&Key）
+    UnsupportedFeature,  ///< 本阶段未实现的功能（如 DAQ、块模式）
     RecoveryFailed,      ///< SYNCH 恢复或重试耗尽
 };
 
@@ -87,26 +87,41 @@ private:
 
 namespace calmcar::xcp::detail {
 
-/// @brief 构造 InvalidArgument 异常
+/// @brief 构造 InvalidArgument 异常（本地参数、AG 换算、长度非法）
 [[nodiscard]] XcpException MakeInvalidArgument(std::string msg);
 
+/// @brief 构造 InvalidState 异常（Session
+/// 状态不允许当前操作，如未连接就发命令）
 [[nodiscard]] XcpException MakeInvalidState(std::string msg);
 
+/// @brief 构造 TransportError 异常（通道打开/发送/接收失败）
+/// @param msg 错误描述
+/// @param transport_detail 底层 Socket 错误细节，可为空
 [[nodiscard]] XcpException MakeTransportError(
     std::string msg, std::string transport_detail = "");
 
+/// @brief 构造 Timeout 异常（规定时间内没有最终响应）
+/// @param msg 错误描述
+/// @param cmd 超时的命令码（可为空）
+/// @param retry 已使用的恢复重试次数
 [[nodiscard]] XcpException MakeTimeout(std::string msg,
                                        std::optional<CommandCode> cmd,
                                        int retry);
 
+/// @brief 构造 MalformedPacket 异常（响应长度/字段与协议布局不符）
 [[nodiscard]] XcpException MakeMalformedPacket(std::string msg);
 
 /// @brief 构造 ProtocolError 异常
 [[nodiscard]] XcpException MakeProtocolError(std::string msg, CommandCode cmd,
                                              ErrorCode code);
 
+/// @brief 构造 UnsupportedFeature 异常（本地未开放的能力，如 DAQ、块模式）
 [[nodiscard]] XcpException MakeUnsupportedFeature(std::string msg);
 
+/// @brief 构造 RecoveryFailed 异常（SYNCH 恢复未获确认或重试次数用尽）
+/// @param msg 错误描述
+/// @param cmd 触发恢复的命令码（可为空）
+/// @param retry 已使用的重试次数
 [[nodiscard]] XcpException MakeRecoveryFailed(std::string msg,
                                               std::optional<CommandCode> cmd,
                                               int retry);

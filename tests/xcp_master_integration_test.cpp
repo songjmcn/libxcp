@@ -632,16 +632,20 @@ TEST(XcpMasterIntegration, UnrecoverableTimeoutReportsRecoveryFailed) {
 // §9.5 第 7 条：畸形包与错误分类
 // --------------------------------------------------------------------------
 
-TEST(XcpMasterIntegration, AccessLockedSurfacesUnsupportedFeature) {
+TEST(XcpMasterIntegration, AccessLockedSurfacesProtocolError) {
     Rig rig;
     rig.slave.SetMemory(0x4000, BytesOf({0x01, 0x02, 0x03, 0x04}));
     rig.slave.SetError(CommandCode::ShortUpload, ErrorCode::AccessLocked);
     rig.master->Connect();
     try {
         (void)rig.master->ReadMemoryBytes(0x4000, 0x00, 4);
-        FAIL() << "ERR_ACCESS_LOCKED 应映射为 UnsupportedFeature";
+        FAIL() << "ERR_ACCESS_LOCKED 应映射为 ProtocolError（批次 7）";
     } catch (const XcpException& e) {
-        EXPECT_EQ(e.Category(), ErrorCategory::UnsupportedFeature);
+        // 批次 7：Seed&Key 解锁已落地，读命令遇锁以 ProtocolError 报告，
+        // 指引调用方显式调用 XcpMaster::Unlock()（计划 §6.4 不自动解锁）
+        EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
+        EXPECT_EQ(e.GetErrorCode(),
+                  std::optional<ErrorCode>(ErrorCode::AccessLocked));
     }
 }
 

@@ -94,6 +94,26 @@ public:
     /// @brief 设置故障注入
     void SetFaultInjection(const FaultInjection& fault);
 
+    /**
+     * @brief 设置受 Seed&Key 保护的资源掩码（批次 7）
+     * @param protected_resources 受保护的资源位组合；0=全部不保护（默认值，
+     *        既有 253 项用例因此零影响）
+     * @details 受保护期间：GET_STATUS 的 Protection 字段反映
+     *          （保护位 & ~已解锁位）；UPLOAD/SHORT_UPLOAD 返回
+     *          ERR_ACCESS_LOCKED；GET_SEED 按单资源位应答分段 Seed，
+     *          UNLOCK 收满 Key 后校验。CONNECT 建立会话时保留本配置并
+     *          清空已解锁位（新会话资源恢复锁定）。
+     */
+    void SetProtectedResources(ResourceMask protected_resources);
+
+    /**
+     * @brief 设置 GET_SEED 返回的 Seed 内容（批次 7）
+     * @param seed_content 固定 Seed 字节（测试确定性优先，不模拟随机 Seed）；
+     *        为空时恢复默认 {0x01,0x02,0x03,0x04}
+     * @details Seed 长度任意：超过 MAX_CTO-2（6 字节）时自动触发分段读取。
+     */
+    void SetSeedContent(const Bytes& seed_content);
+
     /// @brief 获取已处理的 XCP 命令计数
     [[nodiscard]] std::size_t CommandCount() const;
 
@@ -182,6 +202,23 @@ private:
     /// @brief 把 MTA 前进指定元素数；溢出返回 false
     bool AdvanceMta(ElementCount elements);
 
+    /**
+     * @brief 处理 GET_SEED 命令（批次 7，调用方须持有 m_state_mutex_）
+     * @param xcp_packet 完整 CTO：[F8][mode][resource]
+     * @return 应答报文（RES 分段 Seed / ERR_OUT_OF_RANGE / ERR_SEQUENCE）
+     */
+    Bytes HandleGetSeed(BytesView xcp_packet);
+
+    /**
+     * @brief 处理 UNLOCK 命令（批次 7，调用方须持有 m_state_mutex_）
+     * @param xcp_packet 完整 CTO：[F7][length][key...]
+     * @return 应答报文（RES 保护掩码 / ERR_ACCESS_LOCKED 并断开会话）
+     */
+    Bytes HandleUnlock(BytesView xcp_packet);
+
+    /// @brief 当前生效的保护掩码（保护位 & ~已解锁位，调用方须持锁）
+    [[nodiscard]] ResourceMask EffectiveProtection() const;
+
     /// @brief 测试 Socket 私有实现声明
     struct SocketImpl;
 
@@ -204,7 +241,35 @@ private:
     std::size_t m_command_count_{0};       ///< 已处理的 XCP 命令总数
     FaultInjection m_fault_;               ///< 当前故障注入配置
     std::size_t m_response_count_{0};  ///< 已生成的响应计数（故障注入定位用）
+
+    // ---- Seed&Key 模拟状态（批次 7，受 m_state_mutex_ 保护）----
+    ResourceMask m_protected_resources_{0};  ///< 受保护资源掩码（默认无保护）
+    ResourceMask m_unlocked_resources_{0};   ///< 已成功 UNLOCK 的资源位
+    Bytes m_seed_content_{0x01, 0x02, 0x03,
+                          0x04};  ///< GET_SEED 返回的固定 Seed
+    bool m_seed_in_progress_{
+        false};  ///< GET_SEED 分段序列进行中（Mode=0 已发）
+    Resource m_seed_resource_{Resource::None};  ///< 当前 Seed 序列的目标资源
+    std::size_t m_seed_offset_{
+        0};               ///< 下一段 Seed 的发送偏移（调用方须持锁推进）
+    Bytes m_key_buffer_;  ///< UNLOCK 收集中的 Key 缓冲
+    std::size_t m_key_total_{0};     ///< 本序列 Key 总长度（首帧 Length 字段）
+    std::size_t m_key_received_{0};  ///< 已收到的 Key 字节数
+    std::uint8_t m_key_prev_length_{
+        0};  ///< 上一 UNLOCK 帧的 Length（首帧判定）
 };
+
+/**
+ * @brief 测试用 Seed→Key 算法（批次 7）
+ * @param resource 请求解锁的特权资源（本测试算法不使用，占位以匹配
+ *        SeedKeyCalculator 签名与规范 §9.2 XCP_ComputeKeyFromSeed 参数序）
+ * @param seed Seed 字节（按 XCP 传输顺序原样处理）
+ * @return 对应 Key 字节：key[i] = seed[i] ^ 0x5A ^ i 低 8 位
+ * @details Slave 端 UNLOCK 校验与 Master 端回调**共用本函数**，消除测试两端
+ *          算法不一致的可能；简单可逆且确定性，仅供测试，不是任何真实供应商
+ *          算法。可直接作为 SeedKeyCalculator 传入 XcpMaster::Unlock()。
+ */
+[[nodiscard]] Bytes TestKeyAlgorithm(Resource resource, BytesView seed);
 
 }  // namespace calmcar::xcp::test
 

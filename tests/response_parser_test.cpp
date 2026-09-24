@@ -280,6 +280,73 @@ TEST(ParseGetCommModeInfoResponse, TruncatedRejected) {
         parser.ParseGetCommModeInfoResponse(BytesView{body}).has_value());
 }
 
+// --------------------------------------------------------------------------
+// GET_SEED 响应（Seed&Key，批次 7）
+// --------------------------------------------------------------------------
+
+TEST(ParseGetSeedResponse, DecodesLengthAndSegment) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [length=16（总长）][seed 6 字节首段]
+    const auto resp = parser.ParseGetSeedResponse(
+        BytesView{BytesOf({0x10, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06})});
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->length, 0x10U);
+    EXPECT_EQ(resp->seed, BytesOf({0x01, 0x02, 0x03, 0x04, 0x05, 0x06}));
+}
+
+TEST(ParseGetSeedResponse, ZeroLengthMeansUnprotected) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // Length=0：资源未保护、无需 UNLOCK，Seed 为空
+    const auto resp = parser.ParseGetSeedResponse(BytesView{BytesOf({0x00})});
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->length, 0U);
+    EXPECT_TRUE(resp->seed.empty());
+}
+
+TEST(ParseGetSeedResponse, TruncatedRejected) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const Bytes body{};  // 去掉 PID 后无任何字节
+    EXPECT_FALSE(parser.ParseGetSeedResponse(BytesView{body}).has_value());
+}
+
+TEST(ParseGetSeedResponse, ByteOrderIndependent) {
+    // 全部单字节字段：Motorola 解析结果必须与 Intel 完全一致
+    const Bytes body{0x10, 0xAA, 0xBB};
+    const auto intel =
+        ResponseParser(ByteOrder::Intel).ParseGetSeedResponse(BytesView{body});
+    const auto motorola = ResponseParser(ByteOrder::Motorola)
+                              .ParseGetSeedResponse(BytesView{body});
+    ASSERT_TRUE(intel.has_value());
+    ASSERT_TRUE(motorola.has_value());
+    EXPECT_EQ(intel->length, motorola->length);
+    EXPECT_EQ(intel->seed, motorola->seed);
+}
+
+// --------------------------------------------------------------------------
+// UNLOCK 响应（Seed&Key，批次 7）
+// --------------------------------------------------------------------------
+
+TEST(ParseUnlockResponse, DecodesProtectionMask) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [Current Resource Protection Status=0x1C]（CAL/DAQ/STIM/PGM 仍锁定）
+    const auto resp = parser.ParseUnlockResponse(BytesView{BytesOf({0x1C})});
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->resource_protection, 0x1CU);
+}
+
+TEST(ParseUnlockResponse, ZeroMaskMeansAllUnlocked) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto resp = parser.ParseUnlockResponse(BytesView{BytesOf({0x00})});
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->resource_protection, 0U);
+}
+
+TEST(ParseUnlockResponse, TruncatedRejected) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const Bytes body{};
+    EXPECT_FALSE(parser.ParseUnlockResponse(BytesView{body}).has_value());
+}
+
 TEST(ResponseParserBehavior, ReportsConfiguredByteOrder) {
     EXPECT_EQ(ResponseParser(ByteOrder::Intel).GetByteOrder(),
               ByteOrder::Intel);

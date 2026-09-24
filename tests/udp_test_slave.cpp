@@ -6,6 +6,7 @@
 
 #include "udp_test_slave.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <string>
@@ -50,6 +51,12 @@ constexpr std::uint8_t kTestMaxCto = 8U;
 constexpr std::uint16_t kTestMaxDto = 8U;
 /// @brief 接收缓冲区大小
 constexpr std::size_t kReceiveBufferSize = 65536;
+/// @brief Seed/Key 分段的固定头部字节数：PID(1) + Length(1)
+constexpr std::size_t kSeedKeyHeaderBytes = 2U;
+/// @brief 支持 Seed&Key 的资源位集合（CAL/PAG | DAQ | STIM | PGM）
+constexpr std::uint8_t kSupportedResourceBits = 0x1DU;
+/// @brief 测试默认 Seed 内容（4 字节，单帧即可容纳）
+constexpr std::uint8_t kDefaultSeed[] = {0x01, 0x02, 0x03, 0x04};
 
 /// @brief Windows 进程内 WSAStartup 引用计数
 #if defined(_WIN32)
@@ -185,6 +192,49 @@ void UdpTestSlave::SetFaultInjection(const FaultInjection& fault) {
     m_response_count_ = 0;
 }
 
+void UdpTestSlave::SetProtectedResources(ResourceMask protected_resources) {
+    const std::lock_guard<std::mutex> lock(m_state_mutex_);
+    m_protected_resources_ = protected_resources;
+    // 配置变化后清空解锁位与进行中的 Seed/Key 序列，避免新旧状态错配
+    m_unlocked_resources_ = 0;
+    m_seed_in_progress_ = false;
+    m_seed_resource_ = Resource::None;
+    m_seed_offset_ = 0;
+    m_key_buffer_.clear();
+    m_key_total_ = 0;
+    m_key_received_ = 0;
+    m_key_prev_length_ = 0;
+}
+
+void UdpTestSlave::SetSeedContent(const Bytes& seed_content) {
+    const std::lock_guard<std::mutex> lock(m_state_mutex_);
+    m_seed_content_ = seed_content.empty() ? Bytes{std::begin(kDefaultSeed),
+                                                   std::end(kDefaultSeed)}
+                                           : seed_content;
+    // 内容变化后作废进行中的序列，避免偏移指向已失效的内容
+    m_seed_in_progress_ = false;
+    m_seed_offset_ = 0;
+}
+
+ResourceMask UdpTestSlave::EffectiveProtection() const {
+    // 当前仍生效的保护 = 配置的保护位中尚未成功解锁的部分
+    return static_cast<ResourceMask>(m_protected_resources_ &
+                                     ~m_unlocked_resources_);
+}
+
+Bytes TestKeyAlgorithm(Resource resource, BytesView seed) {
+    // resource 仅占位以匹配 SeedKeyCalculator 签名（测试算法与资源无关）
+    (void)resource;
+    // 简单可逆的确定性算法（仅供测试）：key[i] = seed[i] ^ 0x5A ^ i 低 8 位
+    Bytes key;
+    key.reserve(seed.size());
+    for (std::size_t i = 0; i < seed.size(); ++i) {
+        key.push_back(static_cast<std::uint8_t>(seed[i] ^ 0x5AU ^
+                                                static_cast<std::uint8_t>(i)));
+    }
+    return key;
+}
+
 std::size_t UdpTestSlave::CommandCount() const {
     const std::lock_guard<std::mutex> lock(m_state_mutex_);
     return m_command_count_;
@@ -237,6 +287,113 @@ std::optional<Bytes> UdpTestSlave::ReadAtMta(ElementCount elements) {
         }
     }
     return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// Seed&Key 模拟（批次 7）
+// ---------------------------------------------------------------------------
+
+Bytes UdpTestSlave::HandleGetSeed(BytesView xcp_packet) {
+    // GET_SEED: [F8][mode][resource]
+    if (xcp_packet.size() < 3U) {
+        return MakeErr(ErrorCode::CmdSyntax);
+    }
+    const auto mode = xcp_packet[1];
+    const auto resource_byte = xcp_packet[2];
+
+    if (mode == 0U) {
+        // Mode=0：资源必须恰为单个支持位，否则 ERR_OUT_OF_RANGE（规范
+        // §7.5.1.8）
+        const bool is_single_bit =
+            resource_byte != 0U && (resource_byte & (resource_byte - 1U)) == 0U;
+        if (!is_single_bit || (resource_byte & ~kSupportedResourceBits) != 0U) {
+            return MakeErr(ErrorCode::OutOfRange);
+        }
+        if ((m_protected_resources_ & resource_byte) == 0U) {
+            // 资源未保护：Length=0 表示无需 UNLOCK，且不启动分段序列
+            return MakeRes({0x00});
+        }
+        // 启动（或重启）分段序列并记录目标资源
+        m_seed_in_progress_ = true;
+        m_seed_resource_ = static_cast<Resource>(resource_byte);
+        m_seed_offset_ = 0;
+    } else if (!m_seed_in_progress_) {
+        // 未先 Mode=0 就请求续段 → ERR_SEQUENCE（规范 §7.5.1.8）
+        return MakeErr(ErrorCode::Sequence);
+    }
+
+    // 按 MAX_CTO-2 发送当前偏移处的 Seed 分段
+    const auto total = m_seed_content_.size();
+    const auto remaining = total - m_seed_offset_;
+    const auto segment = std::min<std::size_t>(
+        remaining, static_cast<std::size_t>(kTestMaxCto) - kSeedKeyHeaderBytes);
+    // Length 字段：Mode=0 帧=Seed 总长，Mode=1 帧=发送前剩余长度
+    const auto length_field = static_cast<std::uint8_t>(total - m_seed_offset_);
+
+    Bytes response;
+    response.reserve(2 + segment);
+    response.push_back(static_cast<std::uint8_t>(PacketType::Res));
+    response.push_back(length_field);
+    response.insert(
+        response.end(),
+        m_seed_content_.begin() + static_cast<std::ptrdiff_t>(m_seed_offset_),
+        m_seed_content_.begin() +
+            static_cast<std::ptrdiff_t>(m_seed_offset_ + segment));
+    m_seed_offset_ += segment;
+    if (m_seed_offset_ >= total) {
+        // 分段读取完成：复位序列标记，此后多余的 Mode=1 将收到 ERR_SEQUENCE
+        m_seed_in_progress_ = false;
+    }
+    return response;
+}
+
+Bytes UdpTestSlave::HandleUnlock(BytesView xcp_packet) {
+    // UNLOCK: [F7][length][key...]
+    if (xcp_packet.size() < 2U) {
+        return MakeErr(ErrorCode::CmdSyntax);
+    }
+    const auto length_field = xcp_packet[1];
+    const BytesView key_part = xcp_packet.subspan(2);
+
+    // 首帧判定（与 OpenBLT 同款语义）：Length >= 上帧 Length 视为新 Key
+    // 序列的开始（首帧=总长必然大于此前的剩余长度）
+    if (m_key_received_ == 0U || length_field >= m_key_prev_length_) {
+        m_key_total_ = length_field;
+        m_key_buffer_.clear();
+        m_key_received_ = 0;
+    }
+    m_key_prev_length_ = length_field;
+
+    const auto segment = std::min<std::size_t>(
+        key_part.size(),
+        static_cast<std::size_t>(kTestMaxCto) - kSeedKeyHeaderBytes);
+    m_key_buffer_.insert(
+        m_key_buffer_.end(), key_part.begin(),
+        key_part.begin() + static_cast<std::ptrdiff_t>(segment));
+    m_key_received_ += segment;
+
+    if (m_key_received_ >= m_key_total_) {
+        // 全部 Key 字节收满后才校验（规范 §7.5.1.9）
+        m_key_prev_length_ = 0;
+        m_key_total_ = 0;
+        m_key_received_ = 0;
+        if (m_key_buffer_ !=
+            TestKeyAlgorithm(m_seed_resource_, BytesView{m_seed_content_})) {
+            // Key 错误：ERR_ACCESS_LOCKED 且 Slave 主动断开会话
+            Bytes err = MakeErr(ErrorCode::AccessLocked);
+            m_connected_ = false;
+            m_seed_in_progress_ = false;
+            m_seed_resource_ = Resource::None;
+            m_key_buffer_.clear();
+            return err;
+        }
+        // 解锁成功：目标资源来自最近一次 Mode=0 记录的资源
+        m_unlocked_resources_ |= static_cast<ResourceMask>(m_seed_resource_);
+        m_seed_resource_ = Resource::None;
+        m_key_buffer_.clear();
+    }
+    // 每帧 UNLOCK 均返回当前生效的保护掩码（末帧为解锁后的最终值）
+    return MakeRes({EffectiveProtection()});
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +464,16 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             m_connect_source_port_ = source_port;
             m_mta_ = 0U;
             m_mta_extension_ = 0U;
+            // 新会话：清空已解锁位与 Seed/Key 序列状态（受保护配置保留，
+            // 资源在每次新会话上恢复锁定）
+            m_unlocked_resources_ = 0;
+            m_seed_in_progress_ = false;
+            m_seed_resource_ = Resource::None;
+            m_seed_offset_ = 0;
+            m_key_buffer_.clear();
+            m_key_total_ = 0;
+            m_key_received_ = 0;
+            m_key_prev_length_ = 0;
             // RESOURCE=0x15(CAL/PAG+DAQ+PGM),
             // COMM_MODE_BASIC=0xC0(Intel/BYTE/Block/Optional), MAX_CTO=8,
             // MAX_DTO=8(小端), ProtoVer=0x10, TransportVer=0x10
@@ -325,9 +492,9 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::GetStatus)) {
-            // Session Status=0x00, Protection=0x00, STATE_NUMBER=0x01,
-            // ConfigID=0x0007(小端)
-            response = MakeRes({0x00, 0x00, 0x01, 0x07, 0x00});
+            // Session Status=0x00, Protection=当前生效掩码（批次 7 动态化）,
+            // STATE_NUMBER=0x01, ConfigID=0x0007(小端)
+            response = MakeRes({0x00, EffectiveProtection(), 0x01, 0x07, 0x00});
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::Synch)) {
@@ -340,6 +507,16 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             // reserved, COMM_MODE_OPTIONAL, reserved, MAX_BS, MIN_ST,
             // QUEUE_SIZE, DRIVER_VER
             response = MakeRes({0x00, 0x0E, 0x00, 0x04, 0x02, 0x08, 0x13});
+            destination =
+                std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
+        } else if (cmd == static_cast<std::uint8_t>(CommandCode::GetSeed)) {
+            // GET_SEED: [F8][mode][resource]（批次 7 Seed&Key）
+            response = HandleGetSeed(xcp_packet);
+            destination =
+                std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
+        } else if (cmd == static_cast<std::uint8_t>(CommandCode::Unlock)) {
+            // UNLOCK: [F7][length][key...]（批次 7 Seed&Key）
+            response = HandleUnlock(xcp_packet);
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::SetMta)) {
@@ -364,6 +541,10 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
                 if (elements == 0U ||
                     elements + 1U > kTestMaxCto / kTestAgBytes) {
                     response = MakeErr(ErrorCode::OutOfRange);
+                } else if (EffectiveProtection() != 0U) {
+                    // 存在未解锁的受保护资源：读操作按 ERR_ACCESS_LOCKED
+                    // 拒绝（批次 7，供端到端解锁用例使用）
+                    response = MakeErr(ErrorCode::AccessLocked);
                 } else if (auto data = ReadAtMta(elements)) {
                     // UPLOAD 的 RES 为 [FF][data...]，长度 ==
                     // elements*AG，不含计数字节 （依据
@@ -393,6 +574,10 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
                     (static_cast<Address>(xcp_packet[7]) << 24);
                 if (elements == 0U || elements > kTestMaxCto / kTestAgBytes) {
                     response = MakeErr(ErrorCode::OutOfRange);
+                } else if (EffectiveProtection() != 0U) {
+                    // 存在未解锁的受保护资源：读操作按 ERR_ACCESS_LOCKED
+                    // 拒绝（批次 7，供端到端解锁用例使用）
+                    response = MakeErr(ErrorCode::AccessLocked);
                 } else {
                     const Address saved_mta = m_mta_;
                     const AddressExtension saved_ext = m_mta_extension_;

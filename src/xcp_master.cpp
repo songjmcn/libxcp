@@ -5,9 +5,27 @@
 
 #include "libxcp/xcp_master.hpp"
 
+#include <algorithm>
+#include <cstddef>
+#include <string>
 #include <utility>
 
 namespace calmcar::xcp {
+
+namespace {
+
+/// @brief Seed/Key 分段的固定头部字节数：PID(1) + Length(1)
+constexpr std::size_t kSeedKeyHeaderBytes = 2;
+/// @brief Key 的 Length 字段为单字节，最大 255 字节（规范 §9.2 建议上限）
+constexpr std::size_t kMaxKeyLength = 255;
+/// @brief 可参与 Seed&Key 解锁的合法资源位集合
+constexpr ResourceMask kValidUnlockResources =
+    static_cast<ResourceMask>(Resource::CalPag) |
+    static_cast<ResourceMask>(Resource::Daq) |
+    static_cast<ResourceMask>(Resource::Stim) |
+    static_cast<ResourceMask>(Resource::Pgm);
+
+}  // namespace
 
 XcpMaster::XcpMaster(std::unique_ptr<IXcpTransport> transport,
                      CommandTimeouts timeouts, IEventListener* event_listener)
@@ -130,6 +148,93 @@ SessionState XcpMaster::GetSessionState() const { return m_session_.State(); }
 
 GetStatusResponse XcpMaster::QueryStatus() {
     return m_executor_->ExecuteGetStatus();
+}
+
+UnlockResult XcpMaster::Unlock(Resource resource,
+                               const SeedKeyCalculator& calculator) {
+    // ---- 1) 本地预检（计划 §4.5：非法参数不发送）----
+    const auto resource_mask = static_cast<ResourceMask>(resource);
+    // 必须恰为单个资源位：非 0、无多余置位、且属于 CAL/PAG|DAQ|STIM|PGM
+    const bool is_single_bit =
+        resource_mask != 0U && (resource_mask & (resource_mask - 1U)) == 0U;
+    if (!is_single_bit || (resource_mask & ~kValidUnlockResources) != 0U) {
+        throw detail::MakeInvalidArgument(
+            "Unlock 仅支持单个资源位（CAL_PAG/DAQ/STIM/PGM 之一），收到掩码 " +
+            std::to_string(resource_mask));
+    }
+    if (!calculator) {
+        throw detail::MakeInvalidArgument(
+            "Unlock 的 SeedKeyCalculator 回调不能为空");
+    }
+
+    // Seed/Key 每帧最大载荷 = MAX_CTO - 2（协议已保证 MAX_CTO >= 8）
+    const auto max_segment =
+        static_cast<std::size_t>(m_session_.MaxCto()) - kSeedKeyHeaderBytes;
+
+    // ---- 2) GET_SEED 首段，获得 Seed 总长度 ----
+    const GetSeedResponse first =
+        m_executor_->ExecuteGetSeed(resource, SeedMode::First);
+    if (first.length == 0U) {
+        // Length=0：资源未保护，无需 UNLOCK（规范 §7.5.1.8），
+        // 不调用回调、不发送 UNLOCK
+        return UnlockResult{true, std::nullopt};
+    }
+
+    // ---- 3) 分段收集 Seed（Remainder 帧）----
+    Bytes seed(first.seed.begin(), first.seed.end());
+    if (seed.empty()) {
+        throw detail::MakeMalformedPacket("GET_SEED 声明 Length " +
+                                          std::to_string(first.length) +
+                                          " 但首段 Seed 为空");
+    }
+    if (seed.size() > first.length) {
+        throw detail::MakeMalformedPacket(
+            "GET_SEED 首段 Seed 字节数 " + std::to_string(seed.size()) +
+            " 超过声明总长度 " + std::to_string(first.length));
+    }
+    while (seed.size() < first.length) {
+        const GetSeedResponse part =
+            m_executor_->ExecuteGetSeed(resource, SeedMode::Remainder);
+        if (part.seed.empty()) {
+            // 空续段无法推进进度，终止以防死循环
+            throw detail::MakeMalformedPacket(
+                "GET_SEED 续段返回空 Seed，无法收满声明总长度 " +
+                std::to_string(first.length));
+        }
+        if (seed.size() + part.seed.size() > first.length) {
+            throw detail::MakeMalformedPacket(
+                "GET_SEED 续段累计字节数超过声明总长度 " +
+                std::to_string(first.length));
+        }
+        seed.insert(seed.end(), part.seed.begin(), part.seed.end());
+    }
+
+    // ---- 4) 调用方算法计算 Key（异常原样传播）----
+    Bytes key = calculator(resource, BytesView{seed});
+    if (key.empty()) {
+        throw detail::MakeInvalidArgument(
+            "SeedKeyCalculator 返回空 Key，无法执行 UNLOCK");
+    }
+    if (key.size() > kMaxKeyLength) {
+        throw detail::MakeInvalidArgument("SeedKeyCalculator 返回的 Key 长度 " +
+                                          std::to_string(key.size()) +
+                                          " 字节超过 Length 字段上限 255");
+    }
+
+    // ---- 5) 分段发送 UNLOCK：首帧 Length=Key 总长，后续帧=剩余长度 ----
+    std::size_t offset = 0;
+    UnlockResponse last{};
+    do {
+        const std::size_t remaining = key.size() - offset;
+        const std::size_t segment = std::min(remaining, max_segment);
+        const auto length_field =
+            static_cast<std::uint8_t>(offset == 0U ? key.size() : remaining);
+        last = m_executor_->ExecuteUnlock(
+            length_field, BytesView{key}.subspan(offset, segment));
+        offset += segment;
+    } while (offset < key.size());
+
+    return UnlockResult{false, last.resource_protection};
 }
 
 }  // namespace calmcar::xcp

@@ -8,7 +8,9 @@
 #ifndef CALMCAR_XCP_XCP_MASTER_HPP_
 #define CALMCAR_XCP_XCP_MASTER_HPP_
 
+#include <functional>
 #include <memory>
+#include <optional>
 
 #include "libxcp/command_executor.hpp"
 #include "libxcp/ixcp_transport.hpp"
@@ -17,6 +19,31 @@
 #include "libxcp/xcp_error.hpp"
 
 namespace calmcar::xcp {
+
+/**
+ * @brief Seed→Key 算法回调（Seed&Key，批次 7）
+ *
+ * XCP 不规定算法，A2L 的 SEED_AND_KEY_EXTERNAL_FUNCTION 仅给出供应商函数名；
+ * 本库以回调注入方式由调用方提供算法（可为函数、lambda 或捕获上下文的可调用
+ * 对象）。参数顺序与规范 §9.2 的 XCP_ComputeKeyFromSeed 一致：先特权资源、
+ * 后 Seed。
+ * @note seed 按 XCP Packet 实际传输顺序原样传入，返回的 Key 字节同样按传输
+ *       顺序、禁止按本机字节序重排（docs/XCP_1.3.0_document.md §9.2）。
+ */
+using SeedKeyCalculator =
+    std::function<Bytes(Resource resource, BytesView seed)>;
+
+/**
+ * @brief XcpMaster::Unlock 的执行结果（Seed&Key，批次 7）
+ */
+struct UnlockResult {
+    /// @brief true = GET_SEED 返回 Length 0，资源本就未保护（未发送 UNLOCK）
+    bool was_already_unlocked{false};
+    /// @brief UNLOCK 末帧响应的 Current Resource Protection Status
+    /// @details 资源本就未保护时为 std::nullopt——GET_SEED 响应协议上不含该
+    ///          字段，不伪造值；需要权威保护掩码请调用 QueryStatus()。
+    std::optional<ResourceMask> resource_protection;
+};
 
 /**
  * @brief XCP Master 顶层门面
@@ -81,6 +108,26 @@ public:
      */
     [[nodiscard]] Bytes ReadMemory(Address address, AddressExtension extension,
                                    ElementCount element_count);
+
+    // ---- Seed&Key 解锁（批次 7）----
+
+    /**
+     * @brief 解锁受 Seed&Key 保护的单个资源
+     * @param resource 要解锁的资源（必须恰为 CAL/PAG、DAQ、STIM、PGM 之一）
+     * @param calculator Seed→Key 算法回调（不可为空）
+     * @return 解锁结果（本就未解锁短路 / UNLOCK 末帧保护掩码）
+     * @throws XcpException(InvalidArgument) resource 非单资源位、回调为空、
+     *         回调返回的 Key 为空或超过 255 字节（Length 字段上限）
+     * @throws XcpException(ProtocolError) 协议错误；Key 校验失败时 Session
+     *         转入 Failed（Slave 已主动断开，再次 Connect() 自动 Reset 重建）
+     * @throws XcpException 超时或恢复失败
+     * @details 编排流程：GET_SEED(First) -> [GET_SEED(Remainder)*] ->
+     *          calculator(seed) -> [UNLOCK 分段]*，Seed/Key 按 MAX_CTO-2
+     *          分段。计划 §6.4：ERR_ACCESS_LOCKED 只报告、不自动触发解锁，
+     *          本方法必须由调用方显式调用。
+     */
+    [[nodiscard]] UnlockResult Unlock(Resource resource,
+                                      const SeedKeyCalculator& calculator);
 
     // ---- 状态查询 ----
 

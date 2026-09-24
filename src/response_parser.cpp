@@ -22,6 +22,8 @@ constexpr std::size_t kConnectResMinSize = 7;
 constexpr std::size_t kGetStatusResMinSize = 5;
 /// @brief GET_COMM_MODE_INFO 响应去掉 PID 后的最小长度
 constexpr std::size_t kGetCommModeInfoResMinSize = 7;
+/// @brief GET_SEED / UNLOCK 响应去掉 PID 后的最小长度（[length]/[protection]）
+constexpr std::size_t kSeedKeyResMinSize = 1;
 
 /// @brief COMM_MODE_BASIC 位掩码
 constexpr std::uint8_t kByteOrderMask = 0x01U;
@@ -204,6 +206,30 @@ ResponseParser::ParseGetCommModeInfoResponse(BytesView res_data) const {
         static_cast<std::uint8_t>((driver_version >> 4) & 0x0FU);
     resp.driver_version_minor =
         static_cast<std::uint8_t>(driver_version & 0x0FU);
+    return resp;
+}
+
+std::optional<GetSeedResponse> ResponseParser::ParseGetSeedResponse(
+    BytesView res_data) const {
+    if (res_data.size() < kSeedKeyResMinSize) {
+        return std::nullopt;
+    }
+    GetSeedResponse resp;
+    // Length 字段保留原值：First 帧=Seed 总长、Remainder 帧=剩余长、
+    // 0=资源未保护（语义由编排层按已发 Mode 解读）
+    resp.length = res_data[0];
+    const BytesView seed = res_data.subspan(1);
+    resp.seed.assign(seed.begin(), seed.end());
+    return resp;
+}
+
+std::optional<UnlockResponse> ResponseParser::ParseUnlockResponse(
+    BytesView res_data) const {
+    if (res_data.size() < kSeedKeyResMinSize) {
+        return std::nullopt;
+    }
+    UnlockResponse resp;
+    resp.resource_protection = res_data[0];
     return resp;
 }
 

@@ -254,12 +254,20 @@ ParsedPacket CommandExecutor::DispatchResponse(CommandCode cmd,
                     cmd, code);
             }
         }
-        // ERR_ACCESS_LOCKED：需要 Seed&Key，本阶段不支持（计划 §6.4）
+        // ERR_ACCESS_LOCKED（批次 7）：Seed&Key 解锁功能已落地，不再映射为
+        // UnsupportedFeature。区分两种语义：
+        //  - UNLOCK 命令：Key 校验失败，Slave 随后主动断开会话（规范
+        //    §7.5.1.9），Session 标记 Failed 由 ExecuteUnlock 完成；
+        //  - 其他命令：资源受 Seed&Key 保护，按计划 §6.4 只报告、不自动解锁，
+        //    指引调用方显式调用 XcpMaster::Unlock()。
         if (code == ErrorCode::AccessLocked) {
-            throw XcpException(
-                ErrorCategory::UnsupportedFeature,
-                protocolMessage("资源被 Seed&Key 保护，本阶段不支持解锁", cmd,
-                                *err),
+            if (cmd == CommandCode::Unlock) {
+                throw detail::MakeProtocolError(
+                    "UNLOCK Key 校验失败，Slave 已主动断开会话", cmd, code);
+            }
+            throw detail::MakeProtocolError(
+                protocolMessage("资源受 Seed&Key 保护，请先调用 Unlock() 解锁",
+                                cmd, *err),
                 cmd, code);
         }
         throw detail::MakeProtocolError(message, cmd, code);
@@ -410,8 +418,7 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
         }
 
         if (response) {
-            // dispatchResponse 可能抛
-            // ProtocolError/UnsupportedFeature，交由上层处理
+            // dispatchResponse 可能抛 ProtocolError 等结构化错误，交由上层处理
             return DispatchResponse(cmd, *response);
         }
 
@@ -583,6 +590,49 @@ Bytes CommandExecutor::ExecuteShortUpload(ElementCount number_of_elements,
     auto& res = std::get<PositiveResponse>(response);
     CheckResLength(CommandCode::ShortUpload, res, number_of_elements);
     return std::move(res.data);
+}
+
+GetSeedResponse CommandExecutor::ExecuteGetSeed(Resource resource,
+                                                SeedMode mode) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetSeed(resource, mode);
+    auto response = RunCommand(CommandCode::GetSeed, encoded);
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetSeedResponse(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket("GET_SEED 响应长度不足（RES 数据 " +
+                                          std::to_string(res.data.size()) +
+                                          " 字节）");
+    }
+    return *parsed;
+}
+
+UnlockResponse CommandExecutor::ExecuteUnlock(std::uint8_t length_field,
+                                              BytesView key_segment) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeUnlock(length_field, key_segment);
+
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::Unlock, encoded);
+    } catch (const XcpException& e) {
+        // Key 校验失败：Slave 已主动断开会话（规范 §7.5.1.9），本地会话
+        // 不可继续，标记 Failed（XcpMaster::Connect() 会自动 Reset 重连）
+        if (e.Category() == ErrorCategory::ProtocolError && e.GetErrorCode() &&
+            *e.GetErrorCode() == ErrorCode::AccessLocked) {
+            m_session_.Fail("UNLOCK Key 校验失败，Slave 已主动断开会话");
+        }
+        throw;
+    }
+
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseUnlockResponse(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket("UNLOCK 响应长度不足（RES 数据 " +
+                                          std::to_string(res.data.size()) +
+                                          " 字节）");
+    }
+    return *parsed;
 }
 
 }  // namespace calmcar::xcp

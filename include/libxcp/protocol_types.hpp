@@ -218,6 +218,19 @@ using ResourceMask = std::underlying_type_t<Resource>;
                                                Resource rhs) noexcept;
 
 /**
+ * @brief GET_SEED 命令的 Mode 字段（Seed&Key 分段读取）
+ * @details First=0 请求 Seed 首段并从响应获得 Seed 总长度；Remainder=1 续取
+ *          后续分段（仅当 Seed 长于 MAX_CTO-2 时存在）。未先发 First 直接发
+ *          Remainder 时 Slave 返回 ERR_SEQUENCE（规范 §7.5.1.8）。
+ *          报文中的字段顺序为 [F8][mode][resource]（OpenBLT 与
+ *          robotjatek/XCP 双源交叉验证）。
+ */
+enum class SeedMode : std::uint8_t {
+    First = 0,      ///< 模式 0：请求 Seed 第一部分（获得总长度）
+    Remainder = 1,  ///< 模式 1：请求 Seed 后续部分
+};
+
+/**
  * @brief Session 状态机状态
  */
 enum class SessionState {

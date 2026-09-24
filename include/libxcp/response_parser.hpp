@@ -58,6 +58,23 @@ struct DtoPacket {
     Bytes data;           ///< DTO 数据（PID 之后的全部字节）
 };
 
+/// @brief GET_SEED 响应解析结果（Seed&Key，批次 7）
+struct GetSeedResponse {
+    /// @brief Length 字段原值（保留原始语义，不翻译）
+    /// @details Mode=First 时为 Seed 总长度；Mode=Remainder 时为发送本帧前的
+    ///          剩余长度；0 表示资源未保护、无需 UNLOCK（规范 §7.5.1.8）。
+    std::uint8_t length{0};
+    /// @brief 本帧携带的 Seed 分段字节（多段由编排层拼接）
+    Bytes seed;
+};
+
+/// @brief UNLOCK 响应解析结果（Seed&Key，批次 7）
+struct UnlockResponse {
+    /// @brief Current Resource Protection Status；
+    ///        每帧 UNLOCK 均返回（末帧为解锁后的最终掩码）
+    ResourceMask resource_protection{};
+};
+
 /// @brief 解析后的 Packet 联合类型
 using ParsedPacket = std::variant<PositiveResponse, NegativeResponse,
                                   EventPacket, ServicePacket, DtoPacket>;
@@ -113,12 +130,37 @@ public:
     [[nodiscard]] std::optional<GetCommModeInfoResponse>
     ParseGetCommModeInfoResponse(BytesView res_data) const;
 
+    /**
+     * @brief 解析 GET_SEED 响应（Seed&Key，批次 7）
+     * @param res_data RES 后的数据（布局 [length][seed...]，长度必须 >= 1）
+     * @return 解析结果；长度不足返回 std::nullopt
+     */
+    [[nodiscard]] std::optional<GetSeedResponse> ParseGetSeedResponse(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 UNLOCK 响应（Seed&Key，批次 7）
+     * @param res_data RES 后的数据（布局 [resource_protection]，长度必须 >= 1）
+     * @return 解析结果；长度不足返回 std::nullopt
+     */
+    [[nodiscard]] std::optional<UnlockResponse> ParseUnlockResponse(
+        BytesView res_data) const;
+
 private:
+    /// @brief CONNECT 协商出的 Session 字节序，决定多字节字段的读取方向
     ByteOrder m_byte_order_;
 
+    /// @brief 按 Session 字节序读取 16 位字段
+    /// @param data 响应数据
+    /// @param offset 字段起始偏移
+    /// @return 取值；越界时返回 std::nullopt（由调用方判为畸形包）
     [[nodiscard]] std::optional<std::uint16_t> ReadU16(
         BytesView data, std::size_t offset) const;
 
+    /// @brief 读取单字节字段（带越界保护）
+    /// @param data 响应数据
+    /// @param offset 字段偏移
+    /// @return 取值；越界时返回 std::nullopt
     [[nodiscard]] static std::optional<std::uint8_t> ReadU8(
         BytesView data, std::size_t offset) noexcept;
 };

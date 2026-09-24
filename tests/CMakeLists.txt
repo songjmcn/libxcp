@@ -44,6 +44,7 @@ add_executable(libxcp_tests
         udp_test_slave_test.cpp
         memory_access_test.cpp
         recovery_test.cpp
+        seed_key_test.cpp
         xcp_master_integration_test.cpp
         xcp_udp_loopback_test.cpp
         udp_test_slave.cpp)

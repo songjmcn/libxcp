@@ -679,5 +679,137 @@ TEST(UdpLoopback, RepeatedSessionsRemainStable) {
     slave.Stop();
 }
 
+// --------------------------------------------------------------------------
+// Seed&Key 端到端（批次 7，真实 UDP Socket 上的 GET_SEED/UNLOCK 序列）
+// --------------------------------------------------------------------------
+
+/// @brief 错误的 Key 算法（固定输出，非 TestKeyAlgorithm 的逆运算）
+Bytes WrongKeyAlgorithm(Resource /*resource*/, BytesView seed) {
+    (void)seed;
+    return BytesOf({0xDE, 0xAD, 0xBE, 0xEF});
+}
+
+TEST(SeedKeyEndToEnd, UnlockProtectedResourceRestoresRead) {
+    test::UdpTestSlave slave;
+    slave.SetProtectedResources(
+        static_cast<ResourceMask>(Resource::CalPag));  // CAL/PAG 受保护
+    const Bytes content = BytesOf({0xDE, 0xAD, 0xBE, 0xEF});
+    slave.SetMemory(0x70012340, content);
+    slave.Start();
+
+    auto master = MakeMaster(slave.Port());
+    master->Connect();
+
+    // 连接后 GET_STATUS 应暴露保护位
+    const GetStatusResponse locked_status = master->QueryStatus();
+    EXPECT_EQ(locked_status.resource_protection,
+              static_cast<ResourceMask>(Resource::CalPag));
+
+    // 未解锁读取 → ProtocolError(AccessLocked)，指引显式 Unlock（计划 §6.4）
+    try {
+        (void)master->ReadMemoryBytes(0x70012340, 0x00, 4);
+        FAIL() << "受保护资源读取应被拒绝";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
+        EXPECT_EQ(e.GetErrorCode(),
+                  std::optional<ErrorCode>(ErrorCode::AccessLocked));
+    }
+
+    // 显式解锁（默认 4 字节 Seed，单帧 GET_SEED + 单帧 UNLOCK）
+    const UnlockResult result =
+        master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+    EXPECT_FALSE(result.was_already_unlocked);
+    ASSERT_TRUE(result.resource_protection.has_value());
+    EXPECT_EQ(*result.resource_protection, 0U);
+
+    // 解锁后读取成功，且 GET_STATUS 的保护位已清除
+    const Bytes got = master->ReadMemoryBytes(0x70012340, 0x00, 4);
+    EXPECT_EQ(got, content);
+    const GetStatusResponse unlocked_status = master->QueryStatus();
+    EXPECT_EQ(unlocked_status.resource_protection, 0U);
+
+    master->Disconnect();
+    slave.Stop();
+}
+
+TEST(SeedKeyEndToEnd, MultiSegmentSeedKeyOverRealSocket) {
+    test::UdpTestSlave slave;
+    slave.SetProtectedResources(static_cast<ResourceMask>(Resource::CalPag));
+    // 16 字节 Seed > MAX_CTO-2(6)：GET_SEED 必须分 3 帧；对应的 16 字节 Key
+    // 同样分 3 帧 UNLOCK（6+6+4），全部在真实 Datagram 上交互
+    slave.SetSeedContent(
+        BytesOf({0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A,
+                 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10}));
+    const Bytes content = BytesOf({0x11, 0x22, 0x33, 0x44});
+    slave.SetMemory(0x4000, content);
+    slave.Start();
+
+    auto master = MakeMaster(slave.Port());
+    master->Connect();
+
+    const UnlockResult result =
+        master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+    EXPECT_FALSE(result.was_already_unlocked);
+    ASSERT_TRUE(result.resource_protection.has_value());
+    EXPECT_EQ(*result.resource_protection, 0U);
+
+    const Bytes got = master->ReadMemoryBytes(0x4000, 0x00, 4);
+    EXPECT_EQ(got, content);
+
+    master->Disconnect();
+    slave.Stop();
+}
+
+TEST(SeedKeyEndToEnd, UnprotectedResourceShortCircuits) {
+    test::UdpTestSlave slave;
+    slave.Start();  // 默认不启用任何保护
+
+    auto master = MakeMaster(slave.Port());
+    master->Connect();
+    const auto commands_after_connect = slave.CommandCount();
+
+    bool callback_called = false;
+    const UnlockResult result =
+        master->Unlock(Resource::CalPag, [&](Resource, BytesView) {
+            callback_called = true;
+            return Bytes{};
+        });
+
+    EXPECT_TRUE(result.was_already_unlocked);
+    EXPECT_FALSE(result.resource_protection.has_value());
+    EXPECT_FALSE(callback_called) << "未保护资源不应调用算法回调";
+    // 仅多出 1 条 GET_SEED，没有任何 UNLOCK
+    EXPECT_EQ(slave.CommandCount(), commands_after_connect + 1);
+
+    master->Disconnect();
+    slave.Stop();
+}
+
+TEST(SeedKeyEndToEnd, WrongKeyDisconnectsSlaveAndFailsSession) {
+    test::UdpTestSlave slave;
+    slave.SetProtectedResources(static_cast<ResourceMask>(Resource::CalPag));
+    slave.Start();
+
+    auto master = MakeMaster(slave.Port());
+    master->Connect();
+
+    try {
+        (void)master->Unlock(Resource::CalPag, WrongKeyAlgorithm);
+        FAIL() << "错误 Key 应抛 ProtocolError(AccessLocked)";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
+        EXPECT_EQ(e.GetErrorCode(),
+                  std::optional<ErrorCode>(ErrorCode::AccessLocked));
+    }
+
+    // Slave 按规范主动断开（§7.5.1.9）：本地会话停止于 Failed，
+    // Slave 侧会话标记同步为断开
+    EXPECT_EQ(master->GetSessionState(), SessionState::Failed);
+    EXPECT_FALSE(slave.IsConnected());
+    // master 析构对 Failed 状态安全（IsConnected 为 false，跳过 DISCONNECT）
+    master.reset();
+    slave.Stop();
+}
+
 }  // namespace
 }  // namespace calmcar::xcp

@@ -132,4 +132,33 @@ Bytes CommandCodec::EncodeShortUpload(ElementCount number_of_elements,
     return cto;
 }
 
+Bytes CommandCodec::EncodeGetSeed(Resource resource, SeedMode mode) const {
+    // GET_SEED: [F8][mode][resource]。Mode 与 Resource 均为单字节字段，
+    // 与 Session Byte Order 无关；resource 的单资源位合法性由 Slave 判定
+    // （ERR_OUT_OF_RANGE），本地预检在 XcpMaster::Unlock 完成。
+    Bytes cto;
+    cto.reserve(3);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetSeed));
+    cto.push_back(static_cast<std::uint8_t>(mode));
+    cto.push_back(static_cast<std::uint8_t>(resource));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeUnlock(std::uint8_t length_field,
+                                 BytesView key_segment) const {
+    // 长度字段声明的剩余 Key 量不可能小于本帧携带量（首帧=总长，后续帧=剩余）
+    if (static_cast<std::size_t>(length_field) < key_segment.size()) {
+        throw detail::MakeInvalidArgument(
+            "UNLOCK Length 字段 " + std::to_string(length_field) +
+            " 小于本帧 Key 字节数 " + std::to_string(key_segment.size()));
+    }
+    // UNLOCK: [F7][length][key...]，单字节字段与 Session Byte Order 无关
+    Bytes cto;
+    cto.reserve(2 + key_segment.size());
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::Unlock));
+    cto.push_back(length_field);
+    cto.insert(cto.end(), key_segment.begin(), key_segment.end());
+    return cto;
+}
+
 }  // namespace calmcar::xcp

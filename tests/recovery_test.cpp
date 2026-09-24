@@ -473,19 +473,23 @@ TEST(EventDispatch, AsyncPacketsDoNotDisturbResponseMatching) {
 // 错误分派（计划 §6.4 表格）
 // --------------------------------------------------------------------------
 
-TEST(ErrorDispatch, AccessLockedMapsToUnsupportedFeature) {
+TEST(ErrorDispatch, AccessLockedMapsToProtocolErrorWithUnlockHint) {
     Fixture f;
     f.Connect();
     f.slave.SetResponse(CommandCode::Upload, ErrBytes(ErrorCode::AccessLocked));
     try {
         (void)f.executor.ExecuteUpload(1);
-        FAIL() << "ERR_ACCESS_LOCKED 应映射为 UnsupportedFeature";
+        FAIL() << "ERR_ACCESS_LOCKED 应映射为 ProtocolError（批次 7）";
     } catch (const XcpException& e) {
-        EXPECT_EQ(e.Category(), ErrorCategory::UnsupportedFeature);
+        // 批次 7：解锁功能已落地，读命令遇锁不再映射 UnsupportedFeature，
+        // 而是以 ProtocolError 报告并指引显式调用 Unlock()（计划 §6.4）
+        EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
         EXPECT_EQ(e.GetErrorCode(),
                   std::optional<ErrorCode>(ErrorCode::AccessLocked));
         EXPECT_EQ(e.GetCommandCode(),
                   std::optional<CommandCode>(CommandCode::Upload));
+        EXPECT_NE(std::string(e.what()).find("Unlock"), std::string::npos)
+            << "错误消息应指引调用方先执行 Unlock()";
     }
 }
 
