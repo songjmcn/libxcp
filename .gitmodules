@@ -1,0 +1,3 @@
+[submodule "thirdparty/a2llib"]
+	path = thirdparty/a2llib
+	url = https://github.com/ihedvall/a2llib.git
