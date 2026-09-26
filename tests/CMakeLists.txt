@@ -63,3 +63,41 @@ endif()
 
 include(GoogleTest)
 gtest_discover_tests(libxcp_tests DISCOVERY_TIMEOUT 60)
+
+# ----------------------------------------------------------------------------
+# A2lSmoke —— A2L 最小开发验证集（code-plan/A2L_CMake最小开发验证集_R4.md §5）
+#
+# 仅 LIBXCP_BUILD_A2L=ON 时构建；不依赖 GoogleTest（独立 main + 退出码）。
+# 门禁 7（OFF 模式原构建不变）由 OFF 配置重新生成构建目录验证，不在本目标。
+# ----------------------------------------------------------------------------
+if(LIBXCP_BUILD_A2L)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+  set(A2L_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/a2l_gen")
+  set(A2L_GOLDEN_FILE "${A2L_GOLDEN_DIR}/golden_basic.a2l")
+
+  # P10（设计 §7.1-A / §8.2）：CTest fixture 先跑生成器，再运行 A2lSmoke；
+  # 生成文件只落 build tree，不入仓库。
+  add_test(NAME a2l_gen
+           COMMAND ${Python3_EXECUTABLE}
+                   "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
+                   --out "${A2L_GOLDEN_DIR}")
+  set_tests_properties(a2l_gen PROPERTIES FIXTURES_SETUP A2lGolden)
+
+  add_executable(A2lSmoke a2l_smoke_test.cpp)
+  target_compile_features(A2lSmoke PRIVATE cxx_std_20)
+  # 经桥接层消费（libxcp::a2lbridge PUBLIC 传播 liba2l 导入目标的头与链接库）
+  target_link_libraries(A2lSmoke PRIVATE libxcp::a2lbridge)
+  target_compile_definitions(A2lSmoke PRIVATE A2L_GOLDEN_PATH="${A2L_GOLDEN_FILE}")
+  if(MSVC)
+    target_compile_options(A2lSmoke PRIVATE /utf-8)
+  endif()
+
+  # 运行期寻址：把 liba2l.dll 复制到可执行文件目录（免改 PATH）
+  add_custom_command(TARGET A2lSmoke POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                  "$<TARGET_FILE:liba2l::liba2l>" "$<TARGET_FILE_DIR:A2lSmoke>")
+
+  add_test(NAME A2lSmoke COMMAND A2lSmoke)
+  set_tests_properties(A2lSmoke PROPERTIES FIXTURES_REQUIRED A2lGolden)
+endif()

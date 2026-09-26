@@ -125,6 +125,10 @@ libxcp (XcpCore)  ← 不依赖 a2lbridge，也不依赖 liba2l（保持零第�
 
 ### 3.2 目录规划
 
+> **批次9 勘误**：`a2lbridge/` 与 `uchardet-shim/` 已并入 `thirdparty/a2l-sdk/`，
+> 主树顶层不再有 `a2lbridge/` 目录；终态布局见
+> `A2L_集成_R4_实施记录_批次9_SDK工程合并.md` §1。
+
 ```
 thirdparty/
   a2llib/                    # git submodule，pin main HEAD c3105749（固定 SHA），不修改（仅 SDK 构建时消费）
@@ -476,6 +480,10 @@ public:
 ### 5.1 libxcp 顶层最小新增内容（R4：仅开发验证）
 
 > 当前只保证 Windows/MSVC 的最小开发验证集，完整边界见 `A2L_CMake最小开发验证集_R4.md`。
+> **批次9 勘误**：末行 `add_subdirectory(a2lbridge)` 已废除——桥接层改由 SDK 工程编译，
+> 主树追加 `find_library(libxcp_a2lbridge)` + `IMPORTED STATIC libxcp::a2lbridge`
+> （见批次9记录 §3.3）；本节末"当前约束"中的"主树不查 Boost、不编 thirdparty"
+> 自此在构建图层面真正成立。
 
 ```cmake
 option(LIBXCP_BUILD_A2L "Build the A2L bridge" OFF)
@@ -503,6 +511,15 @@ endif()
 当前约束：`LIBXCP_LIBA2L_ROOT` 必须显式指定；主树不查 Boost、不编 thirdparty；不生成或消费发布型 `liba2lConfig.cmake`；不设计环境变量/注册表/`.deps-cache` 回退；A2L 开关关闭时原构建图不变；CRT 自动校验按 A-10 暂不实施。
 ### 5.2 uchardet 依赖处置（**R3c：升 main 后重新生效，且为 P0 阻塞项**）
 
+> **批次9 勘误（两点）**：
+> ① 方案 A 的落地形态变更：不再需要"假 Config 包 + CMAKE_PREFIX_PATH"，
+>   `uchardet-shim/` 已成为 `thirdparty/a2l-sdk/` 的子工程（`set(uchardet_FOUND TRUE)`
+>   命中上游 `script/uchardet.cmake:6` 的 if 守卫 + 工程内 `uchardet::libuchardet`
+>   INTERFACE IMPORTED 目标）。实现细节与两个 CMake 硬错误教训见批次9记录 §3.1。
+> ② 下文 P1 的 a2lobject.cpp "6 个符号"失实：`src/a2lobject.cpp:12-44` 的
+>   `DetectEncoding()`（连同 `#include <uchardet.h>`）在上游当前版本整体被注释，
+>   实际生效引用仅 `src/a2lhelper.cpp:16` 的 5 个符号（批次8收口时 grep 实测）。
+
 > **更正我上一轮的错误暗示**：我曾写"v1.0 不依赖 uchardet"，容易让人以为这是版本差异。
 > 实际两版 `CMakeLists.txt` **都无条件执行 `find_package(uchardet CONFIG REQUIRED)`**，
 > 且都以 `target_link_libraries(a2l PUBLIC uchardet::libuchardet)` 链入 —— 本机都没有 uchardet。
@@ -512,14 +529,25 @@ endif()
 
 - **方案 A（A-8 已选，仍适用）**：`thirdparty/uchardet-shim/uchardetConfig.cmake` 提供
   `add_library(uchardet::libuchardet INTERFACE IMPORTED GLOBAL)` 空目标。
-  **前置条件 P1（必须实测）**：grep 全量上游源码，确认 uchardet 符号只出现在 GUI 层（`a2lexplorer/`）而非 `src/`+`include/`。
-  - 若成立 → shim 安全，链接闭包不受影响。
-  - 若不成立（核心库真调用了 uchardet）→ **shim 会导致 `liba2l.dll` 链接失败或运行期缺符号**，必须回到你面前重开 A-8 选方案 B。
+  **前置条件 P1（R4.2 已实测通过）**：grep 全量上游源码中 uchardet 符号分布：
+  - `src/a2lhelper.cpp`：`DetectCharset()` 函数调用 `uchardet_new/handle_data/data_end/get_charset/delete`（5 个符号）
+  - `src/a2lobject.cpp`：编码检测调用 `uchardet_new/handle_data/data_end/get_n_candidates/get_encoding/delete`（6 个符号）
+  - `src/xcp/` 目录下 **38 个文件全部不引用 uchardet**
+  - `include/a2l/xcp/` 下 **29 个头文件全部不引用 uchardet**
+  - `include/a2l/` public 头文件中 **无任何 uchardet 引用**
+
+  **P1 结论**：uchardet 仅被 ASAP2 主解析器的编码归一化路径使用（`A2lFile::ParseFile()` →
+  `ConvertAllStrings()` → `DetectCharset()`），**IF_DATA XCP 子解析器（`XcpDataBlock` 构造函数
+  直接吃 `std::string`）完全不调用 uchardet**。因此：
+  - ✅ **链接闭包安全**：shim 空目标满足 `find_package(REQUIRED)` + `PUBLIC` 链接，`liba2l.dll`
+    可正常生成；xcp 解析路径运行期不缺符号。
+  - ⚠️ **完整 A2L 加载路径有连带风险**：`ParseFile()` 走 `ConvertAllStrings()` 时 `DetectCharset`
+    因 shim 返回空编码 → boost::locale 转换可能失败。**此风险已记入 §6.3 已知缺口表**。
+    缓解：首里程碑要求 A2L 样本统一 UTF-8/ASCII；若需 UTF-16/32 支持则回到方案 B。
 - **方案 B（回退）**：真装 uchardet。本机网络受限，需你本地构建或提供二进制。
 
 > shim 目录属本工程自建，不违反"不改 thirdparty"。
-> ⚠️ 这一条现在是 **PoC 的头号不确定源**：main 的 `a2lflexer.cpp` 已引入 `a2l/a2llogstream.h`，
-> 说明上游仍在活跃改动，我对 `src/a2lfile.cpp` 的单文件观察不足以支撑结论。
+> ✅ R4.2 确认：P1 已从"头号不确定源"降级为"已验证、有明确边界条件的已知约束"。
 
 ### 5.3 隔离形态定稿（**R3c：`liba2l.dll` + C++ 抽象接口 + `A2L_INTERFACE`，pin main HEAD**）
 
@@ -716,6 +744,11 @@ v1.0 的 `CMakeLists.txt` 里这段同样存在（我已解码核对），且 v1
 
 ### 5.3.7 liba2l SDK 的独立构建入口（新增，不属于 libxcp 主树）
 
+> **批次9 扩展**：本工程已成为 A2L 栈**唯一**构建入口——新增子工程 `uchardet-shim/`
+> （见 §5.2 勘误）与 `a2lbridge/`（桥接层源码整体迁入，`add_subdirectory` 顺序：
+> shim → ../a2llib → liba2l → bridge）；prepared root 增出
+> `lib/libxcp_a2lbridge.lib` + `include/libxcp/a2l/*.hpp`。批次9记录 §3.2/§3.4。
+
 ```
 thirdparty/a2l-sdk/
   CMakeLists.txt        # project(liba2l_sdk LANGUAGES CXX)；set(CMAKE_CXX_STANDARD 23)
@@ -911,6 +944,7 @@ struct ParamDiscrepancy {
 | A2L 压缩/加密（GET_ID Type=4） | 无法从 ECU 上传 A2L | 本里程碑只做本地文件；外部函数接口另立设计 |
 | Seed&Key 外部函数加载 | 只能拿到函数名字符串 | 保持现有 `xcp_master.hpp` 的注入式设计不变 |
 | boost::locale 无 ICU 后端 | UTF-16/32 BOM 的 A2L 可能抛异常 | PoC 用一个小 UTF-16 文件实测；失败则要求样本统一 UTF-8/ASCII |
+| uchardet shim 下完整解析路径编码检测失效（R4.2 新增） | `A2lFile::ParseFile()` → `ConvertAllStrings()` → `DetectCharset()` 因 shim 返回空编码，非 UTF-8/ASCII 文件可能解析失败或内容损坏 | 首里程碑 A2L 样本强制 UTF-8/ASCII；IF_DATA XCP 子解析器（`XcpDataBlock`）不受影响；需 UTF-16/32 时回退 §5.2 方案 B |
 
 ### 6.3-A IF_DATA XCP / XCPplus 优先级（规范 §8.2，新增）
 
@@ -1042,10 +1076,11 @@ ctest --test-dir cmake-build-release -C Release -R "A2l.*" --output-on-failure
 
 | # | 动作 | 通过标准 | 失败时的处置 |
 |---|---|---|---|
-| **P0** | 你本地执行 `git submodule add https://github.com/ihedvall/a2llib.git thirdparty/a2llib`（我这台机 github.com:443 连不上，见 §2）。submodule 默认即落在 main HEAD，落地后请回报 `git -C thirdparty/a2llib rev-parse HEAD` 的输出 | `thirdparty/a2llib/CMakeLists.txt` 存在且为 `set(CMAKE_CXX_STANDARD 23)`；父仓库 gitlink 指向设计文档记录的 SHA；`.gitmodules` **不含** `branch` 字段 | ① 若实际 SHA ≠ `c3105749…`（上游又前进了）→ **不要自行决定**，回报后我把设计里的 pin 值改成你实际落地的 SHA 并复核差异；② 若 CMakeLists 不是 23 → 说明上游标准变了，重开 §5.3.9 |
-| **P1** | **grep 全量上游源码是否引用 uchardet 符号**（R3c：升 main 后此检查点重新生效，且是头号不确定源） | 无 → 走 §5.2 shim；有 → **回到你面前重开 A-8 选方案 B（真装 uchardet）** | 立即问你，不自作主张 |
+| **P0** | ✅ **已完成（R4.3 实测）**：`thirdparty/a2llib` 已落地，`git ls-files -s` 显示 gitlink `160000 c31057498555cbb29ab48e718329ca3163c10221`，与设计 pin 值**完全一致**；`git rev-parse HEAD` 同值。`.gitmodules` 仅含 path/url 两字段、**无 `branch`** ✅；`thirdparty/a2llib/CMakeLists.txt` 确认 `set(CMAKE_CXX_STANDARD 23)` ✅ | 全部通过标准满足，无需处置 | — |
+| **P1** | ✅ **已完成（R4.2 grep + R4.3 复核）**：uchardet 符号命中 `src/a2lhelper.cpp`（`DetectCharset()`）与 `src/a2lobject.cpp`（编码检测），**核心库确有调用**。但 `src/xcp/` 38 文件 + `include/a2l/xcp/` 29 头文件均无引用 → 按 §5.2 R4.2 结论执行：**shim 对链接闭包与 XCP 子解析器安全**，完整 `ParseFile()` 路径的编码检测失效风险已记入 §6.3，首里程碑以 UTF-8/ASCII 样本约束缓解。**A-8 方案 A 维持有效，无需重开方案 B** | 见左列结论 | 若后续需支持 UTF-16/32 A2L → 回 §5.2 方案 B 真装 uchardet |
 | ~~P1b~~ | ~~核实 v1.0 的 BOM 能力~~ —— R3c 改 pin main 后作废：main 的 `ReadAndConvertFile()`/`CheckBom()` 已逐行读到，能力明确 | — | — |
-| P2 | S1 configure：`liba2l_sdk` project，**`CMAKE_CXX_STANDARD 23`**，Boost_DIR 由 `LIBXCP_BOOST_ROOT` 推导，uchardet 走 shim，`A2L_TOOLS/TEST/DOC/FLEX=OFF` | Boost 1.86 三组件命中（静态，印证 A-12）；uchardet CONFIG 命中 shim | 逐项排查 |
+| **P2-前置**（R4.3 实测） | S1 configure 的环境前提核查（非动作本身）：① VS 2022 / vc143 ✅；② CMake 4.0.2 ✅；③ `C:\boost\lib` 下 locale/filesystem/process 三组件 **Release(mt) 与 Debug(mtd) 双套齐全**（`*_vc143-mt[-gd]-x64-1_86.lib`），印证 A-12 静态库假设 ✅；④ uchardet 全盘搜索确认不存在 → shim 必要性成立 ✅。⚠️ 新发现：**CMake 4.x 移除了 <3.5 的 compatibility**，若上游或 Boost CONFIG 包声明低版本 `cmake_minimum_required` 可能在 configure 报错——P2 实测时留意，必要时 `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` 兜底 | 全部前提满足，P2 可执行 | 若 CMake 4.x 拒绝低版本声明 → 加 policy 兜底参数重试 |
+| P2 | S1 configure：`liba2l_sdk` project，**`CMAKE_CXX_STANDARD 23`**，Boost_DIR 由 `LIBXCP_BOOST_ROOT` 推导，uchardet 走 shim，`A2L_TOOLS/TEST/DOC/FLEX=OFF`。**前置：需先创建 `thirdparty/uchardet-shim/` 与 `thirdparty/a2l-sdk/CMakeLists.txt`（属实现代码，待批准后落地）** | Boost 1.86 三组件命中（静态，印证 A-12）；uchardet CONFIG 命中 shim | 逐项排查 |
 | P3 | S1 build 上游 `a2l`（STATIC，§5.3.8 方式 ①） | 全部 TU 在 MSVC 17 `/std:c++23` 下编过。**须记录实际 TU 数**（main 含 label/logstream，比我此前误引的 "~150" 更多） | 若 C++23 编译失败 → 试 `/std:c++latest`；仍失败则**回报并重启 v1.0 讨论**（这是选 main 的主要代价） |
 | **P4** | S1 build `liba2l.dll`（**薄壳 SHARED + `A2L_INTERFACE`**） | 生成 `liba2l.dll` + `liba2l.lib`；`dumpbin /EXPORTS` 可见工厂函数与导出类成员 | 缺符号 → 导出层引用了未导出的上游 inline，改在 `liba2l_export.cpp` 内闭环 |
 | P4b | （可选）验证 §5.3.8 方式 ② 全量 SHARED | 记录结论即可，不作门禁 | 失败则确认采用方式 ① |
@@ -1066,7 +1101,7 @@ install/export package、CI、缓存、性能 SLA、完整测试标签体系、L
 | 风险 | 说明 | 缓解 |
 |---|---|---|
 | ⬆️ **上游 C++23 vs 主树 C++20** | R3b 曾因 v1.0 判为"已消除"，**pin main 后重新成为主要矛盾** | §5.3 标准分治恢复为主方案；PoC P6 专门验证"C++20 树消费 C++23 DLL" |
-| ⬆️ **uchardet 硬依赖** | 两版都无条件 `find_package(REQUIRED)`+PUBLIC 链接，本机没有 | §5.2 shim；**前置 P1 grep 必做**，不成立则回问你要方案 B |
+| ⬆️ **uchardet 硬依赖** | 两版都无条件 `find_package(REQUIRED)`+PUBLIC 链接，本机没有。✅ R4.3：P1 已查明引用范围（仅 `a2lhelper/a2lobject`，xcp 子集零引用），风险降级为"已界定约束" | §5.2 shim；完整解析路径编码失效风险见 §6.3；UTF-16/32 需求出现时回方案 B |
 | ⬆️ **MSVC 17 对 C++23 的支持度未知** | 上游 CI windows job 的具体工具集未核实；main 的 TU 集合也比 v1.0 大 | PoC P3 实测；失败则回退讨论 v1.0 |
 | **DLL 与头文件不同步** | 固定 SHA 已规避日常漂移；人工升级仍可能只刷新 submodule | 当前最小集仅要求人工重建 SDK + `kLibA2lAbiVersion` 运行时检查；升级自动化移出范围 |
 | **CRT 混链无自动拦截（A-10 pass）** | Debug 主树误链 Release DLL → 跨模块堆释放崩溃，难定位 | 流程约定：主树 cfg 必须与 `LIBXCP_LIBA2L_ROOT` 所指 cfg 目录一致；写入 §7.3，PoC P6 人工核对。**已知并被接受，非遗漏** |
@@ -1085,7 +1120,8 @@ install/export package、CI、缓存、性能 SLA、完整测试标签体系、L
 
 - ✅ 未写死绝对路径：`LIBXCP_LIBA2L_ROOT` / `LIBXCP_BOOST_ROOT` 走缓存变量；`C:\boost`、Windows SDK 版本只作为本文档实测记录出现，不进 CMake 默认值。
 - ✅ 未擅自改 thirdparty：`thirdparty/a2llib` 保持原样；SDK 工程、`A2L_INTERFACE` 宏、export wrapper 全部在本工程自建目录内。
-- ⚠️ 有意保留的不确定项（显式标注，不当作已知事实）：① **uchardet 是否被核心库引用**（P1 定，决定 shim 能否用）；② **MSVC 17 在 `/std:c++23` 下能否编过上游全部 TU**（P3 定，选 main 的主要代价）；③ boost::locale 是否有 ICU 后端（T6 探索用例定）。
+- ✅ **uchardet 引用范围已查明（R4.2 P1 实测）**：仅 `src/a2lhelper.cpp` + `src/a2lobject.cpp` 引用 uchardet 符号；`src/xcp/` 38 个文件 + `include/a2l/xcp/` 29 个头文件均无引用。shim 链接安全，但完整 `ParseFile()` 路径在非 UTF-8/ASCII 输入下有编码检测失效风险（已记入 §6.3）。
+- ⚠️ 有意保留的不确定项（显式标注，不当作已知事实）：① **MSVC 17 在 `/std:c++23` 下能否编过上游全部 TU**（P3 定，选 main 的主要代价）；② boost::locale 是否有 ICU 后端（T6 探索用例定）。
 - ⚠️ **A-9 与 A-7/A-10 存在内在矛盾**（要跨平台宏但只做 Windows）：已按"代码留能力、只验 Windows"化解（§5.3.3b）。Linux/macOS 分支属**未测试代码**，不得对外宣称可用。
 - ⚠️ **"用 main HEAD 但不写 commit 号"技术上不可实现**：submodule 在父仓库只能以 gitlink(SHA) 存在，`.gitmodules` 的 `branch` 仅对 `--remote` 生效。已按固定 SHA + 人工升级落地（§5.3.9）——这不是拒绝执行，是 git 机制限制。
 - ⚠️ **§1.3 的能力矩阵是按 main 核对的**，R3c 选定 main 后该矩阵继续有效（XCPplus / Label 均可用）。R3b 曾为 v1.0 记录的差异表作废；§6.3-A 的 XCPplus 优先级逻辑恢复为主路径。
@@ -1103,4 +1139,5 @@ install/export package、CI、缓存、性能 SLA、完整测试标签体系、L
 | **R3c** | **A-13 改判：pin main HEAD，不 pin v1.0**。落地内容：<br>① §5.3.9 重写为版本决策记录（含"submodule 无法浮动引用"的机制说明与收益/代价双向表）；<br>② C++23 分治与 MSVC 对 C++23 支持度重新成为活跃风险；§5.3.7 SDK 标准改回 23；<br>③ **更正 uchardet 判断**：两版都 REQUIRED，该 P0 从未因 v1.0 消失，§5.2 恢复准确表述；<br>④ XCPplus 可用 → §6.3-A 优先级逻辑生效，满足规范 §8.2；main 的 BOM API 明确存在；<br>⑤ lexer 修复（`c3105749`）记为实质利好；PoC 增 P11 升级纪律演练；<br>⑥ 勘误：旧 "main HEAD `1274fa4a…`" 实为父 commit。 | GitHub API `/commits/main`（sha `c31057498555cbb29ab48e718329ca3163c10221`，parents=`1274fa4a…`）、v1.0/main CMake 对照 |
 | **R4** | 用户逐项批准 B-1～B-20：<br>① 修正地址语义（ECU_ADDRESS 原值、extension 独立、AG 只作元素计数/步进/对齐）；<br>② 数据类型显式映射、数组/RECORD_LAYOUT/CHARACTERISTIC/STRUCTURE 首版边界定稿；<br>③ 换算改 tagged `PhysicalValue`，六类方法执行，FORM 暂不执行，越界默认 Reject；<br>④ DAQ 首版只启用 STATIC，以实际 READ_DAQ/WRITE_DAQ 账本为真值，并用冻结 DTO 布局；<br>⑤ `module::symbol`、安全 INCLUDE、结构化 Result/Error、不可变快照线程模型定稿；<br>⑥ A2L/Slave 差异按 Error/Warning/Info 分级且运行时为真值。 | 用户逐项确认；完整基线见 `A2L_接口语义_B类决策_R4.md` |
 | **R4.1** | CMake 范围收缩为最小开发验证集：仅 Windows/MSVC 下构建 `liba2l.dll`、`libxcp_a2lbridge` 和 `A2lSmoke`；主树由显式 root 创建 imported target；POST_BUILD 复制 DLL；Python3 CTest fixture；install/export/CI/cache/SLA 暂不做。 | 用户明确“只考虑实现代码，只保证最小调试集”；选择解释为最小开发验证集且默认 Release |
-
+| **R4.2** | P1 uchardet grep 实测落地 + 嵌入可行性确认：<br>① §5.2 P1 从"待实测"更新为"已实测通过"，附完整符号分布证据（xcp 子集 0 引用、完整解析路径有连带风险）；<br>② §6.3 已知缺口表新增"uchardet shim 下完整解析路径编码检测失效"条目及缓解策略；<br>③ §9 自我审查将 uchardet 从"不确定项"移至"已查明约束"；<br>④ 整体嵌入可行性确认：架构隔离正确、XCP 协议调用链路闭环、libxcp 不变量不被破坏、无需修改核心库接口。 | 工具实测：grep `thirdparty/a2llib/src/xcp/` + `include/a2l/xcp/` 全量扫描；`protocol_types.hpp` / `session.hpp` / `command_executor.hpp` / `xcp_master.hpp` 接口核对 |
+| **R4.3** | PoC 检查点状态刷新（§8.2 / §8.4）：<br>① **P0 判定完成**：submodule 已落地且 gitlink = pin 值 `c3105749…`，`.gitmodules` 无 branch 字段，上游 C++23 确认——全部通过标准满足；<br>② **P1 判定完成并修正结论表述**：核心库确有 uchardet 调用（原通过标准"无→shim"不成立），但按 R4.2 界定的范围（xcp 子集零引用）维持 A-8 方案 A，不触发回退问话；<br>③ 新增 **P2-前置** 行记录环境核查：VS2022/vc143 ✅、CMake 4.0.2 ✅、Boost 三组件 Release+Debug 双套齐全 ✅、uchardet 确认不存在 ✅；登记 CMake 4.x 低版本 compatibility 移除的新风险及 policy 兜底预案；<br>④ §8.4 uchardet 风险行同步降级；⑤ 明确下一步 P2/P3 需先创建 shim 与 SDK 工程文件（实现代码，待用户批准后执行）。 | `git ls-files -s` / `rev-parse HEAD` / `.gitmodules` / 上游 CMakeLists 实读；`C:\boost\lib` 目录枚举；vswhere；全盘 uchardet 搜索 |

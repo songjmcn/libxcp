@@ -1,16 +1,94 @@
-# 构建产物
+# ============================================================================
+# libxcp .gitignore
+# 目标：排除一切由 CMake / 编译器 / 构建工具 / 测试运行产生的中间与输出产物，
+#       绝不入库；源码（src/ include/ tests/ thirdparty/* 的源码、脚本、文档）均不受影响。
+# 说明：仓库当前无任何被跟踪的 .exe/.dll/.lib/.obj/.pdb/.sln/.vcxproj 等二进制或
+#       生成文件（66 个被跟踪项全为源码/配置/文档），故可用较宽泛的模式统一排除。
+# ============================================================================
+
+# ---- 构建产物目录（含源码树内被误跑的 in-source / 就地构建） ----
 cmake-build-*/
 build/
+build*/
 out/
 
-# 离线依赖缓存（由 CMake 的 .deps-cache/googletest 本地源机制使用，不入库）
-.deps-cache/
+# ---- CMake 生成文件（就地/in-source 构建时散落在根目录与子目录的产物） ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.vcxproj.filters.user
+ALL_BUILD/
+INSTALL/
+RUN_TESTS/
+ZERO_CHECK/
+*[[]1[]]_include.cmake
+compile_commands.json
+CMakeLists.txt.*.swp
 
-# IDE
+# ---- 编译器 / 链接器中间产物 ----
+*.obj
+*.o
+*.lo
+*.a
+*.lib
+*.dll
+*.dll.a
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.so
+*.so.*
+*.dylib
+*.mod
+*.tlog/
+*.recipe
+*.ipch
+*.iobj
+*.ipdb
+*.idb
+*.vshost.*
+*.cpl
+*.drv
+
+# ---- Ninja / 生成器落盘 ----
+build.ninja
+.ninja_deps
+.ninja_log
+.rules.ninja
+CMakePresets.json.tmp
+
+# ---- 离线依赖缓存（由 CMake 的 .deps-cache/googletest 本地源机制使用，不入库） ----
+.deps-cache/
+_deps/
+
+# ---- 测试 / 运行产物 ----
+Testing/
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+coverage/
+
+# ---- 语言运行时字节码 / 缓存 ----
+__pycache__/
+*.py[cod]
+
+# ---- IDE / 编辑器 ----
 .vs/
+.vscode/
 .idea/
 .cache/
-.vscode
-compile_commands.json
-__pycache__
-scripts
+.clangd/
+*.user
+*.suo
+*.userprefs
+/out/
+
+# ---- 本地审计/批改工具脚本（历史 code-plan 记录引用，未纳入版本库；如改用 git 时需显式 add -f） ----
+scripts/
