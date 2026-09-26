@@ -28,6 +28,14 @@ struct LoadOptions {
     bool require_if_data_xcp =
         true;  ///< 缺失 IF_DATA XCP 时是否判为错误（§6.1）
     int progress_notify_percent = 5;  ///< 进度回调的最小百分比间隔
+    /// @brief IF_DATA XCP 来源 MODULE（B-17，批次10）
+    /// @details 空=自动：恰一个 MODULE 含有效 IF_DATA 时取它；多个 MODULE
+    /// 同时声明时报 AmbiguousName（require_if_data_xcp=true 时为加载错误，
+    /// false 时降级为 info.ok=false）。非空=精确匹配 MODULE 名。
+    std::string active_module;
+    /// @brief 是否允许 /include 越出主 A2L 目录（B-18，批次10，默认禁止）
+    /// @details 循环 include 与深度 >32 无论本开关一律拒绝（解析前预扫描）。
+    bool allow_include_outside_root = false;
 };
 
 /**

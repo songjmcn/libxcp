@@ -101,7 +101,7 @@ struct UdpTestSlave::SocketImpl {
 // 构造 / 析构 / 生命周期
 // ---------------------------------------------------------------------------
 
-UdpTestSlave::UdpTestSlave() {
+UdpTestSlave::UdpTestSlave(std::uint16_t fixed_port) {
     auto impl = std::make_unique<SocketImpl>();
     impl->handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (impl->handle == kInvalidSocket) {
@@ -110,7 +110,7 @@ UdpTestSlave::UdpTestSlave() {
 
     sockaddr_in local{};
     local.sin_family = AF_INET;
-    local.sin_port = 0;  // 由 OS 分配临时端口，测试不依赖固定端口
+    local.sin_port = htons(fixed_port);  // 0=OS 临时端口；非0=固定端口（E2E）
     local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::bind(impl->handle, reinterpret_cast<sockaddr*>(&local),
                sizeof(local)) != 0) {

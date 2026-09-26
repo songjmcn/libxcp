@@ -1,0 +1,17 @@
+ASAP2_VERSION 1 61
+/begin PROJECT IncChildProj "include child (own PROJECT, merged by parent)"
+
+  /begin MODULE INC_CHILD "child module"
+
+    /begin COMPU_METHOD CM_C "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+
+    /begin MEASUREMENT CHILD_M "declared in included file" UBYTE CM_C 0 0 0 255
+      ECU_ADDRESS 0x2222
+      ECU_ADDRESS_EXTENSION 0x0
+      READ_WRITE
+    /end MEASUREMENT
+
+  /end MODULE
+
+/end PROJECT

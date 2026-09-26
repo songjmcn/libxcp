@@ -1,0 +1,85 @@
+{
+  "project": "MaskProj",
+  "project_desc": "bitmask / 2d layout / events / record layout golden sample (B-2/B-4/B-9)",
+  "modules": [
+    {
+      "name": "MASK_ECU",
+      "comment": "masks, 2d matrix, event channel, value layout",
+      "mod_common": true,
+      "mod_par": true,
+      "record_layouts": [
+        {"name": "RL_VALUE", "attributes": ["FNC_VALUES 0 UWORD ROW_DIR DIRECT"]}
+      ],
+      "compu_methods": [
+        {"name": "CM_IDENT", "type": "IDENTICAL"}
+      ],
+      "measurements": [
+        {"name": "M_MASK", "desc": "连续位掩码 UWORD", "datatype": "UWORD",
+         "compu": "CM_IDENT", "address": "0x3000", "ext": "0x0",
+         "bit_mask": "0x0F00", "sample_raw_int": 15},
+        {"name": "M_BADMASK", "desc": "non-contiguous mask", "datatype": "UWORD",
+         "compu": "CM_IDENT", "address": "0x3002", "ext": "0x0",
+         "bit_mask": "0x0F0F"},
+        {"name": "M_2D", "desc": "2x3 UWORD regular matrix", "datatype": "UWORD",
+         "compu": "CM_IDENT", "address": "0x3010", "ext": "0x12",
+         "matrix_dim": [2, 3], "layout": "ROW_DIR", "read_write": false},
+        {"name": "M_UBYTE", "desc": "1-byte element for AG unaligned",
+         "datatype": "UBYTE", "compu": "CM_IDENT", "address": "0x3020",
+         "ext": "0x0"},
+        {"name": "M_ARR8", "desc": "8-byte array for AG element counting",
+         "datatype": "UBYTE", "compu": "CM_IDENT", "address": "0x3048",
+         "ext": "0x0", "array_size": 8, "read_write": false},
+        {"name": "M_U64", "desc": "8-byte element for AG counting",
+         "datatype": "A_UINT64", "compu": "CM_IDENT", "address": "0x3030",
+         "ext": "0x0"},
+        {"name": "M_U64MAX", "desc": "uint64 max precision (B-14)",
+         "datatype": "A_UINT64", "compu": "CM_IDENT", "address": "0x3038",
+         "ext": "0x0"},
+        {"name": "M_I64MIN", "desc": "int64 min precision (B-14)",
+         "datatype": "A_INT64", "compu": "CM_IDENT", "address": "0x3040",
+         "ext": "0x0"}
+      ],
+      "characteristics": [
+        {"name": "C_VALUE", "desc": "VALUE with RECORD_LAYOUT inference",
+         "ctype": "VALUE", "address": "0x3100", "deposit": "RL_VALUE",
+         "compu": "CM_IDENT", "upper": 65535, "ext": "0x12"},
+        {"name": "C_CURVE", "desc": "curve is metadata only", "ctype": "CURVE",
+         "address": "0x3200", "deposit": "RL_VALUE", "compu": "CM_IDENT",
+         "upper": 65535},
+        {"name": "C_VALBLK", "desc": "valblk metadata only (batch10)",
+         "ctype": "VAL_BLK", "address": "0x3300", "deposit": "RL_VALUE",
+         "compu": "CM_IDENT", "upper": 65535}
+      ],
+      "if_data": [
+        {
+          "protocol": "XCP",
+          "protocol_layer": {"version": "0x100", "max_cto": "0x10",
+                             "max_dto": "0x20"},
+          "udp": {"port": "0x15B9", "host": "localhost"},
+          "daq": {
+            "type": "STATIC", "max_daq": 4, "max_event": 2, "min_daq": 1,
+            "overload": "NO_OVERLOAD_INDICATION",
+            "events": [
+              {"name": "ev_read", "short": "evr", "number": 1,
+               "type": "DAQ", "max_daq_list": 2, "time_cycle": 10,
+               "time_unit": 4, "priority": 2}
+            ],
+            "daq_list": {
+              "number": 2, "odt_number": 1, "type": "DAQ",
+              "max_odt": 2, "max_odt_entries": 3, "first_pid": 4,
+              "event_fixed": 1,
+              "entries": [
+                {"number": 1, "address": "0x3000", "ext": "0x0", "size": 2,
+                 "bit_offset": 0},
+                {"number": 2, "address": "0x3020", "ext": "0x0", "size": 1,
+                 "bit_offset": 3},
+                {"number": 3, "address": "0x3010", "ext": "0x12", "size": 12,
+                 "bit_offset": 0}
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

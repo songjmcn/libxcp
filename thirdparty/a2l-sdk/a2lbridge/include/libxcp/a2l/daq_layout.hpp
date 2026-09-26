@@ -68,11 +68,24 @@ struct DaqInfo {
 
 /**
  * @brief Event Channel 描述（含 TIMING 与 DAQ_LIST 引用）
+ * @details 批次10：time_cycle/time_unit 为 A2L/XCP 原始码；本仓库暂无
+ * TIME_UNIT 码表（XCP 文档仅说明周期 = TIME_CYCLE × TIME_UNIT），因此
+ * cycle_time_us 当前保持 0.0，换算待码表落地后实现（不臆造系数）。
  */
 struct EventChannelInfo {
-    std::string name;  ///< EVENT_CHANNEL 名字（DAQ_EVENT 引用它）
+    std::string name;        ///< EVENT_CHANNEL 名字（DAQ_EVENT 引用它）
+    std::string short_name;  ///< 短名（A2L short_name 字段，批次10）
     std::uint16_t channel_number = 0;  ///< 通道号
-    double cycle_time_us = 0.0;        ///< MIN_CYCLE_TIME / CYCLE_TIME
+    std::uint8_t type = 1;  ///< 1=DAQ 2=STIM 3=DAQ_STIM（原始码，批次10）
+    std::uint8_t max_daq_list =
+        0;  ///< MAX_DAQ_LIST（0=暂不可分配，0xFF=无限制）
+    double cycle_time_us =
+        0.0;  ///< MIN_CYCLE_TIME / CYCLE_TIME（当前恒 0，见类注释）
+    std::uint8_t time_cycle = 0;  ///< TIME_CYCLE 原始码（批次10）
+    std::uint8_t time_unit = 0;   ///< TIME_UNIT 原始码（批次10）
+    std::uint8_t priority = 0;    ///< 优先级（0xFF 最高，原始码）
+    std::optional<std::uint8_t>
+        consistency;  ///< CONSISTENCY 原始码（0=DAQ 1=EVENT 2=ODT 3=NONE）
     std::vector<std::uint16_t>
         daq_list_numbers;          ///< 该事件下要 START 的 DAQ LIST
     bool has_consistency = false;  ///< 是否声明 CONSISTENCY
@@ -104,6 +117,8 @@ struct DtoFrameLayout {
     bool timestamp_enabled = false;        ///< 携带时间戳
     std::uint8_t timestamp_size_bits = 0;  ///< 时间戳位宽（TIMESTAMP_SIZE）
     bool overflow_indicator = false;       ///< 携带 OVERLOAD 指示位
+    bool pid_off =
+        false;  ///< PID_OFF：识别字段缺席（批次11，对齐设计 §4.4，B-7）
     std::uint8_t header_bytes =
         1;  ///< envelope 固定头（PID）字节数，冻结后不可变
 };
@@ -128,6 +143,8 @@ struct OdtLayout {
 struct DaqListLayout {
     std::uint16_t number = 0;     ///< EPK / DAQ 列表号
     std::vector<OdtLayout> odts;  ///< 预定义 ODT 序列
+    std::optional<std::uint16_t>
+        event_fixed;  ///< EVENT_FIXED（固定事件通道号；批次10，事件反查用）
 };
 
 class DaqLayoutSnapshot;  // 定义见

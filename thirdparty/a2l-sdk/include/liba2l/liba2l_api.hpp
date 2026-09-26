@@ -17,6 +17,7 @@
 #ifndef LIBA2L_LIBA2L_API_HPP_
 #define LIBA2L_LIBA2L_API_HPP_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -32,8 +33,13 @@ namespace liba2l {
 
 // ----------------------------------------------------------------------------
 // ABI 版本（R5）。接口布局每次变更必须递增，消费方在 CreateDoc() 内被强制校验。
+// v2（批次10）：IDoc +SetActiveModule/+AllowIncludeOutsideRoot/+LastErrorLine；
+//               IfDataXcpDto
+//               +timers/optional_commands/seed_and_key/has_ecu_states/
+//               module_name/daq_caps/events/plus_conflicts；新增 DaqCapsDto、
+//               EventChannelDto、XcpPlusConflictDto。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 1u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 2u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -152,13 +158,17 @@ enum class DaqListTypeDto : std::int32_t {
  * @brief 数组维度信息（B-1/B-15）。
  *
  * extent 为该维元素个数；source_lower_bound 保留 A2L 中显式给出的下界（若有）。
+ * 批次11 事实：上游 a2llib 词法+语法均无 ARRAY_DIMENSION/SOURCE_LOWER_BOUNDS
+ * （grep 0 命中）→ 该字段恒 0，且含此属性的 A2L 会在上游直接 ParseFailed；
+ * 规则 2D 以 MATRIX_DIM 表达（B-2 注记，§6.3 缺口表）。
  * 规则：只要任一维度的 stride 不等于"前面低维乘积 ×
  * 元素大小"，即视为不规则布局， bridge
  * 必须整体拒绝（kInvalidLayout），禁止展平猜测。
  */
 struct DimensionDto {
-    std::int64_t source_lower_bound = 0;  ///< A2L 声明的下界（未声明时 0）
-    std::uint64_t extent = 0;             ///< 该维元素个数
+    std::int64_t source_lower_bound =
+        0;                          ///< A2L 声明的下界（上游无语法 → 恒 0）
+    std::uint64_t extent = 0;       ///< 该维元素个数
     std::uint64_t byte_stride = 0;  ///< 相邻元素间实际字节步长（由源数据推导）
 };
 
@@ -235,11 +245,74 @@ struct SymbolDto {
 };
 
 /**
+ * @brief DAQ 能力块快照（IF_DATA XCP DAQ 公共参数，源自 Daq::Get* 全族）。
+ *
+ * 各枚举存原始码值（与上游 a2l::xcp 枚举一一对应），由 bridge 映射到领域枚举：
+ * type 0=STATIC/1=DYNAMIC；optimisation 0..5（DEFAULT/ODT16/ODT32/ODT64/
+ * ALIGNMENT/MAX_ENTRY_SIZE）；address_extension_mode 0=FREE/1=ODT/3=DAQ；
+ * identification_field_type
+ * 0..3（ABSOLUTE/REL_BYTE/REL_WORD/REL_WORD_ALIGNED）； granularity
+ * 1/2/4/8（BYTE/WORD/DWORD/DLONG）；overload 0=NONE/1=PID/2=EVENT。
+ */
+struct DaqCapsDto {
+    std::uint8_t type = 0;                    ///< 0=STATIC 1=DYNAMIC
+    std::uint16_t max_daq = 0;                ///< MAX_DAQ
+    std::uint16_t max_event_channel = 0;      ///< MAX_EVENT_CHANNEL
+    std::uint8_t min_daq = 0;                 ///< MIN_DAQ
+    std::uint8_t optimisation = 0;            ///< OPTIMISATION_TYPE 原始码
+    std::uint8_t address_extension_mode = 0;  ///< ADDRESS_EXTENSION 原始码
+    std::uint8_t identification_field_type =
+        0;                         ///< IDENTIFICATION_FIELD_TYPE 原始码
+    std::uint8_t granularity = 1;  ///< GRANULARITY_ODT_ENTRY_SIZE_DAQ（字节）
+    std::uint8_t max_odt_entry_size = 0;  ///< MAX_ODT_ENTRY_SIZE
+    std::uint8_t overload_indicator = 0;  ///< OVERLOAD_INDICATION 原始码
+    bool prescaler_supported = false;     ///< PRESCALER_SUPPORTED
+    bool resume_supported = false;        ///< RESUME_SUPPORTED
+    bool store_daq_supported = false;     ///< STORE_DAQ_SUPPORTED
+    bool dto_ctr_supported = false;       ///< DTO_CTR_SUPPORTED
+    bool pid_off_supported = false;       ///< PID_OFF_SUPPORTED
+    bool odt_strict = false;              ///< OPTIMISATION_TYPE_ODT_STRICT
+    std::optional<std::uint32_t>
+        timestamp_size_bits;  ///< TIMESTAMP_SIZE（字节数×8；未声明为 nullopt）
+};
+
+/**
+ * @brief EVENT 通道快照（IF_DATA XCP DAQ 内的 d_event 块）。
+ *
+ * time_cycle/time_unit 为原始码（上游 uint8 直存）；本仓库无 TIME_UNIT 码表
+ * （XCP 规范仅说明周期=TIME_CYCLE×TIME_UNIT），因此 cycle_time_us 换算留待
+ * 码表落地，bridge 侧 cycle_time_us 当前保持 0（不臆造换算）。
+ */
+struct EventChannelDto {
+    std::string name;          ///< EVENT 通道名（IDENT 或 STRING）
+    std::string short_name;    ///< 短名
+    std::uint16_t number = 0;  ///< 通道号（DAQ_LIST 的 EVENT_FIXED 引用它）
+    std::uint8_t type = 1;     ///< 1=DAQ 2=STIM 3=DAQ_STIM
+    std::uint8_t max_daq_list = 0;  ///< MAX_DAQ_LIST（0xFF=无限制）
+    std::uint8_t time_cycle = 0;    ///< TIME_CYCLE 原始码
+    std::uint8_t time_unit = 0;     ///< TIME_UNIT 原始码
+    std::uint8_t priority = 0;      ///< 优先级（0xFF 最高）
+    std::optional<std::uint8_t>
+        consistency;  ///< CONSISTENCY 原始码（0=DAQ 1=EVENT 2=ODT 3=NONE）
+};
+
+/**
+ * @brief 同一参数在 XCP 与 XCPplus 块取值不同时的差异记录（§6.3-A）。
+ */
+struct XcpPlusConflictDto {
+    std::string parameter;      ///< 参数名（如 MAX_CTO/BYTE_ORDER/UDP_PORT）
+    std::string xcp_value;      ///< plain XCP 块取值（文本）
+    std::string xcpplus_value;  ///< XCPplus 块取值（文本，以它为准）
+};
+
+/**
  * @brief IF_DATA XCP 公共参数快照（§6.3-A 优先级：XCPplus > XCP）。
  */
 struct IfDataXcpDto {
-    bool present = false;                ///< 是否存在 IF_DATA XCP/XCPplus 块
-    bool from_xcp_plus = false;          ///< true = 取自 XCPplus 块（§6.3-A）
+    bool present = false;        ///< 是否存在有效的 IF_DATA XCP/XCPplus 块
+    bool from_xcp_plus = false;  ///< true = 取自 XCPplus 块（§6.3-A）
+    bool ambiguous = false;      ///< 多 MODULE 块且未指定 active_module（B-17）
+    std::string module_name;     ///< 来源 MODULE 名（B-17 module scope）
     std::uint16_t protocol_version = 0;  ///< PROTOCOL_LAYER VERSION
     std::uint8_t max_cto = 0;            ///< MAX_CTO
     std::uint16_t max_dto = 0;           ///< MAX_DTO
@@ -255,6 +328,19 @@ struct IfDataXcpDto {
     std::string udp_host;  ///< XCPonUDP/IP 主机名/IP（可空）
     std::optional<double>
         resource_mask;  ///< 暂不透出的资源位图（保留扩展位，当前不用）
+    // ---- 批次10 扩展（B-16/B-17/§6.1/§6.3-A 数据补全） ----
+    std::array<std::uint16_t, 7> timers =
+        {};  ///< PROTOCOL_LAYER t1..t7（毫秒；0=未声明）
+    std::vector<std::uint8_t>
+        optional_commands;  ///< OPTIONAL_CMD 声明的命令码（XCP 标准码）
+    std::string
+        seed_and_key_function;    ///< SEED_AND_KEY_EXTERNAL_FUNCTION（文件名）
+    bool has_ecu_states = false;  ///< 是否声明 ECUSTATE 块
+    std::optional<DaqCapsDto> daq_caps;   ///< DAQ 能力块（声明了 DAQ 才有效）
+    std::vector<EventChannelDto> events;  ///< EVENT 通道列表
+    std::vector<XcpPlusConflictDto>
+        plus_conflicts;  ///< XCP vs XCPplus 同参数差异（以 XCPplus 为准，Info
+                         ///< 级）
 };
 
 /**
@@ -318,6 +404,31 @@ public:
      */
     virtual ErrorCode Load(const std::string& file_path,
                            bool module_information_only) noexcept = 0;
+
+    /**
+     * @brief 指定 IF_DATA XCP 取值的来源 MODULE（B-17，需在 Load 之前调用）。
+     *
+     * 空串 = 自动：恰有一个 MODULE 含有效 IF_DATA 块时取它；多个 MODULE
+     * 同时声明时 `GetIfDataXcp` 返回 kAmbiguousName（不静默取首个）。
+     * 非空 = 精确匹配 MODULE 名；匹配不到时 GetIfDataXcp 返回 kNotFound。
+     * @param module_name MODULE 名（区分大小写）。
+     */
+    virtual void SetActiveModule(const std::string& module_name) noexcept = 0;
+
+    /**
+     * @brief 是否允许 `/include` 越出主 A2L 根目录（B-18，默认禁止）。
+     *
+     * 无论开关与否，循环 include 与深度 >32 一律在解析前拒绝（kParseFailed）。
+     * @param allow true=允许绝对路径/根目录外的 include。
+     */
+    virtual void AllowIncludeOutsideRoot(bool allow) noexcept = 0;
+
+    /**
+     * @brief 最近一次错误的 A2L 行号（1 基；无信息返回 0）。
+     * @details 解析失败（bison 错误）时可用；文件不存在等异常路径可能为 0。
+     *          消费方仅在 >0 时填入 Error.line。
+     */
+    virtual std::uint32_t LastErrorLine() const noexcept = 0;
 
     /**
      * @brief 异步加载（后台线程解析；进度经 progress_cb 回调百分比 0..100）。

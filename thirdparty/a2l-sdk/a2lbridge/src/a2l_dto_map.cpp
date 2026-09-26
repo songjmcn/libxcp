@@ -268,6 +268,11 @@ SymbolInfo ConvertSymbol(const liba2l::SymbolDto& dto) {
     }
     info.read_write = dto.read_write;
     info.conversion = ConvertConversion(dto.conversion);
+    // B-10 单位归一（批次10）：PHYS_UNIT 原文优先，为空时才保留
+    // COMPU_METHOD 的 REF_UNIT 作为回退
+    if (!dto.phys_unit.empty()) {
+        info.conversion.unit = dto.phys_unit;
+    }
     info.ref_memory_segment = dto.ref_memory_segment;
     if (dto.have_limit) {
         info.have_limit = true;
@@ -299,8 +304,13 @@ void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
                 layer->address_granularity = AddressGranularity::Byte;
                 break;
         }
-        // t1..t7 / optional_commands / seed_and_key / ecu_states：
-        // 当前 SDK 快照未提取（§6.3 已知缺口），保持零值/空。
+        // 批次10（§6.1 数据补全）：t1..t7、可选命令码、Seed&Key、ECU 状态
+        for (std::size_t i = 0; i < 7; ++i) {
+            layer->timeout_ms[i] = dto.timers[i];
+        }
+        layer->optional_commands = dto.optional_commands;
+        layer->seed_and_key_function = dto.seed_and_key_function;
+        layer->has_ecu_states = dto.has_ecu_states;
     }
     if (transports != nullptr &&
         dto.transport != liba2l::XcpTransportDto::kNone) {
@@ -337,6 +347,7 @@ void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
 DaqListLayout ConvertDaqList(const liba2l::DaqListDto& dto) {
     DaqListLayout layout;
     layout.number = dto.number;
+    layout.event_fixed = dto.event_fixed;  // 事件通道反查用（批次10）
     layout.odts.reserve(dto.predefined_odts.size());
     for (const liba2l::OdtDto& odt : dto.predefined_odts) {
         OdtLayout o;
@@ -355,6 +366,97 @@ DaqListLayout ConvertDaqList(const liba2l::DaqListDto& dto) {
         layout.odts.push_back(std::move(o));
     }
     return layout;
+}
+
+DaqInfo ConvertDaqCaps(const liba2l::DaqCapsDto& dto) {
+    DaqInfo d;
+    // type：0=STATIC 1=DYNAMIC（原始码显式映射，禁止序号推断）
+    d.static_supported = (dto.type == 0);
+    d.dynamic_supported = (dto.type == 1);
+    d.max_daq = dto.max_daq;
+    d.max_event_channel = dto.max_event_channel;
+    d.min_daq = dto.min_daq;
+    d.odt_entry_min_size_bytes = dto.granularity;  // 1/2/4/8 字节粒度
+    d.max_odt_entry_size = dto.max_odt_entry_size;
+    // OPTIMISATION_TYPE：0..5 → Default..MaxEntrySize（顺序显式写出）
+    switch (dto.optimisation) {
+        case 1:
+            d.odt_type = DaqInfo::OdtType::Odt16;
+            break;
+        case 2:
+            d.odt_type = DaqInfo::OdtType::Odt32;
+            break;
+        case 3:
+            d.odt_type = DaqInfo::OdtType::Odt64;
+            break;
+        case 4:
+            d.odt_type = DaqInfo::OdtType::Alignment;
+            break;
+        case 5:
+            d.odt_type = DaqInfo::OdtType::MaxEntrySize;
+            break;
+        case 0:
+        default:
+            d.odt_type = DaqInfo::OdtType::Default;
+            break;
+    }
+    // ADDRESS_EXTENSION：上游原始码 0=FREE 1=ODT 3=DAQ（3≠枚举序号！）
+    switch (dto.address_extension_mode) {
+        case 1:
+            d.address_extension_mode = DaqInfo::AddrExtMode::PerOdt;
+            break;
+        case 3:
+            d.address_extension_mode = DaqInfo::AddrExtMode::PerDaq;
+            break;
+        case 0:
+        default:
+            d.address_extension_mode = DaqInfo::AddrExtMode::Free;
+            break;
+    }
+    // IDENTIFICATION_FIELD_TYPE：0..3 与领域枚举一一对应
+    switch (dto.identification_field_type) {
+        case 1:
+            d.identification_field_type = DaqInfo::IdFieldType::RelativeByte;
+            break;
+        case 2:
+            d.identification_field_type = DaqInfo::IdFieldType::RelativeWord;
+            break;
+        case 3:
+            d.identification_field_type =
+                DaqInfo::IdFieldType::RelativeWordAligned;
+            break;
+        case 0:
+        default:
+            d.identification_field_type = DaqInfo::IdFieldType::Absolute;
+            break;
+    }
+    d.dto_counter_supported = dto.dto_ctr_supported;
+    d.pid_off_supported = dto.pid_off_supported;
+    d.prescaler_supported = dto.prescaler_supported;
+    d.resume_supported = dto.resume_supported;
+    d.overflow_flag_supported = (dto.overload_indicator != 0);  // ≠NONE
+    d.timestamp_max_size_bits = dto.timestamp_size_bits;
+    return d;
+}
+
+EventChannelInfo ConvertEventDto(const liba2l::EventChannelDto& dto) {
+    EventChannelInfo ev;
+    ev.name = dto.name;
+    ev.short_name = dto.short_name;
+    ev.channel_number = dto.number;
+    ev.type = dto.type;
+    ev.max_daq_list = dto.max_daq_list;
+    ev.time_cycle = dto.time_cycle;
+    ev.time_unit = dto.time_unit;
+    ev.priority = dto.priority;
+    if (dto.consistency.has_value()) {
+        ev.consistency = dto.consistency;
+        ev.has_consistency = true;
+    }
+    // cycle_time_us 与 daq_list_numbers 不在此转换：
+    // 前者缺 TIME_UNIT 码表（见 EventChannelInfo 类注释），
+    // 后者由 BuildIfDataXcp 用 DAQ_LIST 的 EVENT_FIXED 反查回填。
+    return ev;
 }
 
 }  // namespace calmcar::xcp::a2l::detail

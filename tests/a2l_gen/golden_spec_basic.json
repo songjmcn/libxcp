@@ -1,0 +1,61 @@
+{
+  "project": "SmokeProj",
+  "project_desc": "libxcp A2L minimal smoke sample",
+  "modules": [
+    {
+      "name": "SMOKE_ECU",
+      "comment": "single module for smoke",
+      "mod_common": true,
+      "mod_par": true,
+      "compu_methods": [
+        {"name": "CM_IDENT", "desc": "identity", "type": "IDENTICAL"},
+        {"name": "CM_LINEAR", "desc": "p = i/2", "type": "LINEAR",
+         "format": "%9", "unit": "V", "coeffs_linear": [0.0, 0.5]}
+      ],
+      "measurements": [
+        {"name": "M_ARRAY", "desc": "smoke M_ARRAY", "datatype": "UWORD",
+         "compu": "CM_IDENT", "address": "0x8000", "ext": "0x12",
+         "array_size": 4, "read_write": false},
+        {"name": "M_BYTE", "desc": "smoke M_BYTE", "datatype": "UBYTE",
+         "compu": "CM_IDENT", "address": "0x8010", "ext": "0x0",
+         "sample_raw_int": 42},
+        {"name": "M_LINEAR", "desc": "smoke M_LINEAR", "datatype": "UWORD",
+         "compu": "CM_LINEAR", "address": "0x8020", "ext": "0x12",
+         "phys_unit": "V", "sample_raw_int": 200}
+      ],
+      "characteristics": [
+        {"name": "C_VALUE", "desc": "smoke C_VALUE", "ctype": "VALUE",
+         "address": "0x9000", "deposit": "STD_VALUE", "compu": "CM_LINEAR",
+         "upper": 10000}
+      ],
+      "if_data": [
+        {
+          "protocol": "XCP",
+          "protocol_layer": {"version": "0x100", "max_cto": "0x10",
+                             "max_dto": "0x20", "timers": [1, 1, 5, 5, 5, 1, 1]},
+          "udp": {"port": "0x15B7", "host": "localhost"},
+          "daq": {
+            "type": "STATIC", "max_daq": 3, "max_event": 2, "min_daq": 0,
+            "optimisation": "OPTIMISATION_TYPE_DEFAULT",
+            "addr_ext": "ADDRESS_EXTENSION_DAQ",
+            "id_field": "IDENTIFICATION_FIELD_TYPE_ABSOLUTE",
+            "granularity": "GRANULARITY_ODT_ENTRY_SIZE_DAQ_BYTE",
+            "max_odt_entry_size": 4,
+            "overload": "OVERLOAD_INDICATION_EVENT",
+            "daq_list": {
+              "number": 1, "odt_number": 1, "type": "DAQ",
+              "max_odt": 1, "max_odt_entries": 2, "first_pid": 1,
+              "event_fixed": 1,
+              "entries": [
+                {"number": 1, "address": "0x8020", "ext": "0x12", "size": 2,
+                 "bit_offset": 0},
+                {"number": 2, "address": "0x8010", "ext": "0x0", "size": 1,
+                 "bit_offset": 0}
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

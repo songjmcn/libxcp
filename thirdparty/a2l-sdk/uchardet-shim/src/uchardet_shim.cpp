@@ -18,8 +18,8 @@ namespace {
 
 /** 哨兵对象：句柄仅用于区分 NULL 与非 NULL，无内部状态需求。 */
 struct ShimDetector {
-  /** 占位成员，保证每个实例有独立地址。 */
-  char marker_;
+    /** 占位成员，保证每个实例有独立地址。 */
+    char marker_;
 };
 
 /** 桩固定返回的空字符串（生命周期与进程一致）。 */
@@ -30,47 +30,43 @@ constexpr char kEmpty[] = "";
 extern "C" {
 
 uchardet_t uchardet_new(void) {
-  auto* det = static_cast<ShimDetector*>(std::malloc(sizeof(ShimDetector)));
-  if (det != nullptr) {
-    det->marker_ = 'u';
-  }
-  return static_cast<uchardet_t>(det);
+    auto* det = static_cast<ShimDetector*>(std::malloc(sizeof(ShimDetector)));
+    if (det != nullptr) {
+        det->marker_ = 'u';
+    }
+    return static_cast<uchardet_t>(det);
 }
 
-void uchardet_delete(uchardet_t ud) {
-  std::free(ud);
-}
+void uchardet_delete(uchardet_t ud) { std::free(ud); }
 
 int uchardet_handle_data(uchardet_t ud, const char* data, size_t len) {
-  // 桩不做任何探测；参数校验保持与真库一致的宽容度（NULL 句柄视为失败）。
-  (void)data;
-  (void)len;
-  return ud == nullptr ? -1 : 0;
+    // 桩不做任何探测；参数校验保持与真库一致的宽容度（NULL 句柄视为失败）。
+    (void)data;
+    (void)len;
+    return ud == nullptr ? -1 : 0;
 }
 
-void uchardet_data_end(uchardet_t ud) {
-  (void)ud;
-}
+void uchardet_data_end(uchardet_t ud) { (void)ud; }
 
 const char* uchardet_get_charset(uchardet_t ud) {
-  (void)ud;
-  return kEmpty;
+    (void)ud;
+    return kEmpty;
 }
 
 int uchardet_get_n_candidates(uchardet_t ud) {
-  (void)ud;
-  return 0;
+    (void)ud;
+    return 0;
 }
 
 const char* uchardet_get_candidate(uchardet_t ud, int index) {
-  (void)ud;
-  (void)index;
-  return kEmpty;
+    (void)ud;
+    (void)index;
+    return kEmpty;
 }
 
 const char* uchardet_get_encoding(uchardet_t ud) {
-  (void)ud;
-  return kEmpty;
+    (void)ud;
+    return kEmpty;
 }
 
 }  // extern "C"

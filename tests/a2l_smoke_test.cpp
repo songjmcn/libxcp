@@ -1,7 +1,7 @@
 // =============================================================================
 // a2l_smoke_test.cpp —— A2L 最小开发验证集冒烟测试（门禁清单见
 // code-plan/A2L_CMake最小开发验证集_R4.md §5）：
-//   G1 DLL 可加载 + ABI 版本检查通过；
+//   G1 DLL 可加载 + ABI 三向校验（v2 可建 / v1、v3 必拒，批次10 ABI bump）；
 //   G2 生成的最小 A2L 可解析；
 //   G3 符号可按 module::symbol 查询（含裸名与未命中路径）；
 //   G4 B-1 地址/extension 原值保留 + AG 元素计数/地址推进；
@@ -77,12 +77,19 @@ constexpr std::int64_t kBytePhys = 42;  ///< IDENTICAL：raw 42
 /// @brief double 物理值比较（0.5 系数二进制精确，容差仅防实现路径抖动）
 bool Near(double a, double b) { return std::fabs(a - b) < 1e-9; }
 
-/// @brief G1：DLL 加载 + ABI 双向校验（匹配可建、不匹配必拒）
+/// @brief G1：DLL 加载 + ABI 三向校验（当前版本可建、v-1 与 v+1 必拒）
 void Gate1AbiCheck() {
     liba2l::IDoc* good = liba2l::CreateDoc(liba2l::kLibA2lAbiVersion);
     CHECK(good != nullptr);
     if (good != nullptr) {
         good->Release();
+    }
+    // 批次10：ABI 已 bump 到 2 —— 旧版头（v1）必须被新 DLL 拒绝，
+    // 这是 R5 "DLL 与头不同步只靠 kLibA2lAbiVersion 兜底" 的直接验证
+    liba2l::IDoc* old = liba2l::CreateDoc(liba2l::kLibA2lAbiVersion - 1);
+    CHECK(old == nullptr);
+    if (old != nullptr) {
+        old->Release();
     }
     liba2l::IDoc* bad = liba2l::CreateDoc(liba2l::kLibA2lAbiVersion + 1);
     CHECK(bad == nullptr);
@@ -222,10 +229,42 @@ void CheckIfDataSnapshot(const A2lBridge& bridge) {
         CHECK(xcp->transports[0].remote_host == "localhost");
     }
     CHECK(xcp->daq.has_value() && xcp->daq->static_supported);
+    // ---- 批次10 数据补全断言（§6.1：t1..t7 / DAQ 能力块 / 事件 / 归属） ----
+    CHECK(!xcp->ambiguous);              // B-17：单 MODULE 自动选择，非歧义
+    CHECK(xcp->module_name == kModule);  // B-17 module scope（批次10）
+    const auto& t = xcp->protocol_layer.timeout_ms;
+    CHECK(t[0] == 1 && t[1] == 1 && t[2] == 5 && t[3] == 5 && t[4] == 5 &&
+          t[5] == 1 && t[6] == 1);  // T1..T7 = 1 1 5 5 5 1 1（gen SPEC）
+    CHECK(xcp->protocol_layer.optional_commands
+              .empty());  // 样本未声明 OPTIONAL_CMD
+    CHECK(xcp->protocol_layer.seed_and_key_function.empty());
+    CHECK(!xcp->protocol_layer.has_ecu_states);
+    CHECK(xcp->event_channels.empty());  // 样本无 EVENT 块（黄金变体补测）
+    CHECK(xcp->plus_conflicts.empty());  // 样本无 XCPplus 对照块
+    if (xcp->daq.has_value()) {
+        const auto& caps = *xcp->daq;
+        CHECK(!caps.dynamic_supported);
+        CHECK(caps.max_daq == 3);                   // DAQ STATIC 3 …
+        CHECK(caps.max_event_channel == 2);         // … 2 …
+        CHECK(caps.min_daq == 0);                   // … 0
+        CHECK(caps.odt_entry_min_size_bytes == 1);  // GRANULARITY …_BYTE
+        CHECK(caps.max_odt_entry_size == 4);        // … 4
+        CHECK(caps.odt_type == calmcar::xcp::a2l::DaqInfo::OdtType::Default);
+        CHECK(caps.address_extension_mode ==
+              calmcar::xcp::a2l::DaqInfo::AddrExtMode::PerDaq);
+        CHECK(caps.identification_field_type ==
+              calmcar::xcp::a2l::DaqInfo::IdFieldType::Absolute);
+        CHECK(caps.overflow_flag_supported);  // OVERLOAD_INDICATION_EVENT
+        CHECK(!caps.prescaler_supported && !caps.resume_supported &&
+              !caps.pid_off_supported && !caps.dto_counter_supported);
+        CHECK(!caps.timestamp_max_size_bits.has_value());
+    }
     CHECK(xcp->static_daq_lists.size() == 1);
     if (xcp->static_daq_lists.size() == 1) {
         const auto& list = xcp->static_daq_lists[0];
         CHECK(list.number == kEpPid);
+        // 批次10：EVENT_FIXED 反查通道（事件联动链路的数据来源）
+        CHECK(list.event_fixed.has_value() && *list.event_fixed == 1);
         CHECK(list.odts.size() == 1);
         if (!list.odts.empty()) {
             const auto& entries = list.odts[0].entries;

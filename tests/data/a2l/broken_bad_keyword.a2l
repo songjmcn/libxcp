@@ -1,0 +1,9 @@
+ASAP2_VERSION 1 61
+/begin Project BadProj "keyword typo sample, must fail with line info"
+
+  /begin MODUL BAD_ECU "MODUL instead of MODULE"
+    /begin MEASUREMENT B_X "unreachable" UBYTE CM_B 0 0 0 255
+    /end MEASUREMENT
+  /end MODUL
+
+/end PROJECT

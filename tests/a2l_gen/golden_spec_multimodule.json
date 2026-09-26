@@ -1,0 +1,42 @@
+{
+  "project": "MultiProj",
+  "project_desc": "two modules both declaring IF_DATA (B-17 ambiguity)",
+  "modules": [
+    {
+      "name": "MOD_A",
+      "comment": "module A",
+      "mod_common": true,
+      "mod_par": false,
+      "compu_methods": [{"name": "CM_IDENT", "type": "IDENTICAL"}],
+      "measurements": [
+        {"name": "DUP", "desc": "duplicate bare name in both modules",
+         "datatype": "UWORD", "compu": "CM_IDENT", "address": "0x4000",
+         "ext": "0x0"},
+        {"name": "UNIQUE_A", "desc": "only in MOD_A", "datatype": "UBYTE",
+         "compu": "CM_IDENT", "address": "0x4002", "ext": "0x0"}
+      ],
+      "if_data": [
+        {"protocol": "XCP",
+         "protocol_layer": {"version": "0x100", "max_cto": "0x10",
+                            "max_dto": "0x20"}}
+      ]
+    },
+    {
+      "name": "MOD_B",
+      "comment": "module B",
+      "mod_common": true,
+      "mod_par": false,
+      "compu_methods": [{"name": "CM_IDENT", "type": "IDENTICAL"}],
+      "measurements": [
+        {"name": "DUP", "desc": "duplicate bare name in both modules",
+         "datatype": "UBYTE", "compu": "CM_IDENT", "address": "0x5000",
+         "ext": "0x0"}
+      ],
+      "if_data": [
+        {"protocol": "XCP",
+         "protocol_layer": {"version": "0x100", "max_cto": "0x20",
+                            "max_dto": "0x40"}}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+ASAP2_VERSION 1 61
+/begin PROJECT CycleProj "include cycle entry (a→b→a), must be rejected before parse"
+
+/include "cycle_a.a2l"
+
+  /begin MODULE CYCLE_MAIN "entry module"
+    /begin COMPU_METHOD CM_Y "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+    /begin MEASUREMENT CYCLE_M "unreachable when cycle detected" UBYTE CM_Y 0 0 0 255
+      ECU_ADDRESS 0x3001
+      READ_WRITE
+    /end MEASUREMENT
+  /end MODULE
+
+/end PROJECT

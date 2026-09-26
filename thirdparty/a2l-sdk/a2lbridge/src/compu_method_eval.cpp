@@ -533,6 +533,20 @@ Result<PhysicalValue> EvaluateToPhysical(const SymbolInfo& symbol,
     const bool full_word_mask =
         symbol.bit_mask == 0 || mask_width >= symbol.element_size_bytes * 8u;
 
+    // B-14（批次10）：64 位整型 + IDENTICAL 的全字路径必须全宽精确，
+    // 不经 double 中转（double 尾数仅 53 位，UINT64_MAX/INT64_MIN 会丢精度）。
+    if (full_word_mask &&
+        (symbol.conversion.kind == ConversionKind::None ||
+         symbol.conversion.kind == ConversionKind::Identical)) {
+        if (symbol.data_type == AsamDataType::ULong64) {
+            return PhysicalValue{bits};
+        }
+        if (symbol.data_type == AsamDataType::SLong64) {
+            // C++20：uint64→int64 为模块化定义（高位 1 即负值），精确
+            return PhysicalValue{static_cast<std::int64_t>(bits)};
+        }
+    }
+
     Result<double> numeric = [&]() -> Result<double> {
         if (full_word_mask) {
             return BitsToNumeric(bits, symbol.element_size_bytes,
@@ -597,6 +611,27 @@ Result<Bytes> EvaluateFromPhysical(const SymbolInfo& symbol,
             if (p < symbol.lower_limit || p > symbol.upper_limit) {
                 return ConvError(ErrorCode::ConversionOutOfRange, symbol,
                                  "物理值超出 A2L 符号限值（B-15）");
+            }
+        }
+    }
+
+    // B-14（批次10）：64 位整型 + IDENTICAL 的全字精确编码（不经 double）。
+    // 仅在无位掩码时启用——子字段仍走窄类型编码（≤53 位精度安全）；
+    // 上方 ConvertInverse 的 double 中间值对本路径不生效（仅留限值校验）。
+    if (symbol.bit_mask == 0 &&
+        (symbol.conversion.kind == ConversionKind::None ||
+         symbol.conversion.kind == ConversionKind::Identical)) {
+        if (symbol.data_type == AsamDataType::ULong64) {
+            if (const auto* u = std::get_if<std::uint64_t>(&value)) {
+                return WriteRawLittleEndian(*u, symbol.element_size_bytes,
+                                            symbol.byte_order);
+            }
+        }
+        if (symbol.data_type == AsamDataType::SLong64) {
+            if (const auto* i = std::get_if<std::int64_t>(&value)) {
+                return WriteRawLittleEndian(static_cast<std::uint64_t>(*i),
+                                            symbol.element_size_bytes,
+                                            symbol.byte_order);
             }
         }
     }

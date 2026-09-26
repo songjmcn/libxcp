@@ -101,6 +101,9 @@ Result<std::unique_ptr<A2lBridge>> A2lBridge::Load(const std::string& file_path,
     if (!impl->Create(&create_error)) {
         return BridgeError(ErrorCode::AbiMismatch, Phase::Load, create_error);
     }
+    // 批次10：B-17 active_module 与 B-18 include 越根开关必须在 Load 前生效
+    impl->doc->SetActiveModule(options.active_module);
+    impl->doc->AllowIncludeOutsideRoot(options.allow_include_outside_root);
     const liba2l::ErrorCode rc =
         impl->doc->Load(file_path, options.module_information_only);
     if (rc != liba2l::ErrorCode::kOk) {
@@ -111,6 +114,10 @@ Result<std::unique_ptr<A2lBridge>> A2lBridge::Load(const std::string& file_path,
             rc, Phase::Load,
             sdk_message.empty() ? "SDK 装载失败" : std::move(sdk_message));
         e.path = file_path;
+        // B-19：解析失败时结构化行号（SDK 无信息时为 0 → 保持 nullopt）
+        if (const std::uint32_t line = impl->doc->LastErrorLine(); line > 0) {
+            e.line = line;
+        }
         return e;
     }
     impl->progress = 100;
@@ -146,13 +153,22 @@ Result<std::unique_ptr<A2lBridge>> A2lBridge::LoadAsync(
     // 运行在 SDK 线程。桥接层在回调里发布快照（B-20）后转发用户回调。
     raw->user_cb = std::move(ready_callback);
     raw->require_if_data_xcp = options.require_if_data_xcp;
+    // 批次10：B-17/B-18 选项在受理前生效（SDK 受理时拷贝配置进线程态）
+    raw->doc->SetActiveModule(options.active_module);
+    raw->doc->AllowIncludeOutsideRoot(options.allow_include_outside_root);
     const liba2l::ErrorCode start = raw->doc->LoadAsync(
         file_path, options.module_information_only, nullptr, [raw](int code) {
             Result<void> outcome = [&]() -> Result<void> {
                 if (code != static_cast<int>(liba2l::ErrorCode::kOk)) {
-                    return detail::MapSdkError(
+                    Error e = detail::MapSdkError(
                         static_cast<liba2l::ErrorCode>(code), Phase::Load,
                         "异步解析失败");
+                    // B-19：异步失败同样带出结构化行号
+                    if (const std::uint32_t line = raw->doc->LastErrorLine();
+                        line > 0) {
+                        e.line = line;
+                    }
+                    return e;
                 }
                 raw->progress = 100;
                 if (!raw->PublishSnapshot(raw->require_if_data_xcp)) {
@@ -198,6 +214,13 @@ Result<std::unique_ptr<IDaqLayout>> A2lBridge::CreateDaqLayout() const {
         return BridgeError(ErrorCode::NotFound, Phase::Layout,
                            "A2L 中不存在 STATIC DAQ_LIST");
     }
+    // B-5：DYNAMIC 只解析能力不执行 —— 显式拒绝，不伪装成功
+    if (m_impl_->xcp_info->daq.has_value() &&
+        !m_impl_->xcp_info->daq->static_supported) {
+        return BridgeError(
+            ErrorCode::UnsupportedOperation, Phase::Layout,
+            "动态 DAQ 首里程碑不支持（B-5 DynamicDaqNotImplemented）");
+    }
     return detail::MakeDaqLayout(lists, m_impl_->database.get());
 }
 
@@ -224,13 +247,15 @@ Result<std::vector<ParamDiscrepancy>> A2lBridge::CompareWithRuntime(
     auto fmt = [](auto v) { return std::to_string(v); };
 
     // B-16：运行时为真值；差异只影响对应功能，Error 也只阻断该功能
+    // B-16 分级：容量/能力取两端更保守值即可协商 → Warning（不是 Error）。
+    // Error 仅限破坏协商的项（protocol major、ByteOrder、AG、DAQ 约束）。
     if (runtime.max_cto != a2l.max_cto) {
-        add("MAX_CTO", fmt(a2l.max_cto), fmt(runtime.max_cto), Severity::Error,
-            "传输分片");
+        add("MAX_CTO", fmt(a2l.max_cto), fmt(runtime.max_cto),
+            Severity::Warning, "传输分片");
     }
     if (runtime.max_dto != a2l.max_dto) {
-        add("MAX_DTO", fmt(a2l.max_dto), fmt(runtime.max_dto), Severity::Error,
-            "DTO 组包");
+        add("MAX_DTO", fmt(a2l.max_dto), fmt(runtime.max_dto),
+            Severity::Warning, "DTO 组包");
     }
     if (runtime.byte_order != a2l.byte_order) {
         add("BYTE_ORDER",
@@ -243,10 +268,18 @@ Result<std::vector<ParamDiscrepancy>> A2lBridge::CompareWithRuntime(
             fmt(AgToBytes(runtime.address_granularity)), Severity::Error,
             "地址计算");
     }
-    if (runtime.protocol_version != a2l.version) {
-        // 版本号差异通常兼容（同 major），降为 Warning
-        add("PROTOCOL_VERSION", fmt(a2l.version), fmt(runtime.protocol_version),
-            Severity::Warning, "协议协商");
+    // B-16：protocol major 不兼容 → Error（阻断协议协商）；仅 minor 差异 →
+    // Warning（同 major 可协商兼容）。t1..t7 不参与比对（Master 超时配置）。
+    const std::uint16_t a2l_major =
+        static_cast<std::uint16_t>(a2l.version >> 8);
+    const std::uint16_t rt_major =
+        static_cast<std::uint16_t>(runtime.protocol_version >> 8);
+    if (a2l_major != rt_major) {
+        add("PROTOCOL_VERSION_MAJOR", fmt(a2l_major), fmt(rt_major),
+            Severity::Error, "协议协商");
+    } else if (runtime.protocol_version != a2l.version) {
+        add("PROTOCOL_VERSION_MINOR", fmt(a2l.version),
+            fmt(runtime.protocol_version), Severity::Warning, "协议协商");
     }
     if (runtime.has_daq !=
         (a2l.max_dto > 0 && m_impl_->xcp_info->daq.has_value() &&

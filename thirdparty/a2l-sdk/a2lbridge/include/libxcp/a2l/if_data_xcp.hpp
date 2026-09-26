@@ -59,18 +59,33 @@ struct ProtocolLayerInfo {
 };
 
 /**
+ * @brief 同一参数在 XCP 与 XCPplus 块取值不同的记录（§6.3-A，Info 级）
+ * @details 取值以 XCPplus 为准；本结构仅供 UI 展示与诊断，不阻断功能。
+ */
+struct XcpPlusConflict {
+    std::string parameter;      ///< 参数名（如 MAX_CTO/BYTE_ORDER）
+    std::string xcp_value;      ///< plain XCP 块取值（文本）
+    std::string xcpplus_value;  ///< XCPplus 块取值（文本，以它为准）
+};
+
+/**
  * @brief MODULE 级 IF_DATA XCP 汇总结果
  */
 struct IfDataXcpInfo {
     bool ok = false;             ///< 是否成功提取到有效 IF_DATA XCP
     bool from_xcp_plus = false;  ///< 数据来源为 XCPplus（优先级更高，§6.3-A）
-    std::string last_error;      ///< 提取失败的展示文本（仅 UI 用，B-19）
+    bool ambiguous =
+        false;  ///< 多 MODULE 同时声明且未指定 active_module（B-17，批次10）
+    std::string module_name;  ///< 来源 MODULE 名（B-17 module scope，批次10）
+    std::string last_error;   ///< 提取失败的展示文本（仅 UI 用，B-19）
     ProtocolLayerInfo protocol_layer;              ///< Protocol Layer 参数
     std::vector<TransportEndpoint> transports;     ///< 声明的传输层实例
     std::optional<DaqInfo> daq;                    ///< DAQ 能力（未声明时空）
     std::vector<EventChannelInfo> event_channels;  ///< EVENT_CHANNEL 列表
     std::vector<DaqListLayout>
         static_daq_lists;  ///< STATIC 预定义 DAQ_LIST 布局
+    std::vector<XcpPlusConflict>
+        plus_conflicts;  ///< XCP vs XCPplus 差异（§6.3-A，批次10）
 };
 
 }  // namespace calmcar::xcp::a2l

@@ -65,8 +65,14 @@ struct FaultInjection {
  */
 class UdpTestSlave {
 public:
-    /// @brief 构造并绑定 Loopback 临时端口（使用测试默认 CONNECT 响应参数）
-    UdpTestSlave();
+    /**
+     * @brief 构造并绑定 Loopback 端口
+     * @param fixed_port 0 = OS 分配临时端口（既有用例的默认语义）；
+     *        非 0 = 绑定该固定端口（批次10 E2E：使 Slave 端口与 A2L
+     *        IF_DATA 声明的 XCP_ON_UDP_IP 端口一致，验证"自动建链"）
+     * @throws XcpException 绑定失败（如端口被占用）
+     */
+    explicit UdpTestSlave(std::uint16_t fixed_port = 0);
 
     /// @brief 析构，自动停止
     ~UdpTestSlave();

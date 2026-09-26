@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
 # =============================================================================
-# gen_a2l.py —— 最小 A2L 黄金样本生成器（code-plan/A2L_CMake最小开发验证集_R4.md §5）
+# gen_a2l.py —— A2L 黄金样本生成器（R4 §7.1-A；批次10 重构：SPEC 外置 JSON）
 #
 # 定位：产出「a2llib（main HEAD）能解析、且期望值由 spec 独立算出」的输入文件。
 # 语法逐条对照 thirdparty/a2llib 的 bison/flex 源（只读参考，不修改上游）：
-#   - 主干：src/a2lparser.y + src/a2lflexer.l + src/a2lscanner.cpp
-#   - XCP：src/xcp/xcpdataparser.y + src/xcp/xcpdataflexer.l
-# 关键事实（勿凭记忆改动）：
 #   1) ASAP2 块一律 `/begin KEY ... /end KEY`（闭合关键字重复）；
-#   2) `/begin IF_DATA XCP` 由主干词法器 ReadIfData() 整段吞入直到
-#      `/endIF_DATA`（跳空白匹配），因此 XCP 段可以多行书写；
-#   3) XCP 子词法器把 0x… 直接返回 UINT token，DAQ/ODT_ENTRY 的十六进制合法；
-#   4) PROTOCOL_LAYER 的 ADDRESS_GRANULARITY ident 仅占位（上游不调用
-#      SetAddressGranularity），GetAddressGranularity() 恒为默认 BYTE=1；
-#   5) MEASUREMENT 必填 8 个定位参数（name desc datatype compu res acc lo hi）；
-#   6) DAQ_LIST 必须嵌套在 DAQ 块内（daq_optional → daq_list）；
-#   7) UDP 主机关键字是 HOST_NAME + STRING（不是 HOST / 不是 ADDRESS）。
+#   2) `/begin IF_DATA XCP/XCPplus … /end IF_DATA` 由主干词法器 ReadIfData()
+#      整段吞入直到 `/endIF_DATA`（跳空白匹配），可多行；
+#   3) XCP 子词法器 0x… 返回 UINT；PROTOCOL_LAYER 的 ADDRESS_GRANULARITY
+#      ident 仅占位（上游不调用 SetAddressGranularity，恒默认 BYTE=1）；
+#   4) MEASUREMENT 必填 8 定位参数；DAQ_LIST 必须嵌套在 DAQ 块内；
+#      UDP 主机关键字 HOST_NAME；FNC_VALUES 形如 `FNC_VALUES 0 UWORD ROW_DIR
+#      DIRECT`（position datatype index_mode address_type，全为定位参数）；
+#      FORMULA 块允许空属性（formula_attribute %empty）；
+#      主干词法器大小写敏感（已实测无 caseless 选项）→ 大小写混用属语法错误，
+#      作为负例静态样本而非"合法畸形"变体。
 #
-# 用法：python gen_a2l.py --out <目录>
-#   输出：<目录>/golden_basic.a2l + <目录>/expected.json
-#   （expected.json 供人核对；A2lSmoke 用例内以常量形式固化同一组期望值）
+# 用法：python gen_a2l.py --out <目录> [--spec <json>]
+#   默认扫描本目录 golden_spec*.json 全部生成（CTest fixture 一次产全）。
+#   --variants 额外产基本样本的行尾/空白/UTF-8-BOM 变体（A-6 缓解①）。
 #
-# 期望值推导（独立于 a2llib）：
-#   M_LINEAR：COEFFS_LINEAR 0.0 0.5 → SDK 记 o=0.0(偏移) c=0.5(比例)，
-#             p = f + i*c + i*o = i/2；raw 0x00C8(=200) → 100.0。
-#             0.5 为二进制精确值，正逆算均无浮点误差。
-#   M_BYTE  ：IDENTICAL → raw 42 → 整数物理值 42。
-#   DTO     ：PID(=EPK=1) + [C8 00] + [2A]。
+# 期望值独立推导：样本报文的 sample_raw_int/sample_phys 由 COMPU 系数反算，
+# 不经 a2llib；C++ 侧以常量固化同一组期望值。
 # =============================================================================
 
 import argparse
@@ -34,222 +29,351 @@ import json
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# 黄金样本规格（唯一事实来源；A2lSmoke 内常量与本表逐项对应）
+# 数字字面量：0x 十六进制（spec 里既可写 int 也可写 "0x.." 字符串）
 # ---------------------------------------------------------------------------
-SPEC = {
-    "project": "SmokeProj",
-    "module": "SMOKE_ECU",
-    # 符号地址三件套（B-1：ECU_ADDRESS 原值 + 独立 8-bit extension）
-    "symbols": {
-        "M_ARRAY": {"datatype": "UWORD", "compu": "CM_IDENT",
-                    "address": 0x8000, "ext": 0x12, "array_size": 4},
-        "M_LINEAR": {"datatype": "UWORD", "compu": "CM_LINEAR",
-                     "address": 0x8020, "ext": 0x12},
-        "M_BYTE": {"datatype": "UBYTE", "compu": "CM_IDENT",
-                   "address": 0x8010, "ext": 0x00},
-    },
-    # DAQ_LIST：EPK=1（PID 匹配用），PREDEFINED 单 ODT 两条 entry
-    "daq_list": {
-        "number": 1,
-        "odt_number": 1,
-        "entries": [
-            {"number": 1, "address": 0x8020, "ext": 0x12, "size": 2, "bit_offset": 0},
-            {"number": 2, "address": 0x8010, "ext": 0x00, "size": 1, "bit_offset": 0},
-        ],
-    },
-    "protocol_layer": {"version": 0x0100, "max_cto": 0x10, "max_dto": 0x20},
-    "udp": {"port": 0x15B7, "host": "localhost"},
-    "linear_coeffs": {"offset": 0.0, "factor": 0.5},
-}
+def fmt_int(v) -> str:
+    """把 int 或 '0x..' 字符串格式化为 A2L 十六进制字面量。"""
+    if isinstance(v, str):
+        return v if v.lower().startswith("0x") else f"0x{int(v):X}"
+    return f"0x{int(v):X}"
 
 
-def fmt_int(v: int) -> str:
-    """按 A2L 习惯输出十六进制整数字面量。"""
-    return f"0x{v:X}"
+def fmt_num(v) -> str:
+    """数字 → C++ 字面量（float 保留 .0 / 科学计数）。"""
+    if isinstance(v, float) and v.is_integer():
+        return f"{v:.1f}"
+    return repr(v) if isinstance(v, float) else str(v)
 
 
-def emit_measurements(spec):
-    """生成 MEASUREMENT 块（必填 8 定位参数 + 显式 BYTE_ORDER 属性）。"""
+# ---------------------------------------------------------------------------
+# 块发射器
+# ---------------------------------------------------------------------------
+def emit_record_layouts(mod):
+    """RECORD_LAYOUT：属性串原样输出（含 FNC_VALUES 等定位参数）。"""
     lines = []
-    for name in ("M_ARRAY", "M_BYTE", "M_LINEAR"):  # 字母序输出，便于 diff
-        s = spec["symbols"][name]
+    for rl in mod.get("record_layouts", []):
+        lines.append(f'    /begin RECORD_LAYOUT {rl["name"]}')
+        for attr in rl.get("attributes", []):
+            lines.append(f'      {attr}')
+        lines.append('    /end RECORD_LAYOUT')
+    if lines:
+        lines.append('')
+    return lines
+
+
+def emit_compu_methods(mod):
+    """COMPU_METHOD / COMPU_TAB / COMPU_VTAB（类型名与系数按 spec 原样）。"""
+    lines = []
+    for t in mod.get("compu_tabs", []):
         lines.append(
-            f'    /begin MEASUREMENT {name} "smoke {name}" '
-            f'{s["datatype"]} {s["compu"]} 0 0 0 65535'
-        )
+            f'    /begin COMPU_TAB {t["name"]} "{t.get("desc", "")}" '
+            f'{t["type"]} {len(t["pairs"])}')
+        for a, b in t["pairs"]:
+            lines.append(f'      {fmt_num(a)} {fmt_num(b)}')
+        lines.append('    /end COMPU_TAB')
+    for t in mod.get("compu_vtabs", []):
+        lines.append(
+            f'    /begin COMPU_VTAB {t["name"]} "{t.get("desc", "")}" '
+            f'{t["type"]} {len(t["pairs"])}')
+        for a, b in t["pairs"]:
+            lines.append(f'      {fmt_num(a)} "{b}"')
+        lines.append('    /end COMPU_VTAB')
+    for cm in mod.get("compu_methods", []):
+        lines.append(
+            f'    /begin COMPU_METHOD {cm["name"]} "{cm.get("desc", "")}" '
+            f'{cm["type"]} "{cm.get("format", "%6.2")}" "{cm.get("unit", "")}"')
+        if "coeffs_linear" in cm:
+            o, f = cm["coeffs_linear"]
+            lines.append(f'      COEFFS_LINEAR {fmt_num(o)} {fmt_num(f)}')
+        elif "coeffs" in cm:
+            lines.append('      COEFFS ' + ' '.join(fmt_num(c) for c in cm["coeffs"]))
+        elif "tab_ref" in cm:
+            lines.append(f'      COMPU_TAB_REF {cm["tab_ref"]}')
+        if cm.get("ref_unit"):
+            # B-10 单位回退：符号无 PHYS_UNIT 时 ConversionInfo.unit 取它
+            lines.append(f'      REF_UNIT {cm["ref_unit"]}')
+        if cm.get("formula"):
+            # formula_attribute 允许空 → 文本段直接 /end（a2lparser.y:774-780）
+            lines.append(f'      /begin FORMULA "{cm["formula"]}" /end FORMULA')
+        lines.append('    /end COMPU_METHOD')
+    if lines:
+        lines.append('')
+    return lines
+
+
+def emit_measurements(mod):
+    """MEASUREMENT：8 定位参数 + 可选属性（扩展/位掩码/维度/布局/单位）。"""
+    lines = []
+    for m in mod.get("measurements", []):
+        lines.append(
+            f'    /begin MEASUREMENT {m["name"]} "{m.get("desc", "")}" '
+            f'{m["datatype"]} {m.get("compu", "CM_IDENT")} 0 0 '
+            f'{m.get("lower", 0)} {m.get("upper", 65535)}')
         lines.append('      BYTE_ORDER MSB_LAST')
-        lines.append(f'      ECU_ADDRESS {fmt_int(s["address"])}')
-        lines.append(f'      ECU_ADDRESS_EXTENSION {fmt_int(s["ext"])}')
-        if "array_size" in s:
-            lines.append(f'      ARRAY_SIZE {s["array_size"]}')
-        if name != "M_ARRAY":  # 数组整体只读；标量给 FromPhysical 用例放行
+        lines.append(f'      ECU_ADDRESS {fmt_int(m["address"])}')
+        lines.append(f'      ECU_ADDRESS_EXTENSION {fmt_int(m.get("ext", 0))}')
+        if m.get("array_size"):
+            lines.append(f'      ARRAY_SIZE {m["array_size"]}')
+        if m.get("matrix_dim"):
+            lines.append(
+                '      MATRIX_DIM ' + ' '.join(str(d) for d in m["matrix_dim"]))
+        if m.get("layout"):
+            lines.append(f'      LAYOUT {m["layout"]}')
+        if m.get("bit_mask") is not None:
+            lines.append(f'      BIT_MASK {fmt_int(m["bit_mask"])}')
+        if m.get("read_write", True):
             lines.append('      READ_WRITE')
-        if name == "M_LINEAR":
-            lines.append('      PHYS_UNIT "V"')
+        if m.get("phys_unit"):
+            lines.append(f'      PHYS_UNIT "{m["phys_unit"]}"')
         lines.append('    /end MEASUREMENT')
     return lines
 
 
-def emit_if_data_xcp(spec):
-    """生成 MODULE 级 IF_DATA XCP 段（多行合法，见文件头事实 2）。"""
-    pl = spec["protocol_layer"]
-    dl = spec["daq_list"]
-    udp = spec["udp"]
+def emit_characteristics(mod):
+    """CHARACTERISTIC：name desc TYPE address deposit maxdiff compu lo hi。"""
     lines = []
-    lines.append('    /begin IF_DATA XCP')
-    # PROTOCOL_LAYER：10 个 UINT（version + T1..T7 + MAX_CTO + MAX_DTO）
-    # + BYTE_ORDER ident + ADDRESS_GRANULARITY ident（占位，上游不消费）。
-    # 单行收口：`/begin` 与 `/end` 在同一行也不影响 ReadIfData 的整段吞入。
-    lines.append(
-        f'      /begin PROTOCOL_LAYER {fmt_int(pl["version"])} '
-        '1 1 5 5 5 1 1 '
-        f'{fmt_int(pl["max_cto"])} {fmt_int(pl["max_dto"])} '
-        'BYTE_ORDER_MSB_LAST ADDRESS_GRANULARITY_BYTE /end PROTOCOL_LAYER')
-    # DAQ：token 顺序 = type max_daq max_event min_daq optimisation addr_ext
-    #       id_field granularity max_odt_entry_size overload（xcpdataparser.y:271）
-    lines.append(
-        '      /begin DAQ STATIC 3 2 0 '
-        'OPTIMISATION_TYPE_DEFAULT ADDRESS_EXTENSION_DAQ '
-        'IDENTIFICATION_FIELD_TYPE_ABSOLUTE '
-        'GRANULARITY_ODT_ENTRY_SIZE_DAQ_BYTE 4 OVERLOAD_INDICATION_EVENT')
-    # DAQ_LIST 嵌套于 DAQ 的 optional 项中（daq_optional → daq_list）
-    lines.append(f'        /begin DAQ_LIST {dl["number"]}')
-    lines.append('          DAQ_LIST_TYPE DAQ')
-    lines.append('          MAX_ODT 1')
-    lines.append('          MAX_ODT_ENTRIES 2')
-    lines.append('          FIRST_PID 1')
-    lines.append(f'          EVENT_FIXED {dl["number"]}')
-    lines.append('          /begin PREDEFINED')
-    lines.append(f'            /begin ODT {dl["odt_number"]}')
-    for e in dl["entries"]:
+    for c in mod.get("characteristics", []):
         lines.append(
-            f'              ODT_ENTRY {e["number"]} {fmt_int(e["address"])} '
-            f'{fmt_int(e["ext"])} {e["size"]} {e["bit_offset"]}')
-    lines.append('            /end ODT')
-    lines.append('          /end PREDEFINED')
-    lines.append('        /end DAQ_LIST')
-    lines.append('      /end DAQ')
-    # UDP/IP 传输层（SDK 读 GetPort()/GetHostName()）
+            f'    /begin CHARACTERISTIC {c["name"]} "{c.get("desc", "")}" '
+            f'{c["ctype"]} {fmt_int(c["address"])} {c["deposit"]} 0.0 '
+            f'{c.get("compu", "CM_IDENT")} 0 {c.get("upper", 10000)}')
+        lines.append('      BYTE_ORDER MSB_LAST')
+        lines.append(f'      ECU_ADDRESS_EXTENSION {fmt_int(c.get("ext", 0))}')
+        lines.append('    /end CHARACTERISTIC')
+    return lines
+
+
+def emit_if_data(block):
+    """单个 IF_DATA 块（XCP 或 XCPplus；协议名决定子文法首 token）。"""
+    proto = block.get("protocol", "XCP")
+    lines = []
+    header = f'    /begin IF_DATA {proto}'
+    if proto == "XCPplus":
+        header += f' {block.get("xcpplus_version", 11)}'
+    lines.append(header)
+    pl = block.get("protocol_layer", {})
+    timers = pl.get("timers", [1, 1, 5, 5, 5, 1, 1])
     lines.append(
-        f'      /begin XCP_ON_UDP_IP {fmt_int(pl["version"])} {fmt_int(udp["port"])}')
-    lines.append(f'        HOST_NAME "{udp["host"]}"')
-    lines.append('      /end XCP_ON_UDP_IP')
+        f'      /begin PROTOCOL_LAYER {fmt_int(pl.get("version", "0x100"))} '
+        + ' '.join(str(t) for t in timers) + ' '
+        f'{fmt_int(pl.get("max_cto", "0x10"))} {fmt_int(pl.get("max_dto", "0x20"))} '
+        'BYTE_ORDER_MSB_LAST ADDRESS_GRANULARITY_BYTE /end PROTOCOL_LAYER')
+    daq = block.get("daq")
+    if daq:
+        dtype = daq.get("type", "STATIC")
+        lines.append(
+            f'      /begin DAQ {dtype} {daq.get("max_daq", 3)} '
+            f'{daq.get("max_event", 2)} {daq.get("min_daq", 0)} '
+            f'{daq.get("optimisation", "OPTIMISATION_TYPE_DEFAULT")} '
+            f'{daq.get("addr_ext", "ADDRESS_EXTENSION_DAQ")} '
+            f'{daq.get("id_field", "IDENTIFICATION_FIELD_TYPE_ABSOLUTE")} '
+            f'{daq.get("granularity", "GRANULARITY_ODT_ENTRY_SIZE_DAQ_BYTE")} '
+            f'{daq.get("max_odt_entry_size", 4)} '
+            f'{daq.get("overload", "OVERLOAD_INDICATION_EVENT")}')
+        for ev in daq.get("events", []):
+            lines.append(
+                f'        /begin EVENT {ev["name"]} "{ev.get("short", ev["name"])}" '
+                f'{ev.get("number", 1)} {ev.get("type", "DAQ")} '
+                f'{ev.get("max_daq_list", 1)} {ev.get("time_cycle", 2)} '
+                f'{ev.get("time_unit", 3)} {ev.get("priority", 1)} /end EVENT')
+        dl = daq.get("daq_list")
+        if dl:
+            lines.append(f'        /begin DAQ_LIST {dl["number"]}')
+            lines.append(f'          DAQ_LIST_TYPE {dl.get("type", "DAQ")}')
+            lines.append(f'          MAX_ODT {dl.get("max_odt", 1)}')
+            lines.append(f'          MAX_ODT_ENTRIES {dl.get("max_odt_entries", 2)}')
+            lines.append(f'          FIRST_PID {dl.get("first_pid", 1)}')
+            if "event_fixed" in dl:
+                lines.append(f'          EVENT_FIXED {dl["event_fixed"]}')
+            lines.append('          /begin PREDEFINED')
+            lines.append(f'            /begin ODT {dl.get("odt_number", 1)}')
+            for e in dl["entries"]:
+                lines.append(
+                    f'              ODT_ENTRY {e["number"]} {fmt_int(e["address"])} '
+                    f'{fmt_int(e.get("ext", 0))} {e["size"]} '
+                    f'{e.get("bit_offset", 0)}')
+            lines.append('            /end ODT')
+            lines.append('          /end PREDEFINED')
+            lines.append('        /end DAQ_LIST')
+        lines.append('      /end DAQ')
+    udp = block.get("udp")
+    if udp:
+        lines.append(
+            f'      /begin XCP_ON_UDP_IP {fmt_int(pl.get("version", "0x100"))} '
+            f'{fmt_int(udp["port"])}')
+        lines.append(f'        HOST_NAME "{udp.get("host", "localhost")}"')
+        lines.append('      /end XCP_ON_UDP_IP')
     lines.append('    /end IF_DATA')
     return lines
 
 
-def build_a2l(spec):
-    """组装完整 A2L 文本（行列表）。"""
+def build_module(mod):
+    """一个 MODULE 的全部内容（含可选 IF_DATA 块列表）。"""
     lines = []
-    lines.append('ASAP2_VERSION 1 61')
+    lines.append(f'  /begin MODULE {mod["name"]} "{mod.get("comment", "")}"')
     lines.append('')
-    lines.append(f'/begin PROJECT {spec["project"]} "libxcp A2L minimal smoke sample"')
-    lines.append('')
-    lines.append(f'  /begin MODULE {spec["module"]} "single module for smoke"')
-    lines.append('')
-    lines.append('    /begin MOD_COMMON "smoke"')
-    lines.append('      BYTE_ORDER MSB_LAST')
-    lines.append('      DEPOSIT ABSOLUTE')
-    lines.append('      ALIGNMENT_BYTE 1')
-    lines.append('      ALIGNMENT_WORD 1')
-    lines.append('      ALIGNMENT_LONG 1')
-    lines.append('    /end MOD_COMMON')
-    lines.append('')
-    lines.append('    /begin MOD_PAR "smoke par"')
-    lines.append('      CPU_TYPE "SMOKE-CPU"')
-    lines.append('    /end MOD_PAR')
-    lines.append('')
-    # COMPU_METHOD：IDENTICAL（恒等）与 LINEAR（COEFFS_LINEAR offset factor）
-    lines.append('    /begin COMPU_METHOD CM_IDENT "identity" IDENTICAL "%9" ""')
-    lines.append('    /end COMPU_METHOD')
-    lin = spec["linear_coeffs"]
-    lines.append('    /begin COMPU_METHOD CM_LINEAR "p = i/2" LINEAR "%9" "V"')
-    lines.append(f'      COEFFS_LINEAR {lin["offset"]} {lin["factor"]}')
-    lines.append('    /end COMPU_METHOD')
-    lines.append('')
-    lines.extend(emit_measurements(spec))
-    lines.append('')
-    # CHARACTERISTIC（首里程碑仅元数据：SDK 不推导 RECORD_LAYOUT 元素类型）
+    if mod.get("mod_common", True):
+        lines += [
+            '    /begin MOD_COMMON "smoke"',
+            '      BYTE_ORDER MSB_LAST',
+            '      DEPOSIT ABSOLUTE',
+            '      ALIGNMENT_BYTE 1',
+            '      ALIGNMENT_WORD 1',
+            '      ALIGNMENT_LONG 1',
+            '    /end MOD_COMMON',
+            '',
+        ]
+    if mod.get("mod_par", True):
+        lines += [
+            '    /begin MOD_PAR "smoke par"',
+            '      CPU_TYPE "SMOKE-CPU"',
+            '    /end MOD_PAR',
+            '',
+        ]
+    lines += emit_record_layouts(mod)
+    lines += emit_compu_methods(mod)
+    lines += emit_measurements(mod)
+    lines += emit_characteristics(mod)
+    for block in mod.get("if_data", []):
+        lines += emit_if_data(block)
+        lines.append('')
+    lines.append(f'  /end MODULE {mod["name"]}'.replace(
+        f'/end MODULE {mod["name"]}', '/end MODULE'))
+    return lines
+
+
+def build_a2l(spec):
+    """整文件：ASAP2_VERSION + PROJECT + 全部 MODULE。"""
+    lines = ['ASAP2_VERSION 1 61', '']
     lines.append(
-        f'    /begin CHARACTERISTIC C_VALUE "smoke C_VALUE" VALUE '
-        f'0x9000 STD_VALUE 0.0 CM_LINEAR 0 10000')
-    lines.append('      BYTE_ORDER MSB_LAST')
-    lines.append('      ECU_ADDRESS_EXTENSION 0x00')
-    lines.append('    /end CHARACTERISTIC')
+        f'/begin PROJECT {spec["project"]} '
+        f'"{spec.get("project_desc", "libxcp A2L golden sample")}"')
     lines.append('')
-    lines.extend(emit_if_data_xcp(spec))
-    lines.append('')
-    lines.append('  /end MODULE')
-    lines.append('')
+    for mod in spec["modules"]:
+        lines += build_module(mod)
     lines.append('/end PROJECT')
     return lines
 
 
-def build_expected(spec):
-    """由 spec 独立反算期望值（raw↔phys、地址推进、DTO 帧），不经 a2llib。"""
-    lin = spec["linear_coeffs"]
-    symbols = {}
-    for name, s in spec["symbols"].items():
-        item = {
-            "module": spec["module"],
-            "qualified": f'{spec["module"]}::{name}',
-            "datatype": s["datatype"],
-            "element_size_bytes": {"UBYTE": 1, "UWORD": 2}[s["datatype"]],
-            "xcp_address": s["address"],
-            "address_extension": s["ext"],
-            "read_write": name != "M_ARRAY",
-        }
-        if "array_size" in s:
-            item["dimensions"] = [
-                {"extent": s["array_size"], "byte_stride": item["element_size_bytes"]}]
-            item["byte_size"] = s["array_size"] * item["element_size_bytes"]
-            # B-1：idx2（AG=Byte）→ base+4；AG=Word → base+2（元素宽2/AG2=1步）
-            item["element_address_idx2_byte"] = \
-                s["address"] + 2 * item["element_size_bytes"]
-            item["element_address_idx2_word"] = \
-                s["address"] + (2 * item["element_size_bytes"]) // 2
-        symbols[name] = item
-    # LINEAR：raw 200 → phys = f + i*c + i*o = 0 + 200*0.5 + 200*0 = 100.0
-    raw_linear = 200
-    phys_linear = lin["offset"] + raw_linear * lin["factor"] + raw_linear * 0.0
-    symbols["M_LINEAR"]["sample_raw"] = [raw_linear & 0xFF, raw_linear >> 8]
-    symbols["M_LINEAR"]["sample_phys"] = phys_linear
-    # IDENTICAL：raw 42 → 整数 42
-    symbols["M_BYTE"]["sample_raw"] = [0x2A]
-    symbols["M_BYTE"]["sample_phys"] = 42
+# ---------------------------------------------------------------------------
+# 畸形但合法变体（A-6 缓解①；只做已实测上游接受的变换）
+# ---------------------------------------------------------------------------
+def variant_lf(text: str) -> str:
+    """CRLF → LF（词法器对行尾不敏感）。"""
+    return text.replace("\r\n", "\n")
 
-    dl = spec["daq_list"]
-    dto_frame = [dl["number"]]  # PID == EPK（绝对标识模式）
-    raws = {0: symbols["M_LINEAR"]["sample_raw"],
-            1: symbols["M_BYTE"]["sample_raw"]}
-    for i, e in enumerate(dl["entries"]):
-        dto_frame.extend(raws[i])
-    return {
-        "symbols": symbols,
-        "protocol_layer": spec["protocol_layer"],
-        "udp": spec["udp"],
-        "daq_list": {"number": dl["number"],
-                     "entries": [{"address": e["address"], "ext": e["ext"],
-                                  "size": e["size"]} for e in dl["entries"]]},
-        "dto_frame": dto_frame,
-    }
+
+def variant_ws(text: str) -> str:
+    """字符串外的单空格 → 三空格（拉宽空白；不动字符串内文字）。"""
+    out = []
+    in_str = False
+    for ch in text:
+        if ch == '"':
+            in_str = not in_str
+        elif ch == ' ' and not in_str:
+            out.append('   ')
+            continue
+        out.append(ch)
+    return ''.join(out)
+
+
+def variant_bom(text: str) -> str:
+    """UTF-8 BOM + LF 行尾（上游 CheckBom 路径）。"""
+    return '\ufeff' + variant_lf(text)
+
+
+def build_expected(spec):
+    """由 spec 独立反算期望值（raw↔phys、维度、DTO 帧），不经 a2llib。"""
+    mod = spec["modules"][0]
+    methods = {cm["name"]: cm for cm in mod.get("compu_methods", [])}
+    symbols = {}
+    for m in mod.get("measurements", []):
+        size = {"UBYTE": 1, "SBYTE": 1, "UWORD": 2, "SWORD": 2, "ULONG": 4,
+                "SLONG": 4, "A_UINT64": 8, "A_INT64": 8,
+                "FLOAT16_IEEE": 2, "FLOAT32_IEEE": 4,
+                "FLOAT64_IEEE": 8}[m["datatype"]]
+        item = {
+            "module": mod["name"],
+            "qualified": f'{mod["name"]}::{m["name"]}',
+            "datatype": m["datatype"],
+            "element_size_bytes": size,
+            "xcp_address": int(m["address"], 0) if isinstance(m["address"], str)
+                           else m["address"],
+            "address_extension": int(m.get("ext", 0), 0)
+                if isinstance(m.get("ext", 0), str) else m.get("ext", 0),
+            "read_write": m.get("read_write", True),
+        }
+        if m.get("array_size"):
+            item["dimensions"] = [{"extent": m["array_size"], "byte_stride": size}]
+            item["byte_size"] = m["array_size"] * size
+        # 样本反算：由 COMPU 系数独立算出（经 double 都精确的取值才列入）
+        if "sample_raw_int" in m:
+            raw = m["sample_raw_int"]
+            cm = methods.get(m.get("compu", "CM_IDENT"))
+            item["sample_raw_int"] = raw
+            if cm and cm["type"] == "LINEAR":
+                o, f = cm["coeffs_linear"]
+                item["sample_phys"] = (0.0 + raw * f) + raw * o
+            else:
+                item["sample_phys"] = raw
+        symbols[m["name"]] = item
+    result = {"symbols": symbols, "modules": [x["name"] for x in spec["modules"]]}
+    daq = spec["modules"][0].get("if_data", [{}])[0].get("daq")
+    if daq and daq.get("daq_list"):
+        dl = daq["daq_list"]
+        result["daq_list"] = {
+            "number": dl["number"],
+            "entries": [{"address": e["address"], "ext": e.get("ext", 0),
+                         "size": e["size"]} for e in dl["entries"]],
+        }
+    return result
 
 
 def main():
-    parser = argparse.ArgumentParser(description="生成最小 A2L 黄金样本")
+    parser = argparse.ArgumentParser(description="生成 A2L 黄金样本")
     parser.add_argument("--out", required=True, help="输出目录")
+    parser.add_argument("--spec", default=None,
+                        help="指定单个 spec JSON（默认扫本目录 golden_spec*.json）")
+    parser.add_argument("--variants", action="store_true",
+                        help="额外生成基本样本的 lf/ws/bom 变体")
     args = parser.parse_args()
 
+    script_dir = Path(__file__).resolve().parent
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    a2l_path = out_dir / "golden_basic.a2l"
-    # CRLF 行尾：贴近真实工具导出，同时验证主干词法器对 \r 的处理
-    a2l_path.write_text("\r\n".join(build_a2l(SPEC)) + "\r\n", encoding="ascii")
-    exp_path = out_dir / "expected.json"
-    exp_path.write_text(json.dumps(build_expected(SPEC), ensure_ascii=False, indent=2),
-                        encoding="utf-8")
-    print(f"generated: {a2l_path}")
-    print(f"expected : {exp_path}")
+
+    if args.spec:
+        specs = [Path(args.spec)]
+    else:
+        specs = sorted(script_dir.glob("golden_spec*.json"))
+    if not specs:
+        raise SystemExit("未找到 golden_spec*.json")
+
+    written = []
+    for spec_path in specs:
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        # 输出名 = spec 文件名去掉 _spec（golden_spec_xcpplus → golden_xcpplus）
+        stem = spec_path.stem.replace("_spec", "")
+        text = "\r\n".join(build_a2l(spec)) + "\r\n"
+        # 非纯 ASCII spec（含中文描述）必须 UTF-8；纯 ASCII 也统一 UTF-8（ASCII 兼容）
+        a2l_path = out_dir / f"{stem}.a2l"
+        a2l_path.write_text(text, encoding="utf-8", newline="")
+        written.append(a2l_path)
+        # 基本样本附带期望值（供人核对；C++ 侧以常量固化同一组值）
+        if stem == "golden_basic":
+            exp = out_dir / "expected.json"
+            exp.write_text(json.dumps(build_expected(spec), ensure_ascii=False,
+                                      indent=2), encoding="utf-8")
+            written.append(exp)
+        if args.variants and stem == "golden_basic":
+            for name, fn in (("lf", variant_lf), ("ws", variant_ws),
+                             ("bom", variant_bom)):
+                vp = out_dir / f"golden_basic_{name}.a2l"
+                vp.write_text(fn(text), encoding="utf-8", newline="")
+                written.append(vp)
+
+    for p in written:
+        print(f"generated: {p}")
 
 
 if __name__ == "__main__":

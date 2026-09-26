@@ -51,6 +51,14 @@ void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
 /// @brief DaqListDto → DaqListLayout（STATIC 预定义列表冻结，B-5/B-7）
 [[nodiscard]] DaqListLayout ConvertDaqList(const liba2l::DaqListDto& dto);
 
+/// @brief DaqCapsDto → DaqInfo（原始码显式枚举映射，禁止序号推断，批次10）
+[[nodiscard]] DaqInfo ConvertDaqCaps(const liba2l::DaqCapsDto& dto);
+
+/// @brief EventChannelDto → EventChannelInfo（原始码透传；daq_list_numbers
+/// 由调用方回填，批次10）
+[[nodiscard]] EventChannelInfo ConvertEventDto(
+    const liba2l::EventChannelDto& dto);
+
 /// @brief ByteOrderDto → 领域 ByteOrder（未知值回落 MsbLast 由调用方先行校验）
 [[nodiscard]] ByteOrder ConvertByteOrder(liba2l::ByteOrderDto dto) noexcept;
 
