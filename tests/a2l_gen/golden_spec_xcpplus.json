@@ -17,14 +17,19 @@
           "protocol": "XCP",
           "protocol_layer": {"version": "0x100", "max_cto": "0x10",
                              "max_dto": "0x20"},
-          "udp": {"port": "0x15B7", "host": "localhost"}
+          "udp": {"port": "0x15B7", "host": "localhost",
+                  "packet_alignment": "PACKET_ALIGNMENT_16",
+                  "sub_commands": ["GET_SLAVE_ID_EXTENDED"]}
         },
         {
           "protocol": "XCPplus",
           "xcpplus_version": 11,
           "protocol_layer": {"version": "0x100", "max_cto": "0x18",
                              "max_dto": "0x20"},
-          "udp": {"port": "0x15B7", "host": "localhost"},
+          "udp": {"port": "0x15B7", "host": "localhost",
+                  "packet_alignment": "PACKET_ALIGNMENT_32",
+                  "sub_commands": ["GET_SLAVE_ID_EXTENDED",
+                                   "GET_DAQ_CLOCK_MULTICAST"]},
           "daq": {
             "type": "STATIC", "max_daq": 2, "max_event": 1, "min_daq": 0,
             "daq_list": {

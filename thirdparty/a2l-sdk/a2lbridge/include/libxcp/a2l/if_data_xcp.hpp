@@ -20,22 +20,26 @@ namespace calmcar::xcp::a2l {
 
 /**
  * @brief 一种 transport 实例的连接参数
- * @details 当前 SDK 快照只填 UDP 的 host/port，其余传输层保留 Kind，
- *          字段留待后续里程碑（§4.3）。
+ * @details 当前 SDK 快照填 UDP 的 host/port/packet_alignment/sub_commands
+ *          （批次12 补全后两项）；其余传输层保留 Kind，
+ *          字段留待后续里程碑（§4.3）。多 XCPonUDP/IP 实例只取首个
+ *          （设计 §6.3 已登记限制）。
  */
 struct TransportEndpoint {
     /// @brief 传输层类别
     enum class Kind : std::uint8_t { UdpIp, TcpIp, Can, Sxi, Usb, Flx };
 
-    Kind kind = Kind::UdpIp;            ///< IF_DATA XCP 段声明的传输层
-    std::uint16_t version = 0x0100;     ///< IF_DATA XCP 段版本号
-    std::string remote_host;            ///< IPv4/IPv6 字符串；CAN 时为通道名
-    std::uint16_t remote_port = 0;      ///< 远端端口
-    std::string local_host;             ///< A2L 描述时填入，否则由调用方决定
-    std::uint16_t local_port = 0;       ///< 本地端口
-    std::uint8_t packet_alignment = 1;  ///< 8/16/32 bit（首版恒 1，未建模）
+    Kind kind = Kind::UdpIp;         ///< IF_DATA XCP 段声明的传输层
+    std::uint16_t version = 0x0100;  ///< IF_DATA XCP 段版本号
+    std::string remote_host;         ///< IPv4/IPv6 字符串；CAN 时为通道名
+    std::uint16_t remote_port = 0;   ///< 远端端口
+    std::string local_host;          ///< A2L 描述时填入，否则由调用方决定
+    std::uint16_t local_port = 0;    ///< 本地端口
+    std::uint8_t packet_alignment =
+        8;  ///< 位宽 8/16/32 bit（批次12：取自 A2L PACKET_ALIGNMENT；0=未知）
     std::vector<std::uint8_t>
-        sub_commands;  ///< GET_SLAVE_ID 等子命令（首版未建模）
+        sub_commands;  ///< 传输层子命令码（批次12：A2L OPTIONAL_TL_SUBCMD；
+                       ///< 仅含上游可识别项，空不代表未声明）
 };
 
 /**

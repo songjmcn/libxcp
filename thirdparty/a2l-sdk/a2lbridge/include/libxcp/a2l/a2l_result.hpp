@@ -20,6 +20,7 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace calmcar::xcp::a2l {
 
@@ -98,6 +99,16 @@ struct Error {
     std::string symbol;                    ///< 关联符号名（可空）
     std::string message;                   ///< 人类可读描述（UTF-8，仅展示）
     std::string cause;  ///< 底层原因文本（如 SDK LastError，可空）
+    /**
+     * @brief include 链（B-18 结构化载体，批次12）
+     *
+     * 仅 `/include` 预扫描类错误（循环、深度超限、越根）非空；其余错误恒空。
+     * 元素为 **canonical 全路径（UTF-8）**，顺序 = 主文件 → 触发点，
+     * 首元素恒为主文件；循环错误时链尾为回指节点（故链内必有重复项）。
+     * 与 `message` 中的箭头链文本（仅文件名，B-19 显示契约）互不替代：
+     * 业务逻辑仍只判 `code`/`phase`，本字段供 UI 与诊断定位用。
+     */
+    std::vector<std::string> include_chain;
 };
 
 namespace detail {

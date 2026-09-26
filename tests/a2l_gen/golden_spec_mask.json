@@ -55,7 +55,9 @@
           "protocol": "XCP",
           "protocol_layer": {"version": "0x100", "max_cto": "0x10",
                              "max_dto": "0x20"},
-          "udp": {"port": "0x15B9", "host": "localhost"},
+          "udp": {"port": "0x15B9", "host": "localhost",
+                  "packet_alignment": "PACKET_ALIGNMENT_32",
+                  "sub_commands": ["GET_SLAVE_ID", "SET_SLAVE_IP_ADDRESS"]},
           "daq": {
             "type": "STATIC", "max_daq": 4, "max_event": 2, "min_daq": 1,
             "overload": "NO_OVERLOAD_INDICATION",

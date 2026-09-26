@@ -304,6 +304,10 @@ public:
 > `Result<T>` / `Error` 为本工程 C++20 自有类型，字段至少包含 `ErrorCode`、`Severity`、`Phase`、
 > 文件/行列、MODULE、symbol、message/cause（B-19）。`LastError()` 只保留为 UI 格式化视图，
 > 不允许业务逻辑匹配错误字符串。
+> **批次12 追加（B-18 结构化载体）**：`Error.include_chain`（`std::vector<std::string>`）承载 include 链，
+> 元素为 **canonical 全路径（UTF-8）**，顺序 = 主文件 → 触发点，首元素恒为主文件；非 include 类错误恒空。
+> `message` 里的 `a -> b -> a` 文本维持原样（仅文件名，B-19 显示契约），二者互不替代。
+> 具名失败码与实现归并码的对应关系见 `A2L_接口语义_B类决策_R4.md` §5。
 
 ### 4.3 IF_DATA XCP 提取（`if_data_xcp.hpp`）
 
@@ -317,8 +321,8 @@ struct TransportEndpoint {
     std::uint16_t remote_port = 0;
     std::string local_host;                 ///< 由 A2L 描述时填入，否则由调用方决定
     std::uint16_t local_port = 0;
-    std::uint8_t packet_alignment = 1;      ///< 8/16/32 bit
-    std::vector<std::uint8_t> sub_commands; ///< GET_SLAVE_ID / SET_SLAVE_IP_ADDRESS 等
+    std::uint8_t packet_alignment = 8;      ///< **位宽** 8/16/32 bit（批次12 修正：原默认值 1 与注释矛盾）
+    std::vector<std::uint8_t> sub_commands; ///< 传输层子命令码（A2L 关键字 `OPTIONAL_TL_SUBCMD <IDENT>`）
 };
 
 /// @brief Protocol Layer 级参数（等价于现有 CommandTimeouts + SessionParameters 的来源）
@@ -396,8 +400,10 @@ struct DtoFrameLayout {
     bool first_odt = false;
     bool counter_enabled = false;
     bool timestamp_enabled = false;
-    std::uint8_t timestamp_size_bytes = 0;
-    bool pid_off = false;
+    std::uint8_t timestamp_size_bits = 0;  ///< 时间戳位宽（TIMESTAMP_SIZE）
+    bool overflow_indicator = false;       ///< OVERLOAD 指示位
+    bool pid_off = false;                  ///< PID_OFF（批次11 补齐；true 时 Decode 显式拒绝）
+    std::uint8_t header_bytes = 1;         ///< envelope 固定头（PID）字节数，冻结后不可变
 };
 
 /// @brief 实际 DAQ 配置的不可变快照（B-5/B-6）
@@ -948,6 +954,12 @@ struct ParamDiscrepancy {
 | **ARRAY_DIMENSION / SOURCE_LOWER_BOUNDS 上游无语法（批次11 实测）** | `a2lflexer.l`+`a2lparser.y` grep 均 0 命中：含该属性的 A2L 会在上游直接 ParseFailed；B-2 的 `source_lower_bound` 无数据源、恒 0 | 接受限制（记入 B-2 注记）；规则 2D 以 MATRIX_DIM 表达；真实需求出现时向上游提语法 PR，不自研预处理 |
 | **PID_OFF DTO envelope（B-7，批次11 定口径）** | 关闭识别字段后无法按 EPK 路由帧；XCP 要求唯一标识由 Transport 层保证（docs/XCP_1.3.0 §7.5，UDP 通道无此关联） | `DtoFrameLayout::pid_off` 成员已补齐（对齐 §4.4）；Decode 对 `pid_off==true` 显式拒绝 `UnsupportedOperation`；真实支持待 CAN/传输上下文需求 |
 | **EVENT TIME_UNIT 码表缺失（批次10 核证）** | 仓库内无 Event 时间单位数值表（docs 仅述"周期=TIME_CYCLE×TIME_UNIT、低 nibble 编码"；§2362 的表属 TIMESTAMP 高 nibble，不可套用）→ `cycle_time_us` 无法换算 | raw 码（time_cycle/time_unit）透传、换算恒 0（不臆造）；用户提供 XCP Part 1 权威表后补换算与 T4 正向断言 |
+| **异步进度未透传（批次12 登记，原 ③ 延后）** | `LoadOptions::progress_notify_percent` 当前无消费者；SDK `Doc::LoadAsync` 显式忽略 `progress_cb`，后台线程复用同步 `Load()` → 加载中 `Progress()` 恒 0，完成后恒 100，与设计 §4.5「0..100 取自上游 ProgressInfo」不符 | 维持现状（接口形状已备）；接通需改用上游 `AsynchParseFile()` 并实测其线程/进度语义，属独立小批；不自研行号估算 |
+| **STRUCTURE/INSTANCE 无数据源（批次12 登记，原 ④ 延后）** | SDK 导出层只采 MEASUREMENT/CHARACTERISTIC（`SymbolKindDto::kStructure` 与桥接层映射分支存在但恒不触发）→ B-12「识别并保存元数据」未闭合，且无 STRUCTURE 测试样本 | 列入下一批 A2L 侧功能项；`record_layout_impl.cpp` 的 `CheckRecordLayoutExecutable` 同属**已写未接线**（全仓 0 调用点），接线时一并处理，禁止静默删文件 |
+| **VAL_BLK / ASCII 执行未做（批次12 登记，原 ⑤ 延后）** | RL 推导仅覆盖 CHARACTERISTIC VALUE + 单段 FNC_VALUES；VAL_BLK/ASCII 元素宽不可证 → `UnsupportedDataType` 拒绝（不静默放行）；`golden_spec_mask` 有 C_VALBLK/C_CURVE 负例、无 ASCII 样本 | 保持显式拒绝；扩执行需先核上游 `A2lFncValue` 对连续块/文本的字段语义，另批落地 |
+| **T9/T10/Debug SDK 三项门禁延后（批次12 登记，原 ⑥）** | ① ≥5 MB 合成文件性能基线未测（设计即"先记录后定 SLA"）；② T10 隔离由 configure 期 P9 扫描承担、非 ctest 用例；③ `build/liba2l-prepared` 仅 `msvc-x64-release`，Debug 主树开 A2L 无对应 cfg 产物（A-10 人工核对约定无法执行） | 延后；Debug SDK 用 `build-sdk.ps1 -Config Debug` 即可产出，需要时随批执行 |
+| **上游 UDP 选项非法值静默降级（批次12 实测）** | `PACKET_ALIGNMENT IDENT` 仅接受 `PACKET_ALIGNMENT_8/16/32` 三个字面量，不匹配时 `SetPacketAlignment` **静默保持默认 8**；`OPTIONAL_TL_SUBCMD IDENT` 未识别名同样静默丢弃 → 消费侧无法区分"未声明"与"声明了非法值" | 本批只透传上游已识别值并在注释/DTO 说明该限制，不伪造检测能力；真实需求出现时向上游提语法/报错 PR，不改 thirdparty |
+
 
 ### 6.3-A IF_DATA XCP / XCPplus 优先级（规范 §8.2，新增）
 
@@ -963,6 +975,11 @@ else                                   → 记 warning「A2L 未描述 IF_DATA X
 若两者同时存在且同一参数取值不同：
   → 以 XCPplus 为准，并生成一条 ParamDiscrepancy{Severity::Info,
       "IF_DATA XCP vs XCPplus: <param>"}，让用户知情而非静默。
+
+批次12 起比对项清单（`DiffIfData` 实测覆盖面）：
+  PROTOCOL_VERSION / MAX_CTO / MAX_DTO / BYTE_ORDER / ADDRESS_GRANULARITY
+  / TRANSPORT / UDP_PORT / UDP_HOST / SEED_AND_KEY
+  / PACKET_ALIGNMENT（批次12 新增）/ SUB_CMDS（批次12 新增）
 ```
 
 注意 `GetXcpPlusDataBlock()` 返回的是指向 `mutable std::optional<XcpDataBlock>` 内部的裸指针，
@@ -1145,4 +1162,5 @@ install/export package、CI、缓存、性能 SLA、完整测试标签体系、L
 | **R4.2** | P1 uchardet grep 实测落地 + 嵌入可行性确认：<br>① §5.2 P1 从"待实测"更新为"已实测通过"，附完整符号分布证据（xcp 子集 0 引用、完整解析路径有连带风险）；<br>② §6.3 已知缺口表新增"uchardet shim 下完整解析路径编码检测失效"条目及缓解策略；<br>③ §9 自我审查将 uchardet 从"不确定项"移至"已查明约束"；<br>④ 整体嵌入可行性确认：架构隔离正确、XCP 协议调用链路闭环、libxcp 不变量不被破坏、无需修改核心库接口。 | 工具实测：grep `thirdparty/a2llib/src/xcp/` + `include/a2l/xcp/` 全量扫描；`protocol_types.hpp` / `session.hpp` / `command_executor.hpp` / `xcp_master.hpp` 接口核对 |
 | **R4.3** | PoC 检查点状态刷新（§8.2 / §8.4）：<br>① **P0 判定完成**：submodule 已落地且 gitlink = pin 值 `c3105749…`，`.gitmodules` 无 branch 字段，上游 C++23 确认——全部通过标准满足；<br>② **P1 判定完成并修正结论表述**：核心库确有 uchardet 调用（原通过标准"无→shim"不成立），但按 R4.2 界定的范围（xcp 子集零引用）维持 A-8 方案 A，不触发回退问话；<br>③ 新增 **P2-前置** 行记录环境核查：VS2022/vc143 ✅、CMake 4.0.2 ✅、Boost 三组件 Release+Debug 双套齐全 ✅、uchardet 确认不存在 ✅；登记 CMake 4.x 低版本 compatibility 移除的新风险及 policy 兜底预案；<br>④ §8.4 uchardet 风险行同步降级；⑤ 明确下一步 P2/P3 需先创建 shim 与 SDK 工程文件（实现代码，待用户批准后执行）。 | `git ls-files -s` / `rev-parse HEAD` / `.gitmodules` / 上游 CMakeLists 实读；`C:\boost\lib` 目录枚举；vswhere；全盘 uchardet 搜索 |
 | **R4.4** | 批次10（数据补全 + 黄金回归套件 + 端到端 10.3）落地后的口径修订：<br>① **ABI bump 1→2**：IDoc +SetActiveModule/AllowIncludeOutsideRoot/LastErrorLine；IfDataXcpDto +timers/命令码/Seed&Key/ECU状态/module_name/ambiguous/plus_conflicts，新 DTO DaqCapsDto/EventChannelDto/XcpPlusConflictDto；<br>② **B-17 落地口径**：多 MODULE 同时声明 IF_DATA → GetIfDataXcp 返回 kAmbiguousName，LoadOptions::active_module 显式选择，绝不静默取首个；<br>③ **B-18 落地口径**：实测上游 `/include`（FixIncludeFile）无循环/深度/越根防护（.a2l 递归 ParseFile 会栈溢出），防护由 SDK 解析前预扫描承担（≤32 层、默认禁越根、带行号），LoadOptions::allow_include_outside_root 可放开越根；<br>④ **B-16 修正**：MAX_CTO/MAX_DTO 为 Warning（容量取保守值即可协商），protocol **MAJOR** 不兼容为 Error、仅 MINOR 为 Warning；<br>⑤ **B-14 修正**：64 位整型 IDENTICAL 全字路径正逆算不经 double（精度口径）；<br>⑥ **B-2 补充**：MATRIX_DIM stride 按低维元素数递推（bridge 同递推二次校验）；<br>⑦ **B-4 子集**：CHARACTERISTIC VALUE + 单段 FNC_VALUES(Position=0/DIRECT/纯标量版式) 才推导 data_type；VAL_BLK/ASCII 执行延后（B-11 部分完成）；<br>⑧ B-16 的 DAQ 侧 Error 项与 B-6 实际账本**推迟到 10.4**（XCP 核心 DAQ 命令组两端均未实现，仓库实测）；<br>⑨ 事件 TIME_UNIT 仓库内无码表 → cycle_time_us 恒 0（raw 码透传不臆造换算）；§7.2 T8 探索实测 UTF-16 BOM 报 `Invalid or unsupported charset: UTF-16`（§6.3 缺口实证，样本统一 UTF-8/ASCII 约束维持）。 | `code-plan/A2L_集成_R4_实施记录_批次10_数据补全与黄金套件.md`（核证清单 + 4 处测试倒逼缺陷修正 + 291/288 测试证据） |
-| **R4.5** | 批次11（偏差收口）修订：<br>① **`DtoFrameLayout::pid_off` 补齐**（对齐 §4.4:400）：`Decode` 对 `pid_off==true` 显式拒绝 `UnsupportedOperation/Phase::Layout`（PID 缺席后无法按 EPK 路由，XCP 要求 Transport 层保证唯一标识——docs §7.5，UDP 通道无此关联）；T6 envelope 矩阵补 PID_OFF 维度负例；真实支持（按 Transport 上下文路由无 PID 帧）待 CAN 需求；<br>② **B-18 include chain 文本级交付**：循环/深度错误 message 升级为完整链 `a -> b -> a`（B-19 显示契约，业务仍只判 ErrorCode）；结构化 `Error.include_chain` + IDoc 通道**随 10.4 ABI v3**，不单独 bump；<br>③ **B-2 `source_lower_bound` 事实化**：上游词法+语法 grep 均无 `ARRAY_DIMENSION/SOURCE_LOWER_BOUNDS`（本轮复测）→ 字段恒 0 且含该属性 A2L 会在上游直接 ParseFailed；已在 §6.3 新增缺口行 + B-2 行注记，策略=接受限制（真实需求向上游提语法 PR，不自研预处理）；<br>④ **EVENT TIME_UNIT 码表**：已确认 docs 仅给出"周期=TIME_CYCLE×TIME_UNIT/低 nibble"而无数值表（2362 行的表属 TIMESTAMP 高 nibble 不可套用）→ §6.3 新增缺口行，`cycle_time_us` 维持 raw 码透传/0，待用户提供 XCP Part 1 权威表后补换算。 | `code-plan/A2L_集成_R4_实施记录_批次11_偏差收口.md`（实施+测试证据，待写） |
+| **R4.5** | 批次11（偏差收口）修订：<br>① **`DtoFrameLayout::pid_off` 补齐**（对齐 §4.4:400）：`Decode` 对 `pid_off==true` 显式拒绝 `UnsupportedOperation/Phase::Layout`（PID 缺席后无法按 EPK 路由，XCP 要求 Transport 层保证唯一标识——docs §7.5，UDP 通道无此关联）；T6 envelope 矩阵补 PID_OFF 维度负例；真实支持（按 Transport 上下文路由无 PID 帧）待 CAN 需求；<br>② **B-18 include chain 文本级交付**：循环/深度错误 message 升级为完整链 `a -> b -> a`（B-19 显示契约，业务仍只判 ErrorCode）；结构化 `Error.include_chain` + IDoc 通道**随 10.4 ABI v3**，不单独 bump；<br>③ **B-2 `source_lower_bound` 事实化**：上游词法+语法 grep 均无 `ARRAY_DIMENSION/SOURCE_LOWER_BOUNDS`（本轮复测）→ 字段恒 0 且含该属性 A2L 会在上游直接 ParseFailed；已在 §6.3 新增缺口行 + B-2 行注记，策略=接受限制（真实需求向上游提语法 PR，不自研预处理）；<br>④ **EVENT TIME_UNIT 码表**：已确认 docs 仅给出"周期=TIME_CYCLE×TIME_UNIT/低 nibble"而无数值表（2362 行的表属 TIMESTAMP 高 nibble 不可套用）→ §6.3 新增缺口行，`cycle_time_us` 维持 raw 码透传/0，待用户提供 XCP Part 1 权威表后补换算。 | `code-plan/A2L_集成_R4_实施记录_批次11_偏差收口.md`（实施+测试证据；批次10/11 改动已入库 commit 580bdb0 / 51381a8） |
+| **R4.6** | 批次12（ABI v3：include 链结构化 + UDP 端点透传）修订：<br>① **B-18 结构化载体落地**：`Error.include_chain`（canonical 全路径，主文件→触发点，首元素恒为主文件，非 include 类错误恒空）+ `IDoc::LastErrorChain(std::vector<std::string>*)`（out-param 风格，与 `ListSymbols` 同惯例；`nullptr` 返回 `kBadArgument` 且不改写错误通道）；链填充四个失败点（入口超深 / 父层超深 / 循环 / 越根，越根链含目标文件）；`message` 文本一字不改（B-19 显示契约与既有 `" -> "` 断言保持）；<br>② **liba2l ABI 2→3**（同批承载 ①与③，避免二次重建/回归）；<br>③ **UDP 端点元数据落地**：`IfDataXcpDto` +`udp_packet_alignment`（上游原始码 0/1/2）+`udp_sub_commands`；桥接层按 `8<<raw` 转**位宽 8/16/32**（>2 防御值 0=未知），`DiffIfData` 追加 `PACKET_ALIGNMENT`/`SUB_CMDS` 两条 Info 冲突；**本批零传输行为变化**——`UdpTransportConfig` 实测无 alignment/sub-command 概念，纯元数据；<br>④ §4.3 `packet_alignment` 默认值 `1 → 8`（原行"=1 ///< 8/16/32 bit"自相矛盾）；§6.3 新增上游 `OPTIONAL_TL_SUBCMD`/`PACKET_ALIGNMENT` 非法值静默降级行；⑤ 异步失败分支 message 由硬编码"异步解析失败"改为 SDK `LastError()` 文本 + `cause`（与同步分支对称）；<br>⑥ 错误码口径按用户裁决采**方案 B**：不补具名码，映射表写入 `A2L_接口语义_B类决策_R4.md` §5（逐条实测取证，含"B-12 当前无对应代码路径"与"`record_layout_impl` 已写未接线"两项如实登记）；<br>⑦ 原候选 ③异步进度 / ④STRUCTURE / ⑤VAL_BLK-ASCII / ⑥T9-T10-Debug SDK 经用户裁决**登记延后**（§6.3 四行），10.4 核心 DAQ 与写回（P0）另批立项。<br>⑧ **§4.4 `DtoFrameLayout` 草案块按已验证实现回写**（`timestamp_size_bytes` → `timestamp_size_bits`，补 `overflow_indicator` / `header_bytes`），**改文档不改代码**——该结构字段集已由 T6 DTO 矩阵与 292/292 验证，改名代码无功能收益；同时确立引用纪律：跨文档定位改用**字段名锚点**，不再引用绝对行号（批次11 记录里的 `§4.4:400` 已因文档增删发生漂移）。 | `code-plan/A2L_集成_R4_实施记录_批次12_ABIv3_include链与UDP端点透传.md`（写码前 10 项核证 / 3 处问题实录 / 292·288 门禁 / P9 隔离 0 命中） |

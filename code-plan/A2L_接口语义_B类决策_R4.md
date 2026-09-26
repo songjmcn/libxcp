@@ -32,7 +32,7 @@
 | **B-15 逆换算越界** | 默认严格 Reject；未来可增加显式 ClampPolicy，但默认仍拒绝并必须返回 clamped 状态 | 越界、NaN/Inf、不可逆 → 不产生 raw、不下发 ECU |
 | **B-16 参数比对** | 运行时为真值。Error：protocol major、通信 ByteOrder、AG、不兼容 DAQ ID/entry/address-extension；Warning：MAX_CTO/MAX_DTO、minor、资源/可选命令差异，采用运行时和更保守限制；Info：A2L-only。t1～t7 不作为 Slave runtime 差异项 | Error 只阻断受影响功能，保留数据库、诊断及其他安全功能 |
 | **B-17 多 MODULE** | 保存全部 MODULE；对象和 IF_DATA 均带 module scope；仅恰好一个 MODULE 时自动设 active module，多 MODULE 必须显式选择 | `ModuleRequired/AmbiguousName` |
-| **B-18 INCLUDE** | 相对当前包含文件目录解析；canonical path 活动栈检测循环并去重；最大深度 32；默认禁止越出主 A2L 根目录，可显式放开 | 返回完整 include chain，不发布半成品数据库。**实现注记（批次11 分步）**：上游 FixIncludeFile 无防护，由 SDK 解析前预扫描拦截；循环/深度错误的 message 携带完整链文本（`a -> b -> a`，B-19 显示契约，业务仍只判 ErrorCode）；结构化 `Error.include_chain` 字段与 IDoc 通道随 10.4 ABI v3 交付 |
+| **B-18 INCLUDE** | 相对当前包含文件目录解析；canonical path 活动栈检测循环并去重；最大深度 32；默认禁止越出主 A2L 根目录，可显式放开 | 返回完整 include chain，不发布半成品数据库。**实现注记（批次11 文本级 → 批次12 结构化）**：上游 FixIncludeFile 无防护，由 SDK 解析前预扫描拦截；循环/深度/越根三类错误的 `message` 携带链文本（`a -> b -> a`，B-19 显示契约，业务仍只判 ErrorCode）；结构化载体已落地：`Error.include_chain`（canonical 全路径，主文件→触发点，首元素恒为主文件）+ `IDoc::LastErrorChain(std::vector<std::string>*)`（liba2l ABI v3） |
 | **B-19 错误** | C++20 自建 `Result<T>/Error`，含 ErrorCode、Severity、Phase、path、line、column、module、symbol、message/cause；`LastError()` 仅作展示兼容 | DLL 内捕获所有异常；多错误稳定排序 |
 | **B-20 线程** | 私有 mutable builder 完成后一次性发布 immutable snapshot；发布后 const 查询并发安全；加载中返回 NotReady；Bridge one-shot；工作线程回调在发布后恰好一次；析构/取消安全 join | Busy/NotReady/Cancelled 结构化返回，失败不发布半成品 |
 
@@ -56,3 +56,30 @@
 - DAQ：STATIC；READ_DAQ/WRITE_DAQ 账本；A2L 与 ECU 顺序相反；DTO envelope 组合与截断。
 - 数据库：多 MODULE 重名、限定名、稳定排序、INCLUDE 循环和深度。
 - 错误/线程：结构化错误黄金样本；加载中 NotReady；并发只读；取消/析构；回调恰好一次。
+
+## 5. 具名失败码 → 实现归并码映射（批次12 口径修订）
+
+本文 §2 各行的"首版失败/降级行为"曾按语义具名书写错误码。实现（`a2l_result.hpp` 的 `ErrorCode`）**不逐个建码**，而由
+`ErrorCode`（可执行动作类别）+ `Phase`（发生环节）二元组唯一归因，`Error.symbol`/`Error.module`/`Error.path` 补足定位。
+本批经用户裁决采用**文档记归并口径**（零代码风险、既有断言不动）。下表逐条经代码实测取证，是后续实现与测试断言的权威口径：
+
+| 本文具名码 | 决策行 | 实现码 | 实现 Phase | 实测出处 |
+|---|---|---|---|---|
+| `UnsupportedArrayLayout` | B-2 | `InvalidLayout` | `Query` | `a2l_types.cpp` `CountElements`（extent=0 / 乘积溢出 / stride 不规则） |
+| `UnsupportedRecordLayout` | B-4 | **实际生效**：`UnsupportedDataType`（RL 未推导出元素宽） | `Query` / `Conversion` | `a2l_database_impl.cpp` `ByteSizeOf`；`compu_method_eval.cpp`（无固定宽度） |
+| ↑ 同上（预留判定器） | B-4/B-12 | `InvalidLayout`（Complex/Unknown）、`UnsupportedOperation`（AXIS_PTS） | `Layout` | `record_layout_impl.cpp` —— **当前无调用点**，接线延后（见设计 §6.3） |
+| `DynamicDaqNotImplemented` | B-5 | `UnsupportedOperation` | `Layout` | `a2l_bridge.cpp` `CreateDaqLayout` DYNAMIC 分支 |
+| `LayoutUnknown` | B-6 | `InvalidLayout`（整帧拒绝）；entry 无归属 → `symbol_name` 留空 + raw 原样 | `Layout` | `daq_layout_impl.cpp` `Decode`（头长/净荷长两处、空 symbol_name 分支） |
+| `UnsupportedCharacteristicOperation` | B-11 | `UnsupportedOperation`（多维整体读写）；类型未知时 `UnsupportedDataType` | `Query` | `a2l_database_impl.cpp` `ToPhysical`/`FromPhysical`（dimensions 非空） |
+| `UnsupportedStructuredType` | B-12 | **该路径尚不存在**——SDK 导出层未采集 STRUCTURE/INSTANCE，无读写入口 | — | `liba2l_export.cpp` grep `TypedefStructures/Instances` 0 命中；缺口见设计 §6.3 |
+| `InvalidBitLayout` | B-9 | `InvalidLayout` | `Conversion` | `compu_method_eval.cpp`（`AnalyzeContiguousMask` 判空洞） |
+| `InvalidSearchPattern` | B-13 | `BadArgument`（空模式或 `max_count==0`） | `Query` | `a2l_database_impl.cpp` `Search` |
+| `ModuleRequired` | B-17 | `AmbiguousName` | `Load`（门面）/ `Query` | `a2l_dto_map.cpp` `MapSdkError(kAmbiguousName)` + `if_data_xcp_impl.cpp` 歧义分支 |
+| `PrecisionLoss` | B-14 | `ConversionOutOfRange`（64 位限值校验拦截） | `Conversion` | `compu_method_eval.cpp` 逆算限值分支 |
+| `TypeMismatch` | B-14 | `RawSizeMismatch`（raw 宽 ≠ 元素宽） | `Conversion` | `compu_method_eval.cpp`（`raw.size() != element_size_bytes`） |
+
+> 约束（归并不弱化）：上表**只影响码名，不影响拒绝语义本身**。§2 各行要求的"明确拒绝、不猜测、不静默降级"必须逐条成立。
+> 两点如实登记：① B-12 的具名失败在当前实现里**没有对应代码路径**（元数据未采集，不是"已静默放行"）；
+> ② 若将来 UI 需按类别分流（结构体与曲线不同提示），另立批次补具名码并同步改测试断言。
+
+

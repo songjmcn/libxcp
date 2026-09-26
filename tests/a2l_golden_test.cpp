@@ -64,14 +64,27 @@ protected:
         }
         return std::move(r).Value();
     }
+    /// @brief 取路径末段文件名（链元素为 canonical 全路径，比对只看末段）
+    static std::string FileNameOf(const std::string& p) {
+        const std::size_t sep = p.find_last_of("/\\");
+        return sep == std::string::npos ? p : p.substr(sep + 1);
+    }
     /// @brief 失败加载辅助：断言错误码与行号（不匹配字符串）
-    /// @param expect_include_chain 循环/深度类错误：message 应携带完整
-    ///        include 链文本（B-18 批次11 显示契约；B-19 下业务不判文本，
-    ///        此断言只锁"UI 能看到链"这一交付面）
+    /// @param expect_include_chain include 类错误（循环/深度/越根）：
+    ///        `Error.include_chain` 结构化非空且首尾符合期望（B-18 批次12
+    ///        载体）。与文本开关相互独立。
+    /// @param chain_tail_name 期望链末段的文件名（空=不校验末段）
+    /// @param chain_size 期望链元素数（0=只校验非空；批次12 实测值等值锁定）
+    /// @param expect_chain_text message 应携带 `a -> b` 箭头链文本
+    ///        （B-18 批次11 显示契约；**越根错误不适用**——批次11 明确保持
+    ///        `token (from 文件)` 形式，文本一字不改）
     static void ExpectLoadError(const std::string& path, ErrorCode expect_code,
                                 const LoadOptions& opts = {},
                                 bool expect_line = false,
-                                bool expect_include_chain = false) {
+                                bool expect_include_chain = false,
+                                const std::string& chain_tail_name = {},
+                                std::size_t chain_size = 0,
+                                bool expect_chain_text = false) {
         auto r = A2lBridge::Load(path, opts);
         ASSERT_FALSE(r.HasValue()) << "本应失败却成功: " << path;
         const Error& e = r.ErrorInfo();
@@ -84,9 +97,31 @@ protected:
         } else {
             EXPECT_FALSE(e.line.has_value());
         }
-        if (expect_include_chain) {
+        if (expect_chain_text) {
             EXPECT_NE(e.message.find(" -> "), std::string::npos)
                 << "include 链错误应携带完整链文本: " << e.message;
+        }
+        if (expect_include_chain) {
+            if (chain_size > 0) {
+                EXPECT_EQ(e.include_chain.size(), chain_size)
+                    << "结构化 include 链元素数与实测口径不符: " << e.message;
+            } else {
+                EXPECT_FALSE(e.include_chain.empty())
+                    << "include 类错误应带出结构化链: " << e.message;
+            }
+            if (!e.include_chain.empty()) {
+                EXPECT_EQ(FileNameOf(e.include_chain.front()), FileNameOf(path))
+                    << "链首必须为主文件";
+                if (!chain_tail_name.empty()) {
+                    EXPECT_EQ(FileNameOf(e.include_chain.back()),
+                              chain_tail_name)
+                        << "链尾应为触发文件";
+                }
+            }
+        } else {
+            // 非 include 类错误不得携带链（B-18 边界锁定）
+            EXPECT_TRUE(e.include_chain.empty())
+                << "该错误不应带出 include 链: " << e.message;
         }
     }
 };
@@ -142,8 +177,17 @@ TEST_F(A2lGoldenTest, IncludeTwoLevelLoads) {
 TEST_F(A2lGoldenTest, IncludeCycleRejectedBeforeParse) {
     // B-18 循环检测在上游 ParseFile 之前拦截（否则 .a2l 递归会栈溢出）；
     // 批次11：message 携带完整链 `main -> a -> b -> a`（显示契约）
+    // 批次12：结构化链同带出——链尾为回指节点，故链内必有重复项
     ExpectLoadError(Data("cycle_main.a2l"), ErrorCode::ParseFailed, {},
-                    /*expect_line=*/true, /*expect_include_chain=*/true);
+                    /*expect_line=*/true, /*expect_include_chain=*/true,
+                    /*chain_tail_name=*/"cycle_a.a2l",
+                    /*chain_size=*/4, /*expect_chain_text=*/true);
+    auto r = A2lBridge::Load(Data("cycle_main.a2l"));
+    ASSERT_FALSE(r.HasValue());
+    const std::vector<std::string>& chain = r.ErrorInfo().include_chain;
+    ASSERT_EQ(chain.size(), 4u) << "main -> a -> b -> a";
+    EXPECT_EQ(FileNameOf(chain[1]), FileNameOf(chain[3]))
+        << "循环链的链尾必须回指链中已有节点";
 }
 
 TEST_F(A2lGoldenTest, IncludeEscapeRejectedUnlessAllowed) {
@@ -151,8 +195,12 @@ TEST_F(A2lGoldenTest, IncludeEscapeRejectedUnlessAllowed) {
     LoadOptions require_off;
     require_off.require_if_data_xcp = false;
     // 默认：越根拒绝（root = escape_chain/）
+    // 批次12：越根同样带出结构化链（主文件 → 越根目标，2 个元素）；
+    //         文本按批次11 口径保持 `token (from 文件)`，故不断言箭头链
     ExpectLoadError(main_path, ErrorCode::ParseFailed, {},
-                    /*expect_line=*/true);
+                    /*expect_line=*/true, /*expect_include_chain=*/true,
+                    /*chain_tail_name=*/"escape_target.a2l",
+                    /*chain_size=*/2, /*expect_chain_text=*/false);
     // 显式放开后正常加载并合并目标模块（样本无 IF_DATA → 同时豁免 require）
     require_off.allow_include_outside_root = true;
     auto b = LoadOk(main_path, require_off);
@@ -196,7 +244,9 @@ TEST_F(A2lGoldenTest, IncludeDepthExceed32Rejected) {
         out << "ASAP2_VERSION 1 61\n";
     }
     ExpectLoadError((dir / "d00.a2l").string(), ErrorCode::ParseFailed, {},
-                    /*expect_line=*/true, /*expect_include_chain=*/true);
+                    /*expect_line=*/true, /*expect_include_chain=*/true,
+                    /*chain_tail_name=*/"d32.a2l",
+                    /*chain_size=*/33, /*expect_chain_text=*/true);
     std::filesystem::remove_all(dir, ec);
 }
 
@@ -629,10 +679,27 @@ TEST_F(A2lGoldenTest, UdpEndpointAndProtocolLayer) {
     EXPECT_EQ(xcp->transports[0].kind, TransportEndpoint::Kind::UdpIp);
     EXPECT_EQ(xcp->transports[0].remote_port, 0x15B7);
     EXPECT_EQ(xcp->transports[0].remote_host, "localhost");
+    // 批次12（§4.3）：golden_basic 未声明 PACKET_ALIGNMENT/OPTIONAL_TL_SUBCMD
+    // → 上游默认值透传为位宽 8、子命令空（不是"未知 0"）
+    EXPECT_EQ(xcp->transports[0].packet_alignment, 8);
+    EXPECT_TRUE(xcp->transports[0].sub_commands.empty());
     // B-17 归属 + 事件通道（本样本无 EVENT → 空）
     EXPECT_FALSE(xcp->ambiguous);
     EXPECT_EQ(xcp->module_name, "SMOKE_ECU");
     EXPECT_TRUE(xcp->event_channels.empty());
+
+    // 声明侧正例：golden_mask 声明 PACKET_ALIGNMENT_32 +
+    // OPTIONAL_TL_SUBCMD GET_SLAVE_ID(0xFF) / SET_SLAVE_IP_ADDRESS(0xFC)
+    // （上游 AddSubCmd 按 A2L 出现顺序 push，故顺序即声明顺序）
+    auto bm = LoadOk(Golden("golden_mask.a2l"));
+    ASSERT_NE(bm, nullptr);
+    const IfDataXcpInfo* mx = bm->XcpInfo();
+    ASSERT_NE(mx, nullptr);
+    ASSERT_EQ(mx->transports.size(), 1u);
+    EXPECT_EQ(mx->transports[0].packet_alignment, 32);
+    ASSERT_EQ(mx->transports[0].sub_commands.size(), 2u);
+    EXPECT_EQ(mx->transports[0].sub_commands[0], 0xFF);
+    EXPECT_EQ(mx->transports[0].sub_commands[1], 0xFC);
 }
 
 TEST_F(A2lGoldenTest, EventChannelSnapshot) {
@@ -738,17 +805,28 @@ TEST_F(A2lGoldenTest, XcpPlusPriorityAndConflictReport) {
     EXPECT_TRUE(xcp->from_xcp_plus);
     EXPECT_EQ(xcp->module_name, "PLUS_ECU");
     EXPECT_EQ(xcp->protocol_layer.max_cto, 0x18);  // plus 的 MAX_CTO 胜出
-    // 差异恰好一条：MAX_CTO 16 vs 24（值以 XCPplus 为准）
-    ASSERT_EQ(xcp->plus_conflicts.size(), 1u);
+    // 差异共三条：MAX_CTO 16 vs 24、PACKET_ALIGNMENT 16 vs 32、SUB_CMDS
+    // （批次12 起 DiffIfData 覆盖 UDP 端点新增两项；值以 XCPplus 为准）
+    ASSERT_EQ(xcp->plus_conflicts.size(), 3u);
     EXPECT_EQ(xcp->plus_conflicts[0].parameter, "MAX_CTO");
     EXPECT_EQ(xcp->plus_conflicts[0].xcp_value, "16");
     EXPECT_EQ(xcp->plus_conflicts[0].xcpplus_value, "24");
+    EXPECT_EQ(xcp->plus_conflicts[1].parameter, "PACKET_ALIGNMENT");
+    EXPECT_EQ(xcp->plus_conflicts[1].xcp_value, "16");
+    EXPECT_EQ(xcp->plus_conflicts[1].xcpplus_value, "32");
+    EXPECT_EQ(xcp->plus_conflicts[2].parameter, "SUB_CMDS");
+    EXPECT_EQ(xcp->plus_conflicts[2].xcp_value, "253");          // 0xFD
+    EXPECT_EQ(xcp->plus_conflicts[2].xcpplus_value, "253,250");  // 0xFD,0xFA
     // DAQ 列表取自被选中的 XCPplus 块（EPK=5）
     ASSERT_EQ(xcp->static_daq_lists.size(), 1u);
     EXPECT_EQ(xcp->static_daq_lists[0].number, 5);
-    // 端点仍从选定块透出
+    // 端点仍从选定块透出（含批次12 的 alignment/子命令）
     ASSERT_EQ(xcp->transports.size(), 1u);
     EXPECT_EQ(xcp->transports[0].remote_port, 0x15B7);
+    EXPECT_EQ(xcp->transports[0].packet_alignment, 32);
+    ASSERT_EQ(xcp->transports[0].sub_commands.size(), 2u);
+    EXPECT_EQ(xcp->transports[0].sub_commands[0], 0xFD);
+    EXPECT_EQ(xcp->transports[0].sub_commands[1], 0xFA);
 }
 
 // ============================================================================
@@ -1009,11 +1087,42 @@ TEST_F(A2lGoldenTest, AsyncNotReadyExactlyOnceAndDestructionSafe) {
         ASSERT_TRUE(br.HasValue());
         ASSERT_EQ(fail_f.wait_for(std::chrono::seconds(60)),
                   std::future_status::ready);
-        EXPECT_FALSE(fail_f.get().HasValue());
+        Result<void> fail_res = fail_f.get();
+        ASSERT_FALSE(fail_res.HasValue());
+        // 批次12：异步失败分支的 message 来自 SDK 文本（原先硬编码
+        // "异步解析失败"丢失定位信息）；非 include 错误不得带出链
+        EXPECT_NE(fail_res.ErrorInfo().message.find("no_such_file"),
+                  std::string::npos)
+            << "异步 message 应带出 SDK 原文: " << fail_res.ErrorInfo().message;
+        EXPECT_TRUE(fail_res.ErrorInfo().include_chain.empty())
+            << "IoError 不属于 include 类错误（B-18 边界）";
         EXPECT_EQ(br.Value()->Database(), nullptr);
         auto layout = br.Value()->CreateDaqLayout();
         EXPECT_FALSE(layout.HasValue());
         EXPECT_EQ(layout.ErrorInfo().code, ErrorCode::NotReady);
+    }
+
+    // 场景 2b：异步 include 循环失败 → 结构化链同样带出（B-18 批次12），
+    //          证明链通道在 SDK 工作线程上同样成立
+    std::promise<Result<void>> cyc_outcome;
+    std::future<Result<void>> cyc_f = cyc_outcome.get_future();
+    {
+        auto br = A2lBridge::LoadAsync(
+            Data("cycle_main.a2l"), {},
+            [&](Result<void> res) { cyc_outcome.set_value(std::move(res)); });
+        ASSERT_TRUE(br.HasValue());
+        ASSERT_EQ(cyc_f.wait_for(std::chrono::seconds(60)),
+                  std::future_status::ready);
+        Result<void> res = cyc_f.get();
+        ASSERT_FALSE(res.HasValue());
+        const Error& e = res.ErrorInfo();
+        EXPECT_EQ(e.code, ErrorCode::ParseFailed);
+        EXPECT_EQ(e.phase, Phase::Load);
+        EXPECT_NE(e.message.find(" -> "), std::string::npos)
+            << "异步分支应带出含链的 SDK 文本";
+        ASSERT_EQ(e.include_chain.size(), 4u) << "main -> a -> b -> a";
+        EXPECT_EQ(FileNameOf(e.include_chain[1]),
+                  FileNameOf(e.include_chain[3]));
     }
 
     // 场景 3：完成前析构（取消/析构安全 join，A-11/B-20）

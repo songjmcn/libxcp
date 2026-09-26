@@ -340,6 +340,17 @@ void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
         }
         ep.remote_host = dto.udp_host;
         ep.remote_port = dto.udp_port;
+        // 批次12（§4.3）：alignment / 子命令语义上属 XCPonUDP/IP，
+        // 其它传输层不拿这两个字段凑数（保持默认值，不臆造）。
+        if (ep.kind == TransportEndpoint::Kind::UdpIp) {
+            // 上游原码 0/1/2 = 8/16/32 bit；>2 判为未知 → 0（防御分支，
+            // 上游枚举实际只会给 0/1/2）。
+            ep.packet_alignment =
+                dto.udp_packet_alignment <= 2
+                    ? static_cast<std::uint8_t>(8u << dto.udp_packet_alignment)
+                    : 0;
+            ep.sub_commands = dto.udp_sub_commands;
+        }
         transports->push_back(std::move(ep));
     }
 }

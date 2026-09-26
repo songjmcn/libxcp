@@ -15,6 +15,12 @@
 #      FORMULA 块允许空属性（formula_attribute %empty）；
 #      主干词法器大小写敏感（已实测无 caseless 选项）→ 大小写混用属语法错误，
 #      作为负例静态样本而非"合法畸形"变体。
+#   5) 批次12 实测：XCPonUDP/IP 选项为可重复列表（`udp_ip_options: %empty |
+#      udp_ip_options udp_ip_option`，顺序自由，但 `transport_layer_instance`
+#      必须在选项之后）；`PACKET_ALIGNMENT <IDENT>` 与
+#      `OPTIONAL_TL_SUBCMD <IDENT>` 的 IDENT 由 XcpOnUdpIp 名称表逐项匹配，
+#      **未命中时上游静默保持默认值/静默丢弃**（不报语法错），故本生成器
+#      对超范围取值主动报错（见 UDP_ALIGNMENTS / UDP_SUBCMDS）。
 #
 # 用法：python gen_a2l.py --out <目录> [--spec <json>]
 #   默认扫描本目录 golden_spec*.json 全部生成（CTest fixture 一次产全）。
@@ -143,6 +149,19 @@ def emit_characteristics(mod):
     return lines
 
 
+# ---------------------------------------------------------------------------
+# XCPonUDP/IP 选项合法取值（批次12）——逐条取自上游源码，不是规范推测：
+#   PACKET_ALIGNMENT 的 IDENT 由 XcpOnUdpIp::SetPacketAlignment 查表
+#   （src/xcp/xcponudpip.cpp："PACKET_ALIGNMENT_8/16/32"），未命中即静默保持默认；
+#   OPTIONAL_TL_SUBCMD 的 IDENT 由 XcpOnUdpIp::AddSubCmd 查表，码值 = 0xFA+index，
+#   表内空槽（0xFB/0xFE）不可用，故只列 4 个实际可识别名。
+# ---------------------------------------------------------------------------
+UDP_ALIGNMENTS = {"PACKET_ALIGNMENT_8", "PACKET_ALIGNMENT_16",
+                  "PACKET_ALIGNMENT_32"}
+UDP_SUBCMDS = {"GET_DAQ_CLOCK_MULTICAST", "SET_SLAVE_IP_ADDRESS",
+               "GET_SLAVE_ID_EXTENDED", "GET_SLAVE_ID"}
+
+
 def emit_if_data(block):
     """单个 IF_DATA 块（XCP 或 XCPplus；协议名决定子文法首 token）。"""
     proto = block.get("protocol", "XCP")
@@ -202,6 +221,23 @@ def emit_if_data(block):
             f'      /begin XCP_ON_UDP_IP {fmt_int(pl.get("version", "0x100"))} '
             f'{fmt_int(udp["port"])}')
         lines.append(f'        HOST_NAME "{udp.get("host", "localhost")}"')
+        # 批次12：PACKET_ALIGNMENT / OPTIONAL_TL_SUBCMD 的取值必须是上游
+        # 词法器认得的 IDENT 字面量（xcpdataflexer.l 表 + XcpOnUdpIp 名称表）。
+        # 超范围值一律报错而非静默跳过——上游对未识别值是**静默降级**
+        # （alignment 保持默认 8、subcmd 直接丢弃），若这里也静默就测不到差异。
+        align = udp.get("packet_alignment")
+        if align is not None:
+            if align not in UDP_ALIGNMENTS:
+                raise SystemExit(
+                    f'非法 packet_alignment: {align!r}（仅接受 '
+                    f'{", ".join(sorted(UDP_ALIGNMENTS))}）')
+            lines.append(f'        PACKET_ALIGNMENT {align}')
+        for cmd in udp.get("sub_commands", []):
+            if cmd not in UDP_SUBCMDS:
+                raise SystemExit(
+                    f'非法 sub_command: {cmd!r}（仅接受 '
+                    f'{", ".join(sorted(UDP_SUBCMDS))}）')
+            lines.append(f'        OPTIONAL_TL_SUBCMD {cmd}')
         lines.append('      /end XCP_ON_UDP_IP')
     lines.append('    /end IF_DATA')
     return lines

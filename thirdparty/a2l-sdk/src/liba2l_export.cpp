@@ -338,6 +338,38 @@ std::string PathNameUtf8(const std::filesystem::path& p) {
 }
 
 /**
+ * @brief 取路径全名为窄字符串（批次12：结构化 include 链用，UTF-8）。
+ * @details 与 `PathNameUtf8` 同样做 char8_t→char 收窄，但保留目录部分，
+ *          使同名不同目录的 include 可被消费方区分（B-18 结构化价值所在）。
+ */
+std::string PathFullUtf8(const std::filesystem::path& p) {
+    const std::u8string u8 = p.u8string();
+    return std::string(u8.begin(), u8.end());
+}
+
+/**
+ * @brief 输出结构化 include 链（批次12，`IDoc::LastErrorChain` 的数据源）。
+ * @param out 输出向量（空指针时不做任何事）。
+ * @param chain 当前递归链（主文件 → 当前文件）。
+ * @param tail 链尾触发点；nullptr 表示链就到当前文件为止。
+ */
+void FillChainOut(std::vector<std::string>* out,
+                  const std::vector<std::filesystem::path>& chain,
+                  const std::filesystem::path* tail) {
+    if (out == nullptr) {
+        return;
+    }
+    out->clear();
+    out->reserve(chain.size() + (tail != nullptr ? 1 : 0));
+    for (const auto& node : chain) {
+        out->push_back(PathFullUtf8(node));
+    }
+    if (tail != nullptr) {
+        out->push_back(PathFullUtf8(*tail));
+    }
+}
+
+/**
  * @brief 拼接完整 include 链文本（B-18 批次11：循环/深度错误的显示契约）。
  * @param chain 递归链（主文件 → 当前文件）。
  * @param tail 链尾文件（触发循环回指或深度超限的目标）。
@@ -370,16 +402,19 @@ std::string FormatIncludeChain(const std::vector<std::filesystem::path>& chain,
  * @param depth 当前深度（主文件 = 1；>32 拒绝）。
  * @param err 失败信息输出。
  * @param err_line 失败相关行号（0=无信息）。
+ * @param out_chain 结构化 include 链输出（批次12；四个失败点均填充）。
  * @return true = 扫描通过；false = 存在循环/越根/超深。
  */
 bool WalkIncludes(const std::filesystem::path& current,
                   const std::filesystem::path& root, bool allow_outside,
                   std::vector<std::filesystem::path>* chain, int depth,
-                  std::string* err, std::uint32_t* err_line) {
+                  std::string* err, std::uint32_t* err_line,
+                  std::vector<std::string>* out_chain) {
     constexpr int kMaxDepth = 32;  // B-18：最大深度 32
     if (depth > kMaxDepth) {
         *err = "include depth exceeds " + std::to_string(kMaxDepth) + ": " +
                PathNameUtf8(current);
+        FillChainOut(out_chain, *chain, nullptr);
         return false;
     }
     std::string text;
@@ -411,6 +446,8 @@ bool WalkIncludes(const std::filesystem::path& current,
                     *err = "include escapes A2L root: " + token + " (from " +
                            PathNameUtf8(current) + ")";
                     *err_line = static_cast<std::uint32_t>(line_no);
+                    // 批次12：链含越根目标（与 message 里的 token 同一文件）
+                    FillChainOut(out_chain, *chain, &resolved);
                     return false;
                 }
                 for (const auto& seen : *chain) {
@@ -420,6 +457,8 @@ bool WalkIncludes(const std::filesystem::path& current,
                         *err = "include cycle detected: " +
                                FormatIncludeChain(*chain, resolved);
                         *err_line = static_cast<std::uint32_t>(line_no);
+                        // 批次12：链尾为回指节点（故链中必有重复项）
+                        FillChainOut(out_chain, *chain, &resolved);
                         return false;
                     }
                 }
@@ -432,12 +471,13 @@ bool WalkIncludes(const std::filesystem::path& current,
                                std::to_string(kMaxDepth) + ": " +
                                FormatIncludeChain(*chain, resolved);
                         *err_line = static_cast<std::uint32_t>(line_no);
+                        FillChainOut(out_chain, *chain, &resolved);
                         return false;
                     }
                     chain->push_back(resolved);
                     const bool ok =
                         WalkIncludes(resolved, root, allow_outside, chain,
-                                     depth + 1, err, err_line);
+                                     depth + 1, err, err_line, out_chain);
                     chain->pop_back();
                     if (!ok) {
                         return false;
@@ -459,10 +499,16 @@ bool WalkIncludes(const std::filesystem::path& current,
  * @param main_path 主 A2L 文件（UTF-8 路径，已确认存在）。
  * @param allow_outside 是否允许 include 越根。
  * @param err 失败信息；@param err_line 失败相关行号。
+ * @param out_chain 结构化 include 链（批次12；入口先清空，失败时由
+ *                  `WalkIncludes` 填充）。
  * @return true = 通过（或无 include）。
  */
 bool PreScanIncludes(const std::string& main_path, bool allow_outside,
-                     std::string* err, std::uint32_t* err_line) {
+                     std::string* err, std::uint32_t* err_line,
+                     std::vector<std::string>* out_chain) {
+    if (out_chain != nullptr) {
+        out_chain->clear();
+    }
     try {
         std::error_code ec;
         const std::filesystem::path main_canon =
@@ -474,7 +520,7 @@ bool PreScanIncludes(const std::string& main_path, bool allow_outside,
         const std::filesystem::path root = start.parent_path();
         std::vector<std::filesystem::path> chain{start};
         return WalkIncludes(start, root, allow_outside, &chain, 1, err,
-                            err_line);
+                            err_line, out_chain);
     } catch (const std::exception& ex) {
         *err = std::string("include pre-scan failed: ") + ex.what();
         return false;
@@ -781,7 +827,8 @@ void AppendConflict(const char* param, const std::string& plain_value,
 }
 
 /**
- * @brief §6.3-A：同参数两块取值差异比对（仅标量/端点字段，Info 级）。
+ * @brief §6.3-A：同参数两块取值差异比对（标量/端点字段 + 子命令列表文本化，
+ *        Info 级）。
  * @param plain plain XCP 块快照。@param plus XCPplus 块快照（以它为准）。
  * @param out 差异列表输出。
  */
@@ -814,6 +861,25 @@ void DiffIfData(const IfDataXcpDto& plain, const IfDataXcpDto& plus,
     AppendConflict("UDP_PORT", std::to_string(plain.udp_port),
                    std::to_string(plus.udp_port), out);
     AppendConflict("UDP_HOST", plain.udp_host, plus.udp_host, out);
+    // 批次12（§6.3-A）：UDP 端点新增两项纳入同参数差异比对。文本按位宽呈现
+    // （8/16/32），原始码 0/1/2 不直接示人；越界码显示 UNKNOWN。
+    const auto align_name = [](std::uint8_t raw) -> std::string {
+        return raw <= 2 ? std::to_string(8u << raw) : std::string("UNKNOWN");
+    };
+    AppendConflict("PACKET_ALIGNMENT", align_name(plain.udp_packet_alignment),
+                   align_name(plus.udp_packet_alignment), out);
+    const auto subcmd_name = [](const std::vector<std::uint8_t>& cmds) {
+        std::string s;
+        for (const std::uint8_t c : cmds) {
+            if (!s.empty()) {
+                s += ",";
+            }
+            s += std::to_string(c);
+        }
+        return s;
+    };
+    AppendConflict("SUB_CMDS", subcmd_name(plain.udp_sub_commands),
+                   subcmd_name(plus.udp_sub_commands), out);
     AppendConflict("SEED_AND_KEY", plain.seed_and_key_function,
                    plus.seed_and_key_function, out);
 }
@@ -866,9 +932,13 @@ public:
             // 因为上游 FixIncludeFile 对 .a2l 递归 ParseFile 无任何保护）
             std::string include_err;
             std::uint32_t include_line = 0;
+            std::vector<std::string> include_chain;
             if (!PreScanIncludes(file_path, allow_include_outside_root_,
-                                 &include_err, &include_line)) {
+                                 &include_err, &include_line, &include_chain)) {
                 SetError(ErrorCode::kParseFailed, include_err, include_line);
+                // 批次12：结构化链单独存放（仅预扫描错误携带；ClearError
+                // 与成功路径一并复位）
+                last_include_chain_ = std::move(include_chain);
                 return ErrorCode::kParseFailed;
             }
             if (!file_->ParseFile()) {
@@ -951,6 +1021,23 @@ public:
     /** @copydoc IDoc::LastErrorLine */
     std::uint32_t LastErrorLine() const noexcept override {
         return last_error_line_;
+    }
+
+    /** @copydoc IDoc::LastErrorChain */
+    ErrorCode LastErrorChain(
+        std::vector<std::string>* out) const noexcept override {
+        if (out == nullptr) {
+            // 查询方法不得改写错误通道（LastError/LastErrorCode 保持原值）
+            return ErrorCode::kBadArgument;
+        }
+        try {
+            *out = last_include_chain_;
+        } catch (...) {
+            // 分配失败：清空输出并以 kInternal 如实报告
+            out->clear();
+            return ErrorCode::kInternal;
+        }
+        return ErrorCode::kOk;
     }
 
     /** @copydoc IDoc::Progress */
@@ -1098,6 +1185,7 @@ private:
         daq_lists_.clear();
         conversions_.clear();
         if_data_xcp_ = {};
+        last_include_chain_.clear();
         file_.reset();
     }
 
@@ -1118,6 +1206,8 @@ private:
         last_code_ = ErrorCode::kOk;
         last_error_.clear();
         last_error_line_ = 0;
+        // 批次12：成功路径同样复位结构化链，避免残留上一次加载的链
+        last_include_chain_.clear();
     }
 
     /** 异步线程体：跑同步 Load 并把结果码回抛完成回调。 */
@@ -1262,8 +1352,19 @@ private:
         if (dto->transport == XcpTransportDto::kUdpIp) {
             const auto& udps = blk.GetXcpOnUdpIps();
             if (!udps.empty()) {
-                dto->udp_port = udps.front().GetPort();
-                dto->udp_host = udps.front().GetHostName();
+                // 批次12：首里程碑统一取"首个 XCPonUDP/IP 实例"
+                // （port/host/alignment/sub_cmds 同一实例，多实例建模延后，
+                //  见设计 §6.3；不得出现端口取 front 而子命令取全体的混合口径）
+                const a2l::xcp::XcpOnUdpIp& udp = udps.front();
+                dto->udp_port = udp.GetPort();
+                dto->udp_host = udp.GetHostName();
+                // 原码透传，不做 8/16/32 换算（换算归桥接层，§4.3）
+                dto->udp_packet_alignment =
+                    static_cast<std::uint8_t>(udp.GetPacketAlignment());
+                for (const a2l::xcp::UdpSubCmd sc : udp.GetSubCmds()) {
+                    dto->udp_sub_commands.push_back(
+                        static_cast<std::uint8_t>(sc));
+                }
             }
         }
 
@@ -1340,6 +1441,8 @@ private:
     std::string last_error_;
     /** 最近错误的 A2L 行号（0=无信息；>0 才允许进 Error.line，B-19）。 */
     std::uint32_t last_error_line_ = 0;
+    /** 最近错误的 include 链（批次12，B-18；仅预扫描错误非空）。 */
+    std::vector<std::string> last_include_chain_;
     /** IF_DATA XCP 来源 MODULE（B-17；空=自动选择）。 */
     std::string active_module_;
     /** 是否允许 include 越根（B-18 默认禁止）。 */

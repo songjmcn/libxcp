@@ -38,8 +38,11 @@ namespace liba2l {
 //               +timers/optional_commands/seed_and_key/has_ecu_states/
 //               module_name/daq_caps/events/plus_conflicts；新增 DaqCapsDto、
 //               EventChannelDto、XcpPlusConflictDto。
+// v3（批次12）：IDoc +LastErrorChain（B-18 结构化 include 链，out-param 风格，
+//               与 ListSymbols 同分配惯例）；IfDataXcpDto
+//               +udp_packet_alignment/+udp_sub_commands（UDP 端点元数据补全）。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 2u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 3u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -326,6 +329,16 @@ struct IfDataXcpDto {
     std::uint16_t udp_port =
         0;                 ///< XCPonUDP/IP 端口（transport==kUdpIp 时有效）
     std::string udp_host;  ///< XCPonUDP/IP 主机名/IP（可空）
+    /// @brief PACKET_ALIGNMENT 上游**原始码**（批次12，不做语义换算）
+    /// @details 0/1/2 = 8/16/32 bit（上游 `UdpPacketAlignment`）。上游
+    /// `SetPacketAlignment()` 对非 `PACKET_ALIGNMENT_8/16/32` 的字面量
+    /// **静默保持默认 0**，故 0 无法区分“未声明”与“声明了非法值”
+    /// （设计 §6.3 已知限制）。位宽换算由桥接层承担。
+    std::uint8_t udp_packet_alignment = 0;
+    /// @brief `OPTIONAL_TL_SUBCMD <IDENT>` 声明的子命令码（批次12）
+    /// @details 原值透传（0xFA/0xFC/0xFD/0xFF）；上游对未识别名静默丢弃，
+    ///          故本列表只含上游已识别项，空不代表 A2L 未声明。
+    std::vector<std::uint8_t> udp_sub_commands;
     std::optional<double>
         resource_mask;  ///< 暂不透出的资源位图（保留扩展位，当前不用）
     // ---- 批次10 扩展（B-16/B-17/§6.1/§6.3-A 数据补全） ----
@@ -429,6 +442,23 @@ public:
      *          消费方仅在 >0 时填入 Error.line。
      */
     virtual std::uint32_t LastErrorLine() const noexcept = 0;
+
+    /**
+     * @brief 最近一次错误的 include 链（B-18 结构化载体，批次12）。
+     * @param out 输出向量：由本 DLL 侧先 `clear()` 再填充（与
+     *            `ListSymbols`/`GetIfDataXcp` 同一 out-param 分配惯例，
+     *            §5.3.3 R2/R3）。
+     * @details 元素为 **canonical 全路径（UTF-8）**，顺序 = 主文件 →
+     *          触发点，首元素恒为主文件；仅循环/深度/越根三类预扫描错误
+     *          非空，其余错误（含解析失败）返回空链。`LastError()` 文本里的
+     *          箭头链（仅文件名）保持不变，二者互不替代（B-19：业务只判
+     *          ErrorCode，不匹配文本）。
+     * @return kOk（含“无链”的空输出）；out 为空指针返回 kBadArgument，
+     *         且**不改写**错误通道（查询方法不得污染
+     * LastError/LastErrorCode）。
+     */
+    virtual ErrorCode LastErrorChain(
+        std::vector<std::string>* out) const noexcept = 0;
 
     /**
      * @brief 异步加载（后台线程解析；进度经 progress_cb 回调百分比 0..100）。

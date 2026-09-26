@@ -118,6 +118,13 @@ Result<std::unique_ptr<A2lBridge>> A2lBridge::Load(const std::string& file_path,
         if (const std::uint32_t line = impl->doc->LastErrorLine(); line > 0) {
             e.line = line;
         }
+        // B-18 批次12：include 类错误带出结构化链（其余错误 SDK 返回空链，
+        // 故空链时保持字段为空 vector）
+        std::vector<std::string> chain;
+        if (impl->doc->LastErrorChain(&chain) == liba2l::ErrorCode::kOk &&
+            !chain.empty()) {
+            e.include_chain = std::move(chain);
+        }
         return e;
     }
     impl->progress = 100;
@@ -160,13 +167,28 @@ Result<std::unique_ptr<A2lBridge>> A2lBridge::LoadAsync(
         file_path, options.module_information_only, nullptr, [raw](int code) {
             Result<void> outcome = [&]() -> Result<void> {
                 if (code != static_cast<int>(liba2l::ErrorCode::kOk)) {
+                    // 批次12：与同步分支对称——message 取 SDK 文本（原先硬
+                    // 编码"异步解析失败"丢失了定位信息），固定语义标记进
+                    // cause； B-19 下业务仍只判 ErrorCode。
+                    const char* sdk_text = raw->doc->LastError();
+                    std::string sdk_message =
+                        sdk_text != nullptr ? sdk_text : "";
                     Error e = detail::MapSdkError(
                         static_cast<liba2l::ErrorCode>(code), Phase::Load,
-                        "异步解析失败");
+                        sdk_message.empty() ? "SDK 异步装载失败"
+                                            : std::move(sdk_message));
+                    e.cause = "异步解析失败（completed_cb 携带）";
                     // B-19：异步失败同样带出结构化行号
                     if (const std::uint32_t line = raw->doc->LastErrorLine();
                         line > 0) {
                         e.line = line;
+                    }
+                    // B-18 批次12：异步分支同样带出结构化 include 链
+                    std::vector<std::string> chain;
+                    if (raw->doc->LastErrorChain(&chain) ==
+                            liba2l::ErrorCode::kOk &&
+                        !chain.empty()) {
+                        e.include_chain = std::move(chain);
                     }
                     return e;
                 }

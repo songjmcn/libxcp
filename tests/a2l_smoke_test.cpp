@@ -1,7 +1,8 @@
 // =============================================================================
 // a2l_smoke_test.cpp —— A2L 最小开发验证集冒烟测试（门禁清单见
 // code-plan/A2L_CMake最小开发验证集_R4.md §5）：
-//   G1 DLL 可加载 + ABI 三向校验（v2 可建 / v1、v3 必拒，批次10 ABI bump）；
+//   G1 DLL 可加载 + ABI 三向校验（v3 可建 / v2、v4 必拒，批次12 ABI bump）；
+//   G1b IDoc::LastErrorChain 通道契约（批次12 新增虚函数的边界三态）；
 //   G2 生成的最小 A2L 可解析；
 //   G3 符号可按 module::symbol 查询（含裸名与未命中路径）；
 //   G4 B-1 地址/extension 原值保留 + AG 元素计数/地址推进；
@@ -84,7 +85,7 @@ void Gate1AbiCheck() {
     if (good != nullptr) {
         good->Release();
     }
-    // 批次10：ABI 已 bump 到 2 —— 旧版头（v1）必须被新 DLL 拒绝，
+    // 批次12：ABI 已 bump 到 3 —— 旧版头（v2）必须被新 DLL 拒绝，
     // 这是 R5 "DLL 与头不同步只靠 kLibA2lAbiVersion 兜底" 的直接验证
     liba2l::IDoc* old = liba2l::CreateDoc(liba2l::kLibA2lAbiVersion - 1);
     CHECK(old == nullptr);
@@ -96,6 +97,25 @@ void Gate1AbiCheck() {
     if (bad != nullptr) {
         bad->Release();
     }
+}
+
+/// @brief G1b：`IDoc::LastErrorChain` 通道契约（批次12，ABI v3 新增方法）
+/// @details 三条边界：① 空指针入参返回 kBadArgument；② 该失败**不得**改写
+///          错误通道（查询方法不污染 LastError/LastErrorCode）；③ 正常入参
+///          在未加载时返回 kOk + 空链（"无链"不是错误）。
+void Gate1bLastErrorChainChannel() {
+    liba2l::IDoc* doc = liba2l::CreateDoc(liba2l::kLibA2lAbiVersion);
+    CHECK(doc != nullptr);
+    if (doc == nullptr) {
+        return;
+    }
+    const liba2l::ErrorCode before = doc->LastErrorCode();
+    CHECK(doc->LastErrorChain(nullptr) == liba2l::ErrorCode::kBadArgument);
+    CHECK(doc->LastErrorCode() == before);
+    std::vector<std::string> chain;
+    CHECK(doc->LastErrorChain(&chain) == liba2l::ErrorCode::kOk);
+    CHECK(chain.empty());
+    doc->Release();
 }
 
 /// @brief G3/G4：符号查询 + B-1 地址语义 + 元素计数/推进
@@ -227,6 +247,10 @@ void CheckIfDataSnapshot(const A2lBridge& bridge) {
               calmcar::xcp::a2l::TransportEndpoint::Kind::UdpIp);
         CHECK(xcp->transports[0].remote_port == 0x15B7);
         CHECK(xcp->transports[0].remote_host == "localhost");
+        // 批次12：本样本未声明 PACKET_ALIGNMENT / OPTIONAL_TL_SUBCMD
+        // → 上游默认位宽 8、子命令列表为空（黄金套件用 golden_mask 测正例）
+        CHECK(xcp->transports[0].packet_alignment == 8);
+        CHECK(xcp->transports[0].sub_commands.empty());
     }
     CHECK(xcp->daq.has_value() && xcp->daq->static_supported);
     // ---- 批次10 数据补全断言（§6.1：t1..t7 / DAQ 能力块 / 事件 / 归属） ----
@@ -364,6 +388,8 @@ void CheckAsyncLoad() {
 int main() {
     // G1 —— DLL 可加载 + ABI 校验
     Gate1AbiCheck();
+    // G1b —— LastErrorChain 通道契约（批次12 ABI v3）
+    Gate1bLastErrorChainChannel();
 
     // G2 —— 生成的最小 A2L 可解析（同步 Load）
     auto bridge = A2lBridge::Load(A2L_GOLDEN_PATH);
