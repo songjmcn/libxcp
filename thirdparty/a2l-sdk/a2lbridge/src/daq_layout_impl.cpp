@@ -73,6 +73,14 @@ public:
         if (dto.empty()) {
             return LayoutError(ErrorCode::BadArgument, "DTO 为空帧");
         }
+        // B-7 批次11：PID_OFF 关闭识别字段后无法按 EPK 路由帧（XCP 要求
+        // 唯一标识由 Transport 层保证——docs/XCP_1.3.0 §7.5，UDP 通道无此
+        // 关联），显式结构化拒绝，不做任何猜测性分发。
+        if (frame_layout.pid_off) {
+            return LayoutError(ErrorCode::UnsupportedOperation,
+                               "PID_OFF 帧首里程碑不支持（B-7：无 Transport "
+                               "层 DAQ 列表关联通道）");
+        }
         // PID 低 7 位为事件通道号（EXT 位在首版不解析），高 8 位（EPK）用于
         // 匹配 DAQ 列表号；这里以 EPK == number 匹配（绝对标识模式）。
         const std::uint16_t epk = static_cast<std::uint8_t>(dto[0]);

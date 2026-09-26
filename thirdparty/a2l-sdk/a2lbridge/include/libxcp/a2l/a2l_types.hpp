@@ -94,9 +94,11 @@ enum class ArrayOrder : std::uint8_t { RowMajor, ColumnMajor };
 /**
  * @brief 数组一维的归一化描述（B-2）
  * @details source_lower_bound 保留 A2L 原始下界；API 索引一律 0 基。
+ *          批次11 事实：上游无 ARRAY_DIMENSION/SOURCE_LOWER_BOUNDS 语法 →
+ *          恒 0（含该属性的文件在上游 ParseFailed，§6.3 缺口表）。
  */
 struct Dimension {
-    std::int64_t source_lower_bound = 0;  ///< A2L 原始下界
+    std::int64_t source_lower_bound = 0;  ///< A2L 原始下界（上游无语法 → 恒 0）
     std::uint64_t extent = 0;             ///< 元素数量
     std::uint64_t byte_stride = 0;        ///< 该维索引增加 1 时的实际字节跨度
 };

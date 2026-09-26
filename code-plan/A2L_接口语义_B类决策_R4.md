@@ -16,7 +16,7 @@
 | 编号 | 最终决策 | 首版失败/降级行为 |
 |---|---|---|
 | **B-1 地址** | `xcp_address = A2L ECU_ADDRESS` 原值；`address_extension` 为独立 8-bit 字段；`byte_offset = element_index * element_size_bytes`；要求 `byte_offset % AG == 0`；`element_address = xcp_address + byte_offset / AG`。AG 不乘入基地址，extension 不拼高位 | 未对齐、溢出、INDIRECT/SUB_ADDRESS → 明确错误且不发包；不自动叠加 ECU_CALIBRATION_OFFSET |
-| **B-2 数组** | API 使用 0-based 索引；内部保存 source lower bound、extent、byte stride 和显式主序；首版执行标量、1D、可证明连续的规则 2D | 冲突、溢出、不规则布局 → `UnsupportedArrayLayout` |
+| **B-2 数组** | API 使用 0-based 索引；内部保存 source lower bound、extent、byte stride 和显式主序；首版执行标量、1D、可证明连续的规则 2D | 冲突、溢出、不规则布局 → `UnsupportedArrayLayout`。**事实注记（批次11）**：上游 a2llib 词法+语法 grep `ARRAY_DIMENSION/SOURCE_LOWER_BOUNDS` 均 0 命中 → `source_lower_bound` 恒 0，且含该属性的 A2L 会在上游直接 ParseFailed；规则 2D 以 `MATRIX_DIM` 表达，stride 按低维元素数递推 |
 | **B-3 类型** | 按实际 `A2lDataType` 枚举逐项建立固定宽度映射；禁止 `sizeof(enum)`、ordinal 推断和未知类型默认宽度 | 未知、厂商扩展、长度不明 → `UnsupportedDataType` |
 | **B-4 RECORD_LAYOUT** | 首版执行标量 VALUE、连续 VAL_BLK、标准连续 FNC_VALUES；CURVE/MAP 只保存轴和布局元数据 | 复杂 block order、轴点交错、重定位、厂商扩展 → `UnsupportedRecordLayout` |
 | **B-5 DAQ 范围** | 首里程碑只启用 STATIC DAQ；DYNAMIC 只解析能力，待 Allocator 和 WRITE_DAQ 账本完成后再启用 | `DynamicDaqNotImplemented` |
@@ -32,7 +32,7 @@
 | **B-15 逆换算越界** | 默认严格 Reject；未来可增加显式 ClampPolicy，但默认仍拒绝并必须返回 clamped 状态 | 越界、NaN/Inf、不可逆 → 不产生 raw、不下发 ECU |
 | **B-16 参数比对** | 运行时为真值。Error：protocol major、通信 ByteOrder、AG、不兼容 DAQ ID/entry/address-extension；Warning：MAX_CTO/MAX_DTO、minor、资源/可选命令差异，采用运行时和更保守限制；Info：A2L-only。t1～t7 不作为 Slave runtime 差异项 | Error 只阻断受影响功能，保留数据库、诊断及其他安全功能 |
 | **B-17 多 MODULE** | 保存全部 MODULE；对象和 IF_DATA 均带 module scope；仅恰好一个 MODULE 时自动设 active module，多 MODULE 必须显式选择 | `ModuleRequired/AmbiguousName` |
-| **B-18 INCLUDE** | 相对当前包含文件目录解析；canonical path 活动栈检测循环并去重；最大深度 32；默认禁止越出主 A2L 根目录，可显式放开 | 返回完整 include chain，不发布半成品数据库 |
+| **B-18 INCLUDE** | 相对当前包含文件目录解析；canonical path 活动栈检测循环并去重；最大深度 32；默认禁止越出主 A2L 根目录，可显式放开 | 返回完整 include chain，不发布半成品数据库。**实现注记（批次11 分步）**：上游 FixIncludeFile 无防护，由 SDK 解析前预扫描拦截；循环/深度错误的 message 携带完整链文本（`a -> b -> a`，B-19 显示契约，业务仍只判 ErrorCode）；结构化 `Error.include_chain` 字段与 IDoc 通道随 10.4 ABI v3 交付 |
 | **B-19 错误** | C++20 自建 `Result<T>/Error`，含 ErrorCode、Severity、Phase、path、line、column、module、symbol、message/cause；`LastError()` 仅作展示兼容 | DLL 内捕获所有异常；多错误稳定排序 |
 | **B-20 线程** | 私有 mutable builder 完成后一次性发布 immutable snapshot；发布后 const 查询并发安全；加载中返回 NotReady；Bridge one-shot；工作线程回调在发布后恰好一次；析构/取消安全 join | Busy/NotReady/Cancelled 结构化返回，失败不发布半成品 |
 
