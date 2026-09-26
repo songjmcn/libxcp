@@ -1,3 +1,6 @@
 [submodule "thirdparty/a2llib"]
 	path = thirdparty/a2llib
 	url = https://github.com/ihedvall/a2llib.git
+[submodule "thirdparty/XCPlite"]
+	path = thirdparty/XCPlite
+	url = https://github.com/vectorgrp/XCPlite.git
