@@ -161,4 +161,164 @@ Bytes CommandCodec::EncodeUnlock(std::uint8_t length_field,
     return cto;
 }
 
+Bytes CommandCodec::EncodeClearDaqList(std::uint16_t daq_list) const {
+    // CLEAR_DAQ_LIST: [E3][reserved][daq_lo][daq_hi]（xcp.h:684-686）
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::ClearDaqList));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, daq_list);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeSetDaqPtr(std::uint16_t daq_list,
+                                    std::uint8_t odt_number,
+                                    std::uint8_t odt_entry_number) const {
+    // SET_DAQ_PTR: [E2][reserved][daq(WORD)][odt][entry]（xcp.h:689-693）
+    Bytes cto;
+    cto.reserve(6);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::SetDaqPtr));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, daq_list);
+    cto.push_back(odt_number);
+    cto.push_back(odt_entry_number);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeWriteDaq(std::uint8_t bit_offset, std::uint8_t size,
+                                   AddressExtension extension,
+                                   Address address) const {
+    // WRITE_DAQ: [E1][bit_offset][size][extension][addr(DWORD)]
+    // （xcp.h:696-701）；size 以 AG 为单位，0 = 无效条目（docs L2161-2166）
+    if (size == 0U) {
+        throw detail::MakeInvalidArgument(
+            "WRITE_DAQ Size 字段不得为 0（以 AG 为单位的元素数）");
+    }
+    Bytes cto;
+    cto.reserve(8);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::WriteDaq));
+    cto.push_back(bit_offset);  // 0xFF = 无位偏（kDaqBitOffsetNone）
+    cto.push_back(size);
+    cto.push_back(extension);
+    WriteU32(cto, address);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeReadDaq() const {
+    // READ_DAQ: [DB]（无参；读隐含 DAQ 指针处，xcp.h:781）
+    Bytes cto;
+    cto.reserve(1);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::ReadDaq));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeSetDaqListMode(DaqListModeBit mode,
+                                         std::uint16_t daq_list,
+                                         std::uint16_t event_channel,
+                                         std::uint8_t prescaler,
+                                         std::uint8_t priority) const {
+    // SET_DAQ_LIST_MODE: [E0][mode][daq(WORD)][event(WORD)][prescaler]
+    //                    [priority]（xcp.h:713-719；docs L2180-2186 字段序）
+    Bytes cto;
+    cto.reserve(8);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::SetDaqListMode));
+    cto.push_back(static_cast<std::uint8_t>(mode));
+    WriteU16(cto, daq_list);
+    WriteU16(cto, event_channel);
+    cto.push_back(prescaler);
+    cto.push_back(priority);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeStartStopDaqList(DaqListAction action,
+                                           std::uint16_t daq_list) const {
+    // START_STOP_DAQ_LIST: [DE][mode][daq(WORD)]（xcp.h:731-733）
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::StartStopDaqList));
+    cto.push_back(static_cast<std::uint8_t>(action));
+    WriteU16(cto, daq_list);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeStartStopSynch(DaqSynchAction action) const {
+    // START_STOP_SYNCH: [DD][mode]（xcp.h:738-739）
+    Bytes cto;
+    cto.reserve(2);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::StartStopSynch));
+    cto.push_back(static_cast<std::uint8_t>(action));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetDaqListInfo(std::uint16_t daq_list) const {
+    // GET_DAQ_LIST_INFO: [D8][reserved][daq(WORD)]（xcp.h:808-810）
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqListInfo));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, daq_list);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetDaqProcessorInfo() const {
+    // GET_DAQ_PROCESSOR_INFO: [DA]（1 字节无参；xcp.h:789）
+    Bytes cto;
+    cto.reserve(1);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqProcessorInfo));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetDaqResolutionInfo() const {
+    // GET_DAQ_RESOLUTION_INFO: [D9]（1 字节无参；xcp.h:798
+    // CRO_GET_DAQ_RESOLUTION_INFO_LEN=1）
+    Bytes cto;
+    cto.reserve(1);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqResolutionInfo));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeDownload(ElementCount number_of_elements,
+                                   BytesView data) const {
+    // DOWNLOAD: [F0][size][data...]（xcp.h:578-582）；size 是**元素数**
+    // （以 AG 为单位），与 Session Byte Order 无关
+    if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
+        throw detail::MakeInvalidArgument(
+            "DOWNLOAD NumberOfElements 超出单字节字段范围 1..255: " +
+            std::to_string(number_of_elements));
+    }
+    if (data.empty()) {
+        throw detail::MakeInvalidArgument("DOWNLOAD 数据段为空");
+    }
+    Bytes cto;
+    cto.reserve(2 + data.size());
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::Download));
+    cto.push_back(static_cast<std::uint8_t>(number_of_elements));
+    cto.insert(cto.end(), data.begin(), data.end());
+    return cto;
+}
+
+Bytes CommandCodec::EncodeShortDownload(ElementCount number_of_elements,
+                                        AddressExtension extension,
+                                        Address address, BytesView data) const {
+    // SHORT_DOWNLOAD: [ED][size][reserved][extension][addr(DWORD)][data...]
+    // （xcp.h:597-602）——固定头 8 字节，MAX_CTO=8 时无处放数据（docs L2026）
+    if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
+        throw detail::MakeInvalidArgument(
+            "SHORT_DOWNLOAD NumberOfElements 超出单字节字段范围 1..255: " +
+            std::to_string(number_of_elements));
+    }
+    if (data.empty()) {
+        throw detail::MakeInvalidArgument("SHORT_DOWNLOAD 数据段为空");
+    }
+    Bytes cto;
+    cto.reserve(8 + data.size());
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::ShortDownload));
+    cto.push_back(static_cast<std::uint8_t>(number_of_elements));
+    cto.push_back(0x00U);  // reserved
+    cto.push_back(extension);
+    WriteU32(cto, address);
+    cto.insert(cto.end(), data.begin(), data.end());
+    return cto;
+}
+
 }  // namespace calmcar::xcp

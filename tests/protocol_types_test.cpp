@@ -109,6 +109,33 @@ TEST(ResourceMask, ChecksBits) {
     EXPECT_FALSE(HasResource(0x00U, Resource::CalPag));
 }
 
+TEST(DaqProcessorProperty, ChecksAndCombinesBits) {
+    EXPECT_EQ(static_cast<std::uint8_t>(DaqProcessorPropertyBit::kConfigType),
+              0x01U);
+    EXPECT_EQ(static_cast<std::uint8_t>(DaqProcessorPropertyBit::kPrescaler),
+              0x02U);
+    EXPECT_EQ(static_cast<std::uint8_t>(DaqProcessorPropertyBit::kResume),
+              0x04U);
+    EXPECT_EQ(static_cast<std::uint8_t>(DaqProcessorPropertyBit::kBitStim),
+              0x08U);
+    EXPECT_EQ(static_cast<std::uint8_t>(DaqProcessorPropertyBit::kTimestamp),
+              0x10U);
+    EXPECT_EQ(static_cast<std::uint8_t>(DaqProcessorPropertyBit::kNoPid),
+              0x20U);
+    EXPECT_EQ(
+        static_cast<std::uint8_t>(DaqProcessorPropertyBit::kOverloadIndicator),
+        0xC0U);
+
+    const auto props = DaqProcessorPropertyBit::kConfigType |
+                       DaqProcessorPropertyBit::kTimestamp;
+    EXPECT_TRUE(
+        HasDaqProcessorProperty(props, DaqProcessorPropertyBit::kConfigType));
+    EXPECT_TRUE(
+        HasDaqProcessorProperty(props, DaqProcessorPropertyBit::kTimestamp));
+    EXPECT_FALSE(
+        HasDaqProcessorProperty(props, DaqProcessorPropertyBit::kNoPid));
+}
+
 TEST(ResourceMask, CombinesWithBitOr) {
     // operator| 只接受两个
     // Resource（返回底层掩码类型），因此第三次合并用内置整数 |

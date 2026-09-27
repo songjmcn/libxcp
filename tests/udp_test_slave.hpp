@@ -120,6 +120,42 @@ public:
      */
     void SetSeedContent(const Bytes& seed_content);
 
+    /**
+     * @brief 开启/关闭 DAQ 命令组与 DOWNLOAD 写回模拟（批次14，T14-09）
+     * @param enabled false = 默认值：所有 DAQ/DOWNLOAD 命令一律回
+     *        ERR_CMD_UNKNOWN，既有用例语义完全不变
+     * @details 为什么默认关闭：既有用例 `UnknownCommandReturnsErrCmdUnknown`
+     *          用 0xF0(DOWNLOAD) 断言 ERR_CMD_UNKNOWN。关闭时 CONNECT 会清除
+     *          RESOURCE 的 DAQ 位（0x11），开启后才声明 0x15，保证资源声明与
+     *          实际 Mandatory 命令能力一致（docs L1749）。
+     *          只有显式开启的用例才会走真实 DAQ/写回路径。
+     */
+    void SetDaqSimulationEnabled(bool enabled);
+
+    /// @brief 是否已开启 DAQ/DOWNLOAD 模拟
+    [[nodiscard]] bool DaqSimulationEnabled() const;
+
+    /**
+     * @brief 把某个 DAQ List 标记为 PREDEFINED（WRITE_DAQ 必须被拒）
+     * @param daq_list DAQ List 号
+     * @param predefined true = Slave 侧拒写该列表（ERR_WRITE_PROTECTED，
+     *        docs L2168），供 B-5/B-6 负例使用
+     * @note 需先开启 DAQ 模拟；标记只在开启后的命令处理中生效。
+     */
+    void SetDaqListPredefined(std::uint16_t daq_list, bool predefined);
+
+    /**
+     * @brief 按当前配置发送指定 DAQ List 的全部 ODT DTO（批次14，T14-12）
+     * @param daq_list DAQ List 号
+     * @return 实际发出的 DTO 帧数（0 表示该列表无有效 ODT 配置）
+     * @details 每帧 = [PID][净荷...]：PID 由该列表 FIRST_PID + 相对 ODT 号
+     *          推得（Absolute ODT Number，docs L2225），净荷按 ODT 内 Entry
+     *          顺序从模拟内存取字节。手动触发而非后台周期发送，
+     *          以保证用例确定性；需要"周期"时由测试重复调用即可。
+     * @throws XcpException(InvalidState) 未开启 DAQ 模拟或尚无 CONNECT 来源端点
+     */
+    std::size_t SendDaqListDtos(std::uint16_t daq_list);
+
     /// @brief 获取已处理的 XCP 命令计数
     [[nodiscard]] std::size_t CommandCount() const;
 
@@ -225,6 +261,61 @@ private:
     /// @brief 当前生效的保护掩码（保护位 & ~已解锁位，调用方须持锁）
     [[nodiscard]] ResourceMask EffectiveProtection() const;
 
+    // ---- DAQ / DOWNLOAD 模拟（批次14，T14-09；均受 m_state_mutex_ 保护）----
+
+    /// @brief 模拟侧的一个 ODT Entry（WRITE_DAQ 记账结果）
+    struct SlaveDaqEntry {
+        std::uint8_t bit_offset = kDaqBitOffsetNone;  ///< 位偏（0xFF=无）
+        std::uint8_t size = 0;           ///< 元素数（以 AG 为单位）
+        AddressExtension extension = 0;  ///< 地址扩展
+        Address address = 0;             ///< 32 位地址
+    };
+
+    /// @brief 模拟侧的一个 DAQ List
+    struct SlaveDaqList {
+        bool predefined =
+            false;  ///< PREDEFINED → WRITE_DAQ 回 ERR_WRITE_PROTECTED
+        bool running =
+            false;  ///< 是否处于运行态（影响 GET_STATUS.DAQ_RUNNING）
+        bool selected = false;            ///< START_STOP_DAQ_LIST(Select) 标记
+        std::uint8_t mode = 0;            ///< SET_DAQ_LIST_MODE 的 MODE 字节
+        std::uint16_t event_channel = 0;  ///< 事件通道号
+        std::uint8_t prescaler = 1;       ///< 降频因子
+        std::uint8_t priority = 0;        ///< 优先级
+        std::uint8_t first_pid = 0;       ///< 本列表首个 ODT 的 PID
+        std::vector<std::vector<SlaveDaqEntry>> odts;  ///< 实际 ODT 布局
+    };
+
+    /// @brief 隐含 DAQ 指针（SET_DAQ_PTR 设定，WRITE/READ_DAQ 自增）
+    struct SlaveDaqPtr {
+        std::uint16_t daq = 0;   ///< DAQ List 号
+        std::uint8_t odt = 0;    ///< ODT 号（0 基）
+        std::uint8_t entry = 0;  ///< Entry 号（0 基）
+    };
+
+    /**
+     * @brief 处理 DAQ 命令组与 DOWNLOAD 写回（调用方须持 m_state_mutex_）
+     * @param xcp_packet 完整 CTO
+     * @return 应答报文；返回 handled=false 表示本函数不认识该命令码
+     */
+    struct DaqDispatchResult {
+        bool handled = false;  ///< 是否由本函数处理
+        Bytes response;        ///< 应答报文
+    };
+    [[nodiscard]] DaqDispatchResult HandleDaqOrDownload(BytesView xcp_packet);
+
+    /// @brief 取（或按需创建）指定号的 DAQ List
+    [[nodiscard]] SlaveDaqList& MutableDaqList(std::uint16_t daq_list);
+
+    /// @brief 把 data 写进模拟内存的 [address, address+data.size()) 区间
+    /// @return false = 跨内存块边界或地址非法（视为不可写，回
+    /// ERR_OUT_OF_RANGE）
+    bool WriteAtAddress(Address address, BytesView data);
+
+    /// @brief 读取某 Entry 的净荷字节（供 SendDaqListDtos 组帧）
+    [[nodiscard]] std::optional<Bytes> ReadDaqEntryPayload(
+        const SlaveDaqEntry& entry) const;
+
     /// @brief 测试 Socket 私有实现声明
     struct SocketImpl;
 
@@ -263,6 +354,17 @@ private:
     std::size_t m_key_received_{0};  ///< 已收到的 Key 字节数
     std::uint8_t m_key_prev_length_{
         0};  ///< 上一 UNLOCK 帧的 Length（首帧判定）
+
+    // ---- DAQ / DOWNLOAD 模拟状态（批次14，T14-09，受 m_state_mutex_
+    // 保护）----
+    /// @brief DAQ/DOWNLOAD 模拟总开关（默认关闭 → 既有 253 项用例语义不变）
+    bool m_daq_enabled_{false};
+    /// @brief 按 DAQ List 号索引的模拟配置
+    std::map<std::uint16_t, SlaveDaqList> m_daq_lists_;
+    /// @brief 隐含 DAQ 指针（SET_DAQ_PTR 设定，WRITE/READ_DAQ 自增）
+    SlaveDaqPtr m_daq_ptr_;
+    /// @brief 已发出的 DTO 计数（仅用于 DTO 内可选 CTR 字段的可预测递增）
+    std::uint8_t m_dto_ctr_{0};
 };
 
 /**

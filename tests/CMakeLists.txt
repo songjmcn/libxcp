@@ -46,6 +46,7 @@ add_executable(libxcp_tests
         recovery_test.cpp
         seed_key_test.cpp
         xcp_master_integration_test.cpp
+        xcp_daq_test.cpp
         xcp_udp_loopback_test.cpp
         udp_test_slave.cpp)
 
@@ -109,7 +110,11 @@ if(LIBXCP_BUILD_A2L)
   target_link_libraries(A2lGolden PRIVATE libxcp::a2lbridge GTest::gtest_main)
   target_compile_definitions(A2lGolden PRIVATE
           A2L_GOLDEN_DIR="${A2L_GOLDEN_DIR}"
-          A2L_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/a2l")
+          A2L_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/a2l"
+          # T9 基线预算（ms）：本机实测 5 MB 解析+快照 = 264 ms（批次13 记录），
+          # 按 3 倍放宽并取整锁定 = 900 ms；非 SLA，只拦量级劣化
+          A2L_PERF_REFERENCE_MS=264
+           A2L_PERF_HARD_LIMIT_MS=3000)
   target_include_directories(A2lGolden PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   if(MSVC)
     target_compile_options(A2lGolden PRIVATE /utf-8)
@@ -142,4 +147,31 @@ if(LIBXCP_BUILD_A2L)
   add_test(NAME A2lE2E COMMAND A2lE2E)
   set_tests_properties(A2lE2E PROPERTIES FIXTURES_REQUIRED A2lGolden
           TIMEOUT 300)
+
+  # ----------------------------------------------------------------------------
+  # T9 性能基线（批次13 T13-16/T13-17）：≥5 MB 合成 A2L，**只记基线不设 SLA**。
+  # 产物落 build tree（不入库）；预算常量 = 首次实测值放宽 3 倍后锁定。
+  # ----------------------------------------------------------------------------
+  add_test(NAME a2l_perf_gen
+           COMMAND ${Python3_EXECUTABLE}
+                   "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
+                   --out "${A2L_GOLDEN_DIR}" --perf 5)
+  set_tests_properties(a2l_perf_gen PROPERTIES
+          FIXTURES_SETUP A2lPerf TIMEOUT 300)
+
+  # 单独入口：只跑基线用例（避免把 5 MB 解析塞进 A2lGolden 全量运行里重复计次）
+  add_test(NAME ParseLargeFileUnderBudget
+           COMMAND A2lGolden --gtest_filter=A2lGoldenTest.ParseLargeFileUnderBudget)
+  set_tests_properties(ParseLargeFileUnderBudget PROPERTIES
+          FIXTURES_REQUIRED A2lPerf TIMEOUT 900)
+
+  # ----------------------------------------------------------------------------
+  # T10 隔离自动化（批次13 T13-18）：把 configure 期 P9 扫描变成 ctest 条目。
+  # 两条大小写敏感扫描（桥接层禁含上游头 / 主树禁引用 A2L 栈），命中即非零退出。
+  # ----------------------------------------------------------------------------
+  add_test(NAME A2lIsolation
+           COMMAND ${CMAKE_COMMAND}
+                   "-DA2L_BRIDGE_DIR=${CMAKE_SOURCE_DIR}/thirdparty/a2l-sdk/a2lbridge"
+                   "-DLIBXCP_ROOT_DIR=${CMAKE_SOURCE_DIR}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/a2l_isolation_check.cmake")
 endif()

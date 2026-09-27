@@ -117,6 +117,24 @@ public:
     /// @brief 令 SHORT_UPLOAD 始终返回 ERR_CMD_UNKNOWN
     void RejectShortUpload() { m_reject_short_upload_ = true; }
 
+    /// @brief 令 SHORT_DOWNLOAD 始终返回 ERR_CMD_UNKNOWN（批次14 回落通路）
+    void RejectShortDownload() { m_reject_short_download_ = true; }
+
+    /// @brief 令写回（DOWNLOAD / SHORT_DOWNLOAD）返回 ERR_WRITE_PROTECTED
+    void SetWriteProtected(bool protected_write) {
+        m_write_protected_ = protected_write;
+    }
+
+    /// @brief 读回模拟内存（验证写回真的落进了 Slave 内存）
+    [[nodiscard]] Bytes Peek(Address address, std::size_t bytes) const {
+        Bytes out;
+        for (std::size_t i = 0; i < bytes; ++i) {
+            const auto it = m_memory_.find(address + static_cast<Address>(i));
+            out.push_back(it == m_memory_.end() ? 0x00U : it->second);
+        }
+        return out;
+    }
+
     /// @brief 令第 n 次 UPLOAD（1 起）不响应（模拟超时）
     void SetTimeoutUploadAt(std::size_t n) { m_timeout_upload_n_ = n; }
 
@@ -167,6 +185,10 @@ public:
                 return handleUpload(packet);
             case CommandCode::ShortUpload:
                 return handleShortUpload(packet);
+            case CommandCode::Download:
+                return handleDownload(packet);
+            case CommandCode::ShortDownload:
+                return handleShortDownload(packet);
             default:
                 return Bytes{static_cast<std::uint8_t>(PacketType::Err),
                              static_cast<std::uint8_t>(ErrorCode::CmdUnknown)};
@@ -239,6 +261,52 @@ private:
         return out;
     }
 
+    // ---- 批次14（T14-13）：写回通路 ----
+
+    Bytes handleDownload(BytesView packet) {
+        if (m_write_protected_) {
+            return Err(ErrorCode::WriteProtected);
+        }
+        if (packet.size() < 2U) {
+            return Err(ErrorCode::CmdSyntax);
+        }
+        const auto elements = static_cast<ElementCount>(packet[1]);
+        const auto want = static_cast<std::size_t>(elements) * AgToBytes(m_ag_);
+        if (elements == 0U || want + 2U > packet.size() ||
+            want + 2U > m_max_cto_) {
+            // 元素数与净荷长度必须自洽，且整帧不得超 MAX_CTO
+            return Err(ErrorCode::CmdSyntax);
+        }
+        for (std::size_t i = 0; i < want; ++i) {
+            m_memory_[m_mta_ + static_cast<Address>(i)] = packet[2 + i];
+        }
+        m_mta_ += static_cast<Address>(want);
+        return Bytes{static_cast<std::uint8_t>(PacketType::Res)};
+    }
+
+    Bytes handleShortDownload(BytesView packet) {
+        if (m_reject_short_download_) {
+            return Err(ErrorCode::CmdUnknown);
+        }
+        if (m_write_protected_) {
+            return Err(ErrorCode::WriteProtected);
+        }
+        if (packet.size() < 8U) {
+            return Err(ErrorCode::CmdSyntax);
+        }
+        const auto elements = static_cast<ElementCount>(packet[1]);
+        const auto want = static_cast<std::size_t>(elements) * AgToBytes(m_ag_);
+        if (elements == 0U || want + 8U > packet.size() ||
+            want + 8U > m_max_cto_) {
+            return Err(ErrorCode::CmdSyntax);
+        }
+        const Address address = ParseShortUploadAddress(packet, m_order_);
+        for (std::size_t i = 0; i < want; ++i) {
+            m_memory_[address + static_cast<Address>(i)] = packet[8 + i];
+        }
+        return Bytes{static_cast<std::uint8_t>(PacketType::Res)};
+    }
+
     static Bytes Err(ErrorCode code) {
         return Bytes{static_cast<std::uint8_t>(PacketType::Err),
                      static_cast<std::uint8_t>(code)};
@@ -252,6 +320,10 @@ private:
     Address m_mta_{0};
     AddressExtension m_mta_ext_{0};
     bool m_reject_short_upload_{false};
+    /// @brief 批次14：SHORT_DOWNLOAD 是否回 ERR_CMD_UNKNOWN（测回落通路）
+    bool m_reject_short_download_{false};
+    /// @brief 批次14：写回是否一律拒绝（ERR_WRITE_PROTECTED）
+    bool m_write_protected_{false};
     std::size_t m_timeout_upload_n_{0};
     bool m_timeout_all_uploads_{false};
     std::size_t m_upload_seen_{0};
@@ -612,6 +684,111 @@ TEST(MemoryAccessByteOrder, MotorolaSessionEncodesAddressBigEndian) {
     const Bytes got = access.ReadElements(0x12345678, 0x00, 4);
     EXPECT_EQ(got, content) << "大端会话下地址解码错误会导致读错数据";
     EXPECT_EQ(h.session.GetByteOrder(), ByteOrder::Motorola);
+}
+
+// --------------------------------------------------------------------------
+// 批次14（T14-13）：写回通路（SHORT_DOWNLOAD 优先 / 分块 DOWNLOAD / 负例）
+// --------------------------------------------------------------------------
+
+TEST(MemoryAccessWrite, ShortDownloadUsedWhenItFits) {
+    // MAX_CTO=16 → (16-8)/1 = 8 元素，4 字节一帧装得下
+    Harness h(AddressGranularity::Byte, ByteOrder::Intel, 0x10U, 0x0010U);
+    MemoryAccess access(h.executor, h.session);
+    const Bytes data = BytesOf({0x00, 0x00, 0x80, 0x3F});
+    access.WriteBytes(0x6000, 0x00, data);
+    EXPECT_EQ(h.slave.count(CommandCode::ShortDownload), 1);
+    EXPECT_EQ(h.slave.count(CommandCode::SetMta), 0);
+    EXPECT_EQ(h.slave.count(CommandCode::Download), 0);
+    // 真的落进了 Slave 内存
+    EXPECT_EQ(h.slave.Peek(0x6000, 4), data);
+}
+
+TEST(MemoryAccessWrite, MaxCtoEightCannotUseShortDownload) {
+    // MAX_CTO=8：SHORT_DOWNLOAD 头占满一帧（docs L2026）→ 必须走分块
+    Harness h;
+    MemoryAccess access(h.executor, h.session);
+    access.WriteBytes(0x6100, 0x00, BytesOf({0xAA, 0xBB}));
+    EXPECT_EQ(h.slave.count(CommandCode::ShortDownload), 0);
+    EXPECT_EQ(h.slave.count(CommandCode::Download), 1);
+    EXPECT_EQ(h.slave.count(CommandCode::SetMta), 1);
+}
+
+TEST(MemoryAccessWrite, ChunkedDownloadSetsMtaPerChunk) {
+    // MAX_CTO=8, AG=1 → 每块 (8-2)/1 = 6 元素；14 字节 → 6+6+2 三块
+    Harness h;
+    MemoryAccess access(h.executor, h.session);
+    Bytes data;
+    for (int i = 0; i < 14; ++i) {
+        data.push_back(static_cast<std::uint8_t>(0x10 + i));
+    }
+    access.WriteBytes(0x7000, 0x00, data);
+    EXPECT_EQ(h.slave.count(CommandCode::Download), 3);
+    EXPECT_EQ(h.slave.count(CommandCode::SetMta), 3)
+        << "每块都必须显式 SET_MTA（不依赖 Slave 的 MTA 自增）";
+    EXPECT_EQ(h.slave.Peek(0x7000, 14), data);
+}
+
+TEST(MemoryAccessWrite, FallsBackWhenShortDownloadUnsupported) {
+    Harness h(AddressGranularity::Byte, ByteOrder::Intel, 0x10U, 0x0010U);
+    h.slave.RejectShortDownload();
+    MemoryAccess access(h.executor, h.session);
+    const Bytes data = BytesOf({0x11, 0x22, 0x33, 0x44});
+    access.WriteBytes(0x6200, 0x00, data);
+    // ERR_CMD_UNKNOWN 无副作用（docs L1631）→ 回落 SET_MTA+DOWNLOAD 且成功
+    EXPECT_EQ(h.slave.count(CommandCode::ShortDownload), 1);
+    EXPECT_EQ(h.slave.count(CommandCode::Download), 1);
+    EXPECT_EQ(h.slave.Peek(0x6200, 4), data);
+}
+
+TEST(MemoryAccessWrite, WriteProtectedPropagatesProtocolError) {
+    Harness h;
+    h.slave.SetWriteProtected(true);
+    MemoryAccess access(h.executor, h.session);
+    try {
+        access.WriteBytes(0x6300, 0x00, BytesOf({0x01, 0x02}));
+        FAIL() << "写保护必须上抛 ProtocolError";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
+        ASSERT_TRUE(e.GetErrorCode().has_value());
+        EXPECT_EQ(*e.GetErrorCode(), ErrorCode::WriteProtected);
+    }
+}
+
+TEST(MemoryAccessWrite, RejectsEmptyAndNonMultipleOfAg) {
+    Harness h(AddressGranularity::Word, ByteOrder::Intel, 0x10U, 0x0010U);
+    MemoryAccess access(h.executor, h.session);
+    EXPECT_THROW(access.WriteBytes(0x1000, 0x00, BytesView{}), XcpException);
+    try {
+        access.WriteBytes(0x1000, 0x00, BytesOf({0x01, 0x02, 0x03}));
+        FAIL() << "奇数字节在 AG=WORD 下必须被拒";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+    EXPECT_EQ(h.slave.totalCommands(), 1)
+        << "本地预检失败时一条写命令都不发（AG 换算不猜）";
+}
+
+TEST(MemoryAccessWrite, AgIsOnlyUnitConversionNeverMultipliedIntoAddress) {
+    // B-1/AG 口径：AG=WORD 时字节数 → 元素数要除以 AG，块地址按**元素**推进
+    // （第二块起点 = 0x8000 + 15，不是 0x8000 + 30）
+    Harness h(AddressGranularity::Word, ByteOrder::Intel, 0x20U, 0x0020U);
+    MemoryAccess access(h.executor, h.session);
+    Bytes data;
+    for (int i = 0; i < 40; ++i) {  // 40 字节 = 20 元素
+        data.push_back(static_cast<std::uint8_t>(i));
+    }
+    // MAX_CTO=0x20, AG=2 → 每块 (32-2)/2 = 15 元素；20 元素 → 15+5 两块
+    access.WriteBytes(0x8000, 0x00, data);
+    EXPECT_EQ(h.slave.count(CommandCode::Download), 2);
+    EXPECT_EQ(h.slave.Peek(0x8000, 40), data);
+}
+
+TEST(MemoryAccessWrite, RequiresConnectedSessionAndOverflowGuard) {
+    Harness h;
+    MemoryAccess access(h.executor, h.session);
+    h.session.Reset();
+    EXPECT_THROW(access.WriteBytes(0x1000, 0x00, BytesOf({0x01})),
+                 XcpException);
 }
 
 }  // namespace

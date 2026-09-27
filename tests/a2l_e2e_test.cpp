@@ -18,10 +18,14 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/a2l/ia2l_database.hpp"
@@ -86,6 +90,41 @@ std::string Golden(const char* name) {
 }
 
 /**
+ * @brief DTO 收集监听器（批次14，T14-12）
+ * @details 回调在 Transport 工作线程执行，因此内部用 mutex 保护；测试侧用
+ *          WaitForCount() 有界等待，不做 sleep 猜时间。
+ */
+class DtoListener : public calmcar::xcp::IEventListener {
+public:
+    void OnEvent(const calmcar::xcp::EventPacket& /*event*/) override {}
+    void OnService(const calmcar::xcp::ServicePacket& /*service*/) override {}
+    void OnDto(const calmcar::xcp::DtoPacket& dto) override {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_dtos_.push_back(dto);
+        m_cv_.notify_all();
+    }
+
+    /// @brief 等待收到至少 n 帧 DTO；返回实际计数（超时即返回当前值）
+    std::size_t WaitForCount(std::size_t n, std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(m_mutex_);
+        (void)m_cv_.wait_for(lock, timeout,
+                             [this, n] { return m_dtos_.size() >= n; });
+        return m_dtos_.size();
+    }
+
+    /// @brief 最后一帧 DTO（调用方须先确认 WaitForCount 已达标）
+    [[nodiscard]] calmcar::xcp::DtoPacket LastDto() const {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        return m_dtos_.empty() ? calmcar::xcp::DtoPacket{} : m_dtos_.back();
+    }
+
+private:
+    mutable std::mutex m_mutex_;
+    std::condition_variable m_cv_;
+    std::vector<calmcar::xcp::DtoPacket> m_dtos_;
+};
+
+/**
  * @brief 端到端夹具：固定端口 Slave（预置内存）+ A2L 装载 + A2L 端点自动建链
  * @details 每个用例独立重建（Slave 端口 0x15B9 被占用时构造抛异常，用例
  * 直接失败并给出明确信息——端口冲突即环境问题，不做静默回退）。
@@ -95,6 +134,9 @@ protected:
     void SetUp() override {
         // 1) Slave：绑定 A2L 声明端口 + 预置 ECU 模拟内存（地址来自符号表）
         slave_ = std::make_unique<test::UdpTestSlave>(kA2lPort);
+        // E2E 夹具验证完整 DAQ 能力链，必须在 CONNECT 前开启模拟，
+        // 这样 RESOURCE 声明才能与运行时能力一致。
+        slave_->SetDaqSimulationEnabled(true);
         slave_->Start();
         const Bytes mask_raw{0x00, 0x0F};  // M_MASK：0x0F00 → 掩码提取 15
         slave_->SetMemory(0x3000, mask_raw);
@@ -129,7 +171,7 @@ protected:
         cfg.receive_poll_interval_ms = 20;
         master_ = std::make_unique<calmcar::xcp::XcpMaster>(
             std::make_unique<calmcar::xcp::UdpTransport>(cfg),
-            calmcar::xcp::CommandTimeouts{}, nullptr);
+            calmcar::xcp::CommandTimeouts{}, &dto_listener_);
         master_->Connect();
     }
 
@@ -140,6 +182,9 @@ protected:
         slave_.reset();
     }
 
+    /// @brief DTO 监听器（必须先于 master_ 声明：析构顺序相反，
+    ///        master_ 先销毁才不会用到已析构的监听器）
+    DtoListener dto_listener_;
     std::unique_ptr<test::UdpTestSlave> slave_;
     std::unique_ptr<A2lBridge> bridge_;
     std::unique_ptr<calmcar::xcp::XcpMaster> master_;
@@ -178,6 +223,8 @@ TEST_F(A2lE2ETest, AutoLinkFromA2lEndpointConnects) {
 // ---------------------------------------------------------------------------
 
 TEST_F(A2lE2ETest, RuntimeConsistencyMatchesA2l) {
+    // 一致性用例验证开启 DAQ 后的运行时真值，不依赖 Slave 默认状态。
+    slave_->SetDaqSimulationEnabled(true);
     const calmcar::xcp::SessionParameters params =
         master_->GetSessionParameters();
     const auto& c = params.connect;
@@ -313,6 +360,288 @@ TEST_F(A2lE2ETest, ReadScalarsThroughA2lAddress) {
 
 // ---------------------------------------------------------------------------
 // 4) 未预置内存地址 → 结构化失败（不静默返回零填充数据）
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 5) 写回（T14-12）：变量名 → 地址 → WriteMemoryBytes → 读回换算闭环
+// ---------------------------------------------------------------------------
+
+TEST_F(A2lE2ETest, WriteBackCalibrationVariable) {
+    // Slave 的写回模拟默认关闭（既有 253 用例语义不变），用例需显式开启
+    slave_->SetDaqSimulationEnabled(true);
+    const IA2lDatabase* db = bridge_->Database();
+    ASSERT_NE(db, nullptr);
+    auto ch = db->Find("MASK_ECU::C_VALUE");
+    ASSERT_TRUE(ch.HasValue());
+    // 写前先读：确认目标地址已被 fixture 预置为 0x1234
+    const Bytes before = master_->ReadMemoryBytes(
+        ch.Value().xcp_address, ch.Value().address_extension, 2);
+    ASSERT_EQ(before, (Bytes{0x34, 0x12}));
+
+    // 反算物理值 → 写回 → 读回 → 正算，四步都必须成立
+    auto raw_new = db->FromPhysical(
+        "MASK_ECU::C_VALUE", PhysicalValue{static_cast<std::int64_t>(0x2211)});
+    ASSERT_TRUE(raw_new.HasValue()) << raw_new.ErrorInfo().message;
+    ASSERT_EQ(raw_new.Value().size(), 2u);
+    master_->WriteMemoryBytes(ch.Value().xcp_address,
+                              ch.Value().address_extension, raw_new.Value());
+
+    const Bytes after = master_->ReadMemoryBytes(
+        ch.Value().xcp_address, ch.Value().address_extension, 2);
+    EXPECT_EQ(after, raw_new.Value());
+    auto phys = db->ToPhysical("MASK_ECU::C_VALUE", after);
+    ASSERT_TRUE(phys.HasValue());
+    EXPECT_EQ(std::get<std::int64_t>(phys.Value()), 0x2211);
+}
+
+// ---------------------------------------------------------------------------
+// 6) DAQ 实时链路（T14-12）：配置 → START → 收 DTO → 按**本端账本**解码
+// ---------------------------------------------------------------------------
+
+TEST_F(A2lE2ETest, DaqLiveEndToEndUsesActualLedgerOrder) {
+    slave_->SetDaqSimulationEnabled(true);
+
+    // 故意与 A2L golden_mask 的顺序相反：A2L 是 [0x3000(2B), 0x3020(1B)]，
+    // 这里下发 [0x3020(1B), 0x3000(2B)]。B-6 要求解码只认账本，不认 A2L 序。
+    calmcar::xcp::DaqListSpec spec;
+    spec.daq_list = 2;
+    spec.event_channel = 1;
+    spec.prescaler = 1;
+    spec.priority = 0;
+    calmcar::xcp::DaqOdtSpec odt;
+    odt.entries = {
+        {0x3020, 0x00, 1, calmcar::xcp::kDaqBitOffsetNone},
+        {0x3000, 0x00, 2, calmcar::xcp::kDaqBitOffsetNone},
+    };
+    spec.odts = {odt};
+    ASSERT_NO_THROW(master_->ConfigureDaqList(spec));
+    const std::uint8_t first_pid = master_->StartDaqList(2);
+
+    // 账本 → 桥接侧快照视图（AG=Byte，故 elements == bytes）
+    const std::vector<calmcar::xcp::DaqLedgerEntry>& ledger =
+        master_->DaqLedger();
+    ASSERT_EQ(ledger.size(), 2u);
+    std::vector<calmcar::xcp::a2l::DaqLedgerEntryView> views;
+    for (const auto& e : ledger) {
+        calmcar::xcp::a2l::DaqLedgerEntryView v;
+        v.daq_list = e.daq_list;
+        v.odt_number = e.odt_number;
+        v.odt_entry = e.odt_entry;
+        v.address = e.address;
+        v.address_extension = e.extension;
+        v.size_bytes = static_cast<std::uint8_t>(
+            e.size *
+            calmcar::xcp::AgToBytes(
+                master_->GetSessionParameters().connect.address_granularity));
+        // 批次15（F3）：位偏直接透传 XCP 原值（0xFF=无位偏，docs L1861），
+        // 归一已由桥接层入口吸收 —— 这里故意不转换，以证明调用方无需知晓两套口径
+        v.bit_offset = e.bit_offset;
+        v.pid = e.pid;
+        views.push_back(v);
+    }
+    ASSERT_TRUE(ledger[0].pid.has_value());
+    EXPECT_EQ(*ledger[0].pid, first_pid);
+
+    const std::uint32_t gen = master_->DaqConfigGeneration();
+    auto layout_r = bridge_->CreateDaqLayoutFromLedger(views, gen);
+    ASSERT_TRUE(layout_r.HasValue()) << layout_r.ErrorInfo().message;
+    // 批次15（F4）：代际可查是陈旧快照守卫的前提（调用方据此一行判过期）
+    ASSERT_GT(gen, 0u);
+    EXPECT_EQ(layout_r.Value()->Generation(), gen);
+
+    // Slave 按账本发一帧 DTO（PID = FIRST_PID，净荷 1B + 2B）
+    ASSERT_EQ(slave_->SendDaqListDtos(2), 1u);
+    ASSERT_EQ(dto_listener_.WaitForCount(1, std::chrono::seconds(5)), 1u);
+    const calmcar::xcp::DtoPacket frame = dto_listener_.LastDto();
+    ASSERT_EQ(frame.data.size(), 4u);
+    EXPECT_EQ(frame.data[0], frame.pid)
+        << "R12 帧边界：OnDto 交付的 data 必须含 PID";
+
+    calmcar::xcp::a2l::DtoFrameLayout envelope;  // Absolute + 1B PID
+    auto samples = layout_r.Value()->Decode(
+        envelope,
+        calmcar::xcp::a2l::BytesView{frame.data.data(), frame.data.size()});
+    ASSERT_TRUE(samples.HasValue()) << samples.ErrorInfo().message;
+    ASSERT_EQ(samples.Value().size(), 2u);
+    // 顺序 = 账本顺序（0x3020 在前），不是 A2L 顺序
+    EXPECT_EQ(samples.Value()[0].symbol_name, "MASK_ECU::M_UBYTE");
+    EXPECT_EQ(samples.Value()[0].raw, (Bytes{0x2A}));
+    EXPECT_EQ(samples.Value()[1].symbol_name, "MASK_ECU::M_MASK");
+    EXPECT_EQ(samples.Value()[1].raw, (Bytes{0x00, 0x0F}));
+    // F2：先判换算是否真的做过，再取值（PhysicalValue 默认就是 int64 0）
+    EXPECT_TRUE(samples.Value()[0].physical_valid);
+    auto phys0 = samples.Value()[0].physical_value;
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(phys0));
+    EXPECT_EQ(std::get<std::int64_t>(phys0), 42);
+}
+
+TEST_F(A2lE2ETest, MissingLedgerRejectsDecodeButKeepsRaw) {
+    // B-6：没有账本就不解释 —— 空账本得到的快照必须整帧拒绝
+    auto layout_r = bridge_->CreateDaqLayoutFromLedger({}, 0U);
+    ASSERT_TRUE(layout_r.HasValue());  // 构造不失败：拒绝发生在 Decode
+    const Bytes frame{0x10, 0x2A, 0x00, 0x0F};
+    auto samples = layout_r.Value()->Decode(
+        calmcar::xcp::a2l::DtoFrameLayout{},
+        calmcar::xcp::a2l::BytesView{frame.data(), frame.size()});
+    ASSERT_FALSE(samples.HasValue());
+    EXPECT_EQ(samples.ErrorInfo().code,
+              calmcar::xcp::a2l::ErrorCode::InvalidLayout);
+    EXPECT_EQ(samples.ErrorInfo().phase, calmcar::xcp::a2l::Phase::Layout);
+}
+
+TEST_F(A2lE2ETest, UnknownPidIsRejectedNotGuessed) {
+    slave_->SetDaqSimulationEnabled(true);
+    calmcar::xcp::DaqListSpec spec;
+    spec.daq_list = 1;
+    calmcar::xcp::DaqOdtSpec odt;
+    odt.entries = {{0x3020, 0x00, 1, calmcar::xcp::kDaqBitOffsetNone}};
+    spec.odts = {odt};
+    master_->ConfigureDaqList(spec);
+    const std::uint8_t first_pid = master_->StartDaqList(1);
+
+    std::vector<calmcar::xcp::a2l::DaqLedgerEntryView> views;
+    for (const auto& e : master_->DaqLedger()) {
+        calmcar::xcp::a2l::DaqLedgerEntryView v;
+        v.daq_list = e.daq_list;
+        v.odt_number = e.odt_number;
+        v.odt_entry = e.odt_entry;
+        v.address = e.address;
+        v.address_extension = e.extension;
+        v.size_bytes = e.size;
+        v.bit_offset = e.bit_offset;
+        v.pid = e.pid;
+        views.push_back(v);
+    }
+    auto layout_r = bridge_->CreateDaqLayoutFromLedger(
+        views, master_->DaqConfigGeneration());
+    ASSERT_TRUE(layout_r.HasValue());
+
+    // 负例：把真实 PID 挪一位 —— 净荷只有 1 字节，若解码器误把净荷首字节
+    // 当 PID（R12 风险），这里就会"看起来能解"。必须显式拒绝。
+    const Bytes wrong{static_cast<std::uint8_t>(first_pid + 1U), 0x2A};
+    auto bad = layout_r.Value()->Decode(
+        calmcar::xcp::a2l::DtoFrameLayout{},
+        calmcar::xcp::a2l::BytesView{wrong.data(), wrong.size()});
+    ASSERT_FALSE(bad.HasValue());
+    EXPECT_EQ(bad.ErrorInfo().code, calmcar::xcp::a2l::ErrorCode::NotFound);
+    // 正例：同一帧用正确 PID 就能解出 1 条 entry
+    const Bytes right{first_pid, 0x2A};
+    auto ok = layout_r.Value()->Decode(
+        calmcar::xcp::a2l::DtoFrameLayout{},
+        calmcar::xcp::a2l::BytesView{right.data(), right.size()});
+    ASSERT_TRUE(ok.HasValue()) << ok.ErrorInfo().message;
+    ASSERT_EQ(ok.Value().size(), 1u);
+    EXPECT_EQ(ok.Value()[0].symbol_name, "MASK_ECU::M_UBYTE");
+}
+
+// ---------------------------------------------------------------------------
+// 6b) ECU 回读通路（T14-10）：READ_DAQ 取证 → EcuReadback 快照 → 按 PID 解码
+// ---------------------------------------------------------------------------
+
+TEST_F(A2lE2ETest, EcuReadbackSnapshotDecodesPredefinedDto) {
+    slave_->SetDaqSimulationEnabled(true);
+    calmcar::xcp::DaqListSpec spec;
+    spec.daq_list = 1;
+    calmcar::xcp::DaqOdtSpec odt;
+    odt.entries = {{0x3020, 0x00, 1, calmcar::xcp::kDaqBitOffsetNone}};
+    spec.odts = {odt};
+    master_->ConfigureDaqList(spec);
+    const std::uint8_t first_pid = master_->StartDaqList(1);
+
+    // 取证：READ_DAQ 回读该 Entry（B-6：PREDEFINED 布局只能这样证）
+    const auto readback = master_->ReadDaqEntryAt(1, 0, 0);
+    ASSERT_TRUE(readback.has_value());
+    EXPECT_EQ(readback->address, 0x3020u);
+    EXPECT_EQ(readback->bit_offset, calmcar::xcp::kDaqBitOffsetNone);
+
+    const std::uint8_t ag = calmcar::xcp::AgToBytes(
+        master_->GetSessionParameters().connect.address_granularity);
+    calmcar::xcp::a2l::DaqReadbackEntry e;
+    e.daq_list = 1;
+    e.odt_number = 0;
+    e.odt_entry = 0;
+    e.address = readback->address;
+    e.address_extension = readback->address_extension;
+    e.size_bytes = static_cast<std::uint8_t>(readback->size * ag);
+    // 位偏口径：XCP 的 0xFF（无位偏）→ 桥接层的 0
+    // F3：直接透传 READ_DAQ 原值（0xFF），桥接层负责归一
+    e.bit_offset = readback->bit_offset;
+    const std::vector<calmcar::xcp::a2l::DaqReadbackEntry> readbacks = {e};
+    const std::vector<calmcar::xcp::a2l::DaqListPid> pids = {{1, first_pid}};
+
+    auto layout_r = bridge_->CreateDaqLayoutFromEcuReadback(
+        readbacks, pids, master_->DaqConfigGeneration());
+    ASSERT_TRUE(layout_r.HasValue()) << layout_r.ErrorInfo().message;
+
+    ASSERT_EQ(slave_->SendDaqListDtos(1), 1u);
+    ASSERT_EQ(dto_listener_.WaitForCount(1, std::chrono::seconds(5)), 1u);
+    const calmcar::xcp::DtoPacket frame = dto_listener_.LastDto();
+    auto samples = layout_r.Value()->Decode(
+        calmcar::xcp::a2l::DtoFrameLayout{},
+        calmcar::xcp::a2l::BytesView{frame.data.data(), frame.data.size()});
+    ASSERT_TRUE(samples.HasValue()) << samples.ErrorInfo().message;
+    ASSERT_EQ(samples.Value().size(), 1u);
+    EXPECT_EQ(samples.Value()[0].symbol_name, "MASK_ECU::M_UBYTE");
+    EXPECT_EQ(samples.Value()[0].raw, (Bytes{0x2A}));
+    EXPECT_TRUE(samples.Value()[0].physical_valid) << "F2：换算成功才置位";
+    EXPECT_EQ(std::get<std::int64_t>(samples.Value()[0].physical_value), 42);
+}
+
+// ---------------------------------------------------------------------------
+// 6c) B-16 的 DAQ 侧比对（T14-11）：运行时真值来自 ECU，不是 A2L 自称
+// ---------------------------------------------------------------------------
+
+TEST_F(A2lE2ETest, DaqRuntimeComparisonUsesEcuTruth) {
+    slave_->SetDaqSimulationEnabled(true);
+    const auto processor = master_->QueryDaqProcessorInfo();
+    const auto resolution = master_->QueryDaqResolutionInfo();
+    ASSERT_TRUE(processor.has_value());
+    ASSERT_TRUE(resolution.has_value());
+    // 脚本 Slave：ADDRESS_EXTENSION=DAQ(3)、IDENTIFICATION=ABSOLUTE(0)、粒度 1
+    EXPECT_EQ(processor->key_byte.address_extension_mode, 3U);
+    EXPECT_EQ(processor->key_byte.identification_field_type, 0U);
+
+    const calmcar::xcp::SessionParameters params =
+        master_->GetSessionParameters();
+    RuntimeXcpParams rt;
+    rt.protocol_version =
+        VersionByteToA2l(params.connect.protocol_layer_version);
+    rt.max_cto = params.connect.max_cto;
+    rt.max_dto = params.connect.max_dto;
+    rt.byte_order = ByteOrder::MsbLast;
+    rt.address_granularity = AddressGranularity::Byte;
+    rt.has_daq = true;
+    rt.daq_identification_field_type =
+        processor->key_byte.identification_field_type;
+    rt.daq_address_extension_mode = processor->key_byte.address_extension_mode;
+    rt.daq_odt_entry_min_size_bytes = resolution->granularity_daq;
+    auto diff = bridge_->CompareWithRuntime(rt);
+    ASSERT_TRUE(diff.HasValue());
+    for (const auto& d : diff.Value()) {
+        // 三项 DAQ 比对全部一致 → 不得出现；剩下的只有容量类 Warning
+        EXPECT_NE(d.parameter_name, "IDENTIFICATION_FIELD_TYPE");
+        EXPECT_NE(d.parameter_name, "ADDRESS_EXTENSION_MODE");
+        EXPECT_NE(d.parameter_name, "GRANULARITY_ODT_ENTRY_SIZE_DAQ");
+        EXPECT_EQ(d.severity, Severity::Warning) << d.parameter_name;
+    }
+
+    // 反向证据：篡改识别字段必须立刻产生 Error（证明比对不是摆设）
+    RuntimeXcpParams tampered = rt;
+    tampered.daq_identification_field_type = 2;  // RelativeWord
+    auto bad = bridge_->CompareWithRuntime(tampered);
+    ASSERT_TRUE(bad.HasValue());
+    bool found_error = false;
+    for (const auto& d : bad.Value()) {
+        if (d.parameter_name == "IDENTIFICATION_FIELD_TYPE") {
+            found_error = true;
+            EXPECT_EQ(d.severity, Severity::Error);
+        }
+    }
+    EXPECT_TRUE(found_error) << "识别字段不一致必须是 Error（B-16）";
+}
+
+// ---------------------------------------------------------------------------
+// 7) 错误路径
 // ---------------------------------------------------------------------------
 
 TEST_F(A2lE2ETest, ReadUnconfiguredAddressThrows) {

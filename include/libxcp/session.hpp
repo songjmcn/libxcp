@@ -135,12 +135,52 @@ public:
     /// @brief 单个 DAQ 事件的最大长度（CONNECT 协商值）
     [[nodiscard]] std::uint16_t MaxDto() const;
 
+    // ---- DAQ 运行态（批次14，T14-07）----
+
+    /**
+     * @brief 登记一个已 START 的 DAQ List（幂等；重复登记不产生重复项）
+     * @param daq_list DAQ List 号（EPK）
+     * @details 用途只有一个：断连/析构前判断"是否还有 List 在跑"，从而补发
+     *          START_STOP_SYNCH(stop all)。配置内容本身归 XcpMaster 的
+     *          WRITE_DAQ 账本，不放这里（Session 只管会话级状态）。
+     */
+    void MarkDaqListStarted(std::uint16_t daq_list);
+
+    /// @brief 注销一个 DAQ List（Stop 单列表成功时调用）
+    void MarkDaqListStopped(std::uint16_t daq_list);
+
+    /// @brief 清空 DAQ 运行态（StopAll 成功、或会话级清理时调用）
+    void ClearStartedDaqLists();
+
+    /// @brief 当前已 START 的 DAQ List 号（升序，快照拷贝）
+    [[nodiscard]] std::vector<std::uint16_t> StartedDaqLists() const;
+
+    /// @brief 是否有 DAQ List 处于运行态（决定断连前是否要补发 STOP）
+    [[nodiscard]] bool HasRunningDaqList() const;
+
+    /// @brief 配置代际：每次 CLEAR_DAQ_LIST / 重连递增，用于识别陈旧账本
+    /// @details 账本（XcpMaster 侧）与代际不匹配时，解码器必须拒绝按旧布局
+    ///          解释 DTO（B-6 禁止猜测），而不是继续用错位的 PID。
+    [[nodiscard]] std::uint32_t DaqConfigGeneration() const;
+
+    /// @brief 递增配置代际（CLEAR_DAQ_LIST 成功后调用）
+    void BumpDaqConfigGeneration();
+
 private:
     mutable std::mutex m_mutex_;                        ///< 保护以下全部字段
     SessionState m_state_{SessionState::Disconnected};  ///< 当前状态
     SessionParameters m_params_;                        ///< 协商参数
     std::optional<CommandCode> m_pending_command_;  ///< 单 Outstanding Command
     std::string m_fail_reason_;                     ///< 最近失败原因
+    /**
+     * @brief 已 START 的 DAQ List 号（批次14，T14-07）
+     * @details 只用于"断连/析构前是否需要补发 START_STOP_SYNCH(stop)"的判据；
+     *          会话级清理（EstablishConnection / CompleteDisconnection / Fail /
+     *          Reset）四处必须一并清空，避免残留伪运行态。
+     */
+    std::vector<std::uint16_t> m_daq_running_lists_;
+    /// @brief DAQ 配置代际（CLEAR_DAQ_LIST 或重连时递增；陈旧账本识别用）
+    std::uint32_t m_daq_generation_ = 0U;
 
     /**
      * @brief 校验 CONNECT 参数合法性（调用方须已持锁）
