@@ -5,10 +5,12 @@
 // 快照发布（B-20）、运行时参数比对（B-16）。异常绝不越出本层。
 // =============================================================================
 
+#include <atomic>
 #include <exception>
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,6 +29,9 @@ Error BridgeError(ErrorCode code, Phase phase, std::string message) {
     e.message = std::move(message);
     return e;
 }
+
+/// @brief 快照发布前对外可见的进度上限（批次13；100 只属于"已发布"）
+constexpr int kProgressPublishingCap = 99;
 
 }  // namespace
 
@@ -64,7 +69,28 @@ struct A2lBridge::Impl {
             last_error = detail::MapSdkError(rc, Phase::Load, "枚举符号失败");
             return false;
         }
-        database = detail::MakeDatabase(std::move(symbols));
+        // 批次13（B-12）：STRUCTURE/INSTANCE 元数据快照。SDK 无结构体时返回
+        // 空向量，不是错误——"没有结构体"与"没采集到"必须可区分地如实反映。
+        std::vector<liba2l::StructInfoDto> structs;
+        const liba2l::ErrorCode src_rc = doc->ListStructures(&structs);
+        if (src_rc != liba2l::ErrorCode::kOk) {
+            last_error = detail::MapSdkError(src_rc, Phase::Load,
+                                             "枚举结构体元数据失败");
+            return false;
+        }
+        // 批次13（R3 接线）：SDK 给出了 RECORD_LAYOUT 类别的 CHARACTERISTIC
+        // 才进判定器表；无类别的符号不进（"无信息"≠"不可执行"）。
+        std::unordered_map<std::string, RecordLayoutInfo> record_layouts;
+        for (const liba2l::SymbolDto& dto : symbols) {
+            RecordLayoutInfo info;
+            if (detail::ConvertRecordLayoutInfo(dto, &info)) {
+                record_layouts.emplace(
+                    detail::MakeQualifiedKey(dto.module_name, dto.name),
+                    std::move(info));
+            }
+        }
+        database = detail::MakeDatabase(std::move(symbols), std::move(structs),
+                                        std::move(record_layouts));
 
         Result<IfDataXcpInfo> xcp =
             detail::BuildIfDataXcp(*doc, require_if_data);
@@ -75,20 +101,43 @@ struct A2lBridge::Impl {
         }
         xcp_info = std::move(xcp.Value());
         detail::ResolveDaqListSymbols(&xcp_info->static_daq_lists, *database);
+        // 批次15（F6）：装配加载期告警。① 数据库构造时跳过的同名 STRUCTURE；
+        // ② 未声明 FIRST_PID 的 DAQ_LIST —— 它们的解码只能按"列表号回退"，
+        //    属弱权威（F1/D1），必须让用户知情而不是以为拿到了取证布局。
+        load_warnings = database->LoadWarnings();
+        for (const DaqListLayout& list : xcp_info->static_daq_lists) {
+            if (list.first_pid.has_value()) {
+                continue;
+            }
+            LoadWarning warning;
+            warning.code = ErrorCode::UnsupportedOperation;
+            warning.phase = Phase::Layout;
+            warning.subject = "DAQ_LIST " + std::to_string(list.number);
+            warning.message =
+                "A2L 未声明 FIRST_PID，解码按列表号回退（未经实际取证，弱权威）";
+            load_warnings.push_back(std::move(warning));
+        }
         // 快照至此完整：database/xcp_info 同时可见（无半发布窗口——
         // 本函数仅在 Load 成功路径末尾被调用一次）
-        ready = true;
+        ready.store(true, std::memory_order_release);
         return true;
     }
 
     liba2l::IDoc* doc = nullptr;                        ///< SDK 文档（拥有）
     std::unique_ptr<detail::A2lDatabaseImpl> database;  ///< 不可变快照（B-20）
     std::optional<IfDataXcpInfo> xcp_info;              ///< IF_DATA 快照
-    bool ready = false;                                 ///< 快照是否已发布
-    int progress = 0;                                   ///< 最近进度百分比
-    Error last_error{};                                 ///< 最近错误
-    std::function<void(Result<void>)> user_cb;          ///< 异步完成的用户回调
-    bool require_if_data_xcp = true;  ///< 装载选项缓存（回调内用）
+    /// @brief 加载期告警（批次15，F6；发布时一次性装配，之后只读）
+    std::vector<LoadWarning> load_warnings;
+    /**
+     * @brief 快照是否已发布（B-20）
+     * @details 异步加载时由 SDK 工作线程写、调用方线程读（Progress/Database
+     *          轮询），故必须是 atomic 且用 release/acquire 配对——`ready`
+     *          读到 true 时，`database`/`xcp_info` 的写入对该线程一定可见。
+     */
+    std::atomic<bool> ready{false};
+    Error last_error{};                         ///< 最近错误
+    std::function<void(Result<void>)> user_cb;  ///< 异步完成的用户回调
+    bool require_if_data_xcp = true;            ///< 装载选项缓存（回调内用）
 };
 
 Result<std::unique_ptr<A2lBridge>> A2lBridge::Load(const std::string& file_path,
@@ -127,7 +176,6 @@ Result<std::unique_ptr<A2lBridge>> A2lBridge::Load(const std::string& file_path,
         }
         return e;
     }
-    impl->progress = 100;
     if (!impl->PublishSnapshot(options.require_if_data_xcp)) {
         return Error(impl->last_error);
     }
@@ -192,7 +240,6 @@ Result<std::unique_ptr<A2lBridge>> A2lBridge::LoadAsync(
                     }
                     return e;
                 }
-                raw->progress = 100;
                 if (!raw->PublishSnapshot(raw->require_if_data_xcp)) {
                     return Error(raw->last_error);
                 }
@@ -213,10 +260,29 @@ Result<std::unique_ptr<A2lBridge>> A2lBridge::LoadAsync(
 
 A2lBridge::~A2lBridge() = default;
 
-int A2lBridge::Progress() const noexcept { return m_impl_->progress; }
+int A2lBridge::Progress() const noexcept {
+    // 批次13（R4）：加载中透传 SDK 的**阶段进度**（受理 5 → include 预扫描 25
+    // → 上游解析完成 70 → 快照构建完成 100）。快照未发布前上限 99——桥接层
+    // 还要组装领域快照与 IF_DATA，此时对外宣称 100 会与 B-20"发布前不可见"
+    // 自相矛盾；发布后恒 100。
+    if (m_impl_->ready.load(std::memory_order_acquire)) {
+        return 100;
+    }
+    if (m_impl_->doc == nullptr) {
+        return 0;
+    }
+    const int stage = m_impl_->doc->Progress();
+    return stage > kProgressPublishingCap ? kProgressPublishingCap : stage;
+}
 
 const IA2lDatabase* A2lBridge::Database() const noexcept {
     return m_impl_->ready ? m_impl_->database.get() : nullptr;
+}
+
+const std::vector<LoadWarning>& A2lBridge::ListLoadWarnings() const noexcept {
+    // 加载中/失败时该向量尚未装配（PublishSnapshot 是唯一写入点）→ 空表，
+    // 与 Database() 的 NotReady 语义一致：不报错，但也不给半份告警
+    return m_impl_->load_warnings;
 }
 
 const IfDataXcpInfo* A2lBridge::XcpInfo() const noexcept {
@@ -243,7 +309,66 @@ Result<std::unique_ptr<IDaqLayout>> A2lBridge::CreateDaqLayout() const {
             ErrorCode::UnsupportedOperation, Phase::Layout,
             "动态 DAQ 首里程碑不支持（B-5 DynamicDaqNotImplemented）");
     }
-    return detail::MakeDaqLayout(lists, m_impl_->database.get());
+    // 批次14（B-6）：A2L 侧 PREDEFINED 布局 → 快照来源标记 A2lPredefined。
+    // 批次15（F1/D1）：A2L **声明了 FIRST_PID 的列表**按其生成 PID 路由
+    // （docs/XCP_1.3.0_document.md L2225：绝对 ODT 号 = FIRST_PID + 相对 ODT
+    // 号）；未声明的列表不进路由表，解码对其仍保留"列表号回退"旧口径。
+    // 关键是**路由优先于回退**：列表号与其它列表的 PID 同属一个编号空间，
+    // 有声明时仍让回退参与匹配就会用错列表的布局且全程无报错（批次15 §1 L1）。
+    DaqLayoutSnapshot snapshot;
+    snapshot.source = DaqLayoutSource::A2lPredefined;
+    snapshot.generation = 0U;  // A2L 侧无配置代际概念
+    snapshot.lists = lists;
+    for (const DaqListLayout& l : snapshot.lists) {
+        if (!l.first_pid.has_value()) {
+            continue;
+        }
+        for (std::size_t i = 0; i < l.odts.size(); ++i) {
+            snapshot.routes.push_back(DaqOdtRoute{
+                static_cast<std::uint8_t>(*l.first_pid + i), l.number,
+                static_cast<std::uint8_t>(i)});
+        }
+    }
+    return detail::MakeDaqLayout(std::move(snapshot), m_impl_->database.get());
+}
+
+Result<std::unique_ptr<IDaqLayout>> A2lBridge::CreateDaqLayoutFromLedger(
+    const std::vector<DaqLedgerEntryView>& ledger,
+    std::uint32_t generation) const {
+    if (!m_impl_->ready || m_impl_->database == nullptr) {
+        return BridgeError(ErrorCode::NotReady, Phase::Runtime,
+                           "快照未发布，无法按账本冻结布局（B-20）");
+    }
+    // B-5 不变：DYNAMIC 仍显式拒绝（账本只覆盖"可配置 STATIC"的下发事实）
+    if (m_impl_->xcp_info.has_value() && m_impl_->xcp_info->daq.has_value() &&
+        !m_impl_->xcp_info->daq->static_supported) {
+        return BridgeError(
+            ErrorCode::UnsupportedOperation, Phase::Layout,
+            "动态 DAQ 首里程碑不支持（B-5 DynamicDaqNotImplemented）");
+    }
+    // 账本缺失时**不**降级到 A2L 顺序：空快照在 Decode 处统一 InvalidLayout
+    DaqLayoutSnapshot snapshot =
+        detail::BuildSnapshotFromLedger(ledger, generation, *m_impl_->database);
+    return detail::MakeDaqLayout(std::move(snapshot), m_impl_->database.get());
+}
+
+Result<std::unique_ptr<IDaqLayout>> A2lBridge::CreateDaqLayoutFromEcuReadback(
+    const std::vector<DaqReadbackEntry>& readback,
+    const std::vector<DaqListPid>& list_pids, std::uint32_t generation) const {
+    if (!m_impl_->ready || m_impl_->database == nullptr) {
+        return BridgeError(ErrorCode::NotReady, Phase::Runtime,
+                           "快照未发布，无法按回读冻结布局（B-20）");
+    }
+    if (m_impl_->xcp_info.has_value() && m_impl_->xcp_info->daq.has_value() &&
+        !m_impl_->xcp_info->daq->static_supported) {
+        return BridgeError(
+            ErrorCode::UnsupportedOperation, Phase::Layout,
+            "动态 DAQ 首里程碑不支持（B-5 DynamicDaqNotImplemented）");
+    }
+    // PREDEFINED 列表的取证通路：回读为空同样只产出空快照（B-6 不猜）
+    DaqLayoutSnapshot snapshot = detail::BuildSnapshotFromEcuReadback(
+        readback, list_pids, generation, *m_impl_->database);
+    return detail::MakeDaqLayout(std::move(snapshot), m_impl_->database.get());
 }
 
 Result<std::vector<ParamDiscrepancy>> A2lBridge::CompareWithRuntime(
@@ -311,6 +436,56 @@ Result<std::vector<ParamDiscrepancy>> A2lBridge::CompareWithRuntime(
                 ? "true"
                 : "false",
             runtime.has_daq ? "true" : "false", Severity::Warning, "DAQ 通道");
+    }
+
+    // ---- 批次14（T14-11）：B-16 的 DAQ 侧比对（三类均为 Error）----
+    //
+    // 这三项决定"PID 怎么解释、Entry 怎么对齐"，与协商结果不一致时解码会
+    // 系统性错位，因此按 B-16 口径记 Error（只阻断 DAQ 功能，不影响读写）。
+    // 运行时字段为 nullopt 表示调用方没查（GET_DAQ_PROCESSOR_INFO /
+    // GET_DAQ_RESOLUTION_INFO 都是 Optional）→ **跳过比对**，不拿默认值凑。
+    if (m_impl_->xcp_info->daq.has_value()) {
+        const DaqInfo& daq = *m_impl_->xcp_info->daq;
+        // 领域枚举 → A2L/XCP 原始码（ADDRESS_EXTENSION 的 3=DAQ 不是序号 2，
+        // 必须显式还原后再比，否则 PerDaq 会被误判为不一致）
+        const auto ext_raw = [](DaqInfo::AddrExtMode mode) {
+            switch (mode) {
+                case DaqInfo::AddrExtMode::Free:
+                    return 0U;
+                case DaqInfo::AddrExtMode::PerOdt:
+                    return 1U;
+                case DaqInfo::AddrExtMode::PerDaq:
+                    return 3U;
+            }
+            return 0xFFU;  // 不可达（枚举穷尽）；越界值一律判不一致
+        };
+        const auto idf_raw = [](DaqInfo::IdFieldType type) {
+            return static_cast<unsigned>(type);  // 0..3 与原始码同序
+        };
+        if (runtime.daq_identification_field_type.has_value()) {
+            const unsigned a2l_value = idf_raw(daq.identification_field_type);
+            if (a2l_value != *runtime.daq_identification_field_type) {
+                add("IDENTIFICATION_FIELD_TYPE", std::to_string(a2l_value),
+                    std::to_string(*runtime.daq_identification_field_type),
+                    Severity::Error, "DTO PID 解释");
+            }
+        }
+        if (runtime.daq_address_extension_mode.has_value()) {
+            const unsigned a2l_value = ext_raw(daq.address_extension_mode);
+            if (a2l_value != *runtime.daq_address_extension_mode) {
+                add("ADDRESS_EXTENSION_MODE", std::to_string(a2l_value),
+                    std::to_string(*runtime.daq_address_extension_mode),
+                    Severity::Error, "ODT 地址扩展布局");
+            }
+        }
+        if (runtime.daq_odt_entry_min_size_bytes.has_value()) {
+            const unsigned a2l_value = daq.odt_entry_min_size_bytes;
+            if (a2l_value != *runtime.daq_odt_entry_min_size_bytes) {
+                add("GRANULARITY_ODT_ENTRY_SIZE_DAQ", std::to_string(a2l_value),
+                    std::to_string(*runtime.daq_odt_entry_min_size_bytes),
+                    Severity::Error, "ODT Entry 打包粒度");
+            }
+        }
     }
     // t1..t7 明确不参与比对（§6.2）
     return out;

@@ -9,8 +9,10 @@
 #include "liba2l/liba2l_api.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <clocale>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -27,9 +29,11 @@
 #include "a2l/compumethod.h"
 #include "a2l/computab.h"
 #include "a2l/compuvtab.h"
+#include "a2l/instance.h"  // 批次13：INSTANCE 元数据（B-12）
 #include "a2l/measurement.h"
 #include "a2l/module.h"
 #include "a2l/recordlayout.h"
+#include "a2l/structure.h"  // 批次13：TYPEDEF_STRUCTURE 元数据（B-12）
 #include "a2l/unit.h"
 #include "a2l/xcp/commonparameters.h"
 #include "a2l/xcp/daq.h"
@@ -189,7 +193,7 @@ XcpTransportDto PickTransport(const a2l::xcp::XcpDataBlock& blk) {
 }
 
 // ----------------------------------------------------------------------------
-// RECORD_LAYOUT 平坦性判定（B-4 最小推导前置，批次10）
+// RECORD_LAYOUT 平坦性判定（B-4 最小推导前置，批次10）与类别归一（批次13）
 // ----------------------------------------------------------------------------
 
 /**
@@ -239,6 +243,35 @@ bool IsPlainValueLayout(const a2l::RecordLayout& rl) {
         return false;
     }
     return true;
+}
+
+/**
+ * @brief 判断版式是否含任一 AXIS_PTS_*（仅轴点，不含其它非连续要素）。
+ * @param rl 上游 RECORD_LAYOUT。
+ * @return true = 至少一个轴点算子被声明。
+ */
+bool HasAxisPoints(const a2l::RecordLayout& rl) {
+    const a2l::A2lAxisPts* axes[] = {&rl.AxisPtsX(), &rl.AxisPtsY(),
+                                     &rl.AxisPtsZ(), &rl.AxisPts4(),
+                                     &rl.AxisPts5()};
+    for (const a2l::A2lAxisPts* a : axes) {
+        if (a->DataType != a2l::A2lDataType::UNKNOWN) return true;
+    }
+    return false;
+}
+
+/**
+ * @brief RECORD_LAYOUT → DTO 类别（批次13，B-4/B-12 判定接线的数据来源）。
+ *
+ * 判定顺序固定（先证明"纯标量连续"，再区分轴点，其余归复合），
+ * 全部基于上游既有 getter，不引入任何新解析（禁止自研预处理）。
+ * @param rl 上游 RECORD_LAYOUT（调用方已确保非空）。
+ * @return kPlainScalar / kAxisPts / kComplex 三者之一。
+ */
+RecordLayoutKindDto ClassifyRecordLayout(const a2l::RecordLayout& rl) {
+    if (IsPlainValueLayout(rl)) return RecordLayoutKindDto::kPlainScalar;
+    if (HasAxisPoints(rl)) return RecordLayoutKindDto::kAxisPts;
+    return RecordLayoutKindDto::kComplex;
 }
 
 // ----------------------------------------------------------------------------
@@ -672,23 +705,57 @@ SymbolDto BuildCharacteristicSymbol(const a2l::Characteristic& c,
     s.description = c.Description();
     s.kind = SymbolKindDto::kCharacteristic;
     s.characteristic_type = MapCharType(c.Type());
-    // B-4 最小推导（批次10）：仅 CHARACTERISTIC VALUE 且其 RECORD_LAYOUT 为
-    // "纯标量 VALUE 版式"（除单段 FNC_VALUES 外全默认、FNC_VALUES 起始
-    // 位置为 0、ADDRESS_TYPE=DIRECT）时，才由 FNC_VALUES 的 DATA_TYPE 证明
-    // 元素类型；VAL_BLK/ASCII/CURVE/MAP/复杂版式/缺版式一律保持 kUnknown，
-    // 由 bridge 依 B-3 显式拒绝数值读写（禁止静默猜测）。
+    // B-4 最小推导（批次10 建立、批次13 放宽）：RECORD_LAYOUT 必须是
+    // "纯标量连续版式"（除单段 FNC_VALUES 外全默认、FNC_VALUES 起始位置为 0、
+    // ADDRESS_TYPE=DIRECT）才能由 FNC_VALUES 的 DATA_TYPE 证明**元素类型**；
+    // 在此之上：
+    //   * VALUE      → 标量，维度表保持空；
+    //   * VAL_BLK    → 元素数**必须**由 MATRIX_DIM 乘积证明（批次13 T13-09），
+    //                  不可证（无 MATRIX_DIM / 含 0 / 乘积溢出）即保持
+    //                  kUnknown，由桥接层按 B-3 拒绝；可证时写单维 extent
+    //                  （批次13 T13-10 的 B-1/B-2 寻址通路）。
+    //   * ASCII 以及 CURVE/MAP/复合版式 → 一律保持 kUnknown：ASCII 的字节数
+    //     在上游不可证（MAX_LENGTH 无词法/语法、Characteristic 无长度 getter，
+    //     批次13 核证 T13-02），禁止臆造长度。
     s.data_type = AsamDataTypeDto::kUnknown;
     s.element_size_bytes = 0;
-    if (c.Type() == a2l::A2lCharacteristicType::VALUE) {
-        if (const a2l::RecordLayout* rl = module.GetRecordLayout(c.Deposit());
-            rl != nullptr) {
-            const a2l::A2lFncValue& fnc = rl->FncValues();
-            if (fnc.DataType != a2l::A2lDataType::UNKNOWN &&
-                fnc.Position == 0 &&
-                fnc.AddressType == a2l::A2lAddressType::DIRECT &&
-                IsPlainValueLayout(*rl)) {
-                s.data_type = MapDataType(fnc.DataType);
-                s.element_size_bytes = TypeWidthBytes(s.data_type);
+    s.record_layout_name = c.Deposit();
+    s.record_layout_kind = RecordLayoutKindDto::kNotProvided;
+    if (const a2l::RecordLayout* rl = module.GetRecordLayout(c.Deposit());
+        rl != nullptr) {
+        s.record_layout_kind = ClassifyRecordLayout(*rl);
+        const a2l::A2lFncValue& fnc = rl->FncValues();
+        const bool provable_element =
+            fnc.DataType != a2l::A2lDataType::UNKNOWN && fnc.Position == 0 &&
+            fnc.AddressType == a2l::A2lAddressType::DIRECT &&
+            s.record_layout_kind == RecordLayoutKindDto::kPlainScalar;
+        if (provable_element &&
+            (c.Type() == a2l::A2lCharacteristicType::VALUE ||
+             c.Type() == a2l::A2lCharacteristicType::VAL_BLK)) {
+            s.data_type = MapDataType(fnc.DataType);
+            s.element_size_bytes = TypeWidthBytes(s.data_type);
+            if (c.Type() == a2l::A2lCharacteristicType::VAL_BLK) {
+                // 连续 VAL_BLK：元素数 = MATRIX_DIM 各维乘积（单维 extent）；
+                // 低维递推与溢出防护沿用批次10 口径
+                std::uint64_t extent = 1;
+                bool countable = !c.MatrixDim().empty();
+                for (const auto dim : c.MatrixDim()) {
+                    if (dim == 0 || extent > UINT64_MAX / dim) {
+                        countable = false;
+                        break;
+                    }
+                    extent *= dim;
+                }
+                if (countable && s.element_size_bytes != 0) {
+                    DimensionDto d;
+                    d.extent = extent;
+                    d.byte_stride = s.element_size_bytes;
+                    s.dimensions.push_back(d);
+                } else {
+                    // 元素数不可证 → 整体退回未知类型（不半证半猜）
+                    s.data_type = AsamDataTypeDto::kUnknown;
+                    s.element_size_bytes = 0;
+                }
             }
         }
     }
@@ -709,6 +776,80 @@ SymbolDto BuildCharacteristicSymbol(const a2l::Characteristic& c,
     s.conversion =
         BuildConversion(module.GetCompuMethod(c.Conversion()), module);
     return s;
+}
+
+// ----------------------------------------------------------------------------
+// TYPEDEF_STRUCTURE / INSTANCE 采集（批次13，B-12：只识别、不展开）
+// ----------------------------------------------------------------------------
+
+/**
+ * @brief 采集一个 TYPEDEF_STRUCTURE 的元数据快照。
+ * @param st     上游结构体定义。
+ * @param module 所属模块。
+ * @return 元数据 DTO（成员只存名/偏移/引用 TYPEDEF 名，**不递归展开**）。
+ */
+StructInfoDto BuildStructureInfo(const a2l::Structure& st,
+                                 const a2l::Module& module) {
+    StructInfoDto d;
+    d.name = st.Name();
+    d.description = st.Description();
+    d.module_name = module.Name();
+    d.is_instance = false;
+    d.size_bytes = st.Size();  // TYPEDEF_STRUCTURE 的 SIZE 定位参数原值
+    d.address = 0;             // 类型本身无 ECU 地址
+    d.address_type = static_cast<std::uint8_t>(st.AddressType());
+    d.layout = 0;          // Structure 无 Layout getter（不可证 → 0）
+    d.read_write = false;  // 类型定义不谈读写（INSTANCE 才有 READ_WRITE）
+    // 成员：上游为 unordered_map，按名升序发射以固定快照顺序（B-20 确定性）
+    std::vector<const a2l::A2lStructureComponent*> members;
+    members.reserve(st.StructureComponents().size());
+    for (const auto& [member_name, component] : st.StructureComponents()) {
+        if (component) {
+            members.push_back(component.get());
+        }
+    }
+    std::sort(
+        members.begin(), members.end(),
+        [](const a2l::A2lStructureComponent* a,
+           const a2l::A2lStructureComponent* b) { return a->Name < b->Name; });
+    for (const a2l::A2lStructureComponent* c : members) {
+        StructMemberDto m;
+        m.name = c->Name;
+        m.typedef_name = c->Typedef;  // 引用名；不解析其类型链（B-12 首版边界）
+        m.address_offset = c->AddressOffset;
+        m.address_type = static_cast<std::uint8_t>(c->AddressType);
+        m.layout = static_cast<std::uint8_t>(c->Layout);
+        m.matrix_dim.assign(c->MatrixDim.begin(), c->MatrixDim.end());
+        d.members.push_back(std::move(m));
+    }
+    return d;
+}
+
+/**
+ * @brief 采集一个 INSTANCE 的元数据快照。
+ * @param in     上游实例对象。
+ * @param module 所属模块。
+ * @return 元数据 DTO。
+ */
+StructInfoDto BuildInstanceInfo(const a2l::Instance& in,
+                                const a2l::Module& module) {
+    StructInfoDto d;
+    d.name = in.Name();
+    d.description = in.Description();
+    d.module_name = module.Name();
+    d.is_instance = true;
+    d.ref_typedef = in.RefTypeDef();
+    d.size_bytes = 0;          // Instance 无 Size()：字节数不可证（禁止猜）
+    d.address = in.Address();  // ECU_ADDRESS 定位参数原值（B-1 口径）
+    // 批次15（F5）：扩展地址同样原值直传。int64_t → uint8_t 只取低 8 位，
+    // 与 XCP 的 EXT 字节宽度一致；上游若给出超 1 字节的值说明 A2L 写错了，
+    // 这里不放大也不报错（保持"原值口径"，越界由 XCP 侧命令编码阶段拒绝）
+    d.address_extension =
+        static_cast<std::uint8_t>(in.EcuAddressExtension() & 0xFF);
+    d.address_type = static_cast<std::uint8_t>(in.AddressType());
+    d.layout = static_cast<std::uint8_t>(in.Layout());
+    d.read_write = in.ReadWrite();
+    return d;
 }
 
 // ----------------------------------------------------------------------------
@@ -913,8 +1054,58 @@ public:
     /** @copydoc IDoc::Load */
     ErrorCode Load(const std::string& file_path,
                    bool module_information_only) noexcept override {
+        return LoadInternal(file_path, module_information_only, nullptr);
+    }
+
+    /** @copydoc IDoc::LoadAsync */
+    ErrorCode LoadAsync(
+        const std::string& file_path, bool module_information_only,
+        std::function<void(int)> progress_cb,
+        std::function<void(int)> completed_cb) noexcept override {
+        if (!completed_cb) {
+            SetError(ErrorCode::kBadArgument, "completed callback required");
+            return ErrorCode::kBadArgument;
+        }
+        try {
+            if (parse_thread_.joinable()) {
+                parse_thread_.join();
+            }
+            // 后台线程复用同一内部加载流程。批次13：进度不再是"完成即 100"，
+            // 而是**阶段进度**（见 IDoc::Progress 契约）——由解析线程在四个
+            // 阶段边界发布，调用方可轮询 Progress() 或接收本回调。
+            // 不用上游 AsynchParseFile（其自带线程，与本类线程重复），也不调用
+            // 上游 ProgressInfo()（其内部解引用 ParseFile 的栈上 scanner，
+            // 跨线程存在访问已销毁对象窗口）。
+            async_path_ = file_path;
+            async_module_only_ = module_information_only;
+            progress_cb_local_ = std::move(progress_cb);
+            completed_cb_local_ = std::move(completed_cb);
+            parse_thread_ = std::thread([this] { RunAsyncParse(); });
+            return ErrorCode::kOk;
+        } catch (const std::exception& ex) {
+            SetError(ErrorCode::kInternal, ex.what());
+            return ErrorCode::kInternal;
+        } catch (...) {
+            SetError(ErrorCode::kInternal, "unknown exception");
+            return ErrorCode::kInternal;
+        }
+    }
+
+    // ---------------------------------------------------- 加载期配置（批次10）
+
+    /**
+     * @brief 同步/异步共用的加载流程（批次13：内建阶段进度发布）。
+     * @param file_path UTF-8 路径。
+     * @param module_information_only 快速模式开关。
+     * @param progress_cb 阶段进度回调（同步路径传 nullptr）。
+     * @return 与 IDoc::Load 相同的错误码。
+     */
+    ErrorCode LoadInternal(const std::string& file_path,
+                           bool module_information_only,
+                           const std::function<void(int)>& progress_cb) {
         try {
             ResetState();
+            PublishProgressTo(progress_cb, kProgressStageAccepted);
             file_ = std::make_unique<a2l::A2lFile>();
             file_->Filename(file_path);
             file_->ParserType(
@@ -941,6 +1132,7 @@ public:
                 last_include_chain_ = std::move(include_chain);
                 return ErrorCode::kParseFailed;
             }
+            PublishProgressTo(progress_cb, kProgressStagePreScan);
             if (!file_->ParseFile()) {
                 const std::uint32_t line =
                     file_->LineNo() > 0
@@ -953,9 +1145,10 @@ public:
                          line);
                 return ErrorCode::kParseFailed;
             }
+            PublishProgressTo(progress_cb, kProgressStageParsed);
             BuildSnapshots();
             loaded_ = true;
-            progress_ = 100;
+            PublishProgressTo(progress_cb, kProgressStageDone);
             ClearError();
             return ErrorCode::kOk;
         } catch (const std::exception& ex) {
@@ -966,37 +1159,6 @@ public:
             return ErrorCode::kInternal;
         }
     }
-
-    /** @copydoc IDoc::LoadAsync */
-    ErrorCode LoadAsync(
-        const std::string& file_path, bool module_information_only,
-        std::function<void(int)> /*progress_cb*/,
-        std::function<void(int)> completed_cb) noexcept override {
-        if (!completed_cb) {
-            SetError(ErrorCode::kBadArgument, "completed callback required");
-            return ErrorCode::kBadArgument;
-        }
-        try {
-            if (parse_thread_.joinable()) {
-                parse_thread_.join();
-            }
-            // 后台线程复用同步 Load。进度回调暂不透传（上游 ProgressInfo 属另一
-            // 解析路径，本 SDK 主用 ParseFile；保留接口形状供后续接入）。
-            async_path_ = file_path;
-            async_module_only_ = module_information_only;
-            completed_cb_local_ = std::move(completed_cb);
-            parse_thread_ = std::thread([this] { RunAsyncParse(); });
-            return ErrorCode::kOk;
-        } catch (const std::exception& ex) {
-            SetError(ErrorCode::kInternal, ex.what());
-            return ErrorCode::kInternal;
-        } catch (...) {
-            SetError(ErrorCode::kInternal, "unknown exception");
-            return ErrorCode::kInternal;
-        }
-    }
-
-    // ---------------------------------------------------- 加载期配置（批次10）
 
     /** @copydoc IDoc::SetActiveModule */
     void SetActiveModule(const std::string& module_name) noexcept override {
@@ -1041,7 +1203,9 @@ public:
     }
 
     /** @copydoc IDoc::Progress */
-    int Progress() const noexcept override { return progress_; }
+    int Progress() const noexcept override {
+        return progress_.load(std::memory_order_acquire);
+    }
 
     /** @copydoc IDoc::ModuleCount */
     std::size_t ModuleCount() const noexcept override {
@@ -1151,6 +1315,34 @@ public:
         }
     }
 
+    /** @copydoc IDoc::ListStructures */
+    ErrorCode ListStructures(
+        std::vector<StructInfoDto>* out) const noexcept override {
+        if (out == nullptr) {
+            return ErrorCode::kBadArgument;
+        }
+        if (!loaded_) {
+            return ErrorCode::kNotInitialized;
+        }
+        try {
+            // 先 TYPEDEF（按 MODULE,名升序），后 INSTANCE（同序）；
+            // 两个快照在 BuildSnapshots 里已排序，此处只做拼接。
+            out->clear();
+            out->reserve(typedef_structs_.size() + instances_.size());
+            for (const StructInfoDto& d : typedef_structs_) {
+                out->push_back(d);
+            }
+            for (const StructInfoDto& d : instances_) {
+                out->push_back(d);
+            }
+            return ErrorCode::kOk;
+        } catch (...) {
+            // 分配失败：清空输出并如实报告（不返回半截快照）
+            out->clear();
+            return ErrorCode::kInternal;
+        }
+    }
+
     /** @copydoc IDoc::GetConversion */
     ErrorCode GetConversion(const std::string& compu_method_name,
                             ConversionDto* out) const noexcept override {
@@ -1180,13 +1372,29 @@ private:
     /** 清空一次加载产生的全部状态。 */
     void ResetState() noexcept {
         loaded_ = false;
-        progress_ = 0;
+        progress_.store(0, std::memory_order_release);
         symbols_.clear();
+        typedef_structs_.clear();
+        instances_.clear();
         daq_lists_.clear();
         conversions_.clear();
         if_data_xcp_ = {};
         last_include_chain_.clear();
         file_.reset();
+    }
+
+    /**
+     * @brief 发布阶段进度并回调调用方进度钩子（批次13）。
+     * @param cb 进度回调（可空；同步路径恒空）。
+     * @param percent 阶段对应的百分比。
+     * @details 进度值存 `std::atomic<int>`：异步解析线程写、调用方线程读，
+     *          二者无数据竞争（阶段常量见类内 kProgressStage* 定义）。
+     */
+    void PublishProgressTo(const std::function<void(int)>& cb, int percent) {
+        progress_.store(percent, std::memory_order_release);
+        if (cb) {
+            cb(percent);
+        }
     }
 
     /**
@@ -1210,11 +1418,12 @@ private:
         last_include_chain_.clear();
     }
 
-    /** 异步线程体：跑同步 Load 并把结果码回抛完成回调。 */
+    /** 异步线程体：跑内部加载流程（带阶段进度回调）并把结果码回抛完成回调。 */
     void RunAsyncParse() noexcept {
         ErrorCode code = ErrorCode::kInternal;
         try {
-            code = Load(async_path_, async_module_only_);
+            code = LoadInternal(async_path_, async_module_only_,
+                                progress_cb_local_);
         } catch (...) {
             code = ErrorCode::kInternal;
         }
@@ -1222,6 +1431,7 @@ private:
             completed_cb_local_(static_cast<int>(code));
         }
         completed_cb_local_ = nullptr;
+        progress_cb_local_ = nullptr;
     }
 
     /** 解析成功后构建全部 DTO 快照（排序保证确定性，B-20 不可变快照）。 */
@@ -1252,6 +1462,18 @@ private:
                 if (cm && conversions_.find(name) == conversions_.end()) {
                     conversions_.emplace(name,
                                          BuildConversion(cm.get(), module));
+                }
+            }
+            // TYPEDEF_STRUCTURE / INSTANCE 元数据（批次13，B-12）：
+            // 只采集声明本身，不参与寻址与换算；容器为空时自然得空快照。
+            for (const auto& [name, st] : module.TypedefStructures()) {
+                if (st) {
+                    typedef_structs_.push_back(BuildStructureInfo(*st, module));
+                }
+            }
+            for (const auto& [name, in] : module.Instances()) {
+                if (in) {
+                    instances_.push_back(BuildInstanceInfo(*in, module));
                 }
             }
             if (FindXcpBlock(module, /*want_plus=*/true) != nullptr ||
@@ -1285,6 +1507,16 @@ private:
                           return a.module_name < b.module_name;
                       return a.name < b.name;
                   });
+        // STRUCTURE 快照同样确定性排序（ListStructures 先 TYPEDEF 后 INSTANCE）
+        const auto by_module_then_name = [](const StructInfoDto& a,
+                                            const StructInfoDto& b) {
+            if (a.module_name != b.module_name)
+                return a.module_name < b.module_name;
+            return a.name < b.name;
+        };
+        std::sort(typedef_structs_.begin(), typedef_structs_.end(),
+                  by_module_then_name);
+        std::sort(instances_.begin(), instances_.end(), by_module_then_name);
     }
 
     /**
@@ -1425,6 +1657,10 @@ private:
     std::unique_ptr<a2l::A2lFile> file_;
     /** 符号快照（Load 后不可变）。 */
     std::vector<SymbolDto> symbols_;
+    /** TYPEDEF_STRUCTURE 元数据快照（批次13，B-12；Load 后不可变）。 */
+    std::vector<StructInfoDto> typedef_structs_;
+    /** INSTANCE 元数据快照（批次13，B-12；Load 后不可变）。 */
+    std::vector<StructInfoDto> instances_;
     /** DAQ_LIST 快照。 */
     std::vector<DaqListDto> daq_lists_;
     /** COMPU_METHOD 名 → 转换快照。 */
@@ -1433,8 +1669,20 @@ private:
     IfDataXcpDto if_data_xcp_;
     /** 是否已成功加载。 */
     bool loaded_ = false;
-    /** 进度百分比。 */
-    int progress_ = 0;
+    /**
+     * @brief 阶段进度百分比（批次13：解析线程写、调用方线程轮询读）。
+     * @details 取值恒为 kProgressStage* 之一（或复位后的 0）；用 atomic 是为了
+     *          让"异步解析中轮询 Progress()"这条契约无数据竞争。
+     */
+    std::atomic<int> progress_ = 0;
+    /// @brief 阶段进度：已受理（Load 入口）
+    static constexpr int kProgressStageAccepted = 5;
+    /// @brief 阶段进度：`/include` 预扫描通过
+    static constexpr int kProgressStagePreScan = 25;
+    /// @brief 阶段进度：上游 `ParseFile()` 返回
+    static constexpr int kProgressStageParsed = 70;
+    /// @brief 阶段进度：全部快照构建完成（= 100）
+    static constexpr int kProgressStageDone = 100;
     /** 最近错误码。 */
     ErrorCode last_code_ = ErrorCode::kOk;
     /** 最近错误文本。 */
@@ -1455,6 +1703,8 @@ private:
     bool async_module_only_ = false;
     /** 异步完成回调。 */
     std::function<void(int)> completed_cb_local_;
+    /** 阶段进度回调（批次13；仅异步路径持有）。 */
+    std::function<void(int)> progress_cb_local_;
 };
 
 // ----------------------------------------------------------------------------

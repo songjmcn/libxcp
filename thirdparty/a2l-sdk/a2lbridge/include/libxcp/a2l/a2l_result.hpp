@@ -84,6 +84,25 @@ enum class Phase : std::uint8_t {
 [[nodiscard]] const char* ToString(Phase phase) noexcept;
 
 /**
+ * @brief 加载期告警（批次15，F6/D4）
+ *
+ * @details 与 `Error` 的区别：告警**不阻断加载**，但代表"某个事实被放弃了"，
+ *          必须让用户知情而不是静默消失。当前两个来源：
+ *          ① STRUCTURE/INSTANCE 与已有符号**同名冲突**时被跳过的结构体
+ *            （B-13 保留 MEASUREMENT/CHARACTERISTIC，但被丢弃的一方不能无声）；
+ *          ② A2L 的 DAQ_LIST **未声明 FIRST_PID**，解码只能按"列表号回退"
+ *            （批次15 F1/D1：该回退未经实际取证，属弱权威）。
+ *          消费方只关心成败时可完全忽略本列表；`message` 仅展示用（B-19），
+ *          业务分流只看 `code`/`phase`。
+ */
+struct LoadWarning {
+    ErrorCode code = ErrorCode::Ok;  ///< 归并后的错误码（与 Error 同一口径）
+    Phase phase = Phase::Load;       ///< "被放弃的那一步"所属阶段
+    std::string subject;             ///< 受影响的规范键 / 对象名
+    std::string message;             ///< 人读说明（不参与判定）
+};
+
+/**
  * @brief 结构化错误（B-19）
  *
  * 所有定位字段均可空：SDK 只给行号时列留空，无模块上下文时 module 留空。

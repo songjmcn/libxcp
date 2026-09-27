@@ -405,8 +405,10 @@ TEST_F(A2lGoldenTest, BitMaskAndDaqBitOffsetAreIndependent) {
     // ODT entry BIT_OFFSET ≠ 0：只交 raw、不做猜测性位移（B-9 分离）
     auto layout_r = b->CreateDaqLayout();
     ASSERT_TRUE(layout_r.HasValue());
-    DtoFrameLayout frame;              // Absolute + 1 字节 PID（EPK=2）
-    const Bytes dto{0x02, 0x00, 0x0F,  // entry1: M_MASK 2B
+    // golden_mask 声明 FIRST_PID=4（列表号是 2）：批次15 F1 起按
+    // "绝对 ODT 号 = FIRST_PID + 相对 ODT 号"（docs L2225）路由 → PID=0x04
+    DtoFrameLayout frame;              // Absolute + 1 字节 PID
+    const Bytes dto{0x04, 0x00, 0x0F,  // entry1: M_MASK 2B
                     0xAA,              // entry2: bit_offset=3
                     0,    1,    2,    3, 4,  5,
                     6,    7,    8,    9, 10, 11};  // entry3: M_2D 12B
@@ -796,6 +798,65 @@ TEST_F(A2lGoldenTest, RuntimeTruthAndSeverity) {
     }
 }
 
+TEST_F(A2lGoldenTest, DaqRuntimeComparisonErrors) {
+    // 批次14（T14-11 / B-16）：DAQ 侧三项不一致必须是 Error（决定 PID 解释、
+    // 地址扩展位与 Entry 对齐，错一项就整帧错位）。
+    // golden_basic 的 A2L 声明：IDENTIFICATION=ABSOLUTE(0)、
+    // ADDRESS_EXTENSION=DAQ(3)、GRANULARITY=BYTE(1)。
+    auto b = LoadOk(Golden("golden_basic.a2l"));
+    ASSERT_NE(b, nullptr);
+
+    RuntimeXcpParams rt;
+    rt.protocol_version = 0x0100;
+    rt.max_cto = 0x10;
+    rt.max_dto = 0x20;
+    rt.byte_order = ByteOrder::MsbLast;
+    rt.address_granularity = AddressGranularity::Byte;
+    rt.has_daq = true;
+    rt.daq_identification_field_type = 0;  // ABSOLUTE
+    rt.daq_address_extension_mode = 3;     // DAQ（原始码 3，非枚举序号 2）
+    rt.daq_odt_entry_min_size_bytes = 1;   // BYTE
+    auto all_match = b->CompareWithRuntime(rt);
+    ASSERT_TRUE(all_match.HasValue());
+    EXPECT_TRUE(all_match.Value().empty())
+        << "三项与 A2L 一致时不得产生差异（含 ADDRESS_EXTENSION=3 的口径）";
+
+    // 逐项破坏：每项都必须落成 Error，且只影响自己的功能域
+    auto expect_error = [&](const RuntimeXcpParams& bad, const char* param) {
+        auto r = b->CompareWithRuntime(bad);
+        ASSERT_TRUE(r.HasValue());
+        bool found = false;
+        for (const auto& d : r.Value()) {
+            if (d.parameter_name == param) {
+                found = true;
+                EXPECT_EQ(d.severity, Severity::Error) << param;
+            }
+        }
+        EXPECT_TRUE(found) << "缺少差异项 " << param;
+    };
+    RuntimeXcpParams idf_bad = rt;
+    idf_bad.daq_identification_field_type = 2;  // RelativeWord
+    expect_error(idf_bad, "IDENTIFICATION_FIELD_TYPE");
+
+    RuntimeXcpParams ext_bad = rt;
+    ext_bad.daq_address_extension_mode = 0;  // FREE
+    expect_error(ext_bad, "ADDRESS_EXTENSION_MODE");
+
+    RuntimeXcpParams gran_bad = rt;
+    gran_bad.daq_odt_entry_min_size_bytes = 4;  // DWORD 粒度
+    expect_error(gran_bad, "GRANULARITY_ODT_ENTRY_SIZE_DAQ");
+
+    // 未查询（Optional 命令未实现）→ nullopt：跳过比对，不得凭空报错
+    RuntimeXcpParams unknown = rt;
+    unknown.daq_identification_field_type = std::nullopt;
+    unknown.daq_address_extension_mode = std::nullopt;
+    unknown.daq_odt_entry_min_size_bytes = std::nullopt;
+    auto skipped = b->CompareWithRuntime(unknown);
+    ASSERT_TRUE(skipped.HasValue());
+    EXPECT_TRUE(skipped.Value().empty())
+        << "运行时缺数据时必须跳过该项比对（不拿默认值凑数）";
+}
+
 TEST_F(A2lGoldenTest, XcpPlusPriorityAndConflictReport) {
     // §6.3-A：同模块 XCP+XCPplus 并存 → XCPplus 为准 + Info 级差异记录
     auto b = LoadOk(Golden("golden_xcpplus.a2l"));
@@ -859,20 +920,67 @@ TEST_F(A2lGoldenTest, CharacteristicKindsAndScope) {
     ASSERT_TRUE(cv_back.HasValue());
     EXPECT_EQ(cv_back.Value(), (Bytes{0x05, 0x00}));
 
-    // CURVE / VAL_BLK：识别五型但拒绝数值操作（VAL_BLK/ASCII 执行推迟，B-11
-    // 部分完成）
+    // CURVE：识别五型但拒绝数值操作；ASCII 经批次13 核证改判为"事实化拒绝"
+    // （上游 MAX_LENGTH 无词法/语法、Characteristic 无长度 getter → 字节数
+    //  不可证，B-11 剩余项只做 VAL_BLK 半边）
     auto cc = db->Find("MASK_ECU::C_CURVE");
     ASSERT_TRUE(cc.HasValue());
     EXPECT_EQ(cc.Value().characteristic_type, CharacteristicType::Curve);
     auto cc_size = db->ByteSizeOf("MASK_ECU::C_CURVE");
     EXPECT_FALSE(cc_size.HasValue());
     EXPECT_EQ(cc_size.ErrorInfo().code, ErrorCode::UnsupportedDataType);
+
+    // VAL_BLK 无 MATRIX_DIM → 元素数不可证 → 仍拒（B-11 双向断言之"不可证"）
     auto cvb = db->Find("MASK_ECU::C_VALBLK");
     ASSERT_TRUE(cvb.HasValue());
     EXPECT_EQ(cvb.Value().characteristic_type, CharacteristicType::ValBlk);
+    EXPECT_EQ(cvb.Value().data_type, AsamDataType::Unknown);
     auto cvb_to = db->ToPhysical("MASK_ECU::C_VALBLK", Bytes{0x00, 0x00});
     EXPECT_FALSE(cvb_to.HasValue());
     EXPECT_EQ(cvb_to.ErrorInfo().code, ErrorCode::UnsupportedDataType);
+
+    // 批次13 T13-09/T13-12：连续 VAL_BLK（RL 可证元素类型 + MATRIX_DIM 可证
+    // 元素数）→ 可执行：extent 进 dimensions，ByteSizeOf 与 B-1 元素寻址可用
+    auto cvx = db->Find("MASK_ECU::C_VALBLK_EXEC");
+    ASSERT_TRUE(cvx.HasValue());
+    EXPECT_EQ(cvx.Value().characteristic_type, CharacteristicType::ValBlk);
+    EXPECT_EQ(cvx.Value().data_type, AsamDataType::UWord);
+    EXPECT_EQ(cvx.Value().element_size_bytes, 2);
+    EXPECT_EQ(cvx.Value().xcp_address, 0x3700u);
+    ASSERT_EQ(cvx.Value().dimensions.size(), 1u);  // 单维 extent（乘积）
+    EXPECT_EQ(cvx.Value().dimensions[0].extent, 4u);
+    EXPECT_EQ(cvx.Value().dimensions[0].byte_stride, 2u);
+    auto cvx_count = CountElements(cvx.Value());
+    ASSERT_TRUE(cvx_count.HasValue());
+    EXPECT_EQ(cvx_count.Value(), 4u);
+    auto cvx_bytes = db->ByteSizeOf("MASK_ECU::C_VALBLK_EXEC");
+    ASSERT_TRUE(cvx_bytes.HasValue());
+    EXPECT_EQ(cvx_bytes.Value(), 8u);
+    // 元素级寻址走既有 B-1 通路（AG 只做单位换算，绝不乘进基址）
+    auto cvx_addr =
+        ComputeElementAddress(cvx.Value(), 2, AddressGranularity::Byte);
+    ASSERT_TRUE(cvx_addr.HasValue());
+    EXPECT_EQ(cvx_addr.Value(), 0x3704u);
+    // 多维整体换算仍拒（B-11 归并口径 UnsupportedCharacteristicOperation）
+    auto cvx_whole = db->ToPhysical("MASK_ECU::C_VALBLK_EXEC", Bytes{0, 0});
+    EXPECT_FALSE(cvx_whole.HasValue());
+    EXPECT_EQ(cvx_whole.ErrorInfo().code, ErrorCode::UnsupportedOperation);
+    EXPECT_EQ(cvx_whole.ErrorInfo().phase, Phase::Query);
+
+    // 批次13 T13-11（R3 接线）：RECORD_LAYOUT 判定器已生效——含 AXIS_PTS_X 的
+    // 版式给 UnsupportedOperation、含 RESERVE 的复合版式给 InvalidLayout，
+    // 且 Phase 一律为 Layout（与 B 文档 §5"预留判定器"行一致）
+    auto axis = db->ByteSizeOf("MASK_ECU::C_CURVE_AXIS");
+    EXPECT_FALSE(axis.HasValue());
+    EXPECT_EQ(axis.ErrorInfo().code, ErrorCode::UnsupportedOperation);
+    EXPECT_EQ(axis.ErrorInfo().phase, Phase::Layout);
+    auto cplx = db->ByteSizeOf("MASK_ECU::C_COMPLEX_RL");
+    EXPECT_FALSE(cplx.HasValue());
+    EXPECT_EQ(cplx.ErrorInfo().code, ErrorCode::InvalidLayout);
+    EXPECT_EQ(cplx.ErrorInfo().phase, Phase::Layout);
+    auto cplx_to = db->ToPhysical("MASK_ECU::C_COMPLEX_RL", Bytes{0, 0});
+    EXPECT_FALSE(cplx_to.HasValue());
+    EXPECT_EQ(cplx_to.ErrorInfo().code, ErrorCode::InvalidLayout);
 
     // golden_basic 的 C_VALUE 无 RECORD_LAYOUT → 保持 kUnknown 拒绝（负例锁定）
     auto b2 = LoadOk(Golden("golden_basic.a2l"));
@@ -883,6 +991,82 @@ TEST_F(A2lGoldenTest, CharacteristicKindsAndScope) {
     auto plain_size = b2->Database()->ByteSizeOf("SMOKE_ECU::C_VALUE");
     EXPECT_FALSE(plain_size.HasValue());
     EXPECT_EQ(plain_size.ErrorInfo().code, ErrorCode::UnsupportedDataType);
+}
+
+// ============================================================================
+// T5b STRUCTURE / INSTANCE 元数据（B-12，批次13 T13-08）
+// ============================================================================
+
+TEST_F(A2lGoldenTest, StructureMetadataOnly) {
+    auto b = LoadOk(Golden("golden_mask.a2l"));
+    ASSERT_NE(b, nullptr);
+    const IA2lDatabase* db = b->Database();
+    ASSERT_NE(db, nullptr);
+
+    // TYPEDEF_STRUCTURE：可 Find、kind==Structure、成员数进 description、
+    // 元素宽不可证（=0，B-3 禁止猜）
+    auto st = db->Find("MASK_ECU::ST_ENGINE");
+    ASSERT_TRUE(st.HasValue()) << st.ErrorInfo().message;
+    EXPECT_EQ(st.Value().kind, SymbolKind::Structure);
+    EXPECT_EQ(st.Value().characteristic_type, CharacteristicType::None);
+    EXPECT_EQ(st.Value().data_type, AsamDataType::Unknown);
+    EXPECT_EQ(st.Value().element_size_bytes, 0);
+    EXPECT_TRUE(st.Value().dimensions.empty());
+    EXPECT_EQ(st.Value().xcp_address, 0u);  // 类型本身无 ECU 地址
+    EXPECT_NE(st.Value().description.find("members=2"), std::string::npos)
+        << "description 应记录成员数: " << st.Value().description;
+
+    // 嵌套引用：成员只存引用名，不递归展开（B-12 首版边界）——wrapper 有 1 个
+    // 成员、size 声明 8，但不会因此多出"已解析成员类型"的任何痕迹
+    auto wrap = db->Find("MASK_ECU::ST_WRAPPER");
+    ASSERT_TRUE(wrap.HasValue());
+    EXPECT_NE(wrap.Value().description.find("members=1"), std::string::npos)
+        << wrap.Value().description;
+    EXPECT_NE(wrap.Value().description.find("size_bytes=8"), std::string::npos)
+        << wrap.Value().description;
+
+    // INSTANCE：带 ECU_ADDRESS 原值（B-1 口径：不乘 AG）与引用 TYPEDEF 名
+    auto ins = db->Find("MASK_ECU::I_ENGINE");
+    ASSERT_TRUE(ins.HasValue());
+    EXPECT_EQ(ins.Value().kind, SymbolKind::Structure);
+    EXPECT_EQ(ins.Value().xcp_address, 0x3600u);
+    // 批次15（F5）：INSTANCE 的 ECU_ADDRESS_EXTENSION 必须原值保住。修前它是 0
+    // （StructInfoDto 无该字段）—— 分段地址 ECU 上，拿这个地址去读会静默指到
+    // 另一段内存，而地址本身看起来完全合法，故用例先红后绿（批次15 记录 §2）
+    EXPECT_EQ(ins.Value().address_extension, 0x12);
+    EXPECT_NE(ins.Value().description.find("ref_typedef=ST_ENGINE"),
+              std::string::npos)
+        << ins.Value().description;
+
+    // 读写一律显式拒绝（B-12：禁止静默当字节数组）
+    for (const char* name : {"MASK_ECU::ST_ENGINE", "MASK_ECU::ST_WRAPPER",
+                             "MASK_ECU::I_ENGINE"}) {
+        auto size = db->ByteSizeOf(name);
+        ASSERT_FALSE(size.HasValue()) << name;
+        EXPECT_EQ(size.ErrorInfo().code, ErrorCode::UnsupportedOperation)
+            << name;
+        EXPECT_EQ(size.ErrorInfo().phase, Phase::Query) << name;
+        auto to = db->ToPhysical(name, Bytes{0x00, 0x00});
+        ASSERT_FALSE(to.HasValue()) << name;
+        EXPECT_EQ(to.ErrorInfo().code, ErrorCode::UnsupportedOperation) << name;
+        auto from =
+            db->FromPhysical(name, PhysicalValue{static_cast<int64_t>(1)});
+        ASSERT_FALSE(from.HasValue()) << name;
+        EXPECT_EQ(from.ErrorInfo().code, ErrorCode::UnsupportedOperation)
+            << name;
+    }
+
+    // Search 可列出（元数据符号与常规符号同库同排序）
+    auto hits = db->Search("mask_ecu::st_*");
+    ASSERT_TRUE(hits.HasValue());
+    ASSERT_EQ(hits.Value().size(), 2u);
+    EXPECT_EQ(hits.Value()[0].name, "ST_ENGINE");  // 稳定字典序
+    EXPECT_EQ(hits.Value()[1].name, "ST_WRAPPER");
+
+    // STRUCTURE/INSTANCE 不参与基址反查：DAQ entry 归属仍只认
+    // MEASUREMENT/CHARACTERISTIC（B-12 不寻址）
+    auto layout_r = b->CreateDaqLayout();
+    ASSERT_TRUE(layout_r.HasValue());
 }
 
 // ============================================================================
@@ -957,7 +1141,8 @@ TEST_F(A2lGoldenTest, DtoEnvelopeMatrix) {
         cases.push_back({"combo", f});
     }
     for (const Case& c : cases) {
-        const Bytes dto = MakeEnvelope(c.frame, 1 /*EPK*/, payload);
+        // PID=1：golden_basic 的列表号与 FIRST_PID 都是 1，两种口径同值
+    const Bytes dto = MakeEnvelope(c.frame, 1 /*FIRST_PID+相对 ODT 号*/, payload);
         auto samples = layout->Decode(c.frame, dto);
         ASSERT_TRUE(samples.HasValue()) << c.name;
         ASSERT_EQ(samples.Value().size(), 2u) << c.name;
@@ -1000,13 +1185,14 @@ TEST_F(A2lGoldenTest, DtoEnvelopeMatrix) {
 }
 
 TEST_F(A2lGoldenTest, StaticPredefinedDaqDecode) {
-    // golden_mask 的 EPK=2 列表：BIT_MASK / BIT_OFFSET / 2D raw 三分支
+    // golden_mask 的 DAQ 列表（列表号 2、FIRST_PID=4）：
+    // 批次15 F1 起 PID=FIRST_PID+0=0x04；覆盖 BIT_MASK / BIT_OFFSET / 2D raw 三分支
     auto b = LoadOk(Golden("golden_mask.a2l"));
     ASSERT_NE(b, nullptr);
     auto layout_r = b->CreateDaqLayout();
     ASSERT_TRUE(layout_r.HasValue());
     DtoFrameLayout frame;  // Absolute + 1B PID
-    const Bytes dto{0x02, 0x00, 0x0F, 0xAA, 0, 1, 2,  3,
+    const Bytes dto{0x04, 0x00, 0x0F, 0xAA, 0, 1, 2,  3,
                     4,    5,    6,    7,    8, 9, 10, 11};
     auto packed = layout_r.Value()->PackedByteSize(
         {"MASK_ECU::M_MASK", "MASK_ECU::M_UBYTE", "MASK_ECU::M_2D"});
@@ -1015,6 +1201,126 @@ TEST_F(A2lGoldenTest, StaticPredefinedDaqDecode) {
     auto samples = layout_r.Value()->Decode(frame, dto);
     ASSERT_TRUE(samples.HasValue());
     EXPECT_EQ(samples.Value().size(), 3u);
+}
+
+TEST_F(A2lGoldenTest, A2lFirstPidRoutesInsteadOfListNumber) {
+    // 批次15（F1）静默错值回归锁：golden_mask 的列表号是 2、FIRST_PID 是 4。
+    // 修复前解码按"PID == 列表号"，因此喂 0x02 会**成功解出 3 条 entry**——
+    // 这在真实 ECU 上是错的（XCP 发的是 4），更要命的是"别的列表的 PID 恰好
+    // 等于本列表号"时会用错布局且全程无报错。修复后：
+    //   ① 喂 0x02（列表号）必须失败；② 喂 0x04（FIRST_PID+0）才成功。
+    auto b = LoadOk(Golden("golden_mask.a2l"));
+    ASSERT_NE(b, nullptr);
+    auto layout_r = b->CreateDaqLayout();
+    ASSERT_TRUE(layout_r.HasValue());
+    const std::unique_ptr<IDaqLayout>& layout = layout_r.Value();
+
+    DtoFrameLayout frame;  // Absolute + 1B PID
+    const Bytes body{0x00, 0x0F, 0xAA, 0, 1, 2, 3,
+                     4,    5,    6,    7, 8, 9, 10, 11};
+    Bytes by_list_number;
+    by_list_number.push_back(0x02);  // 旧的错误口径
+    by_list_number.insert(by_list_number.end(), body.begin(), body.end());
+    auto wrong = layout->Decode(frame, by_list_number);
+    ASSERT_FALSE(wrong.HasValue())
+        << "A2L 声明了 FIRST_PID 时，列表号不得再充当 PID 参与解释（L1）";
+    EXPECT_EQ(wrong.ErrorInfo().code, ErrorCode::NotFound);
+    EXPECT_EQ(wrong.ErrorInfo().phase, Phase::Layout);
+
+    Bytes by_first_pid;
+    by_first_pid.push_back(0x04);  // docs L2225：FIRST_PID + 相对 ODT 号
+    by_first_pid.insert(by_first_pid.end(), body.begin(), body.end());
+    auto ok = layout->Decode(frame, by_first_pid);
+    ASSERT_TRUE(ok.HasValue()) << ok.ErrorInfo().message;
+    ASSERT_EQ(ok.Value().size(), 3u);
+    EXPECT_EQ(ok.Value()[0].symbol_name, "MASK_ECU::M_MASK");
+    EXPECT_EQ(ok.Value()[1].symbol_name, "MASK_ECU::M_UBYTE");
+
+    // 批次15（F4）：代际可查，供调用方一行识别陈旧解码器
+    EXPECT_EQ(layout->Generation(), 0u)
+        << "A2L 侧来源无配置代际概念（恒 0），账本/回读侧才带真值";
+}
+
+TEST_F(A2lGoldenTest, DecodedPhysicalValidityFlagDistinguishesUnconverted) {
+    // 批次15（F2）：PhysicalValue 的默认构造值就是 int64_t{0}，没有
+    // physical_valid 时"没换算"与"算出 0"不可区分。这里用同一份布局的三类
+    // entry 各自钉死一种状态。
+    auto b = LoadOk(Golden("golden_mask.a2l"));
+    ASSERT_NE(b, nullptr);
+    auto layout_r = b->CreateDaqLayout();
+    ASSERT_TRUE(layout_r.HasValue());
+    DtoFrameLayout frame;
+    // 全零净荷：即使换算成功，物理值也可能是 0，故必须看标志位
+    const Bytes zeros{0x04, 0x00, 0x00, 0x00, 0, 0, 0, 0,
+                      0,    0,    0,    0,    0, 0, 0, 0};
+    auto samples = layout_r.Value()->Decode(frame, zeros);
+    ASSERT_TRUE(samples.HasValue());
+    ASSERT_EQ(samples.Value().size(), 3u);
+    // entry1 M_MASK（UWORD + LINEAR）：换算成功
+    EXPECT_TRUE(samples.Value()[0].physical_valid);
+    EXPECT_EQ(std::get<std::int64_t>(samples.Value()[0].physical_value), 0);
+    // entry3 M_2D（多维数组）：不整体换算 → 标志必须为 false，raw 仍在
+    EXPECT_FALSE(samples.Value()[2].physical_valid);
+    EXPECT_EQ(samples.Value()[2].raw.size(), 12u);
+    for (const auto& s : samples.Value()) {
+        if (!s.physical_valid) {
+            // 唯一的合法用法：退回 raw，不拿默认值当结果
+            EXPECT_FALSE(s.raw.empty()) << s.symbol_name;
+        }
+    }
+}
+
+TEST_F(A2lGoldenTest, LoadWarningsReportAbandonedFacts) {
+    // 批次15（F6/D4）：被放弃的事实必须留痕。golden_collision 同时制造两种：
+    //   ① TYPEDEF_STRUCTURE 与 MEASUREMENT 同名（B-13 保留后者、跳过前者）；
+    //   ② DAQ_LIST 未声明 FIRST_PID（F1/D1 的"列表号回退"弱权威）。
+    auto b = LoadOk(Golden("golden_collision.a2l"));
+    ASSERT_NE(b, nullptr);
+
+    const std::vector<LoadWarning>& warnings = b->ListLoadWarnings();
+    bool has_collision = false;
+    bool has_nofirstpid = false;
+    for (const auto& w : warnings) {
+        if (w.subject == "COL_ECU::M_BLOCK") {
+            has_collision = true;
+            EXPECT_EQ(w.code, ErrorCode::AmbiguousName) << w.message;
+            EXPECT_EQ(w.phase, Phase::Load);
+        }
+        if (w.subject.find("DAQ_LIST 7") != std::string::npos) {
+            has_nofirstpid = true;
+            EXPECT_EQ(w.code, ErrorCode::UnsupportedOperation) << w.message;
+            EXPECT_EQ(w.phase, Phase::Layout);
+        }
+    }
+    EXPECT_TRUE(has_collision) << "同名冲突被跳过的结构体必须留痕（L6）";
+    EXPECT_TRUE(has_nofirstpid) << "未取证回退必须留痕（L1/D1）";
+
+    // 告警不改变读取语义：同名键仍解析到 MEASUREMENT，且可正常换算
+    const IA2lDatabase* db = b->Database();
+    ASSERT_NE(db, nullptr);
+    auto m = db->Find("COL_ECU::M_BLOCK");
+    ASSERT_TRUE(m.HasValue());
+    EXPECT_EQ(m.Value().kind, SymbolKind::Measurement);
+    EXPECT_EQ(m.Value().element_size_bytes, 2);
+
+    // 未声明 FIRST_PID 的列表：回退口径仍可用（弱权威 != 拒绝服务）
+    auto layout_r = b->CreateDaqLayout();
+    ASSERT_TRUE(layout_r.HasValue());
+    EXPECT_EQ(layout_r.Value()->Generation(), 0u);
+    DtoFrameLayout frame;
+    const Bytes by_number{0x07, 0x12, 0x34};  // 列表号 7 充当 PID
+    auto samples = layout_r.Value()->Decode(
+        frame, BytesView{by_number.data(), by_number.size()});
+    ASSERT_TRUE(samples.HasValue()) << samples.ErrorInfo().message;
+    ASSERT_EQ(samples.Value().size(), 1u);
+    EXPECT_EQ(samples.Value()[0].symbol_name, "COL_ECU::M_BLOCK");
+    EXPECT_TRUE(samples.Value()[0].physical_valid);
+
+    // 正常样本不得产告警（避免把告警通道当噪声源）
+    auto ok = LoadOk(Golden("golden_mask.a2l"));
+    ASSERT_NE(ok, nullptr);
+    EXPECT_TRUE(ok->ListLoadWarnings().empty())
+        << "golden_mask 声明了 FIRST_PID 且无同名冲突，不该有告警";
 }
 
 TEST_F(A2lGoldenTest, DynamicDaqRejectedExplicitly) {
@@ -1075,6 +1381,47 @@ TEST_F(A2lGoldenTest, AsyncNotReadyExactlyOnceAndDestructionSafe) {
         // 回调后不得再触发（恰好一次）
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         EXPECT_EQ(callback_count.load(), 1);
+    }
+
+    // 批次13（T13-15）：异步期间轮询阶段进度。弱断言——小文件可能在第一次
+    // 轮询前就解析完（窗口丢失仅打 NOTE，不判失败，与 NotReady 窗口同风格）；
+    // 但一旦取到过 (0,100) 开区间内的值，其取值必须来自 SDK 的阶段常量。
+    std::atomic<bool> saw_intermediate{false};
+    std::atomic<int> intermediate_value{0};
+    {
+        std::promise<void> done;
+        std::future<void> done_f = done.get_future();
+        std::atomic<bool> finished{false};
+        auto br = A2lBridge::LoadAsync(Golden("golden_basic.a2l"), {},
+                                       [&](Result<void> res) {
+                                           finished.store(true);
+                                           done.set_value();
+                                       });
+        ASSERT_TRUE(br.HasValue());
+        // 紧贴受理时刻密集轮询，最大化命中阶段中间值的概率
+        for (int spin = 0; spin < 20000 && !finished.load(); ++spin) {
+            const int p = br.Value()->Progress();
+            if (p > 0 && p < 100) {
+                saw_intermediate.store(true);
+                intermediate_value.store(p);
+                break;
+            }
+        }
+        if (!finished.load()) {
+            ASSERT_EQ(done_f.wait_for(std::chrono::seconds(60)),
+                      std::future_status::ready);
+        }
+        if (saw_intermediate.load()) {
+            const int p = intermediate_value.load();
+            EXPECT_TRUE(p == 5 || p == 25 || p == 70 || p == 99)
+                << "阶段进度取值必须是 SDK/桥接层的阶段常量，实际 " << p;
+        } else {
+            std::printf(
+                "[NOTE] async parse finished before an intermediate "
+                "progress value was observed\n");
+        }
+        // 完成回调已到（上面的等待保证），发布后恒 100
+        EXPECT_EQ(br.Value()->Progress(), 100);
     }
 
     // 场景 2：失败的异步加载不发布半成品（Database 恒 nullptr）
@@ -1179,6 +1526,56 @@ TEST_F(A2lGoldenTest, ImmutableSnapshotConcurrentReads) {
         th.join();
     }
     EXPECT_EQ(errors.load(), 0);
+}
+
+// ============================================================================
+// T9 性能基线（批次13 T13-17；只记基线，不设 SLA）
+// ============================================================================
+
+TEST_F(A2lGoldenTest, ParseLargeFileUnderBudget) {
+    // 输入由 `gen_a2l.py --perf` 生成（CMake fixture `a2l_gen_perf`），
+    // 只落 build tree。缺失即跳过——本用例是基线记录，不是功能门禁。
+    const std::filesystem::path perf =
+        std::filesystem::path(A2L_GOLDEN_DIR) / "golden_perf_5mb.a2l";
+    if (!std::filesystem::exists(perf)) {
+        GTEST_SKIP() << "未生成性能样本（fixture a2l_gen_perf 未跑）: " << perf;
+    }
+    // 生成器把符号数写进同名 .count 侧车文件：用例据此校验"解析真的做完"，
+    // 而不是把数字硬编码进测试（生成器文本宽度一变就假失败）。
+    std::size_t expected_count = 0;
+    {
+        std::ifstream meta(std::filesystem::path(perf).string() + ".count");
+        std::string text;
+        if (std::getline(meta, text)) {
+            expected_count = std::stoul(text);
+        }
+    }
+    ASSERT_GT(expected_count, 0u) << "侧车文件缺失或为空：" << perf << ".count";
+    LoadOptions require_off;
+    require_off.require_if_data_xcp = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = A2lBridge::Load(perf.string(), require_off);
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    ASSERT_TRUE(r.HasValue()) << r.ErrorInfo().message;
+    const std::size_t bytes = std::filesystem::file_size(perf);
+    ASSERT_NE(r.Value()->Database(), nullptr);
+    auto count = r.Value()->Database()->Count();
+    ASSERT_TRUE(count.HasValue());
+    EXPECT_EQ(count.Value(), expected_count)
+        << "符号数与生成器侧车不一致（样本被截断或快照漏采）";
+    std::printf("[PERF] A2L %.2f MB 解析 + 快照构建 = %lld ms (%zu 符号)\n",
+                static_cast<double>(bytes) / (1024.0 * 1024.0),
+                static_cast<long long>(ms), count.Value());
+    // 双条件门禁：参考值倍率用于跨机器稳定性，绝对上限用于拦截量级劣化。
+    const long long reference_limit =
+        static_cast<long long>(A2L_PERF_REFERENCE_MS) * 3LL;
+    const long long hard_limit = static_cast<long long>(A2L_PERF_HARD_LIMIT_MS);
+    EXPECT_TRUE(static_cast<long long>(ms) <= reference_limit &&
+                static_cast<long long>(ms) <= hard_limit)
+        << "性能超限：实测 " << ms << " ms，参考倍率上限 " << reference_limit
+        << " ms，绝对上限 " << hard_limit << " ms";
 }
 
 // ============================================================================

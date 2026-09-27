@@ -8,7 +8,11 @@
       "mod_common": true,
       "mod_par": true,
       "record_layouts": [
-        {"name": "RL_VALUE", "attributes": ["FNC_VALUES 0 UWORD ROW_DIR DIRECT"]}
+        {"name": "RL_VALUE", "attributes": ["FNC_VALUES 0 UWORD ROW_DIR DIRECT"]},
+        {"name": "RL_CURVE_AXIS", "attributes": ["FNC_VALUES 0 UWORD ROW_DIR DIRECT",
+                                                  "AXIS_PTS_X 2 UWORD INDEX_INCR DIRECT"]},
+        {"name": "RL_COMPLEX", "attributes": ["FNC_VALUES 0 UWORD ROW_DIR DIRECT",
+                                              "RESERVED 1 UWORD"]}
       ],
       "compu_methods": [
         {"name": "CM_IDENT", "type": "IDENTICAL"}
@@ -46,9 +50,39 @@
         {"name": "C_CURVE", "desc": "curve is metadata only", "ctype": "CURVE",
          "address": "0x3200", "deposit": "RL_VALUE", "compu": "CM_IDENT",
          "upper": 65535},
-        {"name": "C_VALBLK", "desc": "valblk metadata only (batch10)",
+        {"name": "C_VALBLK", "desc": "VAL_BLK 无 MATRIX_DIM → 元素数不可证",
          "ctype": "VAL_BLK", "address": "0x3300", "deposit": "RL_VALUE",
-         "compu": "CM_IDENT", "upper": 65535}
+         "compu": "CM_IDENT", "upper": 65535},
+        {"name": "C_VALBLK_EXEC", "desc": "连续 UWORD×4（元素类型与元素数皆可证）",
+         "ctype": "VAL_BLK", "address": "0x3700", "deposit": "RL_VALUE",
+         "compu": "CM_IDENT", "upper": 65535, "matrix_dim": [4]},
+        {"name": "C_CURVE_AXIS", "desc": "版式含 AXIS_PTS_X → 判定器拒绝",
+         "ctype": "CURVE", "address": "0x3800", "deposit": "RL_CURVE_AXIS",
+         "compu": "CM_IDENT", "upper": 65535},
+        {"name": "C_COMPLEX_RL", "desc": "版式含 RESERVE → 复合布局拒绝",
+         "ctype": "VAL_BLK", "address": "0x3900", "deposit": "RL_COMPLEX",
+         "compu": "CM_IDENT", "upper": 65535, "matrix_dim": [4]}
+      ],
+      "typedef_measurements": [
+        {"name": "TM_VOLTAGE", "desc": "STRUCTURE_COMPONENT 引用的 typedef",
+         "datatype": "UWORD", "compu": "CM_IDENT"}
+      ],
+      "typedef_structures": [
+        {"name": "ST_ENGINE", "desc": "引擎状态块（成员不展开）", "size": 6,
+         "members": [
+           {"name": "u_rpm", "typedef": "TM_VOLTAGE", "offset": 0},
+           {"name": "u_flag", "typedef": "TM_VOLTAGE", "offset": 2,
+            "matrix_dim": [2]}
+         ]},
+        {"name": "ST_WRAPPER", "desc": "引用 ST_ENGINE（不递归展开）", "size": 8,
+         "members": [
+           {"name": "inner", "typedef": "ST_ENGINE", "offset": 0}
+         ]}
+      ],
+      "instances": [
+        {"name": "I_ENGINE", "desc": "INSTANCE 元数据",
+         "ref_typedef": "ST_ENGINE", "address": "0x3600", "read_write": true,
+         "ext": "0x12"}
       ],
       "if_data": [
         {

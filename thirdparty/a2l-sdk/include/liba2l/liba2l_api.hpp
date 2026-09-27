@@ -41,8 +41,12 @@ namespace liba2l {
 // v3（批次12）：IDoc +LastErrorChain（B-18 结构化 include 链，out-param 风格，
 //               与 ListSymbols 同分配惯例）；IfDataXcpDto
 //               +udp_packet_alignment/+udp_sub_commands（UDP 端点元数据补全）。
+// v4（批次13）：IDoc +ListStructures（B-12 TYPEDEF_STRUCTURE/INSTANCE 元数据，
+//               只存不展开）；新 DTO StructInfoDto/StructMemberDto；
+//               SymbolDto +record_layout_kind（B-4/B-12 RL 可执行性判定接线）；
+//               Progress() 由"完成即 100"改为**阶段进度**实算（无接口变化）。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 3u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 5u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -154,6 +158,24 @@ enum class DaqListTypeDto : std::int32_t {
     kDaqStim = 3,  ///< DAQ_STIM
 };
 
+/**
+ * @brief RECORD_LAYOUT 的归一化类别（批次13，B-4/B-12）。
+ * @details 判定完全来自上游 `RecordLayout` 的既有 getter（不引入新解析）：
+ *          除单段 `FNC_VALUES`（Position==0 且 ADDRESS_TYPE==DIRECT）外
+ *          全部布局字段均为默认的版式记为 kPlainScalar；含任一
+ *          AXIS_PTS_* 记为 kAxisPts；含 RESERVE/DIST_OP/SHIFT_OP/RIP_ADDR/
+ *          IDENTIFICATION/AXIS_RESCALE/FIX_NO_AXIS_PTS 等非连续要素记为
+ *          kComplex；DEPOSIT 未给出或模块内查不到该 RECORD_LAYOUT 记为
+ *          kNotProvided（**表示"无版式信息"，不等于"版式不可执行"**，
+ *          桥接层此时不得调用可执行性判定器，仍由 B-3 元素宽度门拒绝）。
+ */
+enum class RecordLayoutKindDto : std::int32_t {
+    kNotProvided = 0,  ///< 无 DEPOSIT 名 / 模块内查不到版式
+    kPlainScalar = 1,  ///< 纯标量 FNC_VALUES 连续版式（可执行）
+    kAxisPts = 2,      ///< 含 AXIS_PTS_*（仅元数据）
+    kComplex = 3,      ///< 含非连续要素（拒绝扁平化猜测）
+};
+
 // ----------------------------------------------------------------------------
 // 结构体 DTO
 // ----------------------------------------------------------------------------
@@ -245,6 +267,10 @@ struct SymbolDto {
     bool have_limit = false;         ///< 是否给出 LIMITS
     double lower_limit = 0.0;        ///< 下界（have_limit 时有效）
     double upper_limit = 0.0;        ///< 上界（have_limit 时有效）
+    /// @brief DEPOSIT 指向的 RECORD_LAYOUT 名（批次13；MEASUREMENT 恒空）
+    std::string record_layout_name;
+    /// @brief RECORD_LAYOUT 归一化类别（批次13，B-4/B-12；判定见枚举注释）
+    RecordLayoutKindDto record_layout_kind = RecordLayoutKindDto::kNotProvided;
 };
 
 /**
@@ -389,6 +415,49 @@ struct DaqListDto {
     std::vector<OdtDto> predefined_odts;  ///< PREDEFINED 展开后的 ODT 列表
 };
 
+/**
+ * @brief TYPEDEF_STRUCTURE 的单个成员元数据（批次13，B-12）。
+ * @details 只保存声明本身给出的信息，**不递归展开** `Typedef` 指向的类型，
+ *          也不据此推导可读写布局（首版 STRUCTURE 一律不可读写）。
+ */
+struct StructMemberDto {
+    std::string name;          ///< 成员名（A2lStructureComponent::Name）
+    std::string typedef_name;  ///< 引用的 TYPEDEF 名（空=非结构成员引用）
+    std::uint64_t address_offset = 0;  ///< ADDRESS_OFFSET（结构起始为基准）
+    std::uint8_t address_type = 0;     ///< A2lAddressType 原始码
+    std::uint8_t layout = 0;           ///< A2lLayout 原始码
+    std::vector<std::uint64_t> matrix_dim;  ///< MATRIX_DIM（原样透传）
+};
+
+/**
+ * @brief TYPEDEF_STRUCTURE / INSTANCE 元数据快照（批次13，B-12）。
+ * @details 一条记录要么是 TYPEDEF_STRUCTURE（`is_instance=false`，有
+ * `size_bytes` 与 `members`），要么是 INSTANCE（`is_instance=true`，有
+ * `ref_typedef` 与 `address`）。两者都只做"识别与展示"，不参与寻址与换算。
+ */
+struct StructInfoDto {
+    std::string name;          ///< 对象名（A2lObject::Name）
+    std::string description;   ///< 描述文本（A2lObject::Description）
+    std::string module_name;   ///< 所属 MODULE（B-17 module scope）
+    bool is_instance = false;  ///< true=INSTANCE，false=TYPEDEF_STRUCTURE
+    std::string ref_typedef;   ///< INSTANCE 引用的 TYPEDEF 名；结构体自身为空
+    std::uint64_t size_bytes =
+        0;  ///< Structure::Size()；INSTANCE 固定 0（不可证）
+    std::uint64_t address = 0;  ///< INSTANCE 的 ECU_ADDRESS 原值（B-1 口径）
+    /// @brief INSTANCE 的 ECU_ADDRESS_EXTENSION 原值（批次15，F5；v5 起有值）
+    /// @details 上游 A2lObject::EcuAddressExtension() 明确存在
+    ///          （include/a2l/a2lobject.h:57/60），但 v4 的 DTO 没有这个字段，
+    ///          于是分段地址 ECU 上实例地址只剩 32 位 —— 拿它去读会**静默指到
+    ///          另一段内存**，而地址本身看起来完全合法（缺陷证据见
+    ///          code-plan/A2L_集成_R4_遗留修复计划_批次15.md §1 L5）。
+    ///          TYPEDEF_STRUCTURE 无地址，本字段对它恒 0。
+    std::uint8_t address_extension = 0;
+    std::uint8_t address_type = 0;         ///< A2lAddressType 原始码
+    std::uint8_t layout = 0;               ///< A2lLayout 原始码
+    bool read_write = false;               ///< INSTANCE 的 READ_WRITE 声明
+    std::vector<StructMemberDto> members;  ///< 成员元数据（不展开）
+};
+
 // ----------------------------------------------------------------------------
 // 抽象接口（R2：DLL 侧创建、Release() 同侧销毁；R4：全 noexcept）
 // ----------------------------------------------------------------------------
@@ -483,7 +552,20 @@ public:
     /** @brief 最近一次错误码（与 LastError 同步更新）。 */
     virtual ErrorCode LastErrorCode() const noexcept = 0;
 
-    /** @brief 解析进度 0..100（同步模式下完成后为 100）。 */
+    /**
+     * @brief 解析进度 0..100（**阶段进度**，非按行百分比；批次13 修订）。
+     * @details 上游 `A2lFile::NumberOfLines()` 只在 UTF-16/32 分支被赋值
+     *          （`a2lfile.cpp:239-254`，ASCII/UTF-8 恒 0），而 `LineNo()` 内部
+     *          要解引用 `scanner_`——该 scanner 是 `ParseFile()` 的**栈对象**
+     *          （`a2lfile.cpp:256-277`，解析结束即置空并销毁），跨线程轮询存在
+     *          访问已销毁对象的窗口。因此本 SDK 不调用上游进度接口，改由
+     *          内部 `std::atomic<int>` 在四个阶段边界发布：
+     *          受理=5 → include 预扫描完成=25 → 上游解析完成=70 →
+     *          快照构建完成=100；失败/未加载为 0。`LoadAsync` 的
+     *          `progress_cb`（若提供）由解析线程在这些边界回调。
+     * @note 语义为"进行到哪一步"，不代表已解析的行数比例；
+     *       `LoadOptions::progress_notify_percent` 仅作调用方轮询节奏提示。
+     */
     virtual int Progress() const noexcept = 0;
 
     /** @brief 模块数量。要求 Load 已成功，否则返回 0。 */
@@ -513,6 +595,18 @@ public:
     /** @brief 列出全部预定义 DAQ_LIST 快照。 */
     virtual ErrorCode ListDaqLists(
         std::vector<DaqListDto>* out) const noexcept = 0;
+
+    /**
+     * @brief 列出全部 TYPEDEF_STRUCTURE 与 INSTANCE 元数据（批次13，B-12）。
+     * @param out 输出向量（DLL 侧先 clear 再填充）。
+     * @details 只识别、不展开：成员保留名字/偏移/引用的 TYPEDEF 名与 MATRIX_DIM
+     *          原码；不对结构体做寻址、换算或读写（消费方必须返回
+     *          UnsupportedOperation）。排序稳定：先 TYPEDEF（按名升序），
+     *          后 INSTANCE（按名升序）。
+     * @return kOk（无结构体时输出空向量）/ kNotInitialized / kBadArgument。
+     */
+    virtual ErrorCode ListStructures(
+        std::vector<StructInfoDto>* out) const noexcept = 0;
 
     /**
      * @brief 按 COMPU_METHOD 名取转换快照（含 TAB_* 引用的 COMPU_TAB）。

@@ -8,8 +8,10 @@
 #ifndef LIBXCP_A2L_A2L_BRIDGE_HPP_
 #define LIBXCP_A2L_A2L_BRIDGE_HPP_
 
+#include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "libxcp/a2l/a2l_result.hpp"
@@ -64,6 +66,15 @@ struct RuntimeXcpParams {
     AddressGranularity address_granularity =
         AddressGranularity::Byte;  ///< bit1-2
     bool has_daq = false;          ///< 资源位含 DAQ
+    // ---- 批次14（T14-11）：DAQ 侧比对项；nullopt = 未查询 → 跳过比对 ----
+    /// @brief IDENTIFICATION_FIELD_TYPE 原码（GET_DAQ_PROCESSOR_INFO 的
+    ///        DAQ_KEY_BYTE bit6-7；docs L1445 说它是**实际**编码的唯一来源）
+    std::optional<std::uint8_t> daq_identification_field_type;
+    /// @brief ADDRESS_EXTENSION 原码（DAQ_KEY_BYTE bit4-5：0=FREE/1=ODT/3=DAQ；
+    ///        注意 3 不是枚举序号，与 A2L 侧同口径）
+    std::optional<std::uint8_t> daq_address_extension_mode;
+    /// @brief GRANULARITY_ODT_ENTRY_SIZE_DAQ（GET_DAQ_RESOLUTION_INFO，字节数）
+    std::optional<std::uint8_t> daq_odt_entry_min_size_bytes;
 };
 
 /**
@@ -114,6 +125,21 @@ public:
     [[nodiscard]] const IA2lDatabase* Database() const noexcept;
 
     /**
+     * @brief 加载期告警清单（批次15，F6/D4）
+     * @return 只读引用；无告警时为空（快照未发布时也为空，不报错）
+     * @details 告警 = "某个事实被放弃了，但不阻断加载"，当前两项：
+     *          ① STRUCTURE/INSTANCE 与已有符号同名而被跳过的条目（B-13 保留
+     *            测量/标定量，被丢弃的一方不能无声）；
+     *          ② A2L 的 DAQ_LIST 未声明 FIRST_PID，解码只能按"列表号回退"
+     *            （F1/D1：该回退未经实际取证，属弱权威，需让用户知情）。
+     *          选择"新增只读接口"而不是把提示塞进 description：后者会污染
+     *          展示文本并让既有断言被迫跟着改（B-19 的 message 只展示、不参与
+     *          判定这一契约就破了）。不改 liba2l、不动 SDK ABI。
+     */
+    [[nodiscard]] const std::vector<LoadWarning>& ListLoadWarnings()
+        const noexcept;
+
+    /**
      * @brief IF_DATA XCP 汇总
      * @return 快照未发布时为 nullptr
      */
@@ -122,8 +148,44 @@ public:
     /**
      * @brief 基于已冻结 STATIC DAQ 布局创建解码器
      * @return 无 IF_DATA XCP 或无预定义列表时返回结构化错误
+     * @details 布局来源 = A2L `IF_DATA ... PREDEFINED`（快照
+     *          `source=A2lPredefined`，按 EPK == 列表号路由）。
      */
     [[nodiscard]] Result<std::unique_ptr<IDaqLayout>> CreateDaqLayout() const;
+
+    /**
+     * @brief 用**本端 WRITE_DAQ 账本**冻结布局并创建解码器（批次14，B-6）
+     * @param ledger 账本条目（由调用方从 `XcpMaster::DaqLedger()` 转换而来）
+     * @param generation 配置代际（`XcpMaster::DaqConfigGeneration()`）
+     * @details B-6 的权威分工在此落地：可配置 STATIC 以本端账本为准
+     *          （A2L 的 `static_daq_lists` 只作候选/一致性约束），因此
+     *          **账本与 A2L 顺序相反时按账本解码**；账本为空时得到的快照
+     *          没有 PID 路由，`Decode` 一律 `InvalidLayout`，调用方保留
+     *          raw DTO 原样（不猜符号与顺序）。
+     * @return 成功返回解码器；快照未发布返回 `NotReady`；DYNAMIC 能力返回
+     *         `UnsupportedOperation`（B-5 不变）
+     */
+    [[nodiscard]] Result<std::unique_ptr<IDaqLayout>> CreateDaqLayoutFromLedger(
+        const std::vector<DaqLedgerEntryView>& ledger,
+        std::uint32_t generation) const;
+
+    /**
+     * @brief 用 **ECU 回读**（READ_DAQ + 各列表 FIRST_PID）冻结布局并创建解码器
+     *        （批次14，T14-10；B-6 里 PREDEFINED 列表的取证通路）
+     * @param readback `READ_DAQ` 逐条回读的 Entry（AG
+     * 换算与位偏归一由调用方完成）
+     * @param list_pids 各 DAQ List 的 FIRST_PID（`GET_DAQ_LIST_INFO` 无此项，
+     *        取自 `START_STOP_DAQ_LIST` 响应，docs L2222）
+     * @param generation 配置代际
+     * @details 与账本入口的分工：可配置列表以本端下发为权威，PREDEFINED 列表
+     *          只能靠回读取证。两者都生成 PID 路由，解码一律按路由定位单个
+     * ODT； 回读为空 → `Decode` 返回 `InvalidLayout`（不拿 A2L 顺序凑数）。
+     */
+    [[nodiscard]] Result<std::unique_ptr<IDaqLayout>>
+    CreateDaqLayoutFromEcuReadback(
+        const std::vector<DaqReadbackEntry>& readback,
+        const std::vector<DaqListPid>& list_pids,
+        std::uint32_t generation) const;
 
     /**
      * @brief A2L 声明 vs Slave 运行时一致性比对（B-16，规范 §8.4 要求）

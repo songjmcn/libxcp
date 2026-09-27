@@ -282,6 +282,73 @@ SymbolInfo ConvertSymbol(const liba2l::SymbolDto& dto) {
     return info;
 }
 
+SymbolInfo ConvertStructure(const liba2l::StructInfoDto& dto) {
+    SymbolInfo info;
+    info.module_name = dto.module_name;
+    info.name = dto.name;
+    // B-12 首版边界：STRUCTURE/INSTANCE 只做"可识别的元数据"。成员清单不在
+    // SymbolInfo 里展开（无 leaf 通路），但成员数/引用 TYPEDEF 名/读写声明
+    // 是快照里可证的 fact，写进 description 供 UI 展示与用例断言。
+    std::string derived;
+    if (dto.is_instance) {
+        derived = "[INSTANCE ref_typedef=" + dto.ref_typedef +
+                  " read_write=" + (dto.read_write ? "1" : "0") + "]";
+    } else {
+        derived =
+            "[TYPEDEF_STRUCTURE members=" + std::to_string(dto.members.size()) +
+            " size_bytes=" + std::to_string(dto.size_bytes) + "]";
+    }
+    info.description =
+        dto.description.empty() ? derived : dto.description + " " + derived;
+    info.kind = SymbolKind::Structure;
+    info.characteristic_type = CharacteristicType::None;
+    // 未知类型 → element_size 必为 0（B-3 禁止猜宽度），STRUCTURE 因此
+    // 天然无法参与字节数计算与换算；门面另有显式 UnsupportedOperation 门。
+    info.data_type = AsamDataType::Unknown;
+    info.element_size_bytes = 0;
+    info.dimensions.clear();  // 成员不展开为维度（禁止扁平化猜测）
+    // INSTANCE 的 ECU_ADDRESS 原值直传（B-1：绝不乘 AG）；TYPEDEF 无地址=0
+    info.xcp_address = dto.address;
+    // 批次15（F5）：INSTANCE 的 ECU_ADDRESS_EXTENSION 原值直传（此前恒 0，
+    // 会让分段地址上的实例静默指错内存）。TYPEDEF 无地址，该值本就是 0。
+    info.address_extension = dto.address_extension;
+    info.read_write = false;  // B-12：结构体读写一律拒绝，不随声明放行
+    return info;
+}
+
+bool ConvertRecordLayoutInfo(const liba2l::SymbolDto& dto,
+                             RecordLayoutInfo* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    using S = liba2l::RecordLayoutKindDto;
+    if (dto.record_layout_kind == S::kNotProvided) {
+        // 无版式信息（无 DEPOSIT 或模块内查不到 RECORD_LAYOUT）：
+        // 不据此判定"不可执行"，交由 B-3 元素宽度门处理
+        return false;
+    }
+    out->name = dto.record_layout_name;
+    switch (dto.record_layout_kind) {
+        case S::kPlainScalar:
+            // 纯标量 FNC_VALUES 连续版式（VALUE 与连续 VAL_BLK 共用）
+            out->kind = RecordLayoutKind::FncValues;
+            out->writable = true;
+            return true;
+        case S::kAxisPts:
+            out->kind = RecordLayoutKind::AxisPts;
+            out->writable = false;
+            return true;
+        case S::kComplex:
+            out->kind = RecordLayoutKind::Complex;
+            out->writable = false;
+            return true;
+        case S::kNotProvided:
+        default:
+            // 未列出的上游取值不猜类别（B-3 同款纪律）
+            return false;
+    }
+}
+
 void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
                       std::vector<TransportEndpoint>* transports) noexcept {
     if (layer != nullptr) {
@@ -359,6 +426,11 @@ DaqListLayout ConvertDaqList(const liba2l::DaqListDto& dto) {
     DaqListLayout layout;
     layout.number = dto.number;
     layout.event_fixed = dto.event_fixed;  // 事件通道反查用（批次10）
+    // 批次15（F1）：A2L 声明的 FIRST_PID 必须透传。此前它被丢弃，解码只能落回
+    // "PID == 列表号"，而列表号与其它列表的 PID 同属一个编号空间，撞上时会用
+    // 错列表的布局且**毫无报错**（docs L2225：绝对 ODT 号 = FIRST_PID + 相对
+    // ODT 号）。是否据此生成 PID 路由见 A2lBridge::CreateDaqLayout。
+    layout.first_pid = dto.first_pid;
     layout.odts.reserve(dto.predefined_odts.size());
     for (const liba2l::OdtDto& odt : dto.predefined_odts) {
         OdtLayout o;

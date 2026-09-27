@@ -71,7 +71,7 @@ constexpr std::uint64_t kArrayAddr = 0x8000;
 constexpr std::uint64_t kLinearAddr = 0x8020;
 constexpr std::uint64_t kByteAddr = 0x8010;
 constexpr std::uint8_t kAddrExt = 0x12;
-constexpr std::uint8_t kEpPid = 1;      ///< EPK == DAQ_LIST number
+constexpr std::uint8_t kEpPid = 1;      ///< PID = FIRST_PID + 相对 ODT 号（basic: 1）
 constexpr double kLinearPhys = 100.0;   ///< raw 200 * 0.5
 constexpr std::int64_t kBytePhys = 42;  ///< IDENTICAL：raw 42
 
