@@ -725,8 +725,17 @@ SymbolDto BuildCharacteristicSymbol(const a2l::Characteristic& c,
         rl != nullptr) {
         s.record_layout_kind = ClassifyRecordLayout(*rl);
         const a2l::A2lFncValue& fnc = rl->FncValues();
+        // FNC_VALUES 起始位置口径（XCPlite 对手端协议调试核证）：
+        //   * ASAP2/CANape 生态按 1 起始书写（`FNC_VALUES 1 UBYTE …`，
+        //     值从记录第 1 槽 = 元素偏移 0 开始）；
+        //   * 本项目 golden 语料按 0 起始书写（`FNC_VALUES 0 …`，同语义）。
+        // 两者都表示"值占据记录开头、无前置槽位"，元素类型因此可唯一证明；
+        // Position > 1（0 基 > 0）存在未知前置槽位，维持不可证拒绝。
+        const bool fnc_at_record_start =
+            fnc.Position == 0 || fnc.Position == 1;
         const bool provable_element =
-            fnc.DataType != a2l::A2lDataType::UNKNOWN && fnc.Position == 0 &&
+            fnc.DataType != a2l::A2lDataType::UNKNOWN &&
+            fnc_at_record_start &&
             fnc.AddressType == a2l::A2lAddressType::DIRECT &&
             s.record_layout_kind == RecordLayoutKindDto::kPlainScalar;
         if (provable_element &&
@@ -1589,7 +1598,19 @@ private:
                 //  见设计 §6.3；不得出现端口取 front 而子命令取全体的混合口径）
                 const a2l::xcp::XcpOnUdpIp& udp = udps.front();
                 dto->udp_port = udp.GetPort();
+                // HOST_NAME 与 ADDRESS 是 ASAP2 的两个不同关键字：上游把
+                // HOST_NAME 存进 host_name_、ADDRESS 存进 address_。
+                // XCPlite 等运行时生成器只写 `ADDRESS "IP"`（Vector 工具链
+                // 事实约定），若只取 GetHostName 则端点主机恒空（协议调试
+                // 对手端核证）。回退链：HOST_NAME → ADDRESS → IPV6，
+                // 保持"首个实例"口径不变，仅补齐同一实例内的取值来源。
                 dto->udp_host = udp.GetHostName();
+                if (dto->udp_host.empty()) {
+                    dto->udp_host = udp.GetAddress();
+                }
+                if (dto->udp_host.empty()) {
+                    dto->udp_host = udp.GetIpv6();
+                }
                 // 原码透传，不做 8/16/32 换算（换算归桥接层，§4.3）
                 dto->udp_packet_alignment =
                     static_cast<std::uint8_t>(udp.GetPacketAlignment());

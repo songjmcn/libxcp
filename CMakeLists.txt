@@ -171,6 +171,30 @@ if(LIBXCP_BUILD_A2L)
 endif()
 
 # ----------------------------------------------------------------------------
+# XCPlite 协议调试集成（code-plan/XCPlite_Slave_协议调试集成计划.md）
+#
+# 默认 OFF：不改变原构建。开启时把 thirdparty/XCPlite 作为子项目仅构建库
+# 目标（不建示例/测试/工具/安装），并在此后由 tests 子目录挂接测试 Slave
+# 可执行文件与 XCPlite 集成测试。不修改 XCPlite 任何源文件，全部配置通过
+# 其公开的 CMake 变量（CMP0077 正常变量）控制。
+# ----------------------------------------------------------------------------
+option(LIBXCP_BUILD_XCPLITE_SLAVE
+       "Build the XCPlite-based test slave and protocol-debug integration tests"
+       OFF)
+
+if(LIBXCP_BUILD_XCPLITE_SLAVE)
+  # default 配置含 A2L 运行时生成 + UDP/TCP 传输，满足协议调试需要
+  set(XCPLITE_CONFIGURATION "default")
+  set(XCPLITE_BUILD_EXAMPLES OFF)
+  set(XCPLITE_BUILD_TESTS OFF)
+  set(XCPLITE_BUILD_TOOLS OFF)
+  set(XCPLITE_BUILD_RUST_TOOLS OFF)
+  set(XCPLITE_BUILD_BPF_DEMO OFF)
+  set(XCPLITE_INSTALL OFF)
+  add_subdirectory(thirdparty/XCPlite)
+endif()
+
+# ----------------------------------------------------------------------------
 # 测试
 # ----------------------------------------------------------------------------
 if(LIBXCP_BUILD_TESTS)

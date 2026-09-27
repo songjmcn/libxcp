@@ -91,9 +91,17 @@ Bytes CommandCodec::EncodeGetCommModeInfo() const {
 
 Bytes CommandCodec::EncodeSetMta(AddressExtension extension,
                                  Address address) const {
+    // SET_MTA CRO（XCP 1.3 §7.5.1.10，Table CRO 布局）：
+    //   byte0=0xF6  byte1=MODE(本库恒 0=normal)  byte2=reserved
+    //   byte3=Address Extension  byte4..7=Address(32bit)
+    // 与 SHORT_UPLOAD 的地址域同构（ext@3/addr@4-7）。批次协议调试（XCPlite
+    // 对手端）核证：旧实现把 ext 放 byte2 且总长 7，真实 Slave 按规范回
+    // ERR_CMD_SYNTAX（XCPlite xcp.h CRO_SET_MTA_LEN=8, CRO_SET_MTA_EXT=byte3,
+    // CRO_SET_MTA_ADDR=dw[1]=byte4-7）。
     Bytes cto;
-    cto.reserve(7);
+    cto.reserve(8);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::SetMta));
+    cto.push_back(0x00U);  // MODE：0 = normal（Functional Mode 属后续里程碑）
     cto.push_back(0x00U);  // reserved
     cto.push_back(extension);
     WriteU32(cto, address);

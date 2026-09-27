@@ -92,3 +92,5 @@ __pycache__/
 
 # ---- 本地审计/批改工具脚本（历史 code-plan 记录引用，未纳入版本库；如改用 git 时需显式 add -f） ----
 scripts/
+# XCPlite protocol-debug slave run artifacts (A2L/AML per-test workdirs)
+xcplite_runs/

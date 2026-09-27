@@ -50,27 +50,29 @@ TEST(CommandCodecGolden, TwoByteCommands) {
 }
 
 // --------------------------------------------------------------------------
-// SET_MTA：地址按 Session Byte Order，扩展在 Byte 2
+// SET_MTA：XCP 1.3 CRO 布局 [F6][MODE][reserved][EXT@3][ADDR@4..7]（8 字节）
+// 与 SHORT_UPLOAD 地址域同构；XCPlite 对手端协议调试核证（旧 7 字节布局被
+// 真实 Slave 以 ERR_CMD_SYNTAX 拒绝）。
 // --------------------------------------------------------------------------
 
 TEST(CommandCodecGolden, SetMtaIntel) {
     const CommandCodec codec(ByteOrder::Intel);
-    // 地址 0x70012340, EXT=0x02 => [F6][00][02][40][23][01][70]
+    // 地址 0x70012340, EXT=0x02 => [F6][00][00][02][40][23][01][70]
     ExpectBytes(codec.EncodeSetMta(0x02, 0x70012340U),
-                {0xF6, 0x00, 0x02, 0x40, 0x23, 0x01, 0x70});
+                {0xF6, 0x00, 0x00, 0x02, 0x40, 0x23, 0x01, 0x70});
 }
 
 TEST(CommandCodecGolden, SetMtaMotorola) {
     const CommandCodec codec(ByteOrder::Motorola);
     // 同一地址在大端会话下 MSB 先出
     ExpectBytes(codec.EncodeSetMta(0x02, 0x70012340U),
-                {0xF6, 0x00, 0x02, 0x70, 0x01, 0x23, 0x40});
+                {0xF6, 0x00, 0x00, 0x02, 0x70, 0x01, 0x23, 0x40});
 }
 
 TEST(CommandCodecGolden, SetMtaZeroExtension) {
     const CommandCodec codec(ByteOrder::Intel);
     ExpectBytes(codec.EncodeSetMta(0x00, 0x00000060U),
-                {0xF6, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00});
+                {0xF6, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00});
 }
 
 // --------------------------------------------------------------------------
@@ -287,9 +289,10 @@ TEST(CommandCodecBoundary, DownloadRejectsEmptyAndOutOfRangeElements) {
 }
 
 TEST(CommandCodecBehavior, GoldenLengthsMatchMaxCtoEightLayout) {
-    // MAX_CTO=8 的典型 Slave：SET_MTA 与 SHORT_UPLOAD 恰好占满 8/7 字节
+    // MAX_CTO=8 的典型 Slave：SET_MTA 与 SHORT_UPLOAD 均为 8 字节（地址域
+    // 同构：ext@3、addr@4-7；XCPlite 对手端协议调试核证）
     const CommandCodec codec(ByteOrder::Intel);
-    EXPECT_EQ(codec.EncodeSetMta(0, 0).size(), 7U);
+    EXPECT_EQ(codec.EncodeSetMta(0, 0).size(), 8U);
     EXPECT_EQ(codec.EncodeShortUpload(1, 0, 0).size(), 8U);
     EXPECT_EQ(codec.EncodeConnect().size(), 2U);
     EXPECT_EQ(codec.EncodeUpload(1).size(), 2U);

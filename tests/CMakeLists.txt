@@ -66,6 +66,53 @@ include(GoogleTest)
 gtest_discover_tests(libxcp_tests DISCOVERY_TIMEOUT 60)
 
 # ----------------------------------------------------------------------------
+# XCPlite 协议调试集成测试（code-plan/XCPlite_Slave_协议调试集成计划.md）
+#
+# 仅 LIBXCP_BUILD_XCPLITE_SLAVE=ON 时构建：
+#   xcp_test_slave        —— 基于 XCPlite 的 Slave 独立进程（tests/xcp_test_slave/）
+#   XcpliteIntegration    —— 真实 UDP + 真实 Slave 的集成测试（子进程由夹具管理）
+# A2L 读取用例（xcplite_a2l_read_test.cpp）额外依赖桥接层，
+# 仅当 LIBXCP_BUILD_A2L 同时开启时编入。
+# ----------------------------------------------------------------------------
+if(LIBXCP_BUILD_XCPLITE_SLAVE)
+  add_subdirectory(xcp_test_slave)
+
+  add_executable(XcpliteIntegration
+          xcplite_slave_fixture.cpp
+          xcplite_protocol_test.cpp
+          xcplite_write_test.cpp)
+  target_compile_features(XcpliteIntegration PRIVATE cxx_std_20)
+  target_link_libraries(XcpliteIntegration PRIVATE
+          libxcp::libxcp
+          GTest::gtest
+          GTest::gtest_main)
+  # 夹具与共享类型头的搜索路径（tests/ 与 tests/xcp_test_slave/）
+  target_include_directories(XcpliteIntegration PRIVATE
+          ${CMAKE_CURRENT_SOURCE_DIR})
+  # Slave 可执行文件路径经 CMake 注入，禁止硬编码
+  target_compile_definitions(XcpliteIntegration PRIVATE
+          XCPLITE_SLAVE_EXECUTABLE="$<TARGET_FILE:xcp_test_slave>")
+  add_dependencies(XcpliteIntegration xcp_test_slave)
+  if(MSVC)
+    target_compile_options(XcpliteIntegration PRIVATE /utf-8)
+  endif()
+
+  # A2L 读取用例：依赖桥接层（libxcp::a2lbridge + 运行期 liba2l.dll）
+  if(LIBXCP_BUILD_A2L)
+    target_sources(XcpliteIntegration PRIVATE xcplite_a2l_read_test.cpp)
+    target_link_libraries(XcpliteIntegration PRIVATE libxcp::a2lbridge)
+    target_compile_definitions(XcpliteIntegration PRIVATE
+            LIBXCP_HAS_A2LBRIDGE=1)
+    add_custom_command(TARGET XcpliteIntegration POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:liba2l::liba2l>"
+                    "$<TARGET_FILE_DIR:XcpliteIntegration>")
+  endif()
+
+  gtest_discover_tests(XcpliteIntegration DISCOVERY_TIMEOUT 120)
+endif()
+
+# ----------------------------------------------------------------------------
 # A2lSmoke —— A2L 最小开发验证集（code-plan/A2L_CMake最小开发验证集_R4.md §5）
 #
 # 仅 LIBXCP_BUILD_A2L=ON 时构建；不依赖 GoogleTest（独立 main + 退出码）。

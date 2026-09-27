@@ -111,10 +111,12 @@ public:
             case CommandCode::Synch:
                 return Err(ErrorCode::CmdSynch);
             case CommandCode::SetMta:
-                if (packet.size() < 7U) {
+                // XCP 1.3 布局：[F6][MODE][rsv][EXT@3][ADDR@4..7]（8 字节，
+                // XCPlite 对手端协议调试核证）
+                if (packet.size() < 8U) {
                     return Err(ErrorCode::CmdSyntax);
                 }
-                m_mta_ = le32(packet.subspan(3, 4));
+                m_mta_ = le32(packet.subspan(4, 4));
                 return Res({});
             case CommandCode::ClearDaqList:
                 if (packet.size() < 4U) {
