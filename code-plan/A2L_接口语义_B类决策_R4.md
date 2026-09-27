@@ -67,11 +67,11 @@
 |---|---|---|---|---|
 | `UnsupportedArrayLayout` | B-2 | `InvalidLayout` | `Query` | `a2l_types.cpp` `CountElements`（extent=0 / 乘积溢出 / stride 不规则） |
 | `UnsupportedRecordLayout` | B-4 | **实际生效**：`UnsupportedDataType`（RL 未推导出元素宽） | `Query` / `Conversion` | `a2l_database_impl.cpp` `ByteSizeOf`；`compu_method_eval.cpp`（无固定宽度） |
-| ↑ 同上（预留判定器） | B-4/B-12 | `InvalidLayout`（Complex/Unknown）、`UnsupportedOperation`（AXIS_PTS） | `Layout` | `record_layout_impl.cpp` —— **当前无调用点**，接线延后（见设计 §6.3） |
-| `DynamicDaqNotImplemented` | B-5 | `UnsupportedOperation` | `Layout` | `a2l_bridge.cpp` `CreateDaqLayout` DYNAMIC 分支 |
-| `LayoutUnknown` | B-6 | `InvalidLayout`（整帧拒绝）；entry 无归属 → `symbol_name` 留空 + raw 原样 | `Layout` | `daq_layout_impl.cpp` `Decode`（头长/净荷长两处、空 symbol_name 分支） |
-| `UnsupportedCharacteristicOperation` | B-11 | `UnsupportedOperation`（多维整体读写）；类型未知时 `UnsupportedDataType` | `Query` | `a2l_database_impl.cpp` `ToPhysical`/`FromPhysical`（dimensions 非空） |
-| `UnsupportedStructuredType` | B-12 | **该路径尚不存在**——SDK 导出层未采集 STRUCTURE/INSTANCE，无读写入口 | — | `liba2l_export.cpp` grep `TypedefStructures/Instances` 0 命中；缺口见设计 §6.3 |
+| ↑ 同上（判定器） | B-4/B-12 | `InvalidLayout`（Complex）、`UnsupportedOperation`（AXIS_PTS） | `Layout` | **批次13 已接线**：`a2l_database_impl.cpp::GateExecutable()` 在 `ByteSizeOf/ToPhysical/FromPhysical` 三处 Resolve 之后调用 `record_layout_impl.cpp::CheckRecordLayoutExecutable`；SDK 未给版式类别（`kNotProvided`：无 DEPOSIT 或模块内查不到版式）时**不进判定器**，仍由上一行 B-3 宽度门拒绝 |
+| `DynamicDaqNotImplemented` | B-5 | `UnsupportedOperation` | `Layout` | `a2l_bridge.cpp` `CreateDaqLayout`/`CreateDaqLayoutFromLedger`/`CreateDaqLayoutFromEcuReadback` 三处 DYNAMIC 分支 |
+| `LayoutUnknown` | B-6 | `InvalidLayout`（整帧拒绝）；entry 无归属 → `symbol_name` 留空 + **`symbol_aliases` 留全候选** + raw 原样 | `Layout` | `daq_layout_impl.cpp` `Decode`（批次14 起：路由表缺失 / PID 无路由 / 同 PID 被两个 (daq,odt) 声称 / 头长与净荷长两处不符 / 空 symbol_name 分支） |
+| `UnsupportedCharacteristicOperation` | B-11 | `UnsupportedOperation`（多维整体读写）；类型未知时 `UnsupportedDataType` | `Query` | `a2l_database_impl.cpp` `ToPhysical`/`FromPhysical`（dimensions 非空）。**批次13 更新**：连续 VAL_BLK（RL 证元素类型 + MATRIX_DIM 证元素数）已可执行，走 `ByteSizeOf`/`ComputeElementAddress` 元素级通路；ASCII 经核证改判为"事实化拒绝"（上游无 `MAX_LENGTH`） |
+| `UnsupportedStructuredType` | B-12 | `UnsupportedOperation` | `Query` | **批次13 已落地（此前"无对应代码路径"）**：`IDoc::ListStructures`（ABI v4）采集 TYPEDEF_STRUCTURE/INSTANCE → `ConvertStructure` 映射为 `kind=Structure` 元数据符号 → `GateExecutable()` 第一道门显式拒绝读写（`SymbolKind::Structure` 分支）；`a2l_golden_test.cpp` `StructureMetadataOnly` 锁 ByteSizeOf/ToPhysical/FromPhysical 三处 |
 | `InvalidBitLayout` | B-9 | `InvalidLayout` | `Conversion` | `compu_method_eval.cpp`（`AnalyzeContiguousMask` 判空洞） |
 | `InvalidSearchPattern` | B-13 | `BadArgument`（空模式或 `max_count==0`） | `Query` | `a2l_database_impl.cpp` `Search` |
 | `ModuleRequired` | B-17 | `AmbiguousName` | `Load`（门面）/ `Query` | `a2l_dto_map.cpp` `MapSdkError(kAmbiguousName)` + `if_data_xcp_impl.cpp` 歧义分支 |
@@ -79,7 +79,9 @@
 | `TypeMismatch` | B-14 | `RawSizeMismatch`（raw 宽 ≠ 元素宽） | `Conversion` | `compu_method_eval.cpp`（`raw.size() != element_size_bytes`） |
 
 > 约束（归并不弱化）：上表**只影响码名，不影响拒绝语义本身**。§2 各行要求的"明确拒绝、不猜测、不静默降级"必须逐条成立。
-> 两点如实登记：① B-12 的具名失败在当前实现里**没有对应代码路径**（元数据未采集，不是"已静默放行"）；
-> ② 若将来 UI 需按类别分流（结构体与曲线不同提示），另立批次补具名码并同步改测试断言。
+> 批次13/14 状态更新：原登记的两项事实已闭合——① B-12 的具名失败**已有代码路径**（`ListStructures` 采集 + `GateExecutable` 拒绝，见上表）；② `record_layout_impl.cpp` 的判定器**已接线**（不再是"已写未用"）。
+> 仍成立的一条：若将来 UI 需按类别分流（结构体与曲线给不同提示），另立批次补具名码并同步改测试断言。
+>
+> 批次14 追加（B-6/B-16 落地后的归并补记）：`DaqLayoutSnapshot` 的三种来源（A2L PREDEFINED / 本端账本 / ECU 回读）共用同一个 `InvalidLayout`+`Layout` 归并码——**"账本缺失""PID 无路由""同 PID 被两个 (daq,odt) 声称"三种成因不拆码**，靠 `Error.message` 区分（B-19：message 仅展示，业务只判码）；B-16 的 DAQ 三项比对（识别字段 / 地址扩展 / ODT Entry 粒度）一律 `Error`，因为它们决定 PID 解释与对齐，错一项即整批 DTO 系统性错位。运行时字段为 `nullopt`（未查询）时**跳过比对**，不引入"未知错误码"第 4 类。
 
 

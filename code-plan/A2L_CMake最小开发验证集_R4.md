@@ -104,3 +104,27 @@ endif()
 7. `LIBXCP_BUILD_A2L=OFF` 时原工程构建不变。
 
 完整 B 类黄金测试仍保留在 `A2L_接口语义_B类决策_R4.md`，但不要求在最小 CMake PoC 一次全部完成。
+
+## 5.1 当前门禁基线（批次13/14 落地后，2026-09-27 实测）
+
+| 门禁 | 命令 | 基线 |
+|---|---|---|
+| G1–G6（A2L ON） | `cmake -B cmake-build-release -S . -DLIBXCP_BUILD_A2L=ON -DLIBXCP_LIBA2L_ROOT=<prepared>/msvc-x64-release` → `cmake --build --config Release` → `ctest -C Release` | **346/346 通过**（1 项按设计 SKIPPED）；条目含 `a2l_gen`、`A2lSmoke`、`A2lGolden`、`A2lE2E`、`a2l_perf_gen`、`ParseLargeFileUnderBudget`、`A2lIsolation` |
+| **G7（A2L OFF）** | 同一 build 目录切 `-DLIBXCP_BUILD_A2L=OFF` 重新配置 + 构建 + `ctest` | **339/339 通过、构建 0 error**；OFF 不含任何 A2L 目标 |
+| P9 隔离（configure 期） | `a2lbridge/CMakeLists.txt` 的 `file(GLOB)+MATCHES` 断言 | 命中 0（配置即失败） |
+| **T10 隔离自动化（ctest 期）** | `add_test(NAME A2lIsolation COMMAND cmake -DA2L_BRIDGE_DIR=… -DLIBXCP_ROOT_DIR=… -P tests/a2l_isolation_check.cmake)` | 命中 0。**为什么两条都要**：P9 只在 configure 期生效，缓存复用会跳过；`A2lIsolation` 让"跑测试"时也能复现同一断言（S1 桥接层禁含 `#include <a2l/`，S2 主树禁引用 `liba2l/a2lbridge/calmcar::xcp::a2l`，大小写敏感） |
+| clang-format | `clang-format --dry-run -Werror --style=file` 覆盖全部改动/新增 C++ 文件 | 违规 0 |
+| T9 性能基线 | `ctest -R ParseLargeFileUnderBudget`（fixture `a2l_perf_gen` 生成 5 MB 合成 A2L，只落 build tree） | 实测 **264 ms** → 预算锁 `A2L_PERF_BUDGET_MS=900`（3× 取整）。**只记基线不设 SLA**；换机器/换盘需重标 |
+
+## 5.2 Debug 侧核对（A-10"cfg 同侧"约定，批次13 起双侧可执行）
+
+```powershell
+# Release 与 Debug 各产一份 prepared root，主树按所选 CMAKE_BUILD_TYPE 指到同 cfg
+pwsh -File thirdparty/a2l-sdk/build-sdk.ps1 -BoostRoot <boost> -Config Release -OutRoot build/liba2l-prepared
+pwsh -File thirdparty/a2l-sdk/build-sdk.ps1 -BoostRoot <boost> -Config Debug   -OutRoot build/liba2l-prepared
+# 产物：build/liba2l-prepared/msvc-x64-release/{bin,lib,include} 与 msvc-x64-debug/{bin,lib,include}
+```
+
+* 两侧 `liba2l.dll / liba2l.lib / libxcp_a2lbridge.lib` 与头树各自独立，**不得交叉引用**（Debug 主树指 Release root 即违反 A-10）。
+* 实测两侧头树里的 `kLibA2lAbiVersion` 均为 4 → ABI 常量与所选 cfg 同侧一致，A-10 由"人工核对约定"升级为"双侧产物均在仓库内可核"。
+* 脚本本身无需为 Debug 改动（`-Config` 参数已支持，Boost 侧 `-mt-gd-` 静态库 44 个齐备）。
