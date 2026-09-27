@@ -26,7 +26,7 @@
 | **B-9 位字段** | BIT_MASK 仅用于值提取；DAQ BIT_OFFSET 仅用于 ODT entry 定位；ERROR_MASK 独立保存。首版只执行连续 BIT_MASK，不由 ERROR_MASK 自动推导 valid | 冲突、越界、非连续 mask → `InvalidBitLayout` |
 | **B-10 单位** | 优先 PHYS_UNIT；为空时解析 UNIT_REF；保存 SI exponent 元数据但不自动单位换算；冲突时显示 PHYS_UNIT 并 warning | 悬空 UNIT_REF 不阻断 raw 读取 |
 | **B-11 CHARACTERISTIC** | 显式五型：Value、Curve、Map、ValBlk、Ascii；首版执行 Value、连续 ValBlk、明确长度 Ascii；Curve/Map 只查询轴与布局元数据 | 不支持操作 → `UnsupportedCharacteristicOperation`；引用缺失 warning |
-| **B-12 STRUCTURE** | 首版识别并保存 STRUCTURE/INSTANCE/TYPEDEF 元数据，但不展开、不读写；后续独立展开器按 AddressOffset 生成 qualified leaf 并检测递归 | `UnsupportedStructuredType`，不得静默当 byte array |
+| **B-12 STRUCTURE** | 识别并保存 STRUCTURE/INSTANCE/TYPEDEF 元数据；**批次18 起独立展开器已落地**（`a2lbridge/src/structure_layout.cpp::BuildStructureLeaves` + SDK v6 TYPEDEF 标量事实，CalSeg TYPEDEF_CHARACTERISTIC 并入）：按 AddressOffset 生成 qualified leaf（四形态+结构数组逐元素），环/越界/不可证 → `InvalidLayout/Load` 告警化，不猜测；**本体整块语义不变** | 本体：`UnsupportedStructuredType`，不得静默当 byte array；叶子路径按标量语义 Find/寻址/换算/读写（见 R4.9 与批次18 记录 §4） |
 | **B-13 Search** | 规范键 `module::symbol`；精确 Find 大小写敏感；未限定 module 仅全库唯一时成功；Search 可大小写无关并支持 `* ?`，稳定排序后截断 | 歧义 → `AmbiguousName`；非法模式 → `InvalidSearchPattern` |
 | **B-14 物理值** | `PhysicalValue = variant<int64_t,uint64_t,double,string,bool>`；IDENTICAL 整数保精度，数值换算用 double，TAB_VERB 用 string；raw bytes 独立保留 | 精度损失或类型错误 → `PrecisionLoss/TypeMismatch` |
 | **B-15 逆换算越界** | 默认严格 Reject；未来可增加显式 ClampPolicy，但默认仍拒绝并必须返回 clamped 状态 | 越界、NaN/Inf、不可逆 → 不产生 raw、不下发 ECU |

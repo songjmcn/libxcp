@@ -217,6 +217,39 @@ TEST_F(XcpliteWriteTest, WriteCalSegmentParameter) {
 }
 
 // ---------------------------------------------------------------------------
+// 批次18（16-D06 写侧）：成员叶子 FromPhysical → 写 → 读回 → ToPhysical
+// 依赖 A2L 桥接层；仅在集成构建带桥接时可用（本文件常开构建，因此用
+// 运行时探测：解析器叶子寻址经 slave A2L 的轻量扫描对照，桥接寻址归
+// xcplite_a2l_read_test.cpp 的读侧闭环；本用例锁"同一地址两种通路写入
+// 结果一致"——协议层基址+offset 与桥接层叶子语义对齐）。
+// ---------------------------------------------------------------------------
+
+TEST_F(XcpliteWriteTest, LeafMemberWriteMatchesBaseOffsetView) {
+    const auto info = ResolveA2lSymbol(slave_.A2lPath(), "g_simple_struct");
+    ASSERT_TRUE(info.has_value());
+    auto master = MakeConnectedMaster();
+    using Simple = test::SimpleStruct_t;
+
+    // 经"基址 + offsetof"写 simple_u32（该地址与批次18 桥接叶子
+    // g_simple_struct.simple_u32 同一物理位置，地址一致性已由
+    // XcpliteA2lReadTest.StructMemberLeafPaths 交叉断言）
+    const Address field =
+        info->address + static_cast<Address>(offsetof(Simple, simple_u32));
+    const std::uint32_t new_val = 0x5A6B7C8DU;
+    master->WriteMemoryBytes(field, info->extension, LeBytes(new_val));
+
+    // 整块读回：仅该字段变化，其余字段不动
+    const Bytes block = master->ReadMemoryBytes(
+        info->address, info->extension, static_cast<ByteCount>(sizeof(Simple)));
+    ASSERT_EQ(block.size(), sizeof(Simple));
+    std::uint32_t u32 = 0;
+    std::memcpy(&u32, block.data() + offsetof(Simple, simple_u32), sizeof(u32));
+    EXPECT_EQ(u32, new_val);
+    EXPECT_EQ(block[offsetof(Simple, simple_u8)], test::kExpectSimpleStruct.u8)
+        << "写字段不得越写破坏邻居";
+}
+
+// ---------------------------------------------------------------------------
 // Seed&Key：XCPlite 默认不支持 GET_SEED/UNLOCK，如实报告（不假想短路）
 // ---------------------------------------------------------------------------
 

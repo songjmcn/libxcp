@@ -63,13 +63,15 @@ inline constexpr SimpleStructExpectT kExpectStructArray[3] = {
 
 /**
  * @brief 嵌套结构体（覆盖"结构体嵌套结构体 + 数组嵌套结构体"场景）
- * @details 同时包含单个结构体成员与结构体数组成员。
+ * @details 同时包含标量数组成员、单个结构体成员与结构体数组成员，
+ *          对齐批次16 四形态：标量 / 固定数组 / 嵌套结构 / 数组嵌结构体。
  */
 struct OuterStruct_t {
     std::uint8_t outer_u8;           ///< 标量字段
     std::int16_t outer_i16;          ///< 标量字段（含对齐填充）
     SimpleStruct_t nested_struct;    ///< 结构体嵌套结构体
     SimpleStruct_t nested_array[2];  ///< 结构体内的结构体数组
+    std::uint8_t outer_arr[4];       ///< 结构体内的标量数组（成员数组形态）
 };
 
 /// @brief OuterStruct_t 的期望初始值（逐字段，避免 padding 参与比较）
@@ -78,13 +80,15 @@ struct OuterStructExpectT {
     std::int16_t outer_i16;               ///< 期望 outer_i16
     SimpleStructExpectT nested_struct;    ///< 期望 nested_struct
     SimpleStructExpectT nested_array[2];  ///< 期望 nested_array
+    std::uint8_t outer_arr[4];            ///< 期望 outer_arr
 };
 
 inline constexpr OuterStructExpectT kExpectOuter = {
     .outer_u8 = 99,
     .outer_i16 = -777,
     .nested_struct = {5, -50, 0xABCDU},
-    .nested_array = {{6, -60, 0x1111U}, {7, -70, 0x2222U}}};
+    .nested_array = {{6, -60, 0x1111U}, {7, -70, 0x2222U}},
+    .outer_arr = {11, 22, 33, 44}};
 
 /// @brief 字节数组 g_array_u8 长度
 inline constexpr std::size_t kArrayU8Size = 8;

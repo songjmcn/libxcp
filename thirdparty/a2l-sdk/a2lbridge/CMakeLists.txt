@@ -17,6 +17,7 @@ add_library(libxcp_a2lbridge STATIC
     src/if_data_xcp_impl.cpp
     src/daq_layout_impl.cpp
     src/record_layout_impl.cpp
+    src/structure_layout.cpp
     src/a2l_bridge.cpp
 )
 

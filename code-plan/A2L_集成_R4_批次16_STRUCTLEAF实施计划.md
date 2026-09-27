@@ -1,6 +1,6 @@
 # A2L 集成 R4 批次16修改计划 —— STRUCTURE/INSTANCE Leaf 展开与成员读写
 
-> 状态：**已确认范围，等待真实脱敏 A2L 后实施**
+> 状态：**已实施完成（由批次18 接管闭合，见变更记录 B16-P3 与 `XCPlite_Slave_协议调试_实施记录_批次18_结构叶子展开.md`）**
 >
 > 来源：批次15 D5 决策、设计文档 §4.1/§4.4/§6.3，以及批次13留下的 B-12 首版边界。
 >
@@ -66,6 +66,8 @@ A2L TYPEDEF_MEASUREMENT / TYPEDEF_STRUCTURE / INSTANCE
 | 16-0004 失败样本先行 | 对真实语料和合成 fixture 先建立至少一条“当前首版必须失败”的叶子用例，防止实现后补永真断言 | 红灯日志保留在实施记录 |
 
 > 若 16-0001 的真实 A2L 仍未提供，本批停止在核证阶段，不使用自造语义替代真实语料；可先完成不依赖语料的 DTO/API 设计，但不得标记 leaf 执行能力完成。
+>
+> **✅ 2026-07-29 门已解除**：批次17 测试 Slave 运行时生成的 `xcp_test_slave.a2l`（纯测试符号，天然脱敏）入库为真实语料 `tests/data/a2l/xcplite_structleaf_corpus.a2l`；本批全部范围由批次18 实施完成（见 B16-P3）。
 
 ### 16-A SDK 类型事实导出（ABI v6）
 
@@ -146,6 +148,8 @@ A2L TYPEDEF_MEASUREMENT / TYPEDEF_STRUCTURE / INSTANCE
 
 ## 6. DoD
 
+> **实现状态（批次18 闭合）**：第 1–6 条全部达成（证据见批次18 实施记录 §0/§5 门禁与 §6 映射表）；第 7 条设计文档回写以 **R4.9 行**落地（§4.1/§4.4 处为历史草案块，按 R4.6-⑧ 字段名锚点纪律不回改正文），实施记录由 `XCPlite_Slave_协议调试_实施记录_批次18_结构叶子展开.md` 承担。
+
 1. 真实脱敏 A2L 能成功导出 TYPEDEF_MEASUREMENT、结构定义和实例地址事实。
 2. 标量、固定数组、嵌套结构和嵌套数组叶子路径可查询；地址、尺寸、extension 和索引正确。
 3. 可证叶子完成读写和物理换算闭环；不可证路径全部结构化拒绝，不静默返回 0 或整块字节。
@@ -157,7 +161,7 @@ A2L TYPEDEF_MEASUREMENT / TYPEDEF_STRUCTURE / INSTANCE
 ## 7. 交付物
 
 - 本计划：`A2L_集成_R4_批次16_STRUCTLEAF实施计划.md`
-- 实施记录：`A2L_集成_R4_实施记录_批次16_STRUCTLEAF.md`
+- 实施记录：`A2L_集成_R4_实施记录_批次16_STRUCTLEAF.md`（**实际由批次18 记录承担**：`XCPlite_Slave_协议调试_实施记录_批次18_结构叶子展开.md`）
 - ABI v6 Release/Debug prepared root
 - 真实脱敏 A2L fixture 与生成器/回归测试
 - 设计文档与 B 类语义文档更新
@@ -168,5 +172,6 @@ A2L TYPEDEF_MEASUREMENT / TYPEDEF_STRUCTURE / INSTANCE
 |---|---|
 | B16-P1 | 根据批次15 D5，确定 STRUCTURE/INSTANCE leaf 完整闭环范围：标量、固定数组、嵌套结构、递归环检测、地址/尺寸/换算/读写、不可证路径明确拒绝；确定 SDK 导出事实、桥接层递归解析、ABI v6、真实 A2L 前置核证和 ON/OFF 双侧门禁。 |
 | B16-P2 | 用户确认当前没有真实脱敏 A2L；按计划 §3 的 16-0001 硬门暂停代码实现，不用自造语义替代真实上游字段。 |
+| B16-P3 | **语料门解除并移交批次18 实施（2026-07-29）**：批次17 对手端运行时 A2L 入库为真实语料；批次18 完成 16-A/B/C/D 全部范围（SDK v6、`structure_layout.cpp` 展开器、真实语料 42 符号 0 告警、负例 6 形态告警化、E2E SKIP→PASS、ON 377/OFF 352）。唯一有意延后项 = 16-D08 DAQ 叶子兼容（随批次20）。本计划就此关闭，不再独立实施。 |
 
 (End of file)

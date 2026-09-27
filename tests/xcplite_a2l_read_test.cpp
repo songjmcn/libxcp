@@ -219,10 +219,87 @@ TEST_F(XcpliteA2lReadTest, StructInstanceBaseRead) {
     EXPECT_EQ(u32, test::kExpectSimpleStruct.u32);
 }
 
-TEST_F(XcpliteA2lReadTest, StructMemberLeafPathsPendingBatch16) {
-    GTEST_SKIP() << "叶子路径（MODULE::INSTANCE.member / 嵌套 / 数组元素）解析"
-                    "属批次16 STRUCTLEAF，未完成前不得伪测；协议层原字节读已由 "
-                    "XcpliteProtocolTest 覆盖";
+TEST_F(XcpliteA2lReadTest, StructMemberLeafPaths) {
+    auto loaded = a2l::A2lBridge::Load(slave_.A2lPath().string());
+    ASSERT_TRUE(loaded.HasValue()) << loaded.ErrorInfo().message;
+    const a2l::IA2lDatabase* db = loaded.Value()->Database();
+    auto master = MakeConnectedMaster();
+
+    using Simple = test::SimpleStruct_t;
+    using Outer = test::OuterStruct_t;
+
+    /// @brief 叶子：Find → 交叉校验地址（本体基址 + offsetof）→ 读 → 比对
+    struct Case {
+        std::string leaf;      ///< 限定叶子路径
+        std::string base;      ///< 本体（INSTANCE）符号名
+        std::size_t offset;    ///< offsetof 交叉校验基准
+        std::size_t size;      ///< 元素字节宽
+        std::uint64_t expect;  ///< 期望值（无符号位模式，小端）
+    };
+    const std::vector<Case> cases = {
+        {"g_simple_struct.simple_i16", "g_simple_struct",
+         offsetof(Simple, simple_i16), 2,
+         static_cast<std::uint16_t>(test::kExpectSimpleStruct.i16)},
+        {"g_simple_struct.simple_u32", "g_simple_struct",
+         offsetof(Simple, simple_u32), 4, test::kExpectSimpleStruct.u32},
+        {"g_outer.nested_struct.simple_u32", "g_outer",
+         offsetof(Outer, nested_struct) + offsetof(Simple, simple_u32), 4,
+         test::kExpectOuter.nested_struct.u32},
+        {"g_outer.nested_array[1].simple_i16", "g_outer",
+         offsetof(Outer, nested_array) + sizeof(Simple) +
+             offsetof(Simple, simple_i16),
+         2, static_cast<std::uint16_t>(test::kExpectOuter.nested_array[1].i16)},
+        {"g_struct_array[2].simple_u8", "g_struct_array",
+         2 * sizeof(Simple) + offsetof(Simple, simple_u8), 1,
+         test::kExpectStructArray[2].u8},
+    };
+
+    for (const Case& c : cases) {
+        const auto leaf = db->Find(Qualified(c.leaf));
+        ASSERT_TRUE(leaf.HasValue())
+            << "Find(" << c.leaf << ") 失败: " << leaf.ErrorInfo().message;
+        EXPECT_EQ(leaf.Value().element_size_bytes, c.size) << c.leaf;
+        EXPECT_EQ(leaf.Value().address_extension, 0x01) << c.leaf;
+        // 交叉校验①：叶子地址 = 本体地址 + offsetof（C++ 布局为权威）
+        const auto base = db->Find(Qualified(c.base));
+        ASSERT_TRUE(base.HasValue()) << c.base;
+        EXPECT_EQ(leaf.Value().xcp_address, base.Value().xcp_address + c.offset)
+            << "叶子地址与 offsetof 交叉校验不符: " << c.leaf;
+        // 交叉校验②：真实 ECU 读回 = 期望值
+        const Bytes raw = master->ReadMemoryBytes(
+            leaf.Value().xcp_address, leaf.Value().address_extension, c.size);
+        ASSERT_EQ(raw.size(), c.size) << c.leaf;
+        std::uint64_t got = 0;
+        for (std::size_t b = 0; b < c.size; ++b) {
+            got |= static_cast<std::uint64_t>(raw[b]) << (8U * b);
+        }
+        const std::uint64_t mask =
+            (c.size >= 8) ? ~0ULL : ((1ULL << (8U * c.size)) - 1ULL);
+        EXPECT_EQ(got & mask, c.expect & mask) << c.leaf;
+    }
+
+    // 成员标量数组（四形态之"固定数组"）：整体尺寸 + 元素地址推进 + 读值
+    const auto arr = db->Find(Qualified("g_outer.outer_arr"));
+    ASSERT_TRUE(arr.HasValue()) << arr.ErrorInfo().message;
+    const auto arr_size = db->ByteSizeOf(Qualified("g_outer.outer_arr"));
+    ASSERT_TRUE(arr_size.HasValue()) << arr_size.ErrorInfo().message;
+    EXPECT_EQ(arr_size.Value(), 4u);
+    const auto elem2 = a2l::ComputeElementAddress(
+        arr.Value(), 2, a2l::AddressGranularity::Byte);
+    ASSERT_TRUE(elem2.HasValue()) << elem2.ErrorInfo().message;
+    EXPECT_EQ(elem2.Value(), arr.Value().xcp_address + 2u);
+    const Bytes e2 = master->ReadMemoryBytes(elem2.Value(),
+                                             arr.Value().address_extension, 1);
+    ASSERT_EQ(e2.size(), 1u);
+    EXPECT_EQ(e2[0], test::kExpectOuter.outer_arr[2]);
+
+    // 换算通路：成员叶子按 TYPEDEF 的 COMPU（NO_COMPU → IDENTICAL）换算
+    const auto phys = db->ToPhysical(Qualified("g_simple_struct.simple_u32"),
+                                     Bytes{0x78U, 0x56U, 0x34U, 0x12U});
+    ASSERT_TRUE(phys.HasValue()) << phys.ErrorInfo().message;
+    ASSERT_TRUE(std::holds_alternative<std::int64_t>(phys.Value()));
+    EXPECT_EQ(std::get<std::int64_t>(phys.Value()),
+              static_cast<std::int64_t>(test::kExpectSimpleStruct.u32));
 }
 
 // ---------------------------------------------------------------------------

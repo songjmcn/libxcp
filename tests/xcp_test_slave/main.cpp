@@ -76,11 +76,15 @@ OuterStruct_t g_outer = {
     .nested_struct = {kExpectOuter.nested_struct.u8,
                       kExpectOuter.nested_struct.i16,
                       kExpectOuter.nested_struct.u32},
-    .nested_array = {
-        {kExpectOuter.nested_array[0].u8, kExpectOuter.nested_array[0].i16,
-         kExpectOuter.nested_array[0].u32},
-        {kExpectOuter.nested_array[1].u8, kExpectOuter.nested_array[1].i16,
-         kExpectOuter.nested_array[1].u32}}};  ///< 嵌套结构体
+    .nested_array = {{kExpectOuter.nested_array[0].u8,
+                      kExpectOuter.nested_array[0].i16,
+                      kExpectOuter.nested_array[0].u32},
+                     {kExpectOuter.nested_array[1].u8,
+                      kExpectOuter.nested_array[1].i16,
+                      kExpectOuter.nested_array[1].u32}},
+    .outer_arr = {kExpectOuter.outer_arr[0], kExpectOuter.outer_arr[1],
+                  kExpectOuter.outer_arr[2],
+                  kExpectOuter.outer_arr[3]}};  ///< 嵌套结构体
 
 SimpleStruct_t g_struct_array[3] = {
     {kExpectStructArray[0].u8, kExpectStructArray[0].i16,
@@ -195,6 +199,9 @@ int main(int argc, char** argv) {
     A2lTypedefMeasurementComponent(outer_i16, "Outer word field");
     A2lTypedefComponent(nested_struct, SimpleStruct_t, 1);
     A2lTypedefComponent(nested_array, SimpleStruct_t, 2);
+    // 成员标量数组（批次16 四形态之"固定数组"；生成 M_outer_arr +
+    // STRUCTURE_COMPONENT ... MATRIX_DIM 4）
+    A2lTypedefMeasurementArrayComponent(outer_arr, "Outer scalar array");
     A2lTypedefEnd();
 
     // --- 基本标量测量 ---

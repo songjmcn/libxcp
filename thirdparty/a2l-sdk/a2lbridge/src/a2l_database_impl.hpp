@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "a2l_dto_map.hpp"
@@ -31,15 +32,21 @@ public:
     /// @param structs STRUCTURE/INSTANCE 元数据快照（批次13，B-12）
     /// @param record_layouts 规范键 → RECORD_LAYOUT 元数据（批次13 接线；
     ///        仅 SDK 给出了版式类别的 CHARACTERISTIC 才有项）
+    /// @param leaf_symbols 结构体成员叶子 SymbolInfo（批次18，STRUCTLEAF；
+    ///        name 为 "instance.member[.member][[idx]]" 限定路径）
+    /// @param leaf_warnings 叶子解析产生的不可证拒绝告警（16-B，随快照发布）
     A2lDatabaseImpl(
         std::vector<liba2l::SymbolDto> dtos,
         std::vector<liba2l::StructInfoDto> structs,
-        std::unordered_map<std::string, RecordLayoutInfo> record_layouts);
+        std::unordered_map<std::string, RecordLayoutInfo> record_layouts,
+        std::vector<SymbolInfo> leaf_symbols,
+        std::vector<LoadWarning> leaf_warnings);
 
     /// @brief 加载期被放弃的事实（批次15，F6：同名冲突跳过的结构体等）
     /// @details 门面 A2lBridge::ListLoadWarnings() 在此基础上再补自己的告警
     ///          （如 DAQ 列表未声明 FIRST_PID 的回退提示）。
-    [[nodiscard]] const std::vector<LoadWarning>& LoadWarnings() const noexcept {
+    [[nodiscard]] const std::vector<LoadWarning>& LoadWarnings()
+        const noexcept {
         return m_load_warnings_;
     }
 
@@ -114,6 +121,10 @@ private:
     std::unordered_map<std::uint64_t, std::vector<std::string>> m_addr_to_all_;
     /// @brief 规范键 → RECORD_LAYOUT 元数据（批次13；无类别的符号不在此表）
     std::unordered_map<std::string, RecordLayoutInfo> m_record_layouts_;
+    /// @brief 结构体叶子在 m_symbols_ 中的位置集合（批次18）：地址反查表
+    ///        **排除**这些项，保持既有 FindByAddress/aliases 行为不变
+    ///        （叶子的归属检索是批次20 DAQ 成员路由的前置，另行接线）
+    std::unordered_set<std::size_t> m_leaf_positions_;
 };
 
 }  // namespace calmcar::xcp::a2l::detail

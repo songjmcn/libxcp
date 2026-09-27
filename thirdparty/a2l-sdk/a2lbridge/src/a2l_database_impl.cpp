@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -83,9 +84,14 @@ namespace detail {
 A2lDatabaseImpl::A2lDatabaseImpl(
     std::vector<liba2l::SymbolDto> dtos,
     std::vector<liba2l::StructInfoDto> structs,
-    std::unordered_map<std::string, RecordLayoutInfo> record_layouts) {
+    std::unordered_map<std::string, RecordLayoutInfo> record_layouts,
+    std::vector<SymbolInfo> leaf_symbols,
+    std::vector<LoadWarning> leaf_warnings) {
     m_record_layouts_ = std::move(record_layouts);
-    m_symbols_.reserve(dtos.size() + structs.size());
+    // 批次18（16-B08）：resolver 的不可证拒绝告警并入加载告警清单
+    // （同一 F6 纪律："某个事实被放弃了"必须可见）
+    m_load_warnings_ = std::move(leaf_warnings);
+    m_symbols_.reserve(dtos.size() + structs.size() + leaf_symbols.size());
     for (const liba2l::SymbolDto& dto : dtos) {
         SymbolInfo info = ConvertSymbol(dto);
         const std::string key = MakeQualifiedKey(info.module_name, info.name);
@@ -116,6 +122,28 @@ A2lDatabaseImpl::A2lDatabaseImpl(
         ++m_bare_counts_[ToLower(info.name)];
         m_symbols_.push_back(std::move(info));
     }
+    // 批次18（16-B08）：结构体成员叶子作为"限定路径符号"并入同一快照。
+    // 与本体（STRUCTURE/INSTANCE 元数据）互不覆盖：同名冲突按 B-13 保留
+    // 既有符号并告警跳过叶子；裸名规则不受影响（叶子 name 含 "."/全路径，
+    // 只有完整限定路径或 module:: 前缀才命中，禁止跨结构猜测 16-C01）。
+    std::unordered_set<std::string> leaf_keys;
+    for (SymbolInfo& leaf : leaf_symbols) {
+        const std::string key = MakeQualifiedKey(leaf.module_name, leaf.name);
+        if (m_index_.find(key) != m_index_.end()) {
+            LoadWarning warning;
+            warning.code = ErrorCode::AmbiguousName;
+            warning.phase = Phase::Load;
+            warning.subject = key;
+            warning.message =
+                "STRUCTLEAF 路径与已有符号同名，按 B-13 保留后者、跳过叶子";
+            m_load_warnings_.push_back(std::move(warning));
+            continue;
+        }
+        m_index_[key] = m_symbols_.size();
+        ++m_bare_counts_[ToLower(leaf.name)];
+        leaf_keys.insert(key);
+        m_symbols_.push_back(std::move(leaf));
+    }
     // 稳定排序：按全限定名字典序（Search 输出顺序承诺，B-13）
     std::sort(m_symbols_.begin(), m_symbols_.end(),
               [](const SymbolInfo& a, const SymbolInfo& b) {
@@ -126,8 +154,12 @@ A2lDatabaseImpl::A2lDatabaseImpl(
     m_bare_counts_.clear();
     for (std::size_t i = 0; i < m_symbols_.size(); ++i) {
         const SymbolInfo& s = m_symbols_[i];
-        m_index_[MakeQualifiedKey(s.module_name, s.name)] = i;
+        const std::string key = MakeQualifiedKey(s.module_name, s.name);
+        m_index_[key] = i;
         ++m_bare_counts_[ToLower(s.name)];
+        if (leaf_keys.find(key) != leaf_keys.end()) {
+            m_leaf_positions_.insert(i);
+        }
     }
 }
 
@@ -135,7 +167,13 @@ void A2lDatabaseImpl::BuildAddressIndex() {
     std::unordered_map<std::uint64_t, std::string> first;
     std::vector<std::uint64_t> ambiguous;
     std::unordered_map<std::uint64_t, std::vector<std::string>> all;
-    for (const SymbolInfo& s : m_symbols_) {
+    for (std::size_t i = 0; i < m_symbols_.size(); ++i) {
+        const SymbolInfo& s = m_symbols_[i];
+        // 批次18：叶子不参与基址反查（保持既有 FindByAddress/aliases 行为；
+        // DAQ 成员归属检索到批次20 再接线）
+        if (m_leaf_positions_.find(i) != m_leaf_positions_.end()) {
+            continue;
+        }
         // 批次13（B-12）：STRUCTURE/INSTANCE 不参与基址反查——它们不可寻址
         // （成员不展开），进入反查表只会让 DAQ entry 归属到一个无法读写的符号。
         if (s.kind == SymbolKind::Structure) {
@@ -337,9 +375,12 @@ Result<SymbolInfo> A2lDatabaseImpl::Resolve(std::string_view name) const {
 std::unique_ptr<A2lDatabaseImpl> MakeDatabase(
     std::vector<liba2l::SymbolDto> dtos,
     std::vector<liba2l::StructInfoDto> structs,
-    std::unordered_map<std::string, RecordLayoutInfo> record_layouts) {
+    std::unordered_map<std::string, RecordLayoutInfo> record_layouts,
+    std::vector<SymbolInfo> leaf_symbols,
+    std::vector<LoadWarning> leaf_warnings) {
     auto db = std::make_unique<A2lDatabaseImpl>(
-        std::move(dtos), std::move(structs), std::move(record_layouts));
+        std::move(dtos), std::move(structs), std::move(record_layouts),
+        std::move(leaf_symbols), std::move(leaf_warnings));
     db->BuildAddressIndex();
     return db;
 }
