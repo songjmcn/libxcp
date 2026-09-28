@@ -80,13 +80,15 @@ GET_SEED（含分段）→ 算法回调 → UNLOCK → 受保护写 → 再连�
 
 ## 4. 批次21 —— 工程性收口与跨平台（可拆分穿插）
 
+> ✅ **批次21 完成（2026-07-31）**：21-2 GET_ID→UPLOAD 拉 A2L 四件套+E2E 逐字节全等（提交 8d912e9，全量 ctest 394/394）；21-3 run 目录治理+端口基数（fixture +35 行，随本收口提交）；21-4 调试指南 docs/XCPlite_对手端协议调试指南.md；21-1 POSIX 实跑受环境阻塞已记录（WSL Wsl/E_ACCESSDENIED，恢复路径=真实 Linux/macOS runner）；21-5 SDK Debug prepared 销账。**批次18→21 全路线闭环**。
+
 | 任务 | 内容 | 备注 |
 |---|---|---|
-| 21-1 Linux/macOS 实跑 | 夹具 POSIX 分支（fork/exec/SIGTERM）、ELF 链接期事件 ID 路径、`xcp_test_slave` 在 gcc/clang 的编译与全套 ctest | 批次17 仅 Windows 实测；这是交付面的硬缺口 |
-| 21-2 GET_ID 拉取 A2L | Slave 侧经 override 启用 `OPTION_ENABLE_A2L_UPLOAD`，Master 走 `GET_ID(MODE=1)+UPLOAD` 拉取 A2L 文本（免"Slave 落盘+Master 本地读盘"，贴近真实 ECU）；需 libxcp 补 GET_ID/UPLOAD 文件通路（新接口+新测试） | 中期价值；不阻塞 |
-| 21-3 磁盘与并发治理 | `xcplite_runs/` 陈旧 run 目录修剪策略；ctest 并行 `-j` 下端口游标防冲突压测 | 低危 |
-| 21-4 使用文档 | `docs/`新增"真实对手端协议调试指南"（拓扑/构建开关/常见负响应定位表：ERR_CMD_SYNTAX↔SET_MTA 案例式条目） | 可维护资产 |
-| 21-5 SDK Debug prepared | 若 18-E 已完成则销账；否则合入 | 批次17 遗留 |
+| 21-1 Linux/macOS 实跑 | 夹具 POSIX 分支（fork/exec/SIGTERM）、ELF 链接期事件 ID 路径、`xcp_test_slave` 在 gcc/clang 的编译与全套 ctest | ⛔ 实跑阻塞已记录（非代码缺陷）：本机 WSL `Wsl/E_ACCESSDENIED`、MSYS2 ucrt64 系 Windows-PE 非 POSIX；夹具 POSIX 分支静态核证在树，恢复路径=真实 Linux/macOS runner 跑 `Xcplite*` 全套；原"交付面硬缺口"口径据此更新 |
+| 21-2 GET_ID 拉取 A2L | Slave 侧经 override 启用 `OPTION_ENABLE_A2L_UPLOAD`，Master 走 `GET_ID(MODE=1)+UPLOAD` 拉取 A2L 文本（免"Slave 落盘+Master 本地读盘"，贴近真实 ECU）；需 libxcp 补 GET_ID/UPLOAD 文件通路（新接口+新测试） | ✅ 完成（8d912e9）：default 配置自带 `OPTION_ENABLE_A2L_UPLOAD`（`xcplib_cfg.h:168`）无需 override；实然 CRO 仅 `[FA][IDT]` 无 MODE 字节、UPLOAD 走 MODE=0 顺序分块；mock 4 用例+E2E 与盘上 A2L 逐字节全等 |
+| 21-3 磁盘与并发治理 | `xcplite_runs/` 陈旧 run 目录修剪策略；ctest 并行 `-j` 下端口游标防冲突压测 | ✅ 完成：`PruneStaleRunDirs`（mtime 1h）+Stop 自回收+端口基数 pid 混入；`ctest -R Xcplite -j8` 连跑 28/28 零残留 |
+| 21-4 使用文档 | `docs/`新增"真实对手端协议调试指南"（拓扑/构建开关/常见负响应定位表：ERR_CMD_SYNTAX↔SET_MTA 案例式条目） | ✅ 完成：`docs/XCPlite_对手端协议调试指南.md`（六节+9 条实然方言+负响应定位表） |
+| 21-5 SDK Debug prepared | 若 18-E 已完成则销账；否则合入 | ✅ 销账：Debug+Release 双 prepared 树实证存在 |
 
 ## 5. 全局约束（延续批次17，各批次必须遵守）
 
@@ -99,10 +101,11 @@ GET_SEED（含分段）→ 算法回调 → UNLOCK → 受保护写 → 再连�
 
 | 原始需求 | 当前状态 | 批次18-21 后 |
 |---|---|---|
-| XCP 协议全走通（第一阶段） | 基础命令 ✅（批次17）；Seed&Key：对手端实然不支持（19-0 核证停在设计，实然已钉 + loopback 协议闭环双口径） | + DAQ 实时（20）→ 完整（Seed&Key 不增真实对手端项，见 §2 结论） |
+| XCP 协议全走通（第一阶段） | 基础命令 ✅（批次17）；Seed&Key：对手端实然不支持（19-0 核证停在设计，实然已钉 + loopback 协议闭环双口径）；A2L 上传通路 ✅（21-2 GET_ID/UPLOAD） | + DAQ 实时（20）→ 完整（Seed&Key 不增真实对手端项，见 §2 结论） |
 | A2L 走通（第一阶段） | 加载/端点/标量/数组/INSTANCE 基址+**成员级叶子路径**（18 ✅） | ✅ 完整 |
 | 基本/结构体/数组/嵌套变量读取 | 协议层 ✅；A2L 层成员叶子 ✅（18） | 双层全 ✅ |
-| 修改 ECU 变量（第二阶段） | 标量/数组/成员/嵌套/CalSeg ✅（批次17）；受保护资源写=对手端不支持（19 停在设计，实然已钉） | + DAQ 面向实时（20） |
+| 免本地读盘获取 A2L 文本 | 此前=Slave 落盘+Master 本地读文件 | ✅ 21-2 `FetchA2lViaUpload`（GET_ID IDT 4+UPLOAD 顺序分块，E2E 与盘上文件逐字节全等） |
+| 修改 ECU 变量（第二阶段） | 标量/数组/成员/嵌套/CalSeg ✅（批次17）；受保护资源写=对手端不支持（19 停在设计，实然已钉） | + DAQ 实时（20）+ A2L 上传（21-2） |
 
 ## 7. 变更记录
 
@@ -112,3 +115,4 @@ GET_SEED（含分段）→ 算法回调 → UNLOCK → 受保护写 → 再连�
 | P18-21-2 | **批次18 完成（2026-07-29）**：18-0～18-F 全交付，实施中新发现并落地 18-A′（CalSeg TYPEDEF_CHARACTERISTIC 标量事实并入，真实语料 InvalidLayout 2→0）；§6 验收映射"A2L 走通（第一阶段）"与"基本/结构体/数组/嵌套变量读取"两行改判 ✅ 完整；§1 任务表加 18-A′ 行；批次16 计划关闭（B16-P3）、R4 设计文档新增 R4.9、B 类决策 B-12 行更新；证据 `XCPlite_Slave_协议调试_实施记录_批次18_结构叶子展开.md`（ON 377/OFF 352、A2lGolden 38+1SKIP、Xcplite 25/25、双 prepared root、clang-format 0）。下一步：批次19 Seed&Key（19-0 机制核证先行） |
 | P18-21-3 | 批次19 停在设计：19-0 核证**不通过**——GET_SEED/UNLOCK 为 `#if 0` 死代码（xcplite.c:2196-2224，`:2197` `#ifdef XCP_ENABLE_SEED_KEY` 嵌套其下，override 无法激活）+ 上游自述不支持（:25）+ 回调无声明无实现；不改 thirdparty 即无真实对手端 Seed&Key 闭环 → 19-1～19-4 取消，§2 加结论横幅、§6 两行改判。证据 `XCPlite_Slave_协议调试_实施记录_批次19_SeedKey设计停止.md`（V1-V6 核证表：含 V6 命令编码核对 xcp.h:34-35/:533-539 ↔ protocol_types.hpp:71-72 一致）。下一步：批次20 DAQ 实时（20-0 行为核证先行） |
 | P18-21-4 | **批次20 完成（2026-07-30）**：20-1 命令层+编排（FREE/ALLOC 四命令 codec+executor、`ConfigureDaqListsDynamic`/`StartDaqSync`/共享预检/G3 resolution 宽度缓存）；20-1c mock XcpDaqDynamic 9 用例（XcpDaq* 30/30）；20-2/20-3 E2E 三用例（DynamicAcqEndToEnd envelope+时间戳+实时刷新+停流、RunningReconfigureStopsStreamAndRebuilds、MemoryOverflowFailsTransactionAndLeavesUsableTable）；20-4 门禁：全量 ctest 389/389（1 已知 SKIP）+ clang-format，提交 f732ccd。实然推翻两处纸面核证：**D9 修正**（FREE_DAQ 无运行门，运行中整表重配置=合法停流重建）、**新增 D21**（队列 wire 补白客户可见→断言前缀核口径）。证据 `XCPlite_Slave_协议调试_实施记录_批次20_DAQ实时采集.md`下一步：批次21 工程收口（21-1 POSIX 验证或记录阻塞、21-2 GET_ID 拉 A2L 评估、21-3 runs 治理+端口压测、21-4 调试指南） |
+| P18-21-5 | **批次21 完成（2026-07-31）**：21-2 四件套（`EncodeGetId`/`ParseGetId`/`ExecuteGetId`/`FetchA2lViaUpload`；实然方言 CRO=[FA][IDT]、UPLOAD MODE=0 顺序分块）+mock 4 用例+E2E 逐字节全等（提交 8d912e9，10 文件 301 行）；21-3 治理（PruneStaleRunDirs+Stop 自回收+端口基数）；21-4 调试指南；21-1 POSIX 实跑阻塞记录（WSL `Wsl/E_ACCESSDENIED`）；21-5 销账。全量 ctest **394/394**。证据 `XCPlite_Slave_协议调试_实施记录_批次21_工程收口.md`。**批次18→21 全路线闭环** |

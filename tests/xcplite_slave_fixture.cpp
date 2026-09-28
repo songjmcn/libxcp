@@ -239,6 +239,33 @@ bool ProbeOnce(std::uint16_t port) {
 
 }  // namespace
 
+/// 21-3 陈旧运行目录修剪：删除 root 下超过一小时未动的 run_* 目录。
+/// 正常路径由 Stop() 即时回收，本函数兜底崩溃/强杀残留；按 mtime 判定，
+/// 并发 ctest（-j）下在跑目录必然新于阈值，不会被误删。
+void PruneStaleRunDirs(const std::filesystem::path& root) {
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec) || ec) {
+        return;
+    }
+    const auto cutoff =
+        std::filesystem::file_time_type::clock::now() - std::chrono::hours(1);
+    std::filesystem::directory_iterator it(
+        root, std::filesystem::directory_options::skip_permission_denied, ec);
+    const std::filesystem::directory_iterator end;
+    for (; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.rfind("run_", 0U) != 0U) {
+            continue;
+        }
+        std::error_code tec;
+        const auto stamp = it->last_write_time(tec);
+        if (!tec && stamp < cutoff) {
+            std::filesystem::remove_all(it->path(), ec);  // 尽力而为
+            ec.clear();
+        }
+    }
+}
+
 void XcpliteSlaveProcess::Start() {
     if (impl_->started.load()) {
         return;  // 幂等
@@ -248,6 +275,10 @@ void XcpliteSlaveProcess::Start() {
         45000U + (CurrentProcessId() % 3000U) + g_port_cursor.fetch_add(1) * 8U;
 
     std::string last_error;
+    // 21-3：顺手回收崩溃/强杀残留的陈旧 run 目录（mtime
+    // 一小时阈值，在跑目录不受影响）
+    std::error_code pec;
+    PruneStaleRunDirs(std::filesystem::current_path(pec) / "xcplite_runs");
     for (int attempt = 0; attempt < kMaxPortAttempts; ++attempt) {
         const auto port = static_cast<std::uint16_t>(base + attempt * 4U);
         std::error_code ec;
@@ -299,6 +330,12 @@ void XcpliteSlaveProcess::Stop() {
     }
     impl_->Kill();
     impl_->started.store(false);
+    // 21-3：正常收尾即回收自身 run 目录；异常残留交给下次 Start 的
+    // PruneStaleRunDirs 按时效清扫
+    std::error_code rmec;
+    if (!impl_->work_dir.empty()) {
+        std::filesystem::remove_all(impl_->work_dir, rmec);
+    }
 }
 
 bool XcpliteSlaveProcess::IsRunning() const {
