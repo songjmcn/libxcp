@@ -140,6 +140,16 @@ Bytes CommandCodec::EncodeShortUpload(ElementCount number_of_elements,
     return cto;
 }
 
+Bytes CommandCodec::EncodeGetId(std::uint8_t identification_type) const {
+    // GET_ID（XCPlite 实然）：[FA][IDT]，2 字节（xcp.h:519-520）；
+    // 单字节字段与 Session Byte Order 无关。
+    Bytes cto;
+    cto.reserve(2);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetId));
+    cto.push_back(identification_type);
+    return cto;
+}
+
 Bytes CommandCodec::EncodeGetSeed(Resource resource, SeedMode mode) const {
     // GET_SEED: [F8][mode][resource]。Mode 与 Resource 均为单字节字段，
     // 与 Session Byte Order 无关；resource 的单资源位合法性由 Slave 判定

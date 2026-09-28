@@ -37,6 +37,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -464,6 +465,39 @@ TEST_F(XcpliteDaqTest, MemoryOverflowFailsTransactionAndLeavesUsableTable) {
     ok.odts.push_back(MakeOdt(u8_info->address, u8_info->extension, 1U));
     ASSERT_NO_THROW(master->ConfigureDaqListsDynamic({ok}));
     EXPECT_EQ(master->DaqLedger().size(), 1u);
+    master->Disconnect();
+}
+
+// ---------------------------------------------------------------------------
+// 批次21 21-2：GET_ID(IDT_ASAM_UPLOAD) + UPLOAD 顺序分块拉取整份 A2L
+// ---------------------------------------------------------------------------
+
+TEST_F(XcpliteDaqTest, FetchA2lViaUploadMatchesDiskFile) {
+    // 对端实然（xcplite.c:2169-2181 / xcpappl.c:546-596）：GET_ID(0x04) 以
+    // fopen 打开 "<A2L名>.a2l"（相对 Slave 工作目录），上报 MODE=0 +
+    // LENGTH；其后 UPLOAD 为 FILE MTA 纯顺序读（无 fseek）。拉回内容必须
+    // 与盘上夹具记录的 A2lPath 文件逐字节一致。default 配置自带
+    // OPTION_ENABLE_A2L_UPLOAD（xcplib_cfg.h:168），无需额外开关。
+    const auto master = MakeConnectedMaster();
+    const Bytes remote = master->FetchA2lViaUpload();
+
+    std::ifstream in(slave_.A2lPath(), std::ios::binary);
+    ASSERT_TRUE(in.is_open()) << slave_.A2lPath().string();
+    const Bytes disk{std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>()};
+    ASSERT_FALSE(disk.empty());
+    ASSERT_EQ(remote.size(), disk.size())
+        << "拉回 " << remote.size() << " 字节 vs 盘上 " << disk.size();
+    EXPECT_TRUE(remote == disk)
+        << "A2L 上传内容与盘文件首个差异位置="
+        << [&remote, &disk] {
+               std::size_t i = 0;
+               while (i < remote.size() && i < disk.size() &&
+                      remote[i] == disk[i]) {
+                   ++i;
+               }
+               return i;
+           }();
     master->Disconnect();
 }
 

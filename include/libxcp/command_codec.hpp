@@ -120,6 +120,15 @@ public:
                                           AddressExtension extension,
                                           Address address) const;
 
+    /// @brief 编码 GET_ID 命令（批次 21 21-2；XCPlite 实然线格式）
+    /// @param identification_type IDT 编号（0=ASCII、1=ASAM_NAME、2=PATH、
+    ///        3=URL、4=ASAM_UPLOAD 文件上传、5=EPK；xcp.h:248-258）
+    /// @return CTO: [0xFA][identification_type]
+    /// @note 实然优先：XCPlite 在 byte1 直接读 IDT（CRO_GET_ID_TYPE=
+    ///       CRO_BYTE(1)，xcp.h:519-520），无规范 §7.5.1.6 的 MODE/reserved
+    ///       布局；对接规范严格实现的对端时需另开通路（本批不做）。
+    [[nodiscard]] Bytes EncodeGetId(std::uint8_t identification_type) const;
+
     /// @brief 编码 GET_SEED 命令（读取解锁 Seed 的指定分段）
     /// @param resource 要解锁的资源（协议要求恰为单个资源位）
     /// @param mode First=首段（响应含 Seed 总长度）；Remainder=续取后续分段

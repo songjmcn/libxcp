@@ -609,6 +609,22 @@ Bytes CommandExecutor::ExecuteShortUpload(ElementCount number_of_elements,
     return std::move(res.data);
 }
 
+GetIdResponse CommandExecutor::ExecuteGetId(std::uint8_t identification_type) {
+    // GET_ID 在 XCPlite 侧是同步命令、无副作用恢复语义之外的分支：直接复用
+    // RunCommand 的 SYNCH 恢复通路。
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetId(identification_type);
+    auto response = RunCommand(CommandCode::GetId, encoded);
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetId(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket("GET_ID 响应长度不足（RES 数据 " +
+                                          std::to_string(res.data.size()) +
+                                          " 字节）");
+    }
+    return *parsed;
+}
+
 GetSeedResponse CommandExecutor::ExecuteGetSeed(Resource resource,
                                                 SeedMode mode) {
     EnsureCodec(m_session_.GetByteOrder());

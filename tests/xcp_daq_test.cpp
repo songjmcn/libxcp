@@ -61,6 +61,16 @@ public:
     /// @brief 让 GET_DAQ_RESOLUTION_INFO 可答（TIMESTAMP_MODE=0x0C：4 字节
     ///        RAW/fixed，XCPlite 实证值；默认 CmdUnknown 走 Optional 降级）
     void SupportResolutionInfo() { m_resolution_supported_ = true; }
+    /// @brief 让 GET_ID(IDT=4)/UPLOAD 服务一份预置"A2L 文件"（批次21 21-2；
+    ///        FILE MTA 顺序读，越界回 ERR_ACCESS_DENIED；mode=0x01 时数据
+    ///        内嵌在 GET_ID 响应里而非 UPLOAD 通路）
+    void ServeIdentificationFile(const Bytes& file,
+                                 std::uint8_t mode = 0x00U) {
+        m_upload_file_ = file;
+        m_ident_mode_ = mode;
+        m_upload_pos_ = 0;
+        m_upload_ready_ = true;
+    }
     /// @brief 某命令被收到的次数
     [[nodiscard]] int Count(CommandCode cmd) const {
         const auto it = m_counts_.find(cmd);
@@ -148,6 +158,54 @@ public:
                     return Err(ErrorCode::CmdSyntax);
                 }
                 return Res({});
+            case CommandCode::GetId: {
+                // [FA][IDT]（XCPlite 实然 2 字节 CRO 方言，xcp.h:519-520）；
+                // 未预置文件时按未实现回 ERR_CMD_UNKNOWN，非 0x04 回
+                // ERR_OUT_OF_RANGE（仿 xcplite.c:2190 default 分支）
+                if (packet.size() < 2U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                if (!m_upload_ready_) {
+                    return Err(ErrorCode::CmdUnknown);
+                }
+                if (packet[1] != 0x04U) {
+                    return Err(ErrorCode::OutOfRange);
+                }
+                m_upload_pos_ = 0;  // 0x04=ASAM_UPLOAD：重开"文件"顺序游标
+                std::vector<std::uint8_t> body{m_ident_mode_, 0xFF, 0xFF};
+                const auto len =
+                    static_cast<std::uint32_t>(m_upload_file_.size());
+                body.push_back(static_cast<std::uint8_t>(len & 0xFFU));
+                body.push_back(static_cast<std::uint8_t>((len >> 8) & 0xFFU));
+                body.push_back(static_cast<std::uint8_t>((len >> 16) & 0xFFU));
+                body.push_back(static_cast<std::uint8_t>((len >> 24) & 0xFFU));
+                if (m_ident_mode_ == 0x01U) {
+                    body.insert(body.end(), m_upload_file_.begin(),
+                                m_upload_file_.end());
+                }
+                return Res(body);
+            }
+            case CommandCode::Upload: {
+                if (packet.size() < 2U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                if (!m_upload_ready_) {
+                    return Err(ErrorCode::CmdUnknown);
+                }
+                const auto n = static_cast<std::size_t>(packet[1]);
+                // FILE MTA 纯顺序读；越界即对端 closeFile + 拒绝
+                // （仿 xcpappl.c:587-592）
+                if (m_upload_pos_ + n > m_upload_file_.size()) {
+                    return Err(ErrorCode::AccessDenied);
+                }
+                std::vector<std::uint8_t> body(
+                    m_upload_file_.begin() +
+                        static_cast<std::ptrdiff_t>(m_upload_pos_),
+                    m_upload_file_.begin() +
+                        static_cast<std::ptrdiff_t>(m_upload_pos_ + n));
+                m_upload_pos_ += n;
+                return Res(body);
+            }
             case CommandCode::SetMta:
                 // XCP 1.3 布局：[F6][MODE][rsv][EXT@3][ADDR@4..7]（8 字节，
                 // XCPlite 对手端协议调试核证）
@@ -283,6 +341,10 @@ private:
     std::map<CommandCode, ErrorCode> m_errors_;
     std::vector<ExpectedEntry> m_written_;
     std::map<Address, std::uint8_t> m_memory_;
+    Bytes m_upload_file_;
+    std::uint8_t m_ident_mode_{0x00U};
+    std::size_t m_upload_pos_{0};
+    bool m_upload_ready_{false};
 };
 
 /**
@@ -914,6 +976,66 @@ TEST(XcpDaqDynamic, StaticTimestampPrecheckUsesDeclaredWidthOnly) {
     plain.master->ConfigureDaqList(spec);
     EXPECT_EQ(plain.slave.Count(CommandCode::GetDaqResolutionInfo), 1);
     EXPECT_EQ(plain.slave.Count(CommandCode::ClearDaqList), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 批次21 21-2：GET_ID(IDT_ASAM_UPLOAD=4) + UPLOAD 顺序分块的 A2L 上传编排
+// （XCPlite 实然方言：2 字节 CRO [FA][IDT]、4 字节 LE LENGTH、FILE MTA 纯顺序读）
+// ---------------------------------------------------------------------------
+
+Bytes MakeIdentFile() {
+    Bytes f;
+    for (std::uint8_t i = 0; i < 40U; ++i) {
+        f.push_back(static_cast<std::uint8_t>(0x41U + i));
+    }
+    return f;
+}
+
+TEST(XcpGetIdUpload, FetchA2lSplitsIntoSequentialUploadChunks) {
+    Rig rig;  // MAX_CTO=16 → 单块上限 15 字节，40 字节 = 15+15+10
+    rig.slave.ServeIdentificationFile(MakeIdentFile());
+    const Bytes got = rig.master->FetchA2lViaUpload();
+    EXPECT_TRUE(got == MakeIdentFile());
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetId), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 3);
+}
+
+TEST(XcpGetIdUpload, MidStreamUploadFailurePropagates) {
+    // FILE MTA 纯顺序读：对端一旦拒绝，本端不做 fseek 重试，异常直接上抛
+    Rig rig;
+    rig.slave.ServeIdentificationFile(MakeIdentFile());
+    rig.slave.FailWith(CommandCode::Upload, ErrorCode::AccessDenied);
+    EXPECT_THROW(static_cast<void>(rig.master->FetchA2lViaUpload()),
+                 XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetId), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 1);
+}
+
+TEST(XcpGetIdUpload, InlineModeRejectedWithoutUpload) {
+    // MODE=0x01（响应内数据）不在本通路支持范围：先于任何 UPLOAD 抛错
+    Rig rig;
+    rig.slave.ServeIdentificationFile(MakeIdentFile(), 0x01U);
+    try {
+        static_cast<void>(rig.master->FetchA2lViaUpload());
+        FAIL() << "MODE=1 应抛 UnsupportedFeature";
+    } catch (const XcpException& e) {
+        EXPECT_TRUE(e.Category() == ErrorCategory::UnsupportedFeature);
+    }
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetId), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 0);
+}
+
+TEST(XcpGetIdUpload, ZeroLengthRejected) {
+    // openFile 失败时 XCPlite（Release 无 assert）上报 LENGTH=0 → 明确拒绝
+    Rig rig;
+    rig.slave.ServeIdentificationFile(Bytes{});
+    try {
+        static_cast<void>(rig.master->FetchA2lViaUpload());
+        FAIL() << "LENGTH=0 应抛 UnsupportedFeature";
+    } catch (const XcpException& e) {
+        EXPECT_TRUE(e.Category() == ErrorCategory::UnsupportedFeature);
+    }
+    EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 0);
 }
 
 }  // namespace

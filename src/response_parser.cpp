@@ -369,4 +369,30 @@ std::optional<ReadDaqResponse> ResponseParser::ParseReadDaq(
     return resp;
 }
 
+std::optional<GetIdResponse> ResponseParser::ParseGetId(
+    BytesView res_data) const {
+    // GET_ID RES（XCPlite 实然 xcp.h:521-525）：剥 0xFF 后
+    // [MODE@0][reserved×2][LENGTH DWORD@3..6][DATA@7..]；规范 §7.5.1.6
+    // 的 LENGTH 为 WORD 且偏移不同——实然优先（批次21 21-2）。
+    if (res_data.size() < 7U) {
+        return std::nullopt;
+    }
+    GetIdResponse resp;
+    resp.transfer_mode = res_data[0];
+    const auto length = ReadU32(res_data, 3);
+    if (!length) {
+        return std::nullopt;
+    }
+    resp.length = *length;
+    if (res_data.size() > 7U) {
+        const std::size_t avail = res_data.size() - 7U;
+        const std::size_t take =
+            avail < resp.length ? avail : static_cast<std::size_t>(resp.length);
+        resp.identification_data.assign(
+            res_data.begin() + 7,
+            res_data.begin() + 7 + static_cast<std::ptrdiff_t>(take));
+    }
+    return resp;
+}
+
 }  // namespace calmcar::xcp

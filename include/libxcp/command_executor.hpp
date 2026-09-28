@@ -151,6 +151,13 @@ public:
     /// @throws XcpException 超时、协议错误、响应长度不符或恢复失败
     [[nodiscard]] Bytes ExecuteUpload(ElementCount number_of_elements);
 
+    /// @brief 执行 GET_ID 命令（批次 21 21-2；XCPlite 实然方言：byte1=IDT，
+    ///        无规范 §7.5.1.6 的 MODE/reserved 字节）
+    /// @param identification_type IDT 编号（4=ASAM_UPLOAD：对端 A2L 文件）
+    /// @return 解析结果（MODE / LENGTH / 响应内 DATA）
+    /// @throws XcpException 超时、协议错误或恢复失败
+    [[nodiscard]] GetIdResponse ExecuteGetId(std::uint8_t identification_type);
+
     /// @brief 执行 SHORT_UPLOAD 命令（一次命令完成定址读取，不改动 MTA）
     /// @param number_of_elements 元素数
     /// @param extension 地址扩展（8 位）

@@ -582,6 +582,45 @@ void XcpMaster::StartDaqSync() {
     }
 }
 
+Bytes XcpMaster::FetchA2lViaUpload() {
+    // 批次21 21-2：IDT 4 = IDT_ASAM_UPLOAD（XCPlite xcp.h:252）。对端响应
+    // MODE=0x00 + LENGTH（DWORD，文件字节数），内容只能靠后续 UPLOAD 从
+    // FILE MTA 顺序取；对端无 A2L 上传（fopen 失败/文件空）时上报 LENGTH=0。
+    if (!m_session_.IsConnected()) {
+        throw detail::MakeInvalidState(
+            "FetchA2lViaUpload 需要先 Connect Slave");
+    }
+    const GetIdResponse id = m_executor_->ExecuteGetId(0x04U);
+    if (id.transfer_mode != 0x00U) {
+        throw detail::MakeUnsupportedFeature(
+            "GET_ID(IDT=4) 返回 MODE=" + std::to_string(id.transfer_mode) +
+            "（非 0），非 UPLOAD 文件通路，本批不编排");
+    }
+    if (id.length == 0U) {
+        throw detail::MakeUnsupportedFeature(
+            "GET_ID(IDT=4) 上报长度 0：Slave 未启用 A2L 上传或 .a2l 文件缺失");
+    }
+    // 对端 FILE 分支是纯顺序读（xcpappl.c:575-596，无 fseek）：必须按上报
+    // LENGTH 严格连续分块；单块 ≤ MAX_CTO-1（RES 占 1 字节）且 ≤ 255
+    // （UPLOAD 元素数为单字节字段）。中途失败对端已 closeFile，直接上抛，
+    // 调用方需重发 GET_ID 重开文件再整读。
+    const std::size_t chunk_max =
+        (std::min)(static_cast<std::size_t>(m_session_.MaxCto()) - 1U,
+                   static_cast<std::size_t>(255U));
+    Bytes file;
+    file.reserve((std::min)(static_cast<std::size_t>(id.length),
+                            std::size_t{1U << 20}));
+    std::size_t remaining = static_cast<std::size_t>(id.length);
+    while (remaining > 0U) {
+        const auto chunk =
+            static_cast<ElementCount>((std::min)(remaining, chunk_max));
+        Bytes part = m_executor_->ExecuteUpload(chunk);
+        file.insert(file.end(), part.begin(), part.end());
+        remaining -= chunk;
+    }
+    return file;
+}
+
 const std::vector<DaqLedgerEntry>& XcpMaster::DaqLedger() const noexcept {
     return m_daq_ledger_;
 }

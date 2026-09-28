@@ -279,6 +279,23 @@ public:
     void StartDaqSync();
 
     /**
+     * @brief 经 GET_ID(IDT_ASAM_UPLOAD=4) + 连续 UPLOAD 拉取对端 A2L 文件
+     *        （批次21 21-2）
+     * @details XCPlite 实然线格式：GET_ID CRO 只有 2 字节（byte1 直接是
+     *          IDT，无规范 §7.5.1.6 的 MODE/reserved 字节，xcp.h:519-520）；
+     *          响应 LENGTH 是 DWORD@b4..7。对端打开 run 目录里的
+     *          <a2l名>.a2l 进入 FILE MTA 后是**纯顺序读**（xcpappl.c:
+     *          546-596，无 fseek），必须按 LENGTH 严格连续分块 UPLOAD
+     *          （单块 ≤ MAX_CTO-1 且 ≤ 255）；中途失败对端 closeFile，
+     *          需重发 GET_ID 重开文件再整读。
+     * @return A2L 文件的完整字节流（与盘上文件逐字节一致）
+     * @throws XcpException(UnsupportedFeature) 对端上报长度 0（无上传
+     *         能力/.a2l 缺失）或 MODE≠0（非 UPLOAD 通路）
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] Bytes FetchA2lViaUpload();
+
+    /**
      * @brief 启动一个已配置的 DAQ List（START_STOP_DAQ_LIST(Start)）
      * @param daq_list DAQ List 号（EPK）
      * @return Slave 响应的 FIRST_PID（Absolute ODT Number 模式，docs L2222）

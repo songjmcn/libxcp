@@ -155,6 +155,18 @@ struct ReadDaqResponse {
     Address address{0};                     ///< 32 位地址
 };
 
+/**
+ * @brief GET_ID 响应解析结果（批次 21 21-2；XCPlite 实然布局 xcp.h:521-525）
+ * @details CRM：MODE=b1（0x00=走 UPLOAD、0x01=响应内含数据）、
+ *          LENGTH=DWORD@b4..7、DATA=b8..。规范 §7.5.1.6 的 LENGTH 为 WORD
+ *          且偏移不同——实然优先。res_data 已剥 0xFF，索引全体 -1。
+ */
+struct GetIdResponse {
+    std::uint8_t transfer_mode{0};  ///< 传输模式（b1 原码）
+    std::uint32_t length{0};        ///< LENGTH：标识数据/文件的字节长
+    Bytes identification_data;  ///< MODE=0x01 时的响应内数据（MODE=0 为空）
+};
+
 /// @brief 解析后的 Packet 联合类型
 using ParsedPacket = std::variant<PositiveResponse, NegativeResponse,
                                   EventPacket, ServicePacket, DtoPacket>;
@@ -266,6 +278,15 @@ public:
      * @param res_data RES 后的数据（长度必须 >= 7：BITOFFSET/SIZE/EXT/ADDR）
      */
     [[nodiscard]] std::optional<ReadDaqResponse> ParseReadDaq(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_ID 响应（批次 21 21-2；XCPlite 实然布局，
+     *        见 GetIdResponse）
+     * @param res_data RES 后的数据（长度必须 >= 7：MODE + reserved×2 +
+     *                 LENGTH(DWORD)）
+     */
+    [[nodiscard]] std::optional<GetIdResponse> ParseGetId(
         BytesView res_data) const;
 
 private:
