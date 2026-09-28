@@ -59,6 +59,13 @@ GET_SEED（含分段）→ 算法回调 → UNLOCK → 受保护写 → 再连�
 
 ## 3. 批次20 —— DAQ 实时采集端到端（后续里程碑成案）
 
+> **✅ 已完成（2026-07-30）**：20-0～20-4 全交付——FREE/ALLOC 四命令编解码+executor、
+> `ConfigureDaqListsDynamic`/`StartDaqSync` 动态整表编排（G3 resolution 宽度缓存+共享预检）、
+> mock XcpDaqDynamic 9 用例（XcpDaq* 30/30）、E2E 三用例、全量 ctest 389/389（1 已知 SKIP）、
+> clang-format 0，提交 f732ccd。实施中实然推翻两处纸面核证：**D9 修正**（FREE_DAQ 无运行门
+> `xcplite.c:2562-2564`→运行中整表重配置=合法停流重建）、**新增 D21**（队列 wire 补白客户可见
+> `queue32m.c:291-296`→断言前缀核口径）。证据 `XCPlite_Slave_协议调试_实施记录_批次20_DAQ实时采集.md`。
+
 **目标**：Master 对真实 Slave 完成"取证/配置 → START → 事件触发 → DTO 流 → 桥接解码 → 物理值序列"。
 
 | 任务 | 内容 |
@@ -104,3 +111,4 @@ GET_SEED（含分段）→ 算法回调 → UNLOCK → 受保护写 → 再连�
 | P18-21-1 | 依批次17 遗留表 + 计划内"后续里程碑"拆解为 4 批次，给出排序依据、任务表、依赖链（18→19→20）与全局约束；18 同时充当批次16 的解冻与接管批次 |
 | P18-21-2 | **批次18 完成（2026-07-29）**：18-0～18-F 全交付，实施中新发现并落地 18-A′（CalSeg TYPEDEF_CHARACTERISTIC 标量事实并入，真实语料 InvalidLayout 2→0）；§6 验收映射"A2L 走通（第一阶段）"与"基本/结构体/数组/嵌套变量读取"两行改判 ✅ 完整；§1 任务表加 18-A′ 行；批次16 计划关闭（B16-P3）、R4 设计文档新增 R4.9、B 类决策 B-12 行更新；证据 `XCPlite_Slave_协议调试_实施记录_批次18_结构叶子展开.md`（ON 377/OFF 352、A2lGolden 38+1SKIP、Xcplite 25/25、双 prepared root、clang-format 0）。下一步：批次19 Seed&Key（19-0 机制核证先行） |
 | P18-21-3 | 批次19 停在设计：19-0 核证**不通过**——GET_SEED/UNLOCK 为 `#if 0` 死代码（xcplite.c:2196-2224，`:2197` `#ifdef XCP_ENABLE_SEED_KEY` 嵌套其下，override 无法激活）+ 上游自述不支持（:25）+ 回调无声明无实现；不改 thirdparty 即无真实对手端 Seed&Key 闭环 → 19-1～19-4 取消，§2 加结论横幅、§6 两行改判。证据 `XCPlite_Slave_协议调试_实施记录_批次19_SeedKey设计停止.md`（V1-V6 核证表：含 V6 命令编码核对 xcp.h:34-35/:533-539 ↔ protocol_types.hpp:71-72 一致）。下一步：批次20 DAQ 实时（20-0 行为核证先行） |
+| P18-21-4 | **批次20 完成（2026-07-30）**：20-1 命令层+编排（FREE/ALLOC 四命令 codec+executor、`ConfigureDaqListsDynamic`/`StartDaqSync`/共享预检/G3 resolution 宽度缓存）；20-1c mock XcpDaqDynamic 9 用例（XcpDaq* 30/30）；20-2/20-3 E2E 三用例（DynamicAcqEndToEnd envelope+时间戳+实时刷新+停流、RunningReconfigureStopsStreamAndRebuilds、MemoryOverflowFailsTransactionAndLeavesUsableTable）；20-4 门禁：全量 ctest 389/389（1 已知 SKIP）+ clang-format，提交 f732ccd。实然推翻两处纸面核证：**D9 修正**（FREE_DAQ 无运行门，运行中整表重配置=合法停流重建）、**新增 D21**（队列 wire 补白客户可见→断言前缀核口径）。证据 `XCPlite_Slave_协议调试_实施记录_批次20_DAQ实时采集.md`下一步：批次21 工程收口（21-1 POSIX 验证或记录阻塞、21-2 GET_ID 拉 A2L 评估、21-3 runs 治理+端口压测、21-4 调试指南） |
