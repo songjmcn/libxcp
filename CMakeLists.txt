@@ -201,3 +201,30 @@ if(LIBXCP_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
 endif()
+
+# ----------------------------------------------------------------------------
+# 示例程序目录（批次22：examples/xcp_master_udp）
+#
+# 默认 OFF——不改变既有构建。前置门 = LIBXCP_BUILD_XCPLITE_SLAVE=ON（xcplite
+# 库与上游示例源的来源，见上方子项目段）且 LIBXCP_BUILD_A2L=ON（示例经桥接层
+# 加载 A2L，libxcp::a2lbridge 的来源）；任一未满足在 CONFIGURE 期 FATAL_ERROR
+# 明确提示，不静默降级、不二次 add_subdirectory(thirdparty/XCPlite)。
+# 计划：code-plan/XCPlite_cpp_demo_示例对手端计划.md（v2.1）。
+# ----------------------------------------------------------------------------
+option(LIBXCP_BUILD_EXAMPLES
+       "Build the standalone example programs under examples/"
+       OFF)
+
+if(LIBXCP_BUILD_EXAMPLES)
+  if(NOT LIBXCP_BUILD_XCPLITE_SLAVE)
+    message(FATAL_ERROR
+            "LIBXCP_BUILD_EXAMPLES=ON requires LIBXCP_BUILD_XCPLITE_SLAVE=ON "
+            "(the xcplite library and the cpp_demo opponent come from that subproject gate)")
+  endif()
+  if(NOT LIBXCP_BUILD_A2L)
+    message(FATAL_ERROR
+            "LIBXCP_BUILD_EXAMPLES=ON requires LIBXCP_BUILD_A2L=ON "
+            "(the example loads A2L through the bridge; libxcp::a2lbridge is required)")
+  endif()
+  add_subdirectory(examples)
+endif()
