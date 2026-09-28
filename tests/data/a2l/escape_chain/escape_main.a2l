@@ -1,0 +1,15 @@
+ASAP2_VERSION 1 61
+/begin PROJECT EscapeMain "root for B-18 confinement is chain/, target is one level up"
+
+/include "../escape_target.a2l"
+
+  /begin MODULE ESC_MAIN "entry module (gets no symbols itself unless child merges)"
+    /begin COMPU_METHOD CM_M "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+    /begin MEASUREMENT ESC_MAIN_M "root module symbol" UBYTE CM_M 0 0 0 255
+      ECU_ADDRESS 0x4002
+      READ_WRITE
+    /end MEASUREMENT
+  /end MODULE
+
+/end PROJECT

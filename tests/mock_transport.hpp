@@ -35,25 +35,25 @@ public:
     MockTransport(const MockTransport&) = delete;
     MockTransport& operator=(const MockTransport&) = delete;
 
-    void open(IPacketListener& listener) override {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        listener_ = &listener;
-        is_open_ = true;
+    void Open(IPacketListener& listener) override {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_listener_ = &listener;
+        m_is_open_ = true;
     }
 
-    void close() override {
+    void Close() override {
         IPacketListener* listener = nullptr;
         {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            if (!is_open_) {
+            const std::lock_guard<std::mutex> lock(m_mutex_);
+            if (!m_is_open_) {
                 return;  // 幂等
             }
-            is_open_ = false;
-            listener = listener_;
-            listener_ = nullptr;
+            m_is_open_ = false;
+            listener = m_listener_;
+            m_listener_ = nullptr;
         }
         if (listener != nullptr) {
-            listener->onTransportClosed("MockTransport 已关闭");
+            listener->OnTransportClosed("MockTransport 已关闭");
         }
     }
 
@@ -61,114 +61,114 @@ public:
      * @brief 记录发送的 Packet 并同步投递脚本响应
      * @throws XcpException(TransportError) 未打开，或脚本显式要求模拟发送失败
      */
-    void send(BytesView packet) override {
+    void Send(BytesView packet) override {
         std::function<Bytes(BytesView)> responder;
         IPacketListener* listener = nullptr;
         {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            if (!is_open_) {
-                throw detail::makeTransportError(
+            const std::lock_guard<std::mutex> lock(m_mutex_);
+            if (!m_is_open_) {
+                throw detail::MakeTransportError(
                     "MockTransport 未打开时调用 send()");
             }
-            sent_packets_.emplace_back(packet.begin(), packet.end());
-            if (fail_next_send_) {
-                fail_next_send_ = false;
-                throw detail::makeTransportError(
+            m_sent_packets_.emplace_back(packet.begin(), packet.end());
+            if (m_fail_next_send_) {
+                m_fail_next_send_ = false;
+                throw detail::MakeTransportError(
                     "MockTransport 脚本注入的发送失败",
                     "injected send failure");
             }
-            responder = response_func_;
-            listener = listener_;
+            responder = m_response_func_;
+            listener = m_listener_;
         }
         if (responder && listener != nullptr) {
             const Bytes response = responder(packet);
             if (!response.empty()) {
                 // 非空返回值视为对本命令的最终 RES/ERR，同步投递给监听器
-                listener->onPacketReceived(BytesView{response});
+                listener->OnPacketReceived(BytesView{response});
             }
         }
     }
 
-    [[nodiscard]] bool isOpen() const noexcept override {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        return is_open_;
+    [[nodiscard]] bool IsOpen() const noexcept override {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        return m_is_open_;
     }
 
     // ---- 测试控制接口 ----
 
     /**
-     * @brief 设置 send 时的响应生成器
+     * @brief 设置 Send 时的响应生成器
      * @param response_func 接收发送的 Packet，返回要回调的响应 Packet；
      *                      返回空 Bytes 表示本次不产生响应（用于模拟丢包/超时）
      */
-    void setResponse(std::function<Bytes(BytesView)> response_func) {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        response_func_ = std::move(response_func);
+    void SetResponse(std::function<Bytes(BytesView)> response_func) {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_response_func_ = std::move(response_func);
     }
 
-    /// @brief 让下一次 send() 抛出 TransportError（模拟发送失败）
-    void failNextSend() {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        fail_next_send_ = true;
+    /// @brief 让下一次 Send() 抛出 TransportError（模拟发送失败）
+    void FailNextSend() {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_fail_next_send_ = true;
     }
 
     /// @brief 主动注入异步 Packet（模拟 EV/SERV/DTO）
-    void injectPacket(BytesView packet) {
+    void InjectPacket(BytesView packet) {
         IPacketListener* listener = nullptr;
         {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            listener = listener_;
+            const std::lock_guard<std::mutex> lock(m_mutex_);
+            listener = m_listener_;
         }
         if (listener != nullptr) {
-            listener->onPacketReceived(packet);
+            listener->OnPacketReceived(packet);
         }
     }
 
     /// @brief 主动注入 Transport 关闭事件
-    void injectClose(std::string_view reason) {
+    void InjectClose(std::string_view reason) {
         IPacketListener* listener = nullptr;
         {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            listener = listener_;
+            const std::lock_guard<std::mutex> lock(m_mutex_);
+            listener = m_listener_;
         }
         if (listener != nullptr) {
-            listener->onTransportClosed(reason);
+            listener->OnTransportClosed(reason);
         }
     }
 
     /// @brief 主动注入 Transport 警告
-    void injectWarning(std::string_view message) {
+    void InjectWarning(std::string_view message) {
         IPacketListener* listener = nullptr;
         {
-            const std::lock_guard<std::mutex> lock(mutex_);
-            listener = listener_;
+            const std::lock_guard<std::mutex> lock(m_mutex_);
+            listener = m_listener_;
         }
         if (listener != nullptr) {
-            listener->onTransportWarning(message);
+            listener->OnTransportWarning(message);
         }
     }
 
     /// @brief 获取已发送的 Packet 列表副本
-    [[nodiscard]] std::vector<Bytes> sentPackets() const {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        return sent_packets_;
+    [[nodiscard]] std::vector<Bytes> SentPackets() const {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        return m_sent_packets_;
     }
 
     /// @brief 清空已发送记录与响应脚本
-    void reset() {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        sent_packets_.clear();
-        response_func_ = nullptr;
-        fail_next_send_ = false;
+    void Reset() {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_sent_packets_.clear();
+        m_response_func_ = nullptr;
+        m_fail_next_send_ = false;
     }
 
 private:
-    IPacketListener* listener_{nullptr};             ///< 非拥有监听器指针
-    bool is_open_{false};                            ///< 是否已打开
-    mutable std::mutex mutex_;                       ///< 保护以下全部字段
-    std::function<Bytes(BytesView)> response_func_;  ///< 响应脚本
-    bool fail_next_send_{false};                     ///< 下次发送失败标记
-    std::vector<Bytes> sent_packets_;                ///< 已发送 Packet 记录
+    IPacketListener* m_listener_{nullptr};
+    bool m_is_open_{false};
+    mutable std::mutex m_mutex_;
+    std::function<Bytes(BytesView)> m_response_func_;
+    bool m_fail_next_send_{false};
+    std::vector<Bytes> m_sent_packets_;
 };
 
 }  // namespace calmcar::xcp::test

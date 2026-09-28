@@ -30,12 +30,12 @@ enum class ErrorCategory {
     Timeout,             ///< 规定时间内没有最终响应
     MalformedPacket,     ///< PID、长度、对齐或字段非法
     ProtocolError,       ///< Slave 返回 ERR
-    UnsupportedFeature,  ///< 本阶段不支持的功能（如 Seed&Key）
+    UnsupportedFeature,  ///< 本阶段未实现的功能（如 DAQ、块模式）
     RecoveryFailed,      ///< SYNCH 恢复或重试耗尽
 };
 
 /// @brief 将错误分类转为字符串
-[[nodiscard]] std::string_view errorCategoryName(ErrorCategory cat) noexcept;
+[[nodiscard]] std::string_view ErrorCategoryName(ErrorCategory cat) noexcept;
 
 /**
  * @brief XCP 库统一异常类型
@@ -61,59 +61,68 @@ public:
         std::string transport_error = "");
 
     /// @brief 获取错误分类
-    [[nodiscard]] ErrorCategory category() const noexcept;
+    [[nodiscard]] ErrorCategory Category() const noexcept;
 
     /// @brief 获取相关命令码
-    [[nodiscard]] std::optional<CommandCode> commandCode() const noexcept;
+    [[nodiscard]] std::optional<CommandCode> GetCommandCode() const noexcept;
 
     /// @brief 获取协议错误码（仅 ProtocolError 有意义）
-    [[nodiscard]] std::optional<ErrorCode> errorCode() const noexcept;
+    [[nodiscard]] std::optional<ErrorCode> GetErrorCode() const noexcept;
 
     /// @brief 获取恢复重试次数
-    [[nodiscard]] int retryCount() const noexcept;
+    [[nodiscard]] int RetryCount() const noexcept;
 
     /// @brief 获取底层 Transport 错误描述
-    [[nodiscard]] std::string_view transportError() const noexcept;
+    [[nodiscard]] std::string_view TransportError() const noexcept;
 
 private:
-    ErrorCategory category_;                   ///< 错误分类
-    std::optional<CommandCode> command_code_;  ///< 相关命令码
-    std::optional<ErrorCode> error_code_;      ///< 协议错误码
-    int retry_count_;                          ///< 恢复重试次数
-    std::string transport_error_;              ///< 底层 Transport 错误描述
+    ErrorCategory m_category_;                   ///< 错误分类
+    std::optional<CommandCode> m_command_code_;  ///< 相关命令码
+    std::optional<ErrorCode> m_error_code_;      ///< 协议错误码
+    int m_retry_count_;                          ///< 恢复重试次数
+    std::string m_transport_error_;              ///< 底层 Transport 错误描述
 };
 
 }  // namespace calmcar::xcp
 
 namespace calmcar::xcp::detail {
 
-/// @brief 构造 InvalidArgument 异常
-[[nodiscard]] XcpException makeInvalidArgument(std::string msg);
+/// @brief 构造 InvalidArgument 异常（本地参数、AG 换算、长度非法）
+[[nodiscard]] XcpException MakeInvalidArgument(std::string msg);
 
-/// @brief 构造 InvalidState 异常
-[[nodiscard]] XcpException makeInvalidState(std::string msg);
+/// @brief 构造 InvalidState 异常（Session
+/// 状态不允许当前操作，如未连接就发命令）
+[[nodiscard]] XcpException MakeInvalidState(std::string msg);
 
-/// @brief 构造 TransportError 异常
-[[nodiscard]] XcpException makeTransportError(
+/// @brief 构造 TransportError 异常（通道打开/发送/接收失败）
+/// @param msg 错误描述
+/// @param transport_detail 底层 Socket 错误细节，可为空
+[[nodiscard]] XcpException MakeTransportError(
     std::string msg, std::string transport_detail = "");
 
-/// @brief 构造 Timeout 异常
-[[nodiscard]] XcpException makeTimeout(std::string msg,
+/// @brief 构造 Timeout 异常（规定时间内没有最终响应）
+/// @param msg 错误描述
+/// @param cmd 超时的命令码（可为空）
+/// @param retry 已使用的恢复重试次数
+[[nodiscard]] XcpException MakeTimeout(std::string msg,
                                        std::optional<CommandCode> cmd,
                                        int retry);
 
-/// @brief 构造 MalformedPacket 异常
-[[nodiscard]] XcpException makeMalformedPacket(std::string msg);
+/// @brief 构造 MalformedPacket 异常（响应长度/字段与协议布局不符）
+[[nodiscard]] XcpException MakeMalformedPacket(std::string msg);
 
 /// @brief 构造 ProtocolError 异常
-[[nodiscard]] XcpException makeProtocolError(std::string msg, CommandCode cmd,
+[[nodiscard]] XcpException MakeProtocolError(std::string msg, CommandCode cmd,
                                              ErrorCode code);
 
-/// @brief 构造 UnsupportedFeature 异常
-[[nodiscard]] XcpException makeUnsupportedFeature(std::string msg);
+/// @brief 构造 UnsupportedFeature 异常（本地未开放的能力，如 DAQ、块模式）
+[[nodiscard]] XcpException MakeUnsupportedFeature(std::string msg);
 
-/// @brief 构造 RecoveryFailed 异常
-[[nodiscard]] XcpException makeRecoveryFailed(std::string msg,
+/// @brief 构造 RecoveryFailed 异常（SYNCH 恢复未获确认或重试次数用尽）
+/// @param msg 错误描述
+/// @param cmd 触发恢复的命令码（可为空）
+/// @param retry 已使用的重试次数
+[[nodiscard]] XcpException MakeRecoveryFailed(std::string msg,
                                               std::optional<CommandCode> cmd,
                                               int retry);
 

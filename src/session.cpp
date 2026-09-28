@@ -9,205 +9,265 @@
 
 #include "libxcp/session.hpp"
 
+#include <algorithm>
 #include <string>
 
 namespace calmcar::xcp {
 
-void Session::validateConnectParams(const ConnectResponse& resp) const {
+void Session::ValidateConnectParams(const ConnectResponse& resp) const {
     // MAX_CTO 范围校验
-    if (resp.maxCto < kMaxCtoMinimum) {
-        throw detail::makeInvalidArgument(
+    if (resp.max_cto < kMaxCtoMinimum) {
+        throw detail::MakeInvalidArgument(
             "CONNECT 返回的 MAX_CTO 小于协议下限 0x08: " +
-            std::to_string(resp.maxCto));
+            std::to_string(resp.max_cto));
     }
 
     // MAX_DTO 范围校验
-    if (resp.maxDto < kMaxDtoMinimum) {
-        throw detail::makeInvalidArgument(
+    if (resp.max_dto < kMaxDtoMinimum) {
+        throw detail::MakeInvalidArgument(
             "CONNECT 返回的 MAX_DTO 小于协议下限 0x0008: " +
-            std::to_string(resp.maxDto));
+            std::to_string(resp.max_dto));
     }
 
     // AG 整除校验：MAX_CTO mod AG == 0
-    const auto ag_bytes = agToBytes(resp.addressGranularity);
-    if (ag_bytes == 0U || (resp.maxCto % ag_bytes) != 0U) {
-        throw detail::makeInvalidArgument(
+    const auto ag_bytes = AgToBytes(resp.address_granularity);
+    if (ag_bytes == 0U || (resp.max_cto % ag_bytes) != 0U) {
+        throw detail::MakeInvalidArgument(
             "MAX_CTO 不能被 Address Granularity 整除: MAX_CTO=" +
-            std::to_string(resp.maxCto) + ", AG=" + std::to_string(ag_bytes));
+            std::to_string(resp.max_cto) + ", AG=" + std::to_string(ag_bytes));
     }
     // AG 整除校验：MAX_DTO mod AG == 0
-    if ((resp.maxDto % ag_bytes) != 0U) {
-        throw detail::makeInvalidArgument(
+    if ((resp.max_dto % ag_bytes) != 0U) {
+        throw detail::MakeInvalidArgument(
             "MAX_DTO 不能被 Address Granularity 整除: MAX_DTO=" +
-            std::to_string(resp.maxDto) + ", AG=" + std::to_string(ag_bytes));
+            std::to_string(resp.max_dto) + ", AG=" + std::to_string(ag_bytes));
     }
 }
 
-SessionState Session::state() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return state_;
+SessionState Session::State() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_state_;
 }
 
-bool Session::isConnected() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return state_ == SessionState::Connected;
+bool Session::IsConnected() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_state_ == SessionState::Connected;
 }
 
-bool Session::hasPendingCommand() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return pending_command_.has_value();
+bool Session::HasPendingCommand() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_pending_command_.has_value();
 }
 
-std::string Session::failReason() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return fail_reason_;
+std::string Session::FailReason() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_fail_reason_;
 }
 
-void Session::beginConnecting() {
-    const std::lock_guard<std::mutex> lock(mutex_);
+void Session::BeginConnecting() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
     // 仅允许从 Disconnected 发起连接；Failed 必须先 reset()
-    if (state_ != SessionState::Disconnected) {
-        throw detail::makeInvalidState(std::string("当前状态不允许发起连接: ") +
-                                       std::string(sessionStateName(state_)));
+    if (m_state_ != SessionState::Disconnected) {
+        throw detail::MakeInvalidState(std::string("当前状态不允许发起连接: ") +
+                                       std::string(SessionStateName(m_state_)));
     }
-    state_ = SessionState::Connecting;
-    pending_command_.reset();
-    fail_reason_.clear();
+    m_state_ = SessionState::Connecting;
+    m_pending_command_.reset();
+    m_fail_reason_.clear();
 }
 
-void Session::establishConnection(const ConnectResponse& connect_response) {
+void Session::EstablishConnection(const ConnectResponse& connect_response) {
     // 先做无锁的参数校验（校验函数本身不访问成员，但为一致性仍在锁内调用）
     {
-        const std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ != SessionState::Connecting) {
-            throw detail::makeInvalidState(
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        if (m_state_ != SessionState::Connecting) {
+            throw detail::MakeInvalidState(
                 std::string("CONNECT 响应到达时不在 Connecting 状态: ") +
-                std::string(sessionStateName(state_)));
+                std::string(SessionStateName(m_state_)));
         }
-        validateConnectParams(connect_response);
+        ValidateConnectParams(connect_response);
 
-        params_ = SessionParameters{};
-        params_.connect = connect_response;
-        params_.shortUploadAvailable = true;
-        state_ = SessionState::Connected;
-        pending_command_.reset();
-        fail_reason_.clear();
+        m_params_ = SessionParameters{};
+        m_params_.connect = connect_response;
+        m_params_.short_upload_available = true;
+        // 新会话：DAQ 运行态与配置代际一并归零（批次14，T14-07 一致性要求）
+        m_daq_running_lists_.clear();
+        m_daq_generation_ = 0U;
+        m_state_ = SessionState::Connected;
+        m_pending_command_.reset();
+        m_fail_reason_.clear();
     }
 }
 
-void Session::beginDisconnecting() {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ != SessionState::Connected) {
-        throw detail::makeInvalidState(std::string("当前状态不允许断开: ") +
-                                       std::string(sessionStateName(state_)));
+void Session::BeginDisconnecting() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    if (m_state_ != SessionState::Connected) {
+        throw detail::MakeInvalidState(std::string("当前状态不允许断开: ") +
+                                       std::string(SessionStateName(m_state_)));
     }
-    state_ = SessionState::Disconnecting;
+    m_state_ = SessionState::Disconnecting;
 }
 
-void Session::completeDisconnection() {
-    const std::lock_guard<std::mutex> lock(mutex_);
+void Session::CompleteDisconnection() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
     // 断连后清空协商参数与能力（含 MTA 相关能力），回到干净的未连接状态
-    params_ = SessionParameters{};
-    pending_command_.reset();
-    state_ = SessionState::Disconnected;
+    m_params_ = SessionParameters{};
+    // 批次14（T14-07）：会话级清理必须连 DAQ 运行态一起清，否则会残留
+    // "看起来还在跑"的伪状态（调用方已无法再发 STOP）
+    m_daq_running_lists_.clear();
+    m_daq_generation_ = 0U;
+    m_pending_command_.reset();
+    m_state_ = SessionState::Disconnected;
 }
 
-void Session::beginRecovery() {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ != SessionState::Connected) {
-        throw detail::makeInvalidState(std::string("当前状态不允许进入恢复: ") +
-                                       std::string(sessionStateName(state_)));
+void Session::BeginRecovery() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    if (m_state_ != SessionState::Connected) {
+        throw detail::MakeInvalidState(std::string("当前状态不允许进入恢复: ") +
+                                       std::string(SessionStateName(m_state_)));
     }
-    state_ = SessionState::Recovering;
+    m_state_ = SessionState::Recovering;
 }
 
-void Session::completeRecovery() {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ == SessionState::Recovering) {
-        state_ = SessionState::Connected;
+void Session::CompleteRecovery() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    if (m_state_ == SessionState::Recovering) {
+        m_state_ = SessionState::Connected;
     }
 }
 
-void Session::fail(std::string_view reason) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    state_ = SessionState::Failed;
-    fail_reason_ = std::string(reason);
-    params_ = SessionParameters{};
-    pending_command_.reset();
+void Session::Fail(std::string_view reason) {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_state_ = SessionState::Failed;
+    m_fail_reason_ = std::string(reason);
+    m_params_ = SessionParameters{};
+    // 会话已不可用：DAQ 运行态同步清零（再发 STOP 也没有通道）
+    m_daq_running_lists_.clear();
+    m_daq_generation_ = 0U;
+    m_pending_command_.reset();
 }
 
-void Session::reset() {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    state_ = SessionState::Disconnected;
-    params_ = SessionParameters{};
-    pending_command_.reset();
-    fail_reason_.clear();
+void Session::Reset() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_state_ = SessionState::Disconnected;
+    m_params_ = SessionParameters{};
+    m_daq_running_lists_.clear();
+    m_daq_generation_ = 0U;
+    m_pending_command_.reset();
+    m_fail_reason_.clear();
 }
 
-void Session::markCommandSent(CommandCode cmd) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    if (pending_command_.has_value()) {
-        throw detail::makeInvalidState(
+void Session::MarkCommandSent(CommandCode cmd) {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    if (m_pending_command_.has_value()) {
+        throw detail::MakeInvalidState(
             "已有待响应的命令，Standard Communication Model 只允许一条 "
             "Outstanding Command");
     }
     // Failed / Disconnected 状态下不得发送业务命令
-    if (state_ == SessionState::Failed ||
-        state_ == SessionState::Disconnected) {
-        throw detail::makeInvalidState(std::string("当前状态不允许发送命令: ") +
-                                       std::string(sessionStateName(state_)));
+    if (m_state_ == SessionState::Failed ||
+        m_state_ == SessionState::Disconnected) {
+        throw detail::MakeInvalidState(std::string("当前状态不允许发送命令: ") +
+                                       std::string(SessionStateName(m_state_)));
     }
-    pending_command_ = cmd;
+    m_pending_command_ = cmd;
 }
 
-void Session::clearPendingCommand() {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    pending_command_.reset();
+void Session::ClearPendingCommand() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_pending_command_.reset();
 }
 
-std::optional<CommandCode> Session::pendingCommand() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return pending_command_;
+std::optional<CommandCode> Session::PendingCommand() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_pending_command_;
 }
 
-SessionParameters Session::parameters() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return params_;
+SessionParameters Session::Parameters() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_params_;
 }
 
-void Session::updateCommModeInfo(const GetCommModeInfoResponse& info) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    params_.commModeInfo = info;
+void Session::UpdateCommModeInfo(const GetCommModeInfoResponse& info) {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_params_.comm_mode_info = info;
 }
 
-void Session::updateStatus(const GetStatusResponse& status) {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    params_.status = status;
+void Session::UpdateStatus(const GetStatusResponse& status) {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_params_.status = status;
 }
 
-void Session::disableShortUpload() {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    params_.shortUploadAvailable = false;
+void Session::DisableShortUpload() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_params_.short_upload_available = false;
 }
 
-ByteOrder Session::byteOrder() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return params_.connect.byteOrder;
+ByteOrder Session::GetByteOrder() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_params_.connect.byte_order;
 }
 
-AddressGranularity Session::addressGranularity() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return params_.connect.addressGranularity;
+AddressGranularity Session::GetAddressGranularity() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_params_.connect.address_granularity;
 }
 
-std::uint8_t Session::maxCto() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return params_.connect.maxCto;
+std::uint8_t Session::MaxCto() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_params_.connect.max_cto;
 }
 
-std::uint16_t Session::maxDto() const {
-    const std::lock_guard<std::mutex> lock(mutex_);
-    return params_.connect.maxDto;
+std::uint16_t Session::MaxDto() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_params_.connect.max_dto;
+}
+
+// ---------------------------------------------------------------------------
+// DAQ 运行态（批次14，T14-07）
+// ---------------------------------------------------------------------------
+
+void Session::MarkDaqListStarted(std::uint16_t daq_list) {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    // 幂等：重复 Start 同一列表不产生重复项
+    if (std::find(m_daq_running_lists_.begin(), m_daq_running_lists_.end(),
+                  daq_list) == m_daq_running_lists_.end()) {
+        m_daq_running_lists_.push_back(daq_list);
+        std::sort(m_daq_running_lists_.begin(), m_daq_running_lists_.end());
+    }
+}
+
+void Session::MarkDaqListStopped(std::uint16_t daq_list) {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_daq_running_lists_.erase(
+        std::remove(m_daq_running_lists_.begin(), m_daq_running_lists_.end(),
+                    daq_list),
+        m_daq_running_lists_.end());
+}
+
+void Session::ClearStartedDaqLists() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_daq_running_lists_.clear();
+}
+
+std::vector<std::uint16_t> Session::StartedDaqLists() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_daq_running_lists_;
+}
+
+bool Session::HasRunningDaqList() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return !m_daq_running_lists_.empty();
+}
+
+std::uint32_t Session::DaqConfigGeneration() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_daq_generation_;
+}
+
+void Session::BumpDaqConfigGeneration() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    ++m_daq_generation_;
 }
 
 }  // namespace calmcar::xcp

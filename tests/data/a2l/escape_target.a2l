@@ -1,0 +1,13 @@
+ASAP2_VERSION 1 61
+/begin PROJECT EscapeTarget "target lives outside the including root (chain/), rejected by default (B-18)"
+
+  /begin MODULE ESC_TARGET "target module"
+    /begin COMPU_METHOD CM_E "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+    /begin MEASUREMENT ESC_M "only reachable with allow_include_outside_root" UBYTE CM_E 0 0 0 255
+      ECU_ADDRESS 0x4001
+      READ_WRITE
+    /end MEASUREMENT
+  /end MODULE
+
+/end PROJECT

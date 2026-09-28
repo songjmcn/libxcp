@@ -1,0 +1,5 @@
+ASAP2_VERSION 1 61
+/begin PROJECT TruncProj "truncated on purpose, must fail with line info"
+
+  /begin MODULE TRUNC_ECU "truncated module"
+    /begin MEASUREMENT T_X "cut in the middle of a token" UBYTE CM_T 0 0 0 25

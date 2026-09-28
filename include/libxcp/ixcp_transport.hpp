@@ -33,21 +33,21 @@ public:
      * @note 在 Transport 工作线程调用；packet 仅在本次回调期间有效，
      *       监听器若需异步保存必须自行复制字节。
      */
-    virtual void onPacketReceived(BytesView packet) = 0;
+    virtual void OnPacketReceived(BytesView packet) = 0;
 
     /**
      * @brief Transport 通道已关闭（正常关闭或错误关闭）
      * @param reason 关闭原因描述
-     * @note 在 Transport 工作线程调用；返回后不再有 onPacketReceived 回调。
+     * @note 在 Transport 工作线程调用；返回后不再有 OnPacketReceived 回调。
      */
-    virtual void onTransportClosed(std::string_view reason) = 0;
+    virtual void OnTransportClosed(std::string_view reason) = 0;
 
     /**
      * @brief Transport 发生可恢复错误（如畸形 Datagram 丢弃）
      * @param message 错误描述
      * @note 在 Transport 工作线程调用；Transport 不会因此关闭。
      */
-    virtual void onTransportWarning(std::string_view message) = 0;
+    virtual void OnTransportWarning(std::string_view message) = 0;
 };
 
 /**
@@ -67,13 +67,13 @@ public:
      * @throws XcpException(TransportError) 打开失败
      * @note 打开后 Transport 内部线程开始接收并通过 listener 回调。
      */
-    virtual void open(IPacketListener& listener) = 0;
+    virtual void Open(IPacketListener& listener) = 0;
 
     /**
      * @brief 关闭 Transport 通道
      * @note 关闭后不再调用 listener 回调；可安全重复调用（幂等）。
      */
-    virtual void close() = 0;
+    virtual void Close() = 0;
 
     /**
      * @brief 发送一个完整的 XCP CTO Packet
@@ -81,10 +81,10 @@ public:
      * @throws XcpException(TransportError) 未打开或发送失败
      * @note 可在任意线程调用；实现需保证线程安全。
      */
-    virtual void send(BytesView packet) = 0;
+    virtual void Send(BytesView packet) = 0;
 
     /// @brief Transport 是否已打开
-    [[nodiscard]] virtual bool isOpen() const noexcept = 0;
+    [[nodiscard]] virtual bool IsOpen() const noexcept = 0;
 };
 
 }  // namespace calmcar::xcp

@@ -1,0 +1,60 @@
+{
+  "project": "ConvertProj",
+  "project_desc": "conversion matrix golden sample (B-8/B-14/B-15)",
+  "modules": [
+    {
+      "name": "CONV_ECU",
+      "comment": "six conversion kinds + failure negative paths",
+      "mod_common": true,
+      "mod_par": false,
+      "compu_tabs": [
+        {"name": "TAB_A", "type": "TAB_INTP", "pairs": [[0, 0], [10, 20]]}
+      ],
+      "compu_vtabs": [
+        {"name": "VT_A", "type": "TAB_VERB", "pairs": [[0, "off"], [1, "on"]]}
+      ],
+      "compu_methods": [
+        {"name": "CM_IDENT", "type": "IDENTICAL"},
+        {"name": "CM_LINEAR", "type": "LINEAR", "coeffs_linear": [0.0, 0.5]},
+        {"name": "CM_RATFUNC", "type": "RAT_FUNC",
+         "coeffs": [1.0, 2.0, 1.0, 0.0, 0.0, 1.0]},
+        {"name": "CM_RATDIV0", "type": "RAT_FUNC",
+         "coeffs": [0.0, 0.0, 5.0, 0.0, 0.0, 0.0]},
+        {"name": "CM_TABINTP", "type": "TAB_INTP", "tab_ref": "TAB_A",
+         "ref_unit": "hz"},
+        {"name": "CM_TABNOINTP", "type": "TAB_NOINTP", "tab_ref": "TAB_A",
+         "ref_unit": "zz"},
+        {"name": "CM_TABVERB", "type": "TAB_VERB", "tab_ref": "VT_A"},
+        {"name": "CM_FORM", "type": "FORM", "formula": "raw * 3 + 1"}
+      ],
+      "measurements": [
+        {"name": "M_IDENT", "datatype": "UWORD", "compu": "CM_IDENT",
+         "address": "0x2000", "ext": "0x0", "sample_raw_int": 7},
+        {"name": "M_LINEAR", "datatype": "UWORD", "compu": "CM_LINEAR",
+         "address": "0x2002", "ext": "0x0", "sample_raw_int": 200},
+        {"name": "M_RATFUNC", "datatype": "UWORD", "compu": "CM_RATFUNC",
+         "address": "0x2004", "ext": "0x0", "sample_raw_int": 3},
+        {"name": "M_RATDIV0", "datatype": "UWORD", "compu": "CM_RATDIV0",
+         "address": "0x2006", "ext": "0x0"},
+        {"name": "M_TABINTP", "datatype": "UWORD", "compu": "CM_TABINTP",
+         "address": "0x2008", "ext": "0x0", "sample_raw_int": 5},
+        {"name": "M_TABNOINTP", "datatype": "UWORD", "compu": "CM_TABNOINTP",
+         "address": "0x200A", "ext": "0x0", "sample_raw_int": 10,
+         "phys_unit": "rpm"},
+        {"name": "M_TABVERB", "datatype": "UBYTE", "compu": "CM_TABVERB",
+         "address": "0x200C", "ext": "0x0", "sample_raw_int": 1},
+        {"name": "M_FORM", "datatype": "UWORD", "compu": "CM_FORM",
+         "address": "0x200E", "ext": "0x0"},
+        {"name": "M_U64", "datatype": "A_UINT64", "compu": "CM_IDENT",
+         "address": "0x2010", "ext": "0x0",
+         "lower": 0, "upper": 18446744073709551615},
+        {"name": "M_I64", "datatype": "A_INT64", "compu": "CM_IDENT",
+         "address": "0x2018", "ext": "0x0",
+         "lower": -9223372036854775808, "upper": 9223372036854775807},
+        {"name": "M_F32", "datatype": "FLOAT32_IEEE", "compu": "CM_IDENT",
+         "address": "0x2020", "ext": "0x0"}
+      ],
+      "if_data": []
+    }
+  ]
+}

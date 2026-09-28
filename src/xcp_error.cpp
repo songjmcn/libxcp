@@ -9,7 +9,7 @@
 
 namespace calmcar::xcp {
 
-std::string_view errorCategoryName(ErrorCategory cat) noexcept {
+std::string_view ErrorCategoryName(ErrorCategory cat) noexcept {
     switch (cat) {
         case ErrorCategory::InvalidArgument:
             return "InvalidArgument";
@@ -36,67 +36,67 @@ XcpException::XcpException(ErrorCategory category, std::string message,
                            std::optional<ErrorCode> error_code, int retry_count,
                            std::string transport_error)
     : std::runtime_error(std::move(message)),
-      category_(category),
-      command_code_(command_code),
-      error_code_(error_code),
-      retry_count_(retry_count),
-      transport_error_(std::move(transport_error)) {}
+      m_category_(category),
+      m_command_code_(command_code),
+      m_error_code_(error_code),
+      m_retry_count_(retry_count),
+      m_transport_error_(std::move(transport_error)) {}
 
-ErrorCategory XcpException::category() const noexcept { return category_; }
+ErrorCategory XcpException::Category() const noexcept { return m_category_; }
 
-std::optional<CommandCode> XcpException::commandCode() const noexcept {
-    return command_code_;
+std::optional<CommandCode> XcpException::GetCommandCode() const noexcept {
+    return m_command_code_;
 }
 
-std::optional<ErrorCode> XcpException::errorCode() const noexcept {
-    return error_code_;
+std::optional<ErrorCode> XcpException::GetErrorCode() const noexcept {
+    return m_error_code_;
 }
 
-int XcpException::retryCount() const noexcept { return retry_count_; }
+int XcpException::RetryCount() const noexcept { return m_retry_count_; }
 
-std::string_view XcpException::transportError() const noexcept {
-    return transport_error_;
+std::string_view XcpException::TransportError() const noexcept {
+    return m_transport_error_;
 }
 
 }  // namespace calmcar::xcp
 
 namespace calmcar::xcp::detail {
 
-XcpException makeInvalidArgument(std::string msg) {
+XcpException MakeInvalidArgument(std::string msg) {
     return XcpException(ErrorCategory::InvalidArgument, std::move(msg));
 }
 
-XcpException makeInvalidState(std::string msg) {
+XcpException MakeInvalidState(std::string msg) {
     return XcpException(ErrorCategory::InvalidState, std::move(msg));
 }
 
-XcpException makeTransportError(std::string msg, std::string transport_detail) {
+XcpException MakeTransportError(std::string msg, std::string transport_detail) {
     return XcpException(ErrorCategory::TransportError, std::move(msg),
                         std::nullopt, std::nullopt, 0,
                         std::move(transport_detail));
 }
 
-XcpException makeTimeout(std::string msg, std::optional<CommandCode> cmd,
+XcpException MakeTimeout(std::string msg, std::optional<CommandCode> cmd,
                          int retry) {
     return XcpException(ErrorCategory::Timeout, std::move(msg), cmd,
                         std::nullopt, retry);
 }
 
-XcpException makeMalformedPacket(std::string msg) {
+XcpException MakeMalformedPacket(std::string msg) {
     return XcpException(ErrorCategory::MalformedPacket, std::move(msg));
 }
 
-XcpException makeProtocolError(std::string msg, CommandCode cmd,
+XcpException MakeProtocolError(std::string msg, CommandCode cmd,
                                ErrorCode code) {
     return XcpException(ErrorCategory::ProtocolError, std::move(msg), cmd,
                         code);
 }
 
-XcpException makeUnsupportedFeature(std::string msg) {
+XcpException MakeUnsupportedFeature(std::string msg) {
     return XcpException(ErrorCategory::UnsupportedFeature, std::move(msg));
 }
 
-XcpException makeRecoveryFailed(std::string msg, std::optional<CommandCode> cmd,
+XcpException MakeRecoveryFailed(std::string msg, std::optional<CommandCode> cmd,
                                 int retry) {
     return XcpException(ErrorCategory::RecoveryFailed, std::move(msg), cmd,
                         std::nullopt, retry);
