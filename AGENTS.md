@@ -101,9 +101,10 @@ cmake --build cmake-build-release --target clean
 * 所有接口，函数，成员函数，成员变量以及全局变量需要添加注释，注释使用doxygen格式，需要写中文
 * 对代码段需要增加注释说明，注释要用中文
 # git操作
-只允许调用一下命令
-git diff
-git branch
+无明确指令只允许使用如下指令：
+* git diff
+* git branch
+如果有明确指令，按照指令来操作。
 # 路径规范
 代码、脚本、Skill 中禁止写死绝对路径，优先使用相对路径或环境变量/配置驱动
 仅在无法避免时使用绝对路径（如系统路径 /etc/、/proc/ 等）

@@ -57,7 +57,12 @@ public:
     /// @brief 收到异步 Service Request
     virtual void OnService(const ServicePacket& service) = 0;
 
-    /// @brief 收到 DTO（本阶段仅识别，不解析内容）
+    /**
+     * @brief 收到 DTO
+     * @details 批次14（R12 定稿）：`dto.data` 是**完整 DTO 帧**（`data[0]`
+     *          即 PID），可直接喂给 `IDaqLayout::Decode(frame_layout, data)`；
+     *          本层仍不解析内容（envelope 与净荷的解释属桥接层 DAQ 解码）。
+     */
     virtual void OnDto(const DtoPacket& dto) = 0;
 };
 
@@ -184,6 +189,166 @@ public:
     /// @return true 表示 Slave 已用 ERR_CMD_SYNCH 确认；false 表示未获确认
     bool SendSynch();
 
+    /**
+     * @brief 隐含 DAQ 指针的本端记录（批次14，T14-05）
+     * @details XCP 的 DAQ 指针**不可查询**（docs L2172「写过最后一个 Entry
+     *          后 Pointer 值未定义」），所以本端只能记住最近一次成功
+     *          SET_DAQ_PTR 的三元组，用于 SYNCH 恢复后重放。
+     * @note WRITE_DAQ/READ_DAQ 会让 Slave 侧指针自增，而本端记录**不自增**：
+     *       编排层（XcpMaster 的 DAQ 配置）对每个 Entry 都显式发一次
+     *       SET_DAQ_PTR，从而彻底避开"指针越过 ODT 末位后未定义"的陷阱
+     *       （docs L2172 要求跨 ODT/DAQ List 必须重新 SET_DAQ_PTR）。
+     */
+    struct DaqPointer {
+        std::uint16_t daq_list{0};   ///< DAQ List 号（EPK）
+        std::uint8_t odt_number{0};  ///< ODT 号（0 基）
+        std::uint8_t odt_entry{0};   ///< ODT Entry 号（0 基）
+    };
+
+    // ---- 批次14：DAQ 命令组（T14-05）----
+    //
+    // 与既有命令完全同一条执行链（RunCommand：单 Outstanding → 超时 →
+    // SYNCH 恢复 → 重试），不新增事务循环；差异只在于**隐含 DAQ 指针**
+    // 也需要在恢复后重建（docs L2783「WRITE_DAQ 前重新 SET_DAQ_PTR」）。
+
+    /**
+     * @brief 执行 SET_DAQ_PTR（docs L2141-2153；Mandatory）
+     * @param daq_list DAQ List 号（EPK）
+     * @param odt_number ODT 号（0 基）
+     * @param odt_entry_number ODT Entry 号（0 基）
+     * @details 成功后记录为当前隐含指针，供 WRITE_DAQ/READ_DAQ 超时恢复时
+     *          重放（docs L2172 指针不可查询、L2783 恢复要求）。
+     * @throws XcpException 超时、协议错误（指定对象不存在 → ERR_OUT_OF_RANGE）
+     *         或恢复失败
+     */
+    void ExecuteSetDaqPtr(std::uint16_t daq_list, std::uint8_t odt_number,
+                          std::uint8_t odt_entry_number);
+
+    /**
+     * @brief 执行 WRITE_DAQ（docs L2155-2172；Mandatory）
+     * @param bit_offset 位偏；无位偏填 kDaqBitOffsetNone(0xFF)
+     * @param size 本 Entry 元素数（以 AG 为单位）
+     * @param extension 地址扩展
+     * @param address 32 位地址
+     * @details 成功后 Slave 的隐含指针在同 ODT 内自动前移一位；本层同步推进
+     *          记录值，**超过 0xFF 或写过 ODT 末位后指针不可知**（docs
+     * L2172）， 因此记录被清空，调用方必须重新 SET_DAQ_PTR 才能继续跨 ODT
+     * 配置。
+     * @throws XcpException 超时、协议错误（PREDEFINED 列表 →
+     * ERR_WRITE_PROTECTED） 或恢复失败
+     */
+    void ExecuteWriteDaq(std::uint8_t bit_offset, std::uint8_t size,
+                         AddressExtension extension, Address address);
+
+    /**
+     * @brief 执行 CLEAR_DAQ_LIST（docs L2431-2444；Static Mandatory）
+     * @param daq_list DAQ List 号（EPK）
+     * @details 无论 PREDEFINED 还是 configurable 列表，正在运行的数据传输都会
+     *          停止（docs L2444）；因此本命令**清空隐含指针记录**，后续
+     *          WRITE_DAQ 必须显式 SET_DAQ_PTR。
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    void ExecuteClearDaqList(std::uint16_t daq_list);
+
+    /**
+     * @brief 执行 SET_DAQ_LIST_MODE（docs L2174-2204；Mandatory）
+     * @param mode MODE 位组合
+     * @param daq_list DAQ List 号（EPK）
+     * @param event_channel 事件通道号（0 = 不由该通道触发）
+     * @param prescaler 降频因子（1 = 不降频）
+     * @param priority 优先级（0xFF 最高）
+     * @throws XcpException 超时、协议错误（如 ALTERNATING+TIMESTAMP 非法组合
+     *         → ERR_CMD_SYNTAX）或恢复失败
+     */
+    void ExecuteSetDaqListMode(DaqListModeBit mode, std::uint16_t daq_list,
+                               std::uint16_t event_channel,
+                               std::uint8_t prescaler, std::uint8_t priority);
+
+    /**
+     * @brief 执行 START_STOP_DAQ_LIST（docs L2206-2228；Mandatory）
+     * @param action Stop/Start/Select
+     * @param daq_list DAQ List 号（EPK）
+     * @return 响应解析结果（含 FIRST_PID；Stop 时 Slave 也回该字段，语义按
+     *         docs L2222 仅在 Absolute ODT Number 模式下有用）
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    [[nodiscard]] StartStopDaqListResponse ExecuteStartStopDaqList(
+        DaqListAction action, std::uint16_t daq_list);
+
+    /**
+     * @brief 执行 START_STOP_SYNCH（docs L2230-2242；Mandatory）
+     * @param action StopAll/StartSelected/StopSelected
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    void ExecuteStartStopSynch(DaqSynchAction action);
+
+    /**
+     * @brief 执行 GET_DAQ_LIST_INFO（docs L2446-2465；**Optional**）
+     * @param daq_list DAQ List 号（EPK）
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
+     *         （docs L1631：未实现的可选命令必回 ERR_CMD_UNKNOWN 且无副作用）
+     * @throws XcpException 超时、其他协议错误或恢复失败
+     */
+    [[nodiscard]] std::optional<GetDaqListInfoResponse> ExecuteGetDaqListInfo(
+        std::uint16_t daq_list);
+
+    /**
+     * @brief 执行 GET_DAQ_PROCESSOR_INFO（docs L2285-2311；**Optional**）
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
+     * @details B-16 的 identification_field_type / address_extension_mode
+     *          两类比对只能以本响应的 DAQ_KEY_BYTE 为运行时真值（docs L1445），
+     *          因此桥接层 `RuntimeXcpParams` 的 DAQ 字段来自这里。
+     * @throws XcpException 超时、其他协议错误或恢复失败
+     */
+    [[nodiscard]] std::optional<GetDaqProcessorInfoResponse>
+    ExecuteGetDaqProcessorInfo();
+
+    /**
+     * @brief 执行 GET_DAQ_RESOLUTION_INFO（docs L2340-2364；**Optional**）
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
+     * @throws XcpException 超时、其他协议错误或恢复失败
+     */
+    [[nodiscard]] std::optional<GetDaqResolutionInfoResponse>
+    ExecuteGetDaqResolutionInfo();
+
+    /**
+     * @brief 执行 READ_DAQ（docs L2257-2261；**Optional**）
+     * @details 读当前隐含 DAQ 指针处的 Entry 并自动前移；PREDEFINED 与
+     *          configurable 列表都可读（docs L2261）——这是 B-6 实际账本在
+     *          PREDEFINED 侧唯一可取证的通路。
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
+     * @throws XcpException 超时、其他协议错误或恢复失败
+     */
+    [[nodiscard]] std::optional<ReadDaqResponse> ExecuteReadDaq();
+
+    // ---- 批次14：写回（T14-06 的底层通道）----
+
+    /**
+     * @brief 执行 DOWNLOAD（docs L1979-1987；Mandatory，CAL/PAG 可用时）
+     * @param number_of_elements 本帧元素数（以 AG 为单位）
+     * @param data 本帧数据（字节数必须 = 元素数 × AG，由 MemoryAccess 保证）
+     * @details 从当前隐含 MTA 起写入，完成后 Slave 自动前移 MTA；本层同步
+     *          推进 MTA 记录，使分块写回在超时恢复后仍落在正确地址。
+     * @throws XcpException 超时、协议错误（写保护 → ERR_WRITE_PROTECTED）
+     *         或恢复失败
+     */
+    void ExecuteDownload(ElementCount number_of_elements, BytesView data);
+
+    /**
+     * @brief 执行 SHORT_DOWNLOAD（docs L2018-2026；**Optional**）
+     * @param number_of_elements 元素数（以 AG 为单位）
+     * @param extension 地址扩展
+     * @param address 32 位地址
+     * @param data 数据字节
+     * @throws XcpException 超时、其他协议错误或恢复失败
+     * @note Slave 回 ERR_CMD_UNKNOWN 不降级为"部分成功"——写回必须有确认，
+     *       故本方法把 ERR_CMD_UNKNOWN 原样上抛，由 MemoryAccess 回落
+     *       SET_MTA+DOWNLOAD 通路（与 SHORT_UPLOAD 的读降级不同）。
+     */
+    void ExecuteShortDownload(ElementCount number_of_elements,
+                              AddressExtension extension, Address address,
+                              BytesView data);
+
 private:
     /// @brief 单条命令的执行流程：状态检查 -> 发送 -> 等待 -> 错误分派 ->
     /// 恢复重试
@@ -222,14 +387,21 @@ private:
     /// @throws XcpException(RecoveryFailed) SYNCH 未获确认，或重试次数用尽
     void PerformRecovery(CommandCode cmd);
 
-    /// @brief 恢复成功后重建 UPLOAD 所依赖的隐含 MTA
-    /// @details 本 Session 未设置过 MTA 时直接返回；SET_MTA 自身失败不掩盖，
-    ///          交由随后的 UPLOAD 重试把错误暴露出来。
+    /// @brief 恢复成功后重建 UPLOAD / DOWNLOAD 所依赖的隐含 MTA
+    /// @details 与 RestoreDaqPtr 同属"隐含状态重放"，见上面 RunCommand 注释。
     void RestoreUploadMta();
 
     /// @brief 按 Session 字节序惰性创建/重建 Codec 与 Parser
     /// @param byte_order CONNECT 协商出的字节序
     void EnsureCodec(ByteOrder byte_order);
+
+    /**
+     * @brief 恢复成功后重建 WRITE_DAQ/READ_DAQ 依赖的隐含 DAQ 指针
+     * @details docs L2783 明确要求「WRITE_DAQ 前重新 SET_DAQ_PTR」；指针不可
+     *          查询（docs L2172），只能重放本层记录的最近一次成功 SET_DAQ_PTR。
+     *          未记录（含被 CLEAR_DAQ_LIST 作废）时直接返回。
+     */
+    void RestoreDaqPtr();
 
     /// @brief 校验响应数据长度是否等于 elements * AG，不符判为畸形包
     /// @param cmd 命令码（用于错误定位）
@@ -264,6 +436,10 @@ private:
         false};  ///< 本轮收到 EV_CMD_PENDING，需重启计时
     std::optional<XcpAddress40>
         m_last_mta_;  ///< 最近一次成功 SET_MTA 的地址（隐含状态）
+    /// @brief 最近一次成功 SET_DAQ_PTR 的指针三元组（批次14，隐含状态）
+    /// @details WRITE_DAQ/READ_DAQ 超时恢复时重放本值；CLEAR_DAQ_LIST 与
+    ///          CONNECT/DISCONNECT 会将其作废（置 nullopt）。
+    std::optional<DaqPointer> m_last_daq_ptr_;
 };
 
 }  // namespace calmcar::xcp

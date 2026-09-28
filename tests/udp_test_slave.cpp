@@ -58,6 +58,33 @@ constexpr std::uint8_t kSupportedResourceBits = 0x1DU;
 /// @brief 测试默认 Seed 内容（4 字节，单帧即可容纳）
 constexpr std::uint8_t kDefaultSeed[] = {0x01, 0x02, 0x03, 0x04};
 
+// ---- DAQ / DOWNLOAD 模拟参数（批次14，T14-09）----
+// 只影响显式开启 DAQ 模拟的用例；默认关闭时这些常量完全不参与。
+
+/// @brief 模拟 Slave 支持的 DAQ List 数（EPK 0..kTestDaqCount-1）
+constexpr std::uint16_t kTestDaqCount = 4U;
+/// @brief 每个 DAQ List 支持的 ODT 上限（GET_DAQ_LIST_INFO 的 MAX_ODT）
+constexpr std::uint8_t kTestMaxOdt = 4U;
+/// @brief 每个 ODT 支持的 Entry 上限（GET_DAQ_LIST_INFO 的 MAX_ODT_ENTRIES）
+constexpr std::uint8_t kTestMaxOdtEntries = 8U;
+/// @brief FIRST_PID 基址：list n 的 FIRST_PID = kTestFirstPidBase +
+/// n*kTestMaxOdt
+/// @details Absolute ODT Number 模式下 PID 全局唯一（docs L1421-1434），
+///          每个列表预留 kTestMaxOdt 个连续 PID，避免列表间串号。
+constexpr std::uint8_t kTestFirstPidBase = 0x10U;
+/// @brief GET_DAQ_RESOLUTION_INFO 的 ODT Entry 粒度（字节）
+constexpr std::uint8_t kTestDaqGranularity = 1U;
+/// @brief GET_DAQ_RESOLUTION_INFO 的 ODT Entry 上限（字节）
+constexpr std::uint8_t kTestDaqMaxEntrySize = 8U;
+/// @brief GET_DAQ_RESOLUTION_INFO 的 TIMESTAMP_TICKS（时间戳节拍）
+constexpr std::uint16_t kTestDaqTimestampTicks = 1000U;
+/// @brief TIMESTAMP_MODE：非强制、位宽编码 1（1=BYTE）、单位编码 3
+/// @details 单位编码只按原值回显，不做 μs 换算（R13 无权威码表）
+constexpr std::uint8_t kTestDaqTimestampMode = 0x31U;
+/// @brief DOWNLOAD / SHORT_DOWNLOAD 的 CTO 头字节数
+constexpr std::size_t kDownloadHeaderBytes = 2U;
+constexpr std::size_t kShortDownloadHeaderBytes = 8U;
+
 /// @brief Windows 进程内 WSAStartup 引用计数
 #if defined(_WIN32)
 class WinsockSession {
@@ -101,7 +128,7 @@ struct UdpTestSlave::SocketImpl {
 // 构造 / 析构 / 生命周期
 // ---------------------------------------------------------------------------
 
-UdpTestSlave::UdpTestSlave() {
+UdpTestSlave::UdpTestSlave(std::uint16_t fixed_port) {
     auto impl = std::make_unique<SocketImpl>();
     impl->handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (impl->handle == kInvalidSocket) {
@@ -110,7 +137,7 @@ UdpTestSlave::UdpTestSlave() {
 
     sockaddr_in local{};
     local.sin_family = AF_INET;
-    local.sin_port = 0;  // 由 OS 分配临时端口，测试不依赖固定端口
+    local.sin_port = htons(fixed_port);  // 0=OS 临时端口；非0=固定端口（E2E）
     local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (::bind(impl->handle, reinterpret_cast<sockaddr*>(&local),
                sizeof(local)) != 0) {
@@ -287,6 +314,456 @@ std::optional<Bytes> UdpTestSlave::ReadAtMta(ElementCount elements) {
         }
     }
     return std::nullopt;
+}
+
+// ---------------------------------------------------------------------------
+// DAQ / DOWNLOAD 模拟（批次14，T14-09）
+//
+// 默认关闭：SetDaqSimulationEnabled(true) 之前，所有 DAQ 命令码与 DOWNLOAD
+// 一律走既有的 `else → ERR_CMD_UNKNOWN` 分支，既有 253 项用例语义零变化。
+// ---------------------------------------------------------------------------
+
+void UdpTestSlave::SetDaqSimulationEnabled(bool enabled) {
+    const std::lock_guard<std::mutex> lock(m_state_mutex_);
+    m_daq_enabled_ = enabled;
+    if (!enabled) {
+        // 关闭时清空配置，避免"关过一次再开"残留旧布局
+        m_daq_lists_.clear();
+        m_daq_ptr_ = SlaveDaqPtr{};
+        m_dto_ctr_ = 0U;
+    }
+}
+
+bool UdpTestSlave::DaqSimulationEnabled() const {
+    const std::lock_guard<std::mutex> lock(m_state_mutex_);
+    return m_daq_enabled_;
+}
+
+void UdpTestSlave::SetDaqListPredefined(std::uint16_t daq_list,
+                                        bool predefined) {
+    const std::lock_guard<std::mutex> lock(m_state_mutex_);
+    MutableDaqList(daq_list).predefined = predefined;
+}
+
+UdpTestSlave::SlaveDaqList& UdpTestSlave::MutableDaqList(
+    std::uint16_t daq_list) {
+    auto it = m_daq_lists_.find(daq_list);
+    if (it == m_daq_lists_.end()) {
+        SlaveDaqList list;
+        // FIRST_PID：list n 的首个 ODT 号（预留 kTestMaxOdt 个连续 PID）
+        list.first_pid = static_cast<std::uint8_t>(kTestFirstPidBase +
+                                                   daq_list * kTestMaxOdt);
+        it = m_daq_lists_.emplace(daq_list, std::move(list)).first;
+    }
+    return it->second;
+}
+
+bool UdpTestSlave::WriteAtAddress(Address address, BytesView data) {
+    const std::lock_guard<std::mutex> lock(m_memory_mutex_);
+    auto it = m_memory_.find(address);
+    if (it == m_memory_.end()) {
+        // 新块：写开辟一块模拟内存（等价于 ECU 在已分配段内写，测试语义）
+        m_memory_.emplace(address, Bytes(data.begin(), data.end()));
+        return true;
+    }
+    Bytes& block = it->second;
+    if (static_cast<std::size_t>(address - it->first) + data.size() >
+        block.size()) {
+        // 与 READ 侧同一口径：跨块写入视为不可写（禁止"拆开写"的猜测）
+        return false;
+    }
+    const std::size_t offset = static_cast<std::size_t>(address - it->first);
+    std::copy(data.begin(), data.end(),
+              block.begin() + static_cast<std::ptrdiff_t>(offset));
+    return true;
+}
+
+std::optional<Bytes> UdpTestSlave::ReadDaqEntryPayload(
+    const SlaveDaqEntry& entry) const {
+    const auto want = static_cast<std::size_t>(entry.size) * kTestAgBytes;
+    if (want == 0U) {
+        return std::nullopt;
+    }
+    const std::lock_guard<std::mutex> lock(m_memory_mutex_);
+    for (const auto& [base, content] : m_memory_) {
+        if (entry.address >= base &&
+            entry.address < base + static_cast<Address>(content.size())) {
+            const auto offset = static_cast<std::size_t>(entry.address - base);
+            if (offset + want > content.size()) {
+                return std::nullopt;  // 跨块：不猜，直接判不可读
+            }
+            return Bytes(
+                content.begin() + static_cast<std::ptrdiff_t>(offset),
+                content.begin() + static_cast<std::ptrdiff_t>(offset + want));
+        }
+    }
+    return std::nullopt;
+}
+
+UdpTestSlave::DaqDispatchResult UdpTestSlave::HandleDaqOrDownload(
+    BytesView xcp_packet) {
+    // 返回 handled=false 时，调用方沿用既有 ERR_CMD_UNKNOWN 分支
+    DaqDispatchResult out;
+    const std::uint8_t cmd = xcp_packet[0];
+    const auto dest = [&](Bytes resp) {
+        out.handled = true;
+        out.response = std::move(resp);
+        return out;
+    };
+    // 本函数内所有地址解码都按 Session 字节序（测试 Slave 固定 Intel 小端）。
+    // 注意：unsigned 短类型参与 | 与 << 会被整型提升为 int，必须在外层再
+    // static_cast 回目标类型，否则 brace-init 会触发收缩转换错误。
+    const auto read_u16 = [&](std::size_t at) -> std::uint16_t {
+        return static_cast<std::uint16_t>(
+            static_cast<unsigned>(xcp_packet[at]) |
+            (static_cast<unsigned>(xcp_packet[at + 1]) << 8));
+    };
+    const auto read_u32 = [&](std::size_t at) -> Address {
+        return static_cast<Address>(
+            static_cast<std::uint64_t>(xcp_packet[at]) |
+            (static_cast<std::uint64_t>(xcp_packet[at + 1]) << 8) |
+            (static_cast<std::uint64_t>(xcp_packet[at + 2]) << 16) |
+            (static_cast<std::uint64_t>(xcp_packet[at + 3]) << 24));
+    };
+
+    switch (cmd) {
+        case static_cast<std::uint8_t>(CommandCode::ClearDaqList): {
+            // [E3][reserved][DAQ(WORD)]
+            if (xcp_packet.size() < 4U) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            const auto daq = read_u16(2);
+            if (daq >= kTestDaqCount) {
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            auto& list = MutableDaqList(daq);
+            // docs L2437-2444：复位为"无 Entry、BIT_OFFSET=0xFF"，并停止传输
+            list.odts.clear();
+            list.running = false;
+            list.selected = false;
+            m_daq_ptr_ = SlaveDaqPtr{daq, std::uint8_t{0}, std::uint8_t{0}};
+            return dest(MakeRes({}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::SetDaqPtr): {
+            // [E2][reserved][DAQ(WORD)][ODT][ENTRY]
+            if (xcp_packet.size() < 6U) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            const auto daq = read_u16(2);
+            const auto odt = xcp_packet[4];
+            const auto entry = xcp_packet[5];
+            if (daq >= kTestDaqCount || odt >= kTestMaxOdt ||
+                entry >= kTestMaxOdtEntries) {
+                // docs L2153：指定对象不存在 → ERR_OUT_OF_RANGE
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            m_daq_ptr_ = SlaveDaqPtr{daq, odt, entry};
+            return dest(MakeRes({}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::WriteDaq): {
+            // [E1][BIT_OFFSET][SIZE][EXT][ADDR(DWORD)]
+            if (xcp_packet.size() < 8U) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            // 注意：必须走 MutableDaqList()，直接用 operator[] 会绕过
+            // FIRST_PID 的分配规则（list n → 0x10 + n*kTestMaxOdt）
+            const SlaveDaqList& list = MutableDaqList(m_daq_ptr_.daq);
+            if (list.predefined) {
+                // docs L2168：指向 PREDEFINED 列表 → ERR_WRITE_PROTECTED
+                return dest(MakeErr(ErrorCode::WriteProtected));
+            }
+            const auto entry_size = xcp_packet[2];
+            if (entry_size == 0U) {
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            auto& target = MutableDaqList(m_daq_ptr_.daq);
+            while (target.odts.size() <= m_daq_ptr_.odt) {
+                target.odts.emplace_back();
+            }
+            auto& odt = target.odts[m_daq_ptr_.odt];
+            while (odt.size() <= m_daq_ptr_.entry) {
+                odt.emplace_back();
+            }
+            odt[m_daq_ptr_.entry] = SlaveDaqEntry{xcp_packet[1], entry_size,
+                                                  xcp_packet[3], read_u32(4)};
+            // docs L2172：写成功后指针在同 ODT 内自增；越过末位后指针未定义
+            // → 本模拟把 entry 停在末位（不自增到越界），由 Master 显式
+            //   SET_DAQ_PTR（真实 ECU 行为各异，这里取可预测的一种）
+            if (m_daq_ptr_.entry + 1U < kTestMaxOdtEntries) {
+                ++m_daq_ptr_.entry;
+            }
+            return dest(MakeRes({}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::ReadDaq): {
+            // [DB]；RES [FF][BITOFFSET][SIZE][EXT][ADDR(DWORD)]
+            if (m_daq_ptr_.daq >= kTestDaqCount) {
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            const auto it = m_daq_lists_.find(m_daq_ptr_.daq);
+            if (it == m_daq_lists_.end() ||
+                m_daq_ptr_.odt >= it->second.odts.size() ||
+                m_daq_ptr_.entry >= it->second.odts[m_daq_ptr_.odt].size()) {
+                // 指针指向不存在的 Entry：不猜，回 ERR_OUT_OF_RANGE
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            const auto& e = it->second.odts[m_daq_ptr_.odt][m_daq_ptr_.entry];
+            Bytes body;
+            body.push_back(e.bit_offset);
+            body.push_back(e.size);
+            body.push_back(e.extension);
+            body.push_back(static_cast<std::uint8_t>(e.address & 0xFFU));
+            body.push_back(static_cast<std::uint8_t>((e.address >> 8) & 0xFFU));
+            body.push_back(
+                static_cast<std::uint8_t>((e.address >> 16) & 0xFFU));
+            body.push_back(
+                static_cast<std::uint8_t>((e.address >> 24) & 0xFFU));
+            Bytes resp;
+            resp.push_back(static_cast<std::uint8_t>(PacketType::Res));
+            resp.insert(resp.end(), body.begin(), body.end());
+            if (m_daq_ptr_.entry + 1U < kTestMaxOdtEntries) {
+                ++m_daq_ptr_.entry;
+            }
+            return dest(std::move(resp));
+        }
+        case static_cast<std::uint8_t>(CommandCode::SetDaqListMode): {
+            // [E0][MODE][DAQ(WORD)][EVENT(WORD)][PRESCALER][PRIORITY]
+            if (xcp_packet.size() < 8U) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            const auto daq = read_u16(2);
+            if (daq >= kTestDaqCount) {
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            const auto mode = xcp_packet[1];
+            // docs L2198：ALTERNATING 与 TIMESTAMP 不能同时置位
+            if ((mode & 0x01U) != 0U && (mode & 0x10U) != 0U) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            auto& list = MutableDaqList(daq);
+            list.mode = mode;
+            list.event_channel = read_u16(4);
+            list.prescaler = xcp_packet[6];
+            list.priority = xcp_packet[7];
+            return dest(
+                MakeRes({mode, static_cast<std::uint8_t>(daq & 0xFFU),
+                         static_cast<std::uint8_t>(daq >> 8), 0x00, 0x00}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::StartStopDaqList): {
+            // [DE][MODE][DAQ(WORD)]；RES [FF][FIRST_PID]
+            if (xcp_packet.size() < 4U) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            const auto action = xcp_packet[1];
+            const auto daq = read_u16(2);
+            if (daq >= kTestDaqCount) {
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            auto& list = MutableDaqList(daq);
+            switch (action) {
+                case 0x00U:
+                    list.running = false;
+                    break;
+                case 0x01U:
+                    list.running = true;
+                    break;
+                case 0x02U:
+                    list.selected = true;
+                    break;
+                default:
+                    return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            return dest(MakeRes({list.first_pid}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::StartStopSynch): {
+            // [DD][MODE]
+            if (xcp_packet.size() < 2U) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            const auto action = xcp_packet[1];
+            for (auto& [number, list] : m_daq_lists_) {
+                if (action == 0x00U) {
+                    list.running = false;  // stop all
+                } else if (action == 0x01U && list.selected) {
+                    list.running = true;  // start selected
+                } else if (action == 0x02U && list.selected) {
+                    list.running = false;  // stop selected
+                }
+            }
+            if (action <= 0x02U) {
+                if (action != 0x00U) {
+                    for (auto& [number, list] : m_daq_lists_) {
+                        list.selected =
+                            false;  // docs L2442：成功后清除 SELECTED
+                    }
+                }
+                return dest(MakeRes({}));
+            }
+            return dest(MakeErr(ErrorCode::OutOfRange));
+        }
+        case static_cast<std::uint8_t>(CommandCode::GetDaqListInfo): {
+            // [D8][reserved][DAQ(WORD)]
+            // RES [FF][PROPERTIES][MAX_ODT][MAX_ODT_ENTRY][FIXED_EVENT(WORD)]
+            if (xcp_packet.size() < 4U) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            const auto daq = read_u16(2);
+            if (daq >= kTestDaqCount) {
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            const auto& list = MutableDaqList(daq);
+            std::uint8_t props = 0x00U;
+            if (list.predefined) {
+                props |= 0x01U;  // PREDEFINED
+            }
+            if (list.event_channel != 0U) {
+                props |= 0x02U;  // EVENT_FIXED
+            }
+            props |= (HasDaqMode(static_cast<DaqListModeBit>(list.mode),
+                                 DaqListModeBit::kStim))
+                         ? 0x08U
+                         : 0x04U;  // DIR_STIM / DIR_DAQ
+            return dest(
+                MakeRes({props, kTestMaxOdt, kTestMaxOdtEntries,
+                         static_cast<std::uint8_t>(list.event_channel & 0xFFU),
+                         static_cast<std::uint8_t>((list.event_channel >> 8) &
+                                                   0xFFU)}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::GetDaqProcessorInfo): {
+            // [DA]；RES [FF][PROPERTIES][MAX_DAQ(WORD)][MAX_EVENT(WORD)]
+            //   [MIN_DAQ][DAQ_KEY_BYTE]（docs L2292-2297；xcp.h:790-795）
+            // PROPERTIES: bit0 DAQ_CONFIG_TYPE=0（Static；动态 ALLOC 流程不
+            //   支持，与 B-5 一致）| bit1 PRESCALER_SUPPORTED
+            // DAQ_KEY_BYTE: OPTIMISATION=DEFAULT(0) | ADDRESS_EXTENSION=DAQ
+            //   (3<<4) | IDENTIFICATION=ABSOLUTE ODT(0<<6)
+            // —— 后两项即 B-16 DAQ 侧比对的运行时真值（docs L1445）
+            return dest(MakeRes(
+                {0x02U, static_cast<std::uint8_t>(kTestDaqCount & 0xFFU),
+                 static_cast<std::uint8_t>(kTestDaqCount >> 8), 0x02U, 0x00U,
+                 0x00U, 0x30U}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::GetDaqResolutionInfo): {
+            // [D9]；RES 见 xcp.h:799-805
+            return dest(MakeRes(
+                {kTestDaqGranularity, kTestDaqMaxEntrySize, kTestDaqGranularity,
+                 kTestDaqMaxEntrySize, kTestDaqTimestampMode,
+                 static_cast<std::uint8_t>(kTestDaqTimestampTicks & 0xFFU),
+                 static_cast<std::uint8_t>((kTestDaqTimestampTicks >> 8) &
+                                           0xFFU)}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::Download): {
+            // [F0][SIZE][data...]：从当前 MTA 写，写完 MTA 自增（docs L1983）
+            if (xcp_packet.size() < kDownloadHeaderBytes) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            const auto elements = static_cast<ElementCount>(xcp_packet[1]);
+            const auto want = static_cast<std::size_t>(elements) * kTestAgBytes;
+            if (elements == 0U ||
+                xcp_packet.size() - kDownloadHeaderBytes < want) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            if (EffectiveProtection() != 0U) {
+                // 未解锁的受保护资源：写回同样拒绝（与 UPLOAD 侧一致口径）
+                return dest(MakeErr(ErrorCode::AccessLocked));
+            }
+            const BytesView payload =
+                xcp_packet.subspan(kDownloadHeaderBytes, want);
+            if (!WriteAtAddress(m_mta_, payload)) {
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            if (!AdvanceMta(elements)) {
+                return dest(MakeErr(ErrorCode::MemoryOverflow));
+            }
+            return dest(MakeRes({}));
+        }
+        case static_cast<std::uint8_t>(CommandCode::ShortDownload): {
+            // [ED][SIZE][reserved][EXT][ADDR(DWORD)][data...]
+            if (xcp_packet.size() < kShortDownloadHeaderBytes) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            const auto elements = static_cast<ElementCount>(xcp_packet[1]);
+            const auto want = static_cast<std::size_t>(elements) * kTestAgBytes;
+            const std::size_t available =
+                xcp_packet.size() - kShortDownloadHeaderBytes;
+            if (elements == 0U || available < want) {
+                return dest(MakeErr(ErrorCode::CmdSyntax));
+            }
+            if (EffectiveProtection() != 0U) {
+                return dest(MakeErr(ErrorCode::AccessLocked));
+            }
+            const auto address = read_u32(4);
+            const BytesView payload =
+                xcp_packet.subspan(kShortDownloadHeaderBytes, want);
+            if (!WriteAtAddress(address, payload)) {
+                return dest(MakeErr(ErrorCode::OutOfRange));
+            }
+            // docs L2022：SHORT_DOWNLOAD 之后 MTA 指向数据块末尾之后
+            m_mta_ = address;
+            m_mta_extension_ = xcp_packet[3];
+            (void)AdvanceMta(elements);
+            return dest(MakeRes({}));
+        }
+        default:
+            return out;  // handled=false → 交回既有 ERR_CMD_UNKNOWN 分支
+    }
+}
+
+std::size_t UdpTestSlave::SendDaqListDtos(std::uint16_t daq_list) {
+    // 锁内只组帧，发帧必须在锁外（SendResponseTo 自身要拿 m_state_mutex_）
+    std::vector<Bytes> frames;
+    std::string ip;
+    std::uint16_t port = 0U;
+    {
+        const std::lock_guard<std::mutex> lock(m_state_mutex_);
+        if (!m_daq_enabled_) {
+            throw detail::MakeInvalidState(
+                "未开启 DAQ 模拟（SetDaqSimulationEnabled），不能发送 DTO");
+        }
+        if (!m_connect_source_ip_ || !m_connect_source_port_) {
+            throw detail::MakeInvalidState(
+                "尚无 CONNECT 来源端点，无法发送 DTO");
+        }
+        const auto it = m_daq_lists_.find(daq_list);
+        if (it == m_daq_lists_.end() || it->second.odts.empty()) {
+            return 0U;
+        }
+        const SlaveDaqList& list = it->second;
+        for (std::size_t odt = 0; odt < list.odts.size(); ++odt) {
+            Bytes frame;
+            frame.push_back(static_cast<std::uint8_t>(list.first_pid + odt));
+            if (HasDaqMode(static_cast<DaqListModeBit>(list.mode),
+                           DaqListModeBit::kDtoCounter)) {
+                frame.push_back(m_dto_ctr_);
+            }
+            if (HasDaqMode(static_cast<DaqListModeBit>(list.mode),
+                           DaqListModeBit::kTimestamp)) {
+                // 时间戳按 TIMESTAMP_MODE 的位宽编码 1（= 1 字节）发原样节拍
+                frame.push_back(0x00U);
+            }
+            bool readable = true;
+            for (const auto& entry : list.odts[odt]) {
+                auto payload = ReadDaqEntryPayload(entry);
+                if (!payload) {
+                    readable = false;
+                    break;
+                }
+                frame.insert(frame.end(), payload->begin(), payload->end());
+            }
+            if (!readable) {
+                continue;  // 取不到净荷的 ODT 不发半帧（禁止伪造数据）
+            }
+            frames.push_back(std::move(frame));
+        }
+        ip = *m_connect_source_ip_;
+        port = *m_connect_source_port_;
+        if (HasDaqMode(static_cast<DaqListModeBit>(list.mode),
+                       DaqListModeBit::kDtoCounter)) {
+            ++m_dto_ctr_;
+        }
+    }
+    for (const auto& frame : frames) {
+        SendResponseTo(BytesView{frame}, ip, port);
+    }
+    return frames.size();
 }
 
 // ---------------------------------------------------------------------------
@@ -474,11 +951,18 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             m_key_total_ = 0;
             m_key_received_ = 0;
             m_key_prev_length_ = 0;
-            // RESOURCE=0x15(CAL/PAG+DAQ+PGM),
+            // 新会话：DAQ
+            // 配置与隐含指针归零（批次14；即使模拟未开启也无副作用）
+            m_daq_lists_.clear();
+            m_daq_ptr_ = SlaveDaqPtr{};
+            m_dto_ctr_ = 0U;
+            // DAQ 模拟开启时 RESOURCE=0x15(CAL/PAG+DAQ+PGM)，关闭时
+            // 清除 DAQ 位为 0x11，避免声明未实现的 Mandatory 资源能力。
             // COMM_MODE_BASIC=0xC0(Intel/BYTE/Block/Optional), MAX_CTO=8,
             // MAX_DTO=8(小端), ProtoVer=0x10, TransportVer=0x10
+            const std::uint8_t resource = m_daq_enabled_ ? 0x15U : 0x11U;
             response =
-                MakeRes({0x15, 0xC0, kTestMaxCto,
+                MakeRes({resource, 0xC0, kTestMaxCto,
                          static_cast<std::uint8_t>(kTestMaxDto & 0xFFU),
                          static_cast<std::uint8_t>((kTestMaxDto >> 8) & 0xFFU),
                          0x10, 0x10});
@@ -492,9 +976,18 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::GetStatus)) {
-            // Session Status=0x00, Protection=当前生效掩码（批次 7 动态化）,
-            // STATE_NUMBER=0x01, ConfigID=0x0007(小端)
-            response = MakeRes({0x00, EffectiveProtection(), 0x01, 0x07, 0x00});
+            // Session Status=DAQ_RUNNING 位（批次14：只在 DAQ 模拟开启且有
+            // 列表在跑时置位，docs L2220）, Protection=当前生效掩码（批次 7
+            // 动态化）, STATE_NUMBER=0x01, ConfigID=0x0007(小端)
+            std::uint8_t session_status = 0x00U;
+            for (const auto& [number, list] : m_daq_lists_) {
+                if (list.running) {
+                    session_status |= 0x40U;  // bit6 DAQ_RUNNING
+                    break;
+                }
+            }
+            response = MakeRes(
+                {session_status, EffectiveProtection(), 0x01, 0x07, 0x00});
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::Synch)) {
@@ -600,6 +1093,17 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
                         m_mta_extension_ = saved_ext;
                     }
                 }
+            }
+            destination =
+                std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
+        } else if (m_daq_enabled_) {
+            // 批次14（T14-09）：DAQ 命令组与 DOWNLOAD 写回。开关关闭时
+            // 根本不会进这里，既有"未实现命令 → ERR_CMD_UNKNOWN"的语义不变
+            DaqDispatchResult dq = HandleDaqOrDownload(xcp_packet);
+            if (dq.handled) {
+                response = std::move(dq.response);
+            } else {
+                response = MakeErr(ErrorCode::CmdUnknown);
             }
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);

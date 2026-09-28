@@ -188,6 +188,104 @@ TEST(CommandCodecBehavior, ReportsConfiguredByteOrder) {
               ByteOrder::Motorola);
 }
 
+// --------------------------------------------------------------------------
+// 批次14（T14-13）：DAQ 命令组与写回的黄金报文
+//
+// 字节偏移依据：docs/XCP_1.3.0_document.md 的字段顺序 + 只读交叉参考
+// thirdparty/XCPlite/src/xcp.h（见 command_codec.hpp 顶部的对照表）。
+// --------------------------------------------------------------------------
+
+TEST(CommandCodecGolden, ClearDaqListLayout) {
+    const CommandCodec codec(ByteOrder::Intel);
+    ExpectBytes(codec.EncodeClearDaqList(0x0201), {0xE3, 0x00, 0x01, 0x02});
+    const CommandCodec moto(ByteOrder::Motorola);
+    ExpectBytes(moto.EncodeClearDaqList(0x0201), {0xE3, 0x00, 0x02, 0x01});
+}
+
+TEST(CommandCodecGolden, SetDaqPtrLayout) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // [E2][reserved][DAQ(WORD)][ODT][ENTRY]（xcp.h:689-692）
+    ExpectBytes(codec.EncodeSetDaqPtr(3, 1, 2),
+                {0xE2, 0x00, 0x03, 0x00, 0x01, 0x02});
+}
+
+TEST(CommandCodecGolden, WriteDaqLayoutAndBitOffsetNone) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // [E1][BIT_OFFSET][SIZE][EXT][ADDR(DWORD)]；0xFF = 无位偏（docs L1861）
+    ExpectBytes(codec.EncodeWriteDaq(kDaqBitOffsetNone, 4, 0x12, 0x000C5508),
+                {0xE1, 0xFF, 0x04, 0x12, 0x08, 0x55, 0x0C, 0x00});
+}
+
+TEST(CommandCodecBoundary, WriteDaqRejectsZeroSize) {
+    const CommandCodec codec(ByteOrder::Intel);
+    try {
+        (void)codec.EncodeWriteDaq(kDaqBitOffsetNone, 0, 0, 0);
+        FAIL() << "Size=0 应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+}
+
+TEST(CommandCodecGolden, SetDaqListModeLayout) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // [E0][MODE][DAQ(WORD)][EVENT(WORD)][PRESCALER][PRIORITY]（xcp.h:713-718）
+    const DaqListModeBit mode =
+        DaqListModeBit::kDtoCounter | DaqListModeBit::kTimestamp;
+    ExpectBytes(codec.EncodeSetDaqListMode(mode, 2, 1, 1, 0xFF),
+                {0xE0, 0x18, 0x02, 0x00, 0x01, 0x00, 0x01, 0xFF});
+}
+
+TEST(CommandCodecGolden, StartStopDaqListAndSynchLayouts) {
+    const CommandCodec codec(ByteOrder::Intel);
+    ExpectBytes(codec.EncodeStartStopDaqList(DaqListAction::Select, 5),
+                {0xDE, 0x02, 0x05, 0x00});
+    ExpectBytes(codec.EncodeStartStopSynch(DaqSynchAction::StartSelected),
+                {0xDD, 0x01});
+}
+
+TEST(CommandCodecGolden, DaqQueryCommandsHaveNoReservedByte) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // GET_DAQ_PROCESSOR_INFO / GET_DAQ_RESOLUTION_INFO / READ_DAQ 均 1 字节
+    // （xcp.h:789/798/781）；GET_DAQ_LIST_INFO 带 reserved + DAQ(WORD)
+    ExpectBytes(codec.EncodeGetDaqProcessorInfo(), {0xDA});
+    ExpectBytes(codec.EncodeGetDaqResolutionInfo(), {0xD9});
+    ExpectBytes(codec.EncodeReadDaq(), {0xDB});
+    ExpectBytes(codec.EncodeGetDaqListInfo(7), {0xD8, 0x00, 0x07, 0x00});
+}
+
+TEST(CommandCodecGolden, DownloadAndShortDownloadLayouts) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // DOWNLOAD: [F0][SIZE][data...]（xcp.h:578-581）
+    ExpectBytes(codec.EncodeDownload(4, BytesOf({0x00, 0x00, 0x80, 0x3F})),
+                {0xF0, 0x04, 0x00, 0x00, 0x80, 0x3F});
+    // SHORT_DOWNLOAD: [ED][SIZE][reserved][EXT][ADDR(DWORD)][data...]
+    ExpectBytes(
+        codec.EncodeShortDownload(2, 0x12, 0x00003100, BytesOf({0x34, 0x12})),
+        {0xED, 0x02, 0x00, 0x12, 0x00, 0x31, 0x00, 0x00, 0x34, 0x12});
+}
+
+TEST(CommandCodecBoundary, DownloadRejectsEmptyAndOutOfRangeElements) {
+    const CommandCodec codec(ByteOrder::Intel);
+    try {
+        (void)codec.EncodeDownload(1, BytesView{});
+        FAIL() << "空数据应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+    try {
+        (void)codec.EncodeDownload(0, BytesOf({0x01}));
+        FAIL() << "元素数 0 应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+    try {
+        (void)codec.EncodeShortDownload(256, 0, 0, BytesOf({0x01}));
+        FAIL() << "元素数超单字节字段应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+}
+
 TEST(CommandCodecBehavior, GoldenLengthsMatchMaxCtoEightLayout) {
     // MAX_CTO=8 的典型 Slave：SET_MTA 与 SHORT_UPLOAD 恰好占满 8/7 字节
     const CommandCodec codec(ByteOrder::Intel);
@@ -195,6 +293,21 @@ TEST(CommandCodecBehavior, GoldenLengthsMatchMaxCtoEightLayout) {
     EXPECT_EQ(codec.EncodeShortUpload(1, 0, 0).size(), 8U);
     EXPECT_EQ(codec.EncodeConnect().size(), 2U);
     EXPECT_EQ(codec.EncodeUpload(1).size(), 2U);
+    // 批次14 新增命令的定长部分同样受 MAX_CTO=8 约束（写回只能走 DOWNLOAD）
+    EXPECT_EQ(codec.EncodeWriteDaq(kDaqBitOffsetNone, 1, 0, 0).size(), 8U);
+    EXPECT_EQ(
+        codec.EncodeSetDaqListMode(DaqListModeBit::kNone, 0, 0, 1, 0).size(),
+        8U);
+    EXPECT_EQ(codec.EncodeStartStopDaqList(DaqListAction::Start, 0).size(), 4U);
+    EXPECT_EQ(codec.EncodeStartStopSynch(DaqSynchAction::StopAll).size(), 2U);
+    EXPECT_EQ(codec.EncodeGetDaqListInfo(0).size(), 4U);
+    EXPECT_EQ(codec.EncodeGetDaqProcessorInfo().size(), 1U);
+    EXPECT_EQ(codec.EncodeGetDaqResolutionInfo().size(), 1U);
+    EXPECT_EQ(codec.EncodeReadDaq().size(), 1U);
+    EXPECT_EQ(codec.EncodeClearDaqList(0).size(), 4U);
+    EXPECT_EQ(codec.EncodeSetDaqPtr(0, 0, 0).size(), 6U);
+    EXPECT_EQ(codec.EncodeDownload(1, BytesOf({0x11})).size(), 3U);
+    EXPECT_EQ(codec.EncodeShortDownload(1, 0, 0, BytesOf({0x11})).size(), 9U);
 }
 
 }  // namespace

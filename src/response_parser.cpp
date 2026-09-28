@@ -24,6 +24,20 @@ constexpr std::size_t kGetStatusResMinSize = 5;
 constexpr std::size_t kGetCommModeInfoResMinSize = 7;
 /// @brief GET_SEED / UNLOCK 响应去掉 PID 后的最小长度（[length]/[protection]）
 constexpr std::size_t kSeedKeyResMinSize = 1;
+/// @brief START_STOP_DAQ_LIST 响应去掉 PID 后的最小长度（[FIRST_PID]）
+constexpr std::size_t kStartStopDaqListResMinSize = 1;
+/// @brief GET_DAQ_LIST_INFO 响应去掉 PID 后的最小长度
+/// （PROPERTIES/MAX_ODT/MAX_ODT_ENTRY/FIXED_EVENT(WORD)）
+constexpr std::size_t kGetDaqListInfoResMinSize = 5;
+/// @brief GET_DAQ_RESOLUTION_INFO 响应去掉 PID 后的最小长度
+/// （DAQ 粒度+上限、STIM 粒度+上限、TIMESTAMP_MODE、TIMESTAMP_TICKS(WORD)）
+constexpr std::size_t kGetDaqResolutionInfoResMinSize = 7;
+/// @brief GET_DAQ_PROCESSOR_INFO 响应去掉 PID 后的最小长度
+/// （PROPERTIES/MAX_DAQ(WORD)/MAX_EVENT_CHANNEL(WORD)/MIN_DAQ/DAQ_KEY_BYTE）
+constexpr std::size_t kGetDaqProcessorInfoResMinSize = 7;
+/// @brief READ_DAQ 响应去掉 PID 后的最小长度
+/// （BITOFFSET/SIZE/EXT/ADDR(DWORD)）
+constexpr std::size_t kReadDaqResMinSize = 7;
 
 /// @brief COMM_MODE_BASIC 位掩码
 constexpr std::uint8_t kByteOrderMask = 0x01U;
@@ -68,6 +82,28 @@ std::optional<std::uint16_t> ResponseParser::ReadU16(BytesView data,
     }
     return static_cast<std::uint16_t>((static_cast<std::uint16_t>(*lo) << 8) |
                                       *hi);
+}
+
+std::optional<std::uint32_t> ResponseParser::ReadU32(BytesView data,
+                                                     std::size_t offset) const {
+    // 逐字节读，越界即 nullopt（畸形包判错，绝不越界读）
+    const auto b0 = ReadU8(data, offset);
+    const auto b1 = ReadU8(data, offset + 1);
+    const auto b2 = ReadU8(data, offset + 2);
+    const auto b3 = ReadU8(data, offset + 3);
+    if (!b0 || !b1 || !b2 || !b3) {
+        return std::nullopt;
+    }
+    if (m_byte_order_ == ByteOrder::Intel) {
+        return static_cast<std::uint32_t>(*b0) |
+               (static_cast<std::uint32_t>(*b1) << 8) |
+               (static_cast<std::uint32_t>(*b2) << 16) |
+               (static_cast<std::uint32_t>(*b3) << 24);
+    }
+    return (static_cast<std::uint32_t>(*b0) << 24) |
+           (static_cast<std::uint32_t>(*b1) << 16) |
+           (static_cast<std::uint32_t>(*b2) << 8) |
+           static_cast<std::uint32_t>(*b3);
 }
 
 std::optional<ParsedPacket> ResponseParser::Parse(
@@ -121,10 +157,13 @@ std::optional<ParsedPacket> ResponseParser::Parse(
             return ParsedPacket{serv};
         }
         default: {
-            // 0x00..0xFB：DAQ DTO，本阶段仅识别不解析
+            // 0x00..0xFB：DAQ DTO。批次14（R12 定稿）交付**完整帧**——
+            // data[0] 仍是 PID，与 pid 字段等值。下游 IDaqLayout::Decode 按
+            // dto[0] 取 EPK，按其 envelope 契约跳过可变头后才是净荷；
+            // 这里若剥掉 PID，就会把净荷首字节误当 PID（批次11 已警告）。
             DtoPacket dto;
             dto.pid = pid;
-            dto.data.assign(body.begin(), body.end());
+            dto.data.assign(packet.begin(), packet.end());
             return ParsedPacket{dto};
         }
     }
@@ -230,6 +269,103 @@ std::optional<UnlockResponse> ResponseParser::ParseUnlockResponse(
     }
     UnlockResponse resp;
     resp.resource_protection = res_data[0];
+    return resp;
+}
+
+std::optional<StartStopDaqListResponse>
+ResponseParser::ParseStartStopDaqListResponse(BytesView res_data) const {
+    // START_STOP_DAQ_LIST RES: [FF][FIRST_PID]（xcp.h:734-735）
+    // FIRST_PID 只在 Start/Select 成功后有意义；Absolute ODT Number 模式下
+    // 绝对 ODT 号 = FIRST_PID + 相对 ODT 号（docs L2222-2226）
+    if (res_data.size() < kStartStopDaqListResMinSize) {
+        return std::nullopt;
+    }
+    StartStopDaqListResponse resp;
+    resp.first_pid = res_data[0];
+    return resp;
+}
+
+std::optional<GetDaqListInfoResponse> ResponseParser::ParseGetDaqListInfo(
+    BytesView res_data) const {
+    // GET_DAQ_LIST_INFO RES: [FF][PROPERTIES][MAX_ODT][MAX_ODT_ENTRY]
+    //                        [FIXED_EVENT(WORD)]（xcp.h:810-814）
+    // 注意：**没有 FIRST_PID**（docs L2452-2457 的返回字段只有这四项）
+    if (res_data.size() < kGetDaqListInfoResMinSize) {
+        return std::nullopt;
+    }
+    GetDaqListInfoResponse resp;
+    resp.properties = static_cast<DaqListPropertyBit>(res_data[0]);
+    resp.max_odt = res_data[1];
+    resp.max_odt_entries = res_data[2];
+    const auto fixed_event = ReadU16(res_data, 3);
+    if (!fixed_event) {
+        return std::nullopt;
+    }
+    resp.fixed_event = *fixed_event;
+    return resp;
+}
+
+std::optional<GetDaqProcessorInfoResponse>
+ResponseParser::ParseGetDaqProcessorInfo(BytesView res_data) const {
+    // GET_DAQ_PROCESSOR_INFO RES: [FF][PROPERTIES][MAX_DAQ(WORD)]
+    //   [MAX_EVENT_CHANNEL(WORD)][MIN_DAQ][DAQ_KEY_BYTE]（xcp.h:790-795）
+    if (res_data.size() < kGetDaqProcessorInfoResMinSize) {
+        return std::nullopt;
+    }
+    GetDaqProcessorInfoResponse resp;
+    resp.properties = res_data[0];
+    const auto max_daq = ReadU16(res_data, 1);
+    const auto max_event = ReadU16(res_data, 3);
+    if (!max_daq || !max_event) {
+        return std::nullopt;
+    }
+    resp.max_daq = *max_daq;
+    resp.max_event_channel = *max_event;
+    resp.min_daq = res_data[5];
+    // DAQ_KEY_BYTE 只拆位（optimisation / address_extension / identification）
+    resp.key_byte = ParseDaqKeyByte(res_data[6]);
+    return resp;
+}
+
+std::optional<GetDaqResolutionInfoResponse>
+ResponseParser::ParseGetDaqResolutionInfo(BytesView res_data) const {
+    // GET_DAQ_RESOLUTION_INFO RES: [FF][GRANULARITY_DAQ][MAX_SIZE_DAQ]
+    //   [GRANULARITY_STIM][MAX_SIZE_STIM][TIMESTAMP_MODE][TICKS(WORD)]
+    //   （xcp.h:799-805；docs L2346-2356）
+    if (res_data.size() < kGetDaqResolutionInfoResMinSize) {
+        return std::nullopt;
+    }
+    GetDaqResolutionInfoResponse resp;
+    resp.granularity_daq = res_data[0];
+    resp.max_odt_entry_size_daq = res_data[1];
+    resp.granularity_stim = res_data[2];
+    resp.max_odt_entry_size_stim = res_data[3];
+    // TIMESTAMP_MODE 只拆位不换算（时间单位码表缺失，R13 外部阻塞）
+    resp.timestamp_mode = ParseDaqTimestampMode(res_data[4]);
+    const auto ticks = ReadU16(res_data, 5);
+    if (!ticks) {
+        return std::nullopt;
+    }
+    resp.timestamp_ticks = *ticks;
+    return resp;
+}
+
+std::optional<ReadDaqResponse> ResponseParser::ParseReadDaq(
+    BytesView res_data) const {
+    // READ_DAQ RES: [FF][BITOFFSET][SIZE][EXT][ADDR(DWORD)]
+    // （xcp.h:782-786；docs L2257-2261）
+    if (res_data.size() < kReadDaqResMinSize) {
+        return std::nullopt;
+    }
+    ReadDaqResponse resp;
+    resp.bit_offset = res_data[0];  // 0xFF = 无位偏（kDaqBitOffsetNone）
+    resp.size = res_data[1];
+    resp.address_extension = res_data[2];
+    const auto address = ReadU32(res_data, 3);
+    if (!address) {
+        return std::nullopt;
+    }
+    resp.address = *address;
     return resp;
 }
 

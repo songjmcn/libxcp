@@ -1,0 +1,19 @@
+ASAP2_VERSION 1 61
+/begin PROJECT IncMainProj "include main (two level, B-18 positive)"
+
+/include "include_child.a2l"
+
+  /begin MODULE INC_MAIN "main module"
+
+    /begin COMPU_METHOD CM_M "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+
+    /begin MEASUREMENT MAIN_M "declared in main file" UBYTE CM_M 0 0 0 255
+      ECU_ADDRESS 0x1001
+      ECU_ADDRESS_EXTENSION 0x0
+      READ_WRITE
+    /end MEASUREMENT
+
+  /end MODULE
+
+/end PROJECT

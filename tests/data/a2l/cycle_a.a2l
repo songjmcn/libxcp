@@ -1,0 +1,11 @@
+ASAP2_VERSION 1 61
+/begin PROJECT CycleA "cycle link a"
+
+/include "cycle_b.a2l"
+
+  /begin MODULE CYCLE_A "module a"
+    /begin COMPU_METHOD CM_A "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+  /end MODULE
+
+/end PROJECT

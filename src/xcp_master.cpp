@@ -63,6 +63,11 @@ void XcpMaster::Connect() {
         throw detail::MakeInvalidState("Session 已处于 Connected 状态");
     }
     m_session_.Reset();  // 清理 Failed/残留状态
+    // 新会话：本端 WRITE_DAQ 账本随之作废（Session 的 DAQ 运行态在
+    // EstablishConnection 里一并归零）
+    m_daq_ledger_.clear();
+    m_daq_processor_info_queried_ = false;
+    m_daq_processor_properties_.reset();
 
     // Transport.Open 的监听器即 CommandExecutor；Open 之后接收线程立即开始回调
     m_transport_->Open(m_executor_->AsListener());
@@ -105,6 +110,19 @@ void XcpMaster::Disconnect() {
         return;
     }
 
+    // 批次14（T14-07）：断连前尽力补发 START_STOP_SYNCH(stop all)。
+    // 不停就断开会留下"逻辑上仍在跑表"的 Slave 状态；但 STOP 失败也不得
+    // 阻断释放路径（会话即将作废，且 Transport.Close 本身就是终止手段），
+    // 因此这里只吞掉 STOP 的异常，让 DISCONNECT 的错误继续如实上抛。
+    if (m_session_.HasRunningDaqList()) {
+        try {
+            m_executor_->ExecuteStartStopSynch(DaqSynchAction::StopAll);
+            m_session_.ClearStartedDaqLists();
+        } catch (const XcpException&) {
+            // 见上：断连清理路径不做二次抛错
+        }
+    }
+
     std::optional<XcpException> failure;
     try {
         m_executor_->ExecuteDisconnect();
@@ -138,6 +156,227 @@ Bytes XcpMaster::ReadMemoryBytes(Address address, AddressExtension extension,
 Bytes XcpMaster::ReadMemory(Address address, AddressExtension extension,
                             ElementCount element_count) {
     return m_memory_access_->ReadElements(address, extension, element_count);
+}
+
+void XcpMaster::WriteMemoryBytes(Address address, AddressExtension extension,
+                                 BytesView data) {
+    // 批次14（R9）：写回通路，与 ReadMemoryBytes 对称；失败一律上抛，
+    // 绝不静默吞错或只写一半还报成功
+    m_memory_access_->WriteBytes(address, extension, data);
+}
+
+// ---------------------------------------------------------------------------
+// DAQ 编排与 WRITE_DAQ 账本（批次14，T14-08）
+// ---------------------------------------------------------------------------
+
+void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
+    // ---- 1) 入参预检（非法不发命令；字段宽度上限来自 SET_DAQ_PTR 单字节字段）
+    if (spec.odts.empty()) {
+        throw detail::MakeInvalidArgument("DAQ List 至少要有 1 个 ODT");
+    }
+    if (spec.odts.size() > 0xFFU) {
+        throw detail::MakeInvalidArgument(
+            "ODT 数超过 SET_DAQ_PTR 单字节字段上限 255: " +
+            std::to_string(spec.odts.size()));
+    }
+    for (const auto& odt : spec.odts) {
+        if (odt.entries.empty()) {
+            throw detail::MakeInvalidArgument("ODT 至少要有 1 个 Entry");
+        }
+        if (odt.entries.size() > 0xFFU) {
+            throw detail::MakeInvalidArgument(
+                "ODT Entry 数超过 255: " + std::to_string(odt.entries.size()));
+        }
+        for (const auto& e : odt.entries) {
+            if (e.size == 0U) {
+                throw detail::MakeInvalidArgument(
+                    "WRITE_DAQ 的 Size 不得为 0（以 AG 为单位的元素数）");
+            }
+        }
+    }
+
+    // ---- 1b) 解码能力与 DTO 容量前置校验（批次15，F7/D8） ----
+    if (spec.pid_off) {
+        throw detail::MakeInvalidArgument(
+            "PID_OFF 配置被拒绝：当前 DTO 解码器没有 Transport 层列表关联能力");
+    }
+    if (!m_daq_processor_info_queried_) {
+        m_daq_processor_info_queried_ = true;
+        const auto processor = m_executor_->ExecuteGetDaqProcessorInfo();
+        if (processor.has_value()) {
+            m_daq_processor_properties_ = processor->properties;
+        }
+    }
+    if (m_daq_processor_properties_.has_value() &&
+        HasDaqProcessorProperty(
+            static_cast<DaqProcessorPropertyBit>(*m_daq_processor_properties_),
+            DaqProcessorPropertyBit::kConfigType)) {
+        throw detail::MakeUnsupportedFeature(
+            "Slave 声明 DAQ_PROPERTY_CONFIG_TYPE=DYNAMIC，当前只支持 STATIC "
+            "DAQ");
+    }
+
+    const std::size_t ag_bytes = AgToBytes(m_session_.GetAddressGranularity());
+    // 当前 DaqListSpec 未携带 TIMESTAMP_SIZE；只对已有明确字节数的 PID
+    // 与 DTO_COUNTER 计入预检，不能凭空把时间戳猜成 4 字节而拒绝既有配置。
+    const std::size_t header_bytes = 1U + (spec.dto_counter ? 1U : 0U);
+    for (std::size_t odt_index = 0; odt_index < spec.odts.size(); ++odt_index) {
+        std::size_t payload_bytes = 0U;
+        for (const auto& e : spec.odts[odt_index].entries) {
+            payload_bytes += static_cast<std::size_t>(e.size) * ag_bytes;
+        }
+        const std::size_t total_bytes = header_bytes + payload_bytes;
+        if (total_bytes > m_session_.MaxDto()) {
+            throw detail::MakeInvalidArgument(
+                "DAQ List " + std::to_string(spec.daq_list) + " 的 ODT " +
+                std::to_string(odt_index) + " 超过 MAX_DTO：header(" +
+                std::to_string(header_bytes) + ") + payload(" +
+                std::to_string(payload_bytes) +
+                ") = " + std::to_string(total_bytes) + " > " +
+                std::to_string(m_session_.MaxDto()));
+        }
+    }
+
+    // ---- 2) 下发；任何一步失败都回滚账本（B-6：解码只信完整账本） ----
+    const std::size_t ledger_mark = m_daq_ledger_.size();
+    auto rollback = [this, ledger_mark] {
+        m_daq_ledger_.erase(
+            m_daq_ledger_.begin() + static_cast<std::ptrdiff_t>(ledger_mark),
+            m_daq_ledger_.end());
+    };
+    try {
+        // 先清列表：PREDEFINED 列表由 Slave 拒写（ERR_WRITE_PROTECTED，
+        // docs L2168），本方法不会把 PREDEFINED 当可配置列表来改
+        m_executor_->ExecuteClearDaqList(spec.daq_list);
+        m_session_.BumpDaqConfigGeneration();
+
+        // 逐 Entry 显式 SET_DAQ_PTR + WRITE_DAQ：不依赖 Slave 的指针自增
+        // （docs L2172 写过末位后指针未定义）
+        std::uint8_t odt_no = 0U;
+        for (const auto& odt : spec.odts) {
+            std::uint8_t entry_no = 0U;
+            for (const auto& e : odt.entries) {
+                m_executor_->ExecuteSetDaqPtr(spec.daq_list, odt_no, entry_no);
+                m_executor_->ExecuteWriteDaq(e.bit_offset, e.size, e.extension,
+                                             e.address);
+                DaqLedgerEntry rec;
+                rec.daq_list = spec.daq_list;
+                rec.odt_number = odt_no;
+                rec.odt_entry = entry_no;
+                rec.address = e.address;
+                rec.extension = e.extension;
+                rec.size = e.size;
+                rec.bit_offset = e.bit_offset;
+                m_daq_ledger_.push_back(rec);
+                ++entry_no;
+            }
+            ++odt_no;
+        }
+
+        // 设置列表模式（方向 / DTO 计数器 / 时间戳 / PID_OFF / 事件通道）
+        DaqListModeBit mode = DaqListModeBit::kNone;
+        if (spec.stim_direction) {
+            mode = mode | DaqListModeBit::kStim;
+        }
+        if (spec.dto_counter) {
+            mode = mode | DaqListModeBit::kDtoCounter;
+        }
+        if (spec.timestamp) {
+            mode = mode | DaqListModeBit::kTimestamp;
+        }
+        if (spec.pid_off) {
+            mode = mode | DaqListModeBit::kPidOff;
+        }
+        m_executor_->ExecuteSetDaqListMode(mode, spec.daq_list,
+                                           spec.event_channel, spec.prescaler,
+                                           spec.priority);
+    } catch (const XcpException&) {
+        rollback();
+        throw;
+    } catch (const std::exception& e) {
+        rollback();
+        throw detail::MakeTransportError("DAQ 配置过程中发生非协议异常",
+                                         e.what());
+    }
+}
+
+std::uint8_t XcpMaster::StartDaqList(std::uint16_t daq_list) {
+    const bool configured = std::any_of(
+        m_daq_ledger_.begin(), m_daq_ledger_.end(),
+        [daq_list](const DaqLedgerEntry& e) { return e.daq_list == daq_list; });
+    if (!configured) {
+        throw detail::MakeInvalidState(
+            "DAQ List " + std::to_string(daq_list) +
+            " 未在本端登记（ConfigureDaqList 未成功），拒绝启动");
+    }
+    const StartStopDaqListResponse resp =
+        m_executor_->ExecuteStartStopDaqList(DaqListAction::Start, daq_list);
+    // FIRST_PID → PID 回填（Absolute ODT Number：绝对 ODT 号 = FIRST_PID +
+    // 相对 ODT 号，docs L2225）。识别字段类型不是 Absolute 时该推导不成立，
+    // 由 B-16 的 identification_field_type Error 比对拦下（docs L2228），
+    // 本层不做"另一种编码下也当作 PID"的猜测。
+    for (auto& e : m_daq_ledger_) {
+        if (e.daq_list == daq_list) {
+            e.pid = static_cast<std::uint8_t>(resp.first_pid + e.odt_number);
+        }
+    }
+    m_session_.MarkDaqListStarted(daq_list);
+    return resp.first_pid;
+}
+
+void XcpMaster::StopDaqList(std::uint16_t daq_list) {
+    (void)m_executor_->ExecuteStartStopDaqList(DaqListAction::Stop, daq_list);
+    m_session_.MarkDaqListStopped(daq_list);
+}
+
+void XcpMaster::StopDaq() {
+    m_executor_->ExecuteStartStopSynch(DaqSynchAction::StopAll);
+    // 配置仍在 Slave 里，账本保留；只清运行态（重新 Start 不需要重写）
+    m_session_.ClearStartedDaqLists();
+}
+
+void XcpMaster::ClearDaqList(std::uint16_t daq_list) {
+    m_executor_->ExecuteClearDaqList(daq_list);
+    m_session_.BumpDaqConfigGeneration();
+    m_session_.MarkDaqListStopped(daq_list);
+    m_daq_ledger_.erase(
+        std::remove_if(m_daq_ledger_.begin(), m_daq_ledger_.end(),
+                       [daq_list](const DaqLedgerEntry& e) {
+                           return e.daq_list == daq_list;
+                       }),
+        m_daq_ledger_.end());
+}
+
+const std::vector<DaqLedgerEntry>& XcpMaster::DaqLedger() const noexcept {
+    return m_daq_ledger_;
+}
+
+std::uint32_t XcpMaster::DaqConfigGeneration() const {
+    return m_session_.DaqConfigGeneration();
+}
+
+// ---- DAQ 运行时取证薄转发（批次14；零策略，只把 CommandExecutor 的可选命令
+//      暴露给门面调用方，见 xcp_master.hpp 中对应注释）----
+
+std::optional<GetDaqProcessorInfoResponse> XcpMaster::QueryDaqProcessorInfo() {
+    return m_executor_->ExecuteGetDaqProcessorInfo();
+}
+
+std::optional<GetDaqResolutionInfoResponse>
+XcpMaster::QueryDaqResolutionInfo() {
+    return m_executor_->ExecuteGetDaqResolutionInfo();
+}
+
+std::optional<GetDaqListInfoResponse> XcpMaster::QueryDaqListInfo(
+    std::uint16_t daq_list) {
+    return m_executor_->ExecuteGetDaqListInfo(daq_list);
+}
+
+std::optional<ReadDaqResponse> XcpMaster::ReadDaqEntryAt(
+    std::uint16_t daq_list, std::uint8_t odt_number, std::uint8_t odt_entry) {
+    // 先定位再回读：不依赖隐含指针的自增状态（docs L2172 指针不可查询）
+    m_executor_->ExecuteSetDaqPtr(daq_list, odt_number, odt_entry);
+    return m_executor_->ExecuteReadDaq();
 }
 
 SessionParameters XcpMaster::GetSessionParameters() const {

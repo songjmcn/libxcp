@@ -1,0 +1,36 @@
+{
+  "project": "DynProj",
+  "project_desc": "DYNAMIC daq rejected explicitly (B-5)",
+  "modules": [
+    {
+      "name": "DYN_ECU",
+      "comment": "dynamic capability parsed but not executable",
+      "mod_common": true,
+      "mod_par": false,
+      "compu_methods": [{"name": "CM_IDENT", "type": "IDENTICAL"}],
+      "measurements": [
+        {"name": "M_DYN", "datatype": "UWORD", "compu": "CM_IDENT",
+         "address": "0x7000", "ext": "0x0"}
+      ],
+      "if_data": [
+        {
+          "protocol": "XCP",
+          "protocol_layer": {"version": "0x100", "max_cto": "0x10",
+                             "max_dto": "0x20"},
+          "daq": {
+            "type": "DYNAMIC", "max_daq": 8, "max_event": 4, "min_daq": 0,
+            "daq_list": {
+              "number": 3, "odt_number": 1, "type": "DAQ",
+              "max_odt": 1, "max_odt_entries": 1, "first_pid": 1,
+              "event_fixed": 1,
+              "entries": [
+                {"number": 1, "address": "0x7000", "ext": "0x0", "size": 2,
+                 "bit_offset": 0}
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

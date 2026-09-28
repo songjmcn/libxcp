@@ -39,6 +39,15 @@ std::string protocolMessage(std::string_view prefix, CommandCode cmd,
     return msg;
 }
 
+/// @brief 判断异常是否为"可选命令未被 Slave 实现"（批次14 降级判据）
+/// @details docs L1631：未实现的可选命令必须回 ERR_CMD_UNKNOWN 且**不产生
+///          副作用**，因此可安全解释为"能力缺失"而非链路故障。判据与既有
+///          ExecuteGetCommModeInfo / ExecuteShortUpload 的降级分支同口径。
+bool IsCmdUnknown(const XcpException& e) {
+    return e.Category() == ErrorCategory::ProtocolError && e.GetErrorCode() &&
+           *e.GetErrorCode() == ErrorCode::CmdUnknown;
+}
+
 }  // namespace
 
 CommandExecutor::CommandExecutor(IXcpTransport& transport, Session& session,
@@ -431,9 +440,16 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
         }
         ++retries;
         PerformRecovery(cmd);
-        // UPLOAD 依赖隐含的 MTA 状态：重试前必须重新建立（计划 §6.2 第 3 条）
-        if (cmd == CommandCode::Upload) {
+        // UPLOAD / DOWNLOAD 都从隐含 MTA 起算（docs L1907 / L1983）：重试前
+        // 必须重建 MTA。函数名沿用 RestoreUploadMta（当时只有 UPLOAD），
+        // 语义已扩展到 DOWNLOAD —— 为不动既有已验证代码而不改名。
+        if (cmd == CommandCode::Upload || cmd == CommandCode::Download) {
             RestoreUploadMta();
+        }
+        // WRITE_DAQ / READ_DAQ 从隐含 DAQ 指针起算：docs L2783 要求恢复后
+        // 重新 SET_DAQ_PTR（指针不可查询，只能重放本端记录）
+        if (cmd == CommandCode::WriteDaq || cmd == CommandCode::ReadDaq) {
+            RestoreDaqPtr();
         }
     }
 }
@@ -450,9 +466,10 @@ ConnectResponse CommandExecutor::ExecuteConnect(std::uint8_t mode) {
 
     m_session_.BeginConnecting();
     {
-        // 新会话：清空上一会话遗留的 MTA 隐含状态
+        // 新会话：清空上一会话遗留的 MTA 与 DAQ 指针隐含状态
         const std::lock_guard<std::mutex> lock(m_mutex_);
         m_last_mta_.reset();
+        m_last_daq_ptr_.reset();
     }
     ParsedPacket response;
     try {
@@ -633,6 +650,217 @@ UnlockResponse CommandExecutor::ExecuteUnlock(std::uint8_t length_field,
                                           " 字节）");
     }
     return *parsed;
+}
+
+// ---------------------------------------------------------------------------
+// 批次14：DAQ 命令组与写回（T14-05）
+// ---------------------------------------------------------------------------
+
+void CommandExecutor::RestoreDaqPtr() {
+    std::optional<DaqPointer> ptr;
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        ptr = m_last_daq_ptr_;
+    }
+    if (!ptr) {
+        return;  // 未记录或被 CLEAR_DAQ_LIST 作废：无可重放的隐含状态
+    }
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeSetDaqPtr(
+        ptr->daq_list, ptr->odt_number, ptr->odt_entry);
+    const auto response = PerformAttempt(CommandCode::SetDaqPtr, encoded);
+    if (!response) {
+        // SET_DAQ_PTR 自身也失败：不掩盖，交由随后的 WRITE/READ_DAQ 重试
+        // 把错误暴露出来（与 RestoreUploadMta 同一处理口径）
+        return;
+    }
+    (void)DispatchResponse(CommandCode::SetDaqPtr, *response);
+}
+
+void CommandExecutor::ExecuteSetDaqPtr(std::uint16_t daq_list,
+                                       std::uint8_t odt_number,
+                                       std::uint8_t odt_entry_number) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded =
+        m_codec_->EncodeSetDaqPtr(daq_list, odt_number, odt_entry_number);
+    (void)RunCommand(CommandCode::SetDaqPtr, encoded);
+    // 成功后记录隐含指针，供 WRITE_DAQ / READ_DAQ 超时恢复重放（docs L2783）
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_last_daq_ptr_ = DaqPointer{daq_list, odt_number, odt_entry_number};
+    }
+}
+
+void CommandExecutor::ExecuteWriteDaq(std::uint8_t bit_offset,
+                                      std::uint8_t size,
+                                      AddressExtension extension,
+                                      Address address) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded =
+        m_codec_->EncodeWriteDaq(bit_offset, size, extension, address);
+    (void)RunCommand(CommandCode::WriteDaq, encoded);
+    // Slave 侧指针自增，本端**不**跟进：编排层对每个 Entry 都显式
+    // SET_DAQ_PTR，避免"写过 ODT 末位后指针未定义"（docs L2172）
+}
+
+void CommandExecutor::ExecuteClearDaqList(std::uint16_t daq_list) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeClearDaqList(daq_list);
+    (void)RunCommand(CommandCode::ClearDaqList, encoded);
+    // CLEAR 后该列表的 Entry 全部复位，隐含指针语义不再成立 → 作废记录，
+    // 强制调用方重新 SET_DAQ_PTR 才能继续配置
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        if (m_last_daq_ptr_ && m_last_daq_ptr_->daq_list == daq_list) {
+            m_last_daq_ptr_.reset();
+        }
+    }
+}
+
+void CommandExecutor::ExecuteSetDaqListMode(DaqListModeBit mode,
+                                            std::uint16_t daq_list,
+                                            std::uint16_t event_channel,
+                                            std::uint8_t prescaler,
+                                            std::uint8_t priority) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeSetDaqListMode(
+        mode, daq_list, event_channel, prescaler, priority);
+    (void)RunCommand(CommandCode::SetDaqListMode, encoded);
+}
+
+StartStopDaqListResponse CommandExecutor::ExecuteStartStopDaqList(
+    DaqListAction action, std::uint16_t daq_list) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeStartStopDaqList(action, daq_list);
+    auto response = RunCommand(CommandCode::StartStopDaqList, encoded);
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseStartStopDaqListResponse(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "START_STOP_DAQ_LIST 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 1）");
+    }
+    return *parsed;
+}
+
+void CommandExecutor::ExecuteStartStopSynch(DaqSynchAction action) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeStartStopSynch(action);
+    (void)RunCommand(CommandCode::StartStopSynch, encoded);
+}
+
+std::optional<GetDaqListInfoResponse> CommandExecutor::ExecuteGetDaqListInfo(
+    std::uint16_t daq_list) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetDaqListInfo(daq_list);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetDaqListInfo, encoded);
+    } catch (const XcpException& e) {
+        // Optional 命令未实现 → ERR_CMD_UNKNOWN 且无副作用（docs L1631）：
+        // 视为"能力缺失"，由调用方回落 A2L 侧数据，不当作链路故障
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetDaqListInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_DAQ_LIST_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 5）");
+    }
+    return parsed;
+}
+
+std::optional<GetDaqProcessorInfoResponse>
+CommandExecutor::ExecuteGetDaqProcessorInfo() {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetDaqProcessorInfo();
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetDaqProcessorInfo, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetDaqProcessorInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_DAQ_PROCESSOR_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 7）");
+    }
+    return parsed;
+}
+
+std::optional<GetDaqResolutionInfoResponse>
+CommandExecutor::ExecuteGetDaqResolutionInfo() {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetDaqResolutionInfo();
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetDaqResolutionInfo, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetDaqResolutionInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_DAQ_RESOLUTION_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 7）");
+    }
+    return parsed;
+}
+
+std::optional<ReadDaqResponse> CommandExecutor::ExecuteReadDaq() {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeReadDaq();
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::ReadDaq, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseReadDaq(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket("READ_DAQ 响应长度不足（RES 数据 " +
+                                          std::to_string(res.data.size()) +
+                                          " 字节，期望 >= 7）");
+    }
+    return parsed;
+}
+
+void CommandExecutor::ExecuteDownload(ElementCount number_of_elements,
+                                      BytesView data) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeDownload(number_of_elements, data);
+    (void)RunCommand(CommandCode::Download, encoded);
+    // Slave 写完自动前移 MTA（docs L1983）：本端 m_last_mta_ 记录的仍是
+    // 本块起始地址，超时恢复重放 SET_MTA 恰好把 MTA 拉回块首后重发本块，
+    // 幂等且不会错位（MemoryAccess 每块都显式 SET_MTA，不依赖自增）。
+}
+
+void CommandExecutor::ExecuteShortDownload(ElementCount number_of_elements,
+                                           AddressExtension extension,
+                                           Address address, BytesView data) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeShortDownload(
+        number_of_elements, extension, address, data);
+    // 写回必须有确认：ERR_CMD_UNKNOWN 不降级为成功，原样上抛由
+    // MemoryAccess 回落 SET_MTA + DOWNLOAD 通路
+    (void)RunCommand(CommandCode::ShortDownload, encoded);
 }
 
 }  // namespace calmcar::xcp

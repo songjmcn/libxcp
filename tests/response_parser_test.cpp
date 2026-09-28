@@ -81,7 +81,9 @@ TEST(ResponseParserClassify, ServicePacket) {
     EXPECT_EQ(serv->data, BytesOf({0x11}));
 }
 
-TEST(ResponseParserClassify, DtoOnlyIdentifiedNotDecoded) {
+TEST(ResponseParserClassify, DtoDeliversWholeFrameWithPid) {
+    // 批次14（R12 定稿）：DTO 的 data 含 PID（data[0]==pid），
+    // 因为下游 IDaqLayout::Decode 的入参契约是"含 envelope 头的完整帧"
     const ResponseParser parser(ByteOrder::Intel);
     // 初始化列表元素需与循环变量类型一致，避免窄化警告
     for (const std::uint8_t pid :
@@ -92,7 +94,10 @@ TEST(ResponseParserClassify, DtoOnlyIdentifiedNotDecoded) {
         const auto* dto = std::get_if<DtoPacket>(&*parsed);
         ASSERT_NE(dto, nullptr);
         EXPECT_EQ(dto->pid, pid);
-        EXPECT_EQ(dto->data, BytesOf({0xDE, 0xAD}));
+        EXPECT_EQ(dto->data, BytesOf({pid, 0xDE, 0xAD}));
+        ASSERT_FALSE(dto->data.empty());
+        EXPECT_EQ(dto->data[0], dto->pid)
+            << "整帧契约：data[0] 必须与 pid 一致";
     }
 }
 
@@ -352,6 +357,123 @@ TEST(ResponseParserBehavior, ReportsConfiguredByteOrder) {
               ByteOrder::Intel);
     EXPECT_EQ(ResponseParser(ByteOrder::Motorola).GetByteOrder(),
               ByteOrder::Motorola);
+}
+
+// --------------------------------------------------------------------------
+// 批次14（T14-13）：DAQ 命令响应解析（PR 布局 + 截断负例）
+// --------------------------------------------------------------------------
+
+TEST(ParseDaqResponses, StartStopDaqListCarriesFirstPid) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto parsed = parser.ParseStartStopDaqListResponse(BytesOf({0x21}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->first_pid, 0x21U);
+    // 截断（无 FIRST_PID）必须判畸形
+    EXPECT_FALSE(parser.ParseStartStopDaqListResponse(BytesView{}).has_value());
+}
+
+TEST(ParseDaqResponses, GetDaqListInfoFields) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [PROPERTIES][MAX_ODT][MAX_ODT_ENTRY][FIXED_EVENT(WORD 小端)]
+    const auto parsed =
+        parser.ParseGetDaqListInfo(BytesOf({0x05, 0x04, 0x08, 0xE8, 0x03}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(static_cast<unsigned>(parsed->properties), 0x05U);
+    EXPECT_TRUE(
+        HasDaqProperty(parsed->properties, DaqListPropertyBit::kPredefined));
+    EXPECT_TRUE(
+        HasDaqProperty(parsed->properties, DaqListPropertyBit::kDirectionDaq));
+    EXPECT_FALSE(
+        HasDaqProperty(parsed->properties, DaqListPropertyBit::kDirectionStim));
+    EXPECT_EQ(parsed->max_odt, 4U);
+    EXPECT_EQ(parsed->max_odt_entries, 8U);
+    EXPECT_EQ(parsed->fixed_event, 0x03E8U);
+    // 少一字节即畸形（FIXED_EVENT 为 WORD）
+    EXPECT_FALSE(parser.ParseGetDaqListInfo(BytesOf({0x05, 0x04, 0x08, 0xE8}))
+                     .has_value());
+}
+
+TEST(ParseDaqResponses, GetDaqResolutionInfoSplitsTimestampMode) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [GRAN_DAQ][MAX_DAQ][GRAN_STIM][MAX_STIM][TS_MODE][TICKS(WORD 小端)]
+    const auto parsed = parser.ParseGetDaqResolutionInfo(
+        BytesOf({0x01, 0x08, 0x01, 0x08, 0x39, 0xE8, 0x03}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->granularity_daq, 1U);
+    EXPECT_EQ(parsed->max_odt_entry_size_daq, 8U);
+    EXPECT_EQ(parsed->granularity_stim, 1U);
+    EXPECT_EQ(parsed->max_odt_entry_size_stim, 8U);
+    // 0x39 = UNIT 3<<4 | FIXED 0x08 | TYPE 1 → 只拆位，不换算单位（R13 无表）
+    EXPECT_TRUE(parsed->timestamp_mode.fixed);
+    EXPECT_EQ(parsed->timestamp_mode.size_code, 1U);
+    EXPECT_EQ(parsed->timestamp_mode.unit_code, 3U);
+    EXPECT_EQ(parsed->timestamp_mode.raw, 0x39U);
+    EXPECT_EQ(parsed->timestamp_ticks, 0x03E8U);
+    EXPECT_FALSE(parser
+                     .ParseGetDaqResolutionInfo(
+                         BytesOf({0x01, 0x08, 0x01, 0x08, 0x39, 0xE8}))
+                     .has_value());
+}
+
+TEST(ParseDaqResponses, GetDaqProcessorInfoSplitsKeyByte) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [PROPERTIES][MAX_DAQ(WORD)][MAX_EVENT(WORD)][MIN_DAQ][KEY_BYTE]
+    const auto parsed = parser.ParseGetDaqProcessorInfo(
+        BytesOf({0x02, 0x04, 0x00, 0x02, 0x00, 0x00, 0x30}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->properties, 0x02U);
+    EXPECT_EQ(parsed->max_daq, 4U);
+    EXPECT_EQ(parsed->max_event_channel, 2U);
+    EXPECT_EQ(parsed->min_daq, 0U);
+    // 0x30 = ADDRESS_EXTENSION=DAQ(3<<4)、IDENTIFICATION=ABSOLUTE(0<<6)
+    EXPECT_EQ(parsed->key_byte.optimisation_type, 0U);
+    EXPECT_EQ(parsed->key_byte.address_extension_mode, 3U);
+    EXPECT_EQ(parsed->key_byte.identification_field_type, 0U);
+    EXPECT_FALSE(parser
+                     .ParseGetDaqProcessorInfo(
+                         BytesOf({0x02, 0x04, 0x00, 0x02, 0x00, 0x00}))
+                     .has_value());
+}
+
+TEST(ParseDaqResponses, ReadDaqReturnsEntryDescriptor) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [BITOFFSET][SIZE][EXT][ADDR(DWORD 小端)]
+    const auto parsed = parser.ParseReadDaq(
+        BytesOf({0xFF, 0x04, 0x12, 0x08, 0x55, 0x0C, 0x00}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->bit_offset, kDaqBitOffsetNone);
+    EXPECT_EQ(parsed->size, 4U);
+    EXPECT_EQ(parsed->address_extension, 0x12U);
+    EXPECT_EQ(parsed->address, 0x000C5508U);
+    EXPECT_FALSE(parser.ParseReadDaq(BytesOf({0xFF, 0x04, 0x12, 0x08, 0x55}))
+                     .has_value());
+}
+
+TEST(ParseDaqResponses, MotorolaByteOrderReversesMultiByteFields) {
+    const ResponseParser parser(ByteOrder::Motorola);
+    const auto parsed = parser.ParseReadDaq(
+        BytesOf({0xFF, 0x04, 0x12, 0x00, 0x0C, 0x55, 0x08}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->address, 0x000C5508U);
+    const auto info =
+        parser.ParseGetDaqListInfo(BytesOf({0x00, 0x00, 0x00, 0x03, 0xE8}));
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(info->fixed_event, 0x03E8U);
+}
+
+TEST(ParseDaqResponses, DaqKeyByteParserIsPureBitMath) {
+    // ParseDaqKeyByte 与 ParseDaqTimestampMode 是纯位运算，单独锁定位段
+    const DaqKeyByte key = ParseDaqKeyByte(0xD5U);
+    EXPECT_EQ(key.optimisation_type, 0x05U);          // bit0-3
+    EXPECT_EQ(key.address_extension_mode, 0x01U);     // bit4-5
+    EXPECT_EQ(key.identification_field_type, 0x03U);  // bit6-7
+    const DaqTimestampMode ts = ParseDaqTimestampMode(0x39U);
+    EXPECT_EQ(ts.size_code, 1U);
+    EXPECT_TRUE(ts.fixed);
+    EXPECT_EQ(ts.unit_code, 3U);
+    EXPECT_TRUE(HasDaqMode(DaqListModeBit::kStim | DaqListModeBit::kTimestamp,
+                           DaqListModeBit::kTimestamp));
+    EXPECT_FALSE(HasDaqMode(DaqListModeBit::kStim, DaqListModeBit::kPidOff));
 }
 
 }  // namespace

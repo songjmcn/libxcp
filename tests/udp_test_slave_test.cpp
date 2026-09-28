@@ -212,13 +212,30 @@ TEST(UdpTestSlaveSession, ConnectIsAnsweredAtSourceEndpoint) {
     ASSERT_TRUE(ep.recvPacket(resp, ip, port));
     ASSERT_GE(resp.size(), 8U);
     EXPECT_EQ(resp[0], static_cast<std::uint8_t>(PacketType::Res));
-    // 默认参数：RESOURCE=0x15, COMM_MODE_BASIC=0xC0, MAX_CTO=8, MAX_DTO=8
-    EXPECT_EQ(resp[1], 0x15U);
+    // 默认关闭 DAQ 模拟：RESOURCE=0x11（CAL/PAG+PGM），不声明未实现的 DAQ
+    EXPECT_EQ(resp[1], 0x11U);
     EXPECT_EQ(resp[2], 0xC0U);
     EXPECT_EQ(resp[3], 8U);
     EXPECT_EQ(ip, "127.0.0.1");
     EXPECT_EQ(port, slave.Port());
     EXPECT_TRUE(slave.IsConnected());
+    slave.Stop();
+}
+
+TEST(UdpTestSlaveSession, ConnectResourceAdvertisesDaqWhenSimulationEnabled) {
+    UdpTestSlave slave;
+    slave.SetDaqSimulationEnabled(true);
+    slave.Start();
+
+    RawEndpoint ep(43111);
+    ep.sendPacket(BytesView{BytesOf({0xFF, 0x00})}, slave.Port(), 0);
+
+    Bytes resp;
+    std::string ip;
+    std::uint16_t port = 0;
+    ASSERT_TRUE(ep.recvPacket(resp, ip, port));
+    ASSERT_GE(resp.size(), 2U);
+    EXPECT_EQ(resp[1], 0x15U);
     slave.Stop();
 }
 
@@ -343,7 +360,10 @@ TEST_F(UdpTestSlaveCommands, SynchAlwaysAnswersErrCmdSynch) {
 }
 
 TEST_F(UdpTestSlaveCommands, UnknownCommandReturnsErrCmdUnknown) {
-    ASSERT_TRUE(Request(BytesOf({0xF0, 0x00}), res_));  // DOWNLOAD 不在最小集内
+    // 批次14 起 DOWNLOAD(0xF0) 已由 Slave 模拟实现（虽默认关闭，另有专门
+    // 用例锁定其默认拒绝），故本用例改用**始终未实现**的命令码 0xD2，
+    // 保持"未实现 → ERR_CMD_UNKNOWN"这条语义继续被覆盖。
+    ASSERT_TRUE(Request(BytesOf({0xD2, 0x00}), res_));
     ASSERT_EQ(res_.size(), 2U);
     EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Err));
     EXPECT_EQ(res_[1], static_cast<std::uint8_t>(ErrorCode::CmdUnknown));
@@ -490,6 +510,167 @@ TEST(UdpTestSlavePacking, SendPackedFramesRequiresConnection) {
         EXPECT_EQ(e.Category(), ErrorCategory::InvalidState);
     }
     slave.Stop();
+}
+
+// ---------------------------------------------------------------------------
+// 批次14（T14-09）：DAQ 命令组与 DOWNLOAD 写回模拟
+//
+// 默认关闭（既有 253 项用例语义不变）→ 用例必须显式 SetDaqSimulationEnabled。
+// ---------------------------------------------------------------------------
+
+class UdpTestSlaveDaq : public UdpTestSlaveCommands {
+protected:
+    void SetUp() override {
+        UdpTestSlaveCommands::SetUp();
+        slave_.SetDaqSimulationEnabled(true);
+    }
+};
+
+TEST_F(UdpTestSlaveCommands, DaqCommandsRejectedWhileSimulationDisabled) {
+    // 默认关闭 → DAQ 组与 DOWNLOAD 一律 ERR_CMD_UNKNOWN（既有语义锁定）
+    ASSERT_TRUE(Request(BytesOf({0xE2, 0x00, 0x00, 0x00, 0x00, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 2U);
+    EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Err));
+    EXPECT_EQ(res_[1], static_cast<std::uint8_t>(ErrorCode::CmdUnknown));
+}
+
+TEST_F(UdpTestSlaveDaq, ProcessorAndResolutionInfoReportActualKeyByte) {
+    // GET_DAQ_PROCESSOR_INFO: RES [FF][PROPS][MAX_DAQ(2)][MAX_EVENT(2)]
+    //                           [MIN_DAQ][KEY_BYTE]
+    ASSERT_TRUE(Request(BytesOf({0xDA}), res_));
+    ASSERT_EQ(res_.size(), 8U);
+    EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Res));
+    EXPECT_EQ(res_[1] & 0x01U, 0U) << "DAQ_CONFIG_TYPE 必须为 Static（B-5）";
+    EXPECT_EQ(res_[6], 0x00U);
+    EXPECT_EQ(res_[7], 0x30U) << "DAQ_KEY_BYTE: ADDRESS_EXTENSION=DAQ, "
+                                 "IDENTIFICATION=ABSOLUTE（B-16 比对真值）";
+
+    // GET_DAQ_RESOLUTION_INFO: RES
+    // [FF][GRAN][MAX][GRAN][MAX][TS_MODE][TICKS(2)]
+    ASSERT_TRUE(Request(BytesOf({0xD9}), res_));
+    ASSERT_EQ(res_.size(), 8U);
+    EXPECT_EQ(res_[1], 1U);     // 粒度 1 字节
+    EXPECT_EQ(res_[2], 8U);     // Entry 上限 8 字节
+    EXPECT_EQ(res_[5], 0x31U);  // TIMESTAMP_MODE（非 FIXED）
+}
+
+TEST_F(UdpTestSlaveDaq, WriteDaqThenReadDaqRoundTripsEntry) {
+    // SET_DAQ_PTR(daq=1, odt=0, entry=0)
+    ASSERT_TRUE(Request(BytesOf({0xE2, 0x00, 0x01, 0x00, 0x00, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 1U);
+    // WRITE_DAQ: [E1][0xFF 无位偏][size=2][ext=0][addr=0x00003000 小端]
+    ASSERT_TRUE(Request(
+        BytesOf({0xE1, 0xFF, 0x02, 0x00, 0x00, 0x30, 0x00, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 1U);
+    // READ_DAQ 读回的正是刚写入的 Entry（指针自增后被重新定位）
+    ASSERT_TRUE(Request(BytesOf({0xE2, 0x00, 0x01, 0x00, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(BytesOf({0xDB}), res_));
+    ASSERT_EQ(res_.size(), 8U);
+    EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Res));
+    EXPECT_EQ(res_[1], 0xFFU);  // BIT_OFFSET=0xFF（无位偏）
+    EXPECT_EQ(res_[2], 2U);     // SIZE
+    EXPECT_EQ(res_[3], 0U);     // EXT
+    EXPECT_EQ((res_[4] | (res_[5] << 8)), 0x3000U);  // ADDR
+}
+
+TEST_F(UdpTestSlaveDaq, WriteDaqOnPredefinedListIsWriteProtected) {
+    slave_.SetDaqListPredefined(3, true);  // 3 号列表标记为 PREDEFINED
+    // 先定位指针（这一步本身合法，RES 1 字节）
+    ASSERT_TRUE(Request(BytesOf({0xE2, 0x00, 0x03, 0x00, 0x00, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 1U);
+    // 再写 Entry：docs L2168 → ERR_WRITE_PROTECTED
+    ASSERT_TRUE(Request(
+        BytesOf({0xE1, 0xFF, 0x01, 0x00, 0x00, 0x50, 0x00, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 2U);
+    EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Err));
+    EXPECT_EQ(res_[1], static_cast<std::uint8_t>(ErrorCode::WriteProtected))
+        << "docs L2168：WRITE_DAQ 指向 PREDEFINED 列表必须 ERR_WRITE_PROTECTED";
+}
+
+TEST_F(UdpTestSlaveDaq, OutOfRangeDaqObjectRejected) {
+    // docs L2153：指定对象不存在 → ERR_OUT_OF_RANGE
+    ASSERT_TRUE(Request(BytesOf({0xE2, 0x00, 0x63, 0x00, 0x00, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 2U);
+    EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Err));
+    EXPECT_EQ(res_[1], static_cast<std::uint8_t>(ErrorCode::OutOfRange));
+}
+
+TEST_F(UdpTestSlaveDaq,
+       StartStopDaqListReturnsFirstPidAndGetStatusReflectsRun) {
+    ASSERT_TRUE(Request(BytesOf({0xE2, 0x00, 0x02, 0x00, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(
+        BytesOf({0xE1, 0xFF, 0x01, 0x00, 0x00, 0x20, 0x30, 0x00}), res_));
+    // daq=2 的 FIRST_PID = 0x10 + 2*4 = 0x18（预留 4 个连续 PID）
+    ASSERT_TRUE(Request(BytesOf({0xDE, 0x01, 0x02, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 2U);
+    EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Res));
+    EXPECT_EQ(res_[1], 0x18U);
+    // GET_STATUS 的 DAQ_RUNNING（bit6）应随之置位（docs L2220）
+    ASSERT_TRUE(Request(BytesOf({0xFD, 0x00}), res_));
+    ASSERT_GE(res_.size(), 2U);
+    EXPECT_NE(res_[1] & 0x40U, 0U);
+    // STOP ALL 后清除
+    ASSERT_TRUE(Request(BytesOf({0xDD, 0x00}), res_));
+    ASSERT_TRUE(Request(BytesOf({0xFD, 0x00}), res_));
+    EXPECT_EQ(res_[1] & 0x40U, 0U);
+}
+
+TEST_F(UdpTestSlaveDaq, GetDaqListInfoReportsCapacityAndNoFirstPid) {
+    // docs L2452-2457：本命令响应只有 PROPERTIES/MAX_ODT/MAX_ODT_ENTRIES/
+    // FIXED_EVENT 四项 —— **不含 FIRST_PID**（那是 START_STOP_DAQ_LIST 的）
+    ASSERT_TRUE(Request(BytesOf({0xD8, 0x00, 0x02, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 6U);
+    EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Res));
+    EXPECT_EQ(res_[1] & 0x01U, 0U) << "未标记 PREDEFINED";
+    EXPECT_EQ(res_[2], 4U);                     // MAX_ODT
+    EXPECT_EQ(res_[3], 8U);                     // MAX_ODT_ENTRIES
+    EXPECT_EQ((res_[4] | (res_[5] << 8)), 0U);  // FIXED_EVENT
+}
+
+TEST_F(UdpTestSlaveDaq, DownloadWritesAtMtaAndAdvancesIt) {
+    slave_.SetMemory(0x4000, BytesOf({0x00, 0x00, 0x00, 0x00}));
+    // SET_MTA(0x4000) → DOWNLOAD 2 元素 → SHORT_UPLOAD 读回
+    ASSERT_TRUE(
+        Request(BytesOf({0xF6, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(BytesOf({0xF0, 0x02, 0xAA, 0xBB}), res_));
+    ASSERT_EQ(res_.size(), 1U);
+    ASSERT_TRUE(Request(
+        BytesOf({0xF4, 0x02, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 3U);
+    EXPECT_EQ(res_[1], 0xAAU);
+    EXPECT_EQ(res_[2], 0xBBU);
+}
+
+TEST_F(UdpTestSlaveDaq, ShortDownloadWritesGivenAddressAndDownloadNextUnknown) {
+    slave_.SetMemory(0x4100, BytesOf({0x00, 0x00}));
+    // SHORT_DOWNLOAD: [ED][n=2][00][ext=00][addr 小端 00 41 00 00][data...]
+    ASSERT_TRUE(Request(
+        BytesOf({0xED, 0x02, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00, 0x11, 0x22}),
+        res_));
+    ASSERT_EQ(res_.size(), 1U);
+    ASSERT_TRUE(Request(
+        BytesOf({0xF4, 0x02, 0x00, 0x00, 0x00, 0x41, 0x00, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 3U);
+    EXPECT_EQ(res_[1], 0x11U);
+    EXPECT_EQ(res_[2], 0x22U);
+    // DOWNLOAD_NEXT 属 Block Mode，未实现 → 仍须按 docs L1631 回 CMD_UNKNOWN
+    ASSERT_TRUE(Request(BytesOf({0xEF, 0x00}), res_));
+    ASSERT_EQ(res_.size(), 2U);
+    EXPECT_EQ(res_[1], static_cast<std::uint8_t>(ErrorCode::CmdUnknown));
+}
+
+TEST_F(UdpTestSlaveDaq, ClearDaqListResetsEntries) {
+    ASSERT_TRUE(Request(BytesOf({0xE2, 0x00, 0x01, 0x00, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(
+        BytesOf({0xE1, 0xFF, 0x01, 0x00, 0x00, 0x50, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(BytesOf({0xE3, 0x00, 0x01, 0x00}), res_));  // CLEAR
+    ASSERT_EQ(res_.size(), 1U);
+    // 清除后再 READ_DAQ：Entry 已不存在 → 不猜，回 ERR_OUT_OF_RANGE
+    ASSERT_TRUE(Request(BytesOf({0xE2, 0x00, 0x01, 0x00, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(BytesOf({0xDB}), res_));
+    ASSERT_EQ(res_.size(), 2U);
+    EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Err));
+    EXPECT_EQ(res_[1], static_cast<std::uint8_t>(ErrorCode::OutOfRange));
 }
 
 }  // namespace
