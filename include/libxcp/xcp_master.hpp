@@ -243,6 +243,42 @@ public:
     void ConfigureDaqList(const DaqListSpec& spec);
 
     /**
+     * @brief 动态 DAQ 整表编排（批次20，T20-01b）：FREE_DAQ → ALLOC_DAQ →
+     *        ALLOC_ODT → ALLOC_ODT_ENTRY → SET_DAQ_PTR/WRITE_DAQ →
+     *        SET_DAQ_LIST_MODE
+     * @param specs 整表快照：每个 DaqListSpec 一个 List；XCPlite 由 ALLOC_DAQ
+     *        按分配序自增编号，daq_list 必须严格等于下标 0..N-1（docs
+     *        §7.5.4.7：n=2 产生 List 0 与 1）
+     * @details Slave 侧时序硬门（xcplite.c:1148/1176）：ALLOC_DAQ 一次性给出
+     *          List 总数；全表 ODT 分配完才开始分 Entry；ALLOC 出的 Entry 槽
+     *          size=0，必须再 WRITE_DAQ 填。FREE_DAQ 作用域是整张表：旧账本
+     *          快照后全表重建，未出现在 specs 里的 List 一并删除、代际递增；
+     *          失败则账本回滚到调用前快照（不留半份账，B-6）。
+     * @note  只适用于声明 DAQ_PROPERTY_CONFIG_TYPE=DYNAMIC 的 Slave；SET_DAQ_
+     *          LIST_MODE 位与 prescaler 按 spec 透传，不替 Slave 强制
+     *          TIMESTAMP（XCPlite 缺 TIMESTAMP 位回 CRC_CMD_SYNTAX，错误如实
+     *          上浮，B-16）。pid 不回填：本路径识别字段非 Absolute，动态启动
+     *          请走 StartDaqSync()（D12：XCPlite 拒绝单列表 START(mode=1)）。
+     * @throws XcpException(InvalidArgument) specs 空 / daq_list 非下标序 /
+     *         spec 字段非法（同 ConfigureDaqList 口径）/ Slave 不支持
+     *         动态分配 / 单 ODT 超 MAX_DTO（含时间戳信封预检，G3 修正）
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void ConfigureDaqListsDynamic(const std::vector<DaqListSpec>& specs);
+
+    /**
+     * @brief 动态列表的同步启动：逐 List Select → START_STOP_SYNCH(Start
+     *        Selected)（批次20，T20-01b）
+     * @details 绕开拒绝单列表 START(mode=1) 的 Slave（D12：xcplite.c:2668-
+     *          2671 TEST_CHECKS 下回 CRC_MODE_NOT_VALID）。Select 响应的
+     *          FIRST_PID 不回填账本（本路径识别字段非 Absolute，docs
+     *          L2228）。运行态由 Session 登记（Disconnect 自动收尾）。
+     * @throws XcpException(InvalidState) 账本中无任何 List
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void StartDaqSync();
+
+    /**
      * @brief 启动一个已配置的 DAQ List（START_STOP_DAQ_LIST(Start)）
      * @param daq_list DAQ List 号（EPK）
      * @return Slave 响应的 FIRST_PID（Absolute ODT Number 模式，docs L2222）
@@ -345,6 +381,29 @@ private:
      */
     bool m_daq_processor_info_queried_{false};
     std::optional<std::uint8_t> m_daq_processor_properties_;
+
+    /**
+     * @brief 本会话 GET_DAQ_RESOLUTION_INFO 的一次性取证缓存（批次20，G3）
+     * @details 仅供信封预检：时间戳宽度计入 header（XCPlite 每事件首 ODT
+     *          带 4B 时间戳，此前按纯 PID 口径预检会放行超限配置）。
+     *          nullopt = Slave 不支持该 Optional 命令或未声明宽度，按 0 计——
+     *          **不猜**（B-3/B-16）。
+     */
+    bool m_daq_resolution_info_queried_{false};
+    std::optional<std::uint8_t> m_daq_timestamp_bytes_;
+
+    /**
+     * @brief 懒查 GET_DAQ_RESOLUTION_INFO 并缓存 Slave 声明的时间戳字节宽
+     *        （批次20，G3）。未声明/Optional 不支持 → 0——宽度**不猜**（B-3）。
+     * @note 调用时机由信封预检决定：仅当 spec.timestamp 开启才查询，不给
+     *       既有静态路径加命令；FIXED 时间戳 Slave 与 spec.timestamp=false
+     *       的组合本就与 Slave 的 MODE 校验冲突，错误由 Slave 侧如实上浮。
+     */
+    [[nodiscard]] std::size_t DaqTimestampBytesCached();
+
+    /// @brief 动态编排中途失败后的清理：整表 FREE_DAQ 尽力恢复到干净空表，
+    ///        二次失败只尽力不掩盖原异常；账本/解码代际同步作废（批次20）
+    void ClearDynamicTableBestEffort();
 };
 
 }  // namespace calmcar::xcp

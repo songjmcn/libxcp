@@ -285,6 +285,58 @@ Bytes CommandCodec::EncodeGetDaqResolutionInfo() const {
     return cto;
 }
 
+Bytes CommandCodec::EncodeFreeDaq() const {
+    // FREE_DAQ: [D6]（1 字节无参；xcp.h:832 CRO_FREE_DAQ_LEN=1，
+    // xcplite.c:2562）。释放全部动态表，运行中发→CRC_DAQ_ACTIVE（D9）
+    Bytes cto;
+    cto.reserve(1);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::FreeDaq));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeAllocDaq(std::uint16_t count) const {
+    // ALLOC_DAQ: [D5][reserved][count(WORD)]
+    // （xcp.h:836-838：LEN4、COUNT=CRO_WORD(1)→字节2..3；xcplite.c:2567）。
+    // 时序硬门（D9/XcpAllocDaq xcplite.c:1148）：odt/entry 计数非零时再发
+    // →CRC_SEQUENCE，故编排层必须"一次 alloc 全部 list 数"
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::AllocDaq));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, count);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeAllocOdt(std::uint16_t daq_list,
+                                   std::uint8_t count) const {
+    // ALLOC_ODT: [D4][reserved][daq(WORD)][count]（xcp.h:841-844：LEN5、
+    // DAQ=CRO_WORD(1)→2..3、COUNT=CRO_BYTE(4)；xcplite.c:2574）。
+    // 同一 list 的多个 ODT 必须连续分配后再动 entry（游标语义）
+    Bytes cto;
+    cto.reserve(5);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::AllocOdt));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, daq_list);
+    cto.push_back(count);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeAllocOdtEntry(std::uint16_t daq_list,
+                                        std::uint8_t odt_number,
+                                        std::uint8_t count) const {
+    // ALLOC_ODT_ENTRY: [D3][reserved][daq(WORD)][odt][count]
+    // （xcp.h:847-851：LEN6、DAQ=CRO_WORD(1)→2..3、ODT=CRO_BYTE(4)、
+    // COUNT=CRO_BYTE(5)；xcplite.c:2583）。odt 为该 list 内相对号
+    Bytes cto;
+    cto.reserve(6);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::AllocOdtEntry));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, daq_list);
+    cto.push_back(odt_number);
+    cto.push_back(count);
+    return cto;
+}
+
 Bytes CommandCodec::EncodeDownload(ElementCount number_of_elements,
                                    BytesView data) const {
     // DOWNLOAD: [F0][size][data...]（xcp.h:578-582）；size 是**元素数**

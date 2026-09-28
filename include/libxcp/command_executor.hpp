@@ -250,6 +250,46 @@ public:
      */
     void ExecuteClearDaqList(std::uint16_t daq_list);
 
+    // ---- 批次20：动态 DAQ 分配命令组（FREE/ALLOC 三件套；XCPlite 实然
+    //      见 xcplite.c:2562-2591，响应均为纯 RES）----
+
+    /**
+     * @brief 执行 FREE_DAQ（释放 Slave 侧全部 DAQ 资源）
+     * @details 动态配置的第一步：一次性作废 LIST/ODT/ENTRY 全部对象；
+     *          隐含指针记录随全表失效一并清空（口径与 ExecuteClearDaqList
+     *          一致，只是作用域是全表）。运行中调用 → CRC_DAQ_ACTIVE
+     *          （xcplite.c:2567），编排层必须先停。
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    void ExecuteFreeDaq();
+
+    /**
+     * @brief 执行 ALLOC_DAQ（动态分配 count 个 DAQ List）
+     * @param count 本次分配的 List 数（>=1；XCPlite 侧 0 → CRC_OUT_OF_RANGE）
+     * @details XcpAllocDaq 要求既有 odt/entry 计数为零（xcplite.c:1148），
+     *          故一次编排必须**一次给足总数**，不得在 ODT 分配后追加。
+     * @throws XcpException 超时、协议错误（CRC_SEQUENCE/CRC_DAQ_ACTIVE）
+     *         或恢复失败
+     */
+    void ExecuteAllocDaq(std::uint16_t count);
+
+    /**
+     * @brief 执行 ALLOC_ODT（为指定 List 追加 count 个 ODT）
+     * @details 顺序硬门：任何 ALLOC_ODT_ENTRY 之前必须完成**全表所有 List**
+     *          的 ODT 分配（XcpAllocOdt 要求 odt_entry_count==0，
+     *          xcplite.c:1176）——由编排层保证，本方法不越权替 Slave 校验。
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    void ExecuteAllocOdt(std::uint16_t daq_list, std::uint8_t count);
+
+    /**
+     * @brief 执行 ALLOC_ODT_ENTRY（为指定 ODT 分配 count 个 Entry 槽）
+     * @details 分配出的槽位 size=0、地址为空，仍需 WRITE_DAQ 填充后方可用。
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    void ExecuteAllocOdtEntry(std::uint16_t daq_list, std::uint8_t odt_number,
+                              std::uint8_t count);
+
     /**
      * @brief 执行 SET_DAQ_LIST_MODE（docs L2174-2204；Mandatory）
      * @param mode MODE 位组合

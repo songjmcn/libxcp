@@ -80,7 +80,8 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
   add_executable(XcpliteIntegration
           xcplite_slave_fixture.cpp
           xcplite_protocol_test.cpp
-          xcplite_write_test.cpp)
+          xcplite_write_test.cpp
+          xcplite_daq_test.cpp)
   target_compile_features(XcpliteIntegration PRIVATE cxx_std_20)
   target_link_libraries(XcpliteIntegration PRIVATE
           libxcp::libxcp

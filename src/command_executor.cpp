@@ -717,6 +717,46 @@ void CommandExecutor::ExecuteClearDaqList(std::uint16_t daq_list) {
     }
 }
 
+void CommandExecutor::ExecuteFreeDaq() {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeFreeDaq();
+    (void)RunCommand(CommandCode::FreeDaq, encoded);
+    // 全表作废：隐含指针记录一律失效（口径与 ExecuteClearDaqList 一致，
+    // 只是作用域是全部 List）
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_last_daq_ptr_.reset();
+    }
+}
+
+void CommandExecutor::ExecuteAllocDaq(std::uint16_t count) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeAllocDaq(count);
+    (void)RunCommand(CommandCode::AllocDaq, encoded);
+    // 全表已被 FREE_DAQ 清空后才会走到这里（编排层时序，D9）；防御性地
+    // 再作废一次隐含指针，保证本方法单独调用也留干净状态
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_last_daq_ptr_.reset();
+    }
+}
+
+void CommandExecutor::ExecuteAllocOdt(std::uint16_t daq_list,
+                                      std::uint8_t count) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeAllocOdt(daq_list, count);
+    (void)RunCommand(CommandCode::AllocOdt, encoded);
+}
+
+void CommandExecutor::ExecuteAllocOdtEntry(std::uint16_t daq_list,
+                                           std::uint8_t odt_number,
+                                           std::uint8_t count) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded =
+        m_codec_->EncodeAllocOdtEntry(daq_list, odt_number, count);
+    (void)RunCommand(CommandCode::AllocOdtEntry, encoded);
+}
+
 void CommandExecutor::ExecuteSetDaqListMode(DaqListModeBit mode,
                                             std::uint16_t daq_list,
                                             std::uint16_t event_channel,

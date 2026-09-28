@@ -238,6 +238,53 @@ public:
      */
     [[nodiscard]] Bytes EncodeGetDaqResolutionInfo() const;
 
+    // ---- 批次20：动态 DAQ 分配命令组（docs §7.5.4.6-§7.5.4.9；
+    //      CRO 布局对照 thirdparty/XCPlite/src/xcp.h:831-851；
+    //      四条命令响应均为纯 RES，CRM_*_LEN=1）----
+
+    /**
+     * @brief 编码 FREE_DAQ 命令
+     * @return CTO: [0xD6]（1 字节无参；xcp.h:832 CRO_FREE_DAQ_LEN=1）
+     * @details 释放 Slave 侧全部 DAQ 资源（List/ODT/Entry），用于动态配置的
+     *          第一步。XCPlite：DAQ 运行中调用 → CRC_DAQ_ACTIVE
+     *          （xcplite.c:2567），调用方必须先停。
+     */
+    [[nodiscard]] Bytes EncodeFreeDaq() const;
+
+    /**
+     * @brief 编码 ALLOC_DAQ 命令
+     * @param count 要分配的 DAQ List 数（>=1；0 → Slave 回 CRC_OUT_OF_RANGE）
+     * @return CTO: [0xD5][reserved][count(WORD)]（4 字节；xcp.h:836-838）
+     * @details XCPlite 的 XcpAllocDaq 要求 odt/entry 计数为零（否则
+     *          CRC_SEQUENCE，xcplite.c:1148），因此**一次调用分配本次编排的
+     *          全部 List 数**，不得分批追加。
+     */
+    [[nodiscard]] Bytes EncodeAllocDaq(std::uint16_t count) const;
+
+    /**
+     * @brief 编码 ALLOC_ODT 命令
+     * @param daq_list 目标 DAQ List 号
+     * @param count 为该 List 追加的 ODT 数（1..0xFB）
+     * @return CTO: [0xD4][reserved][daq(WORD)][count]（5 字节；xcp.h:841-844）
+     * @details 任何 ALLOC_ODT_ENTRY 之前必须完成全部 List 的 ODT 分配
+     *          （XcpAllocOdt 要求 odt_entry_count==0，xcplite.c:1176）。
+     */
+    [[nodiscard]] Bytes EncodeAllocOdt(std::uint16_t daq_list,
+                                       std::uint8_t count) const;
+
+    /**
+     * @brief 编码 ALLOC_ODT_ENTRY 命令
+     * @param daq_list 目标 DAQ List 号
+     * @param odt_number 该 List 内的相对 ODT 号（0 基）
+     * @param count 为该 ODT 分配的 Entry 槽数（>=1）
+     * @return CTO: [0xD3][reserved][daq(WORD)][odt][count]
+     *         （6 字节；xcp.h:847-851）
+     * @details 分配出的 Entry 槽 size=0，仍需 WRITE_DAQ 填充地址后才可用。
+     */
+    [[nodiscard]] Bytes EncodeAllocOdtEntry(std::uint16_t daq_list,
+                                            std::uint8_t odt_number,
+                                            std::uint8_t count) const;
+
     /**
      * @brief 编码 DOWNLOAD 命令（docs L1979-1987；Mandatory，CAL/PAG 可用时）
      * @param number_of_elements 本帧写入的元素数（以 AG 为单位，1..0xFF）
