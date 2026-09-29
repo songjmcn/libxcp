@@ -92,9 +92,12 @@ enum class CommandCode : std::uint8_t {
     GetDaqResolutionInfo = 0xD9,  ///< 读 ODT Entry 粒度与时间戳信息
     GetDaqProcessorInfo = 0xDA,   ///< 读 DAQ 处理器能力（识别字段/扩展模式）
     GetDaqListInfo = 0xD8,        ///< 读 DAQ List 容量与固定事件信息
+    // ---- v0.3 追加：GET_DAQ_EVENT_INFO（0xD7），单个事件通道的运行时信息；
+    //      原先 :97 记的"0xD7 刻意未收录"在此更正为已收录（测量子系统 v0.3）。----
+    GetDaqEventInfo = 0xD7,  ///< 读事件通道信息（响应六字段，见 response_parser）
     // ---- 批次20：动态 DAQ 分配命令组（docs §7.5.4.6-§7.5.4.9；
     //      命令码与 CRO 布局对照 thirdparty/XCPlite/src/xcp.h:87-90、
-    //      :831-851；注意 0xD7 是 GET_DAQ_EVENT_INFO，FREE_DAQ 是 0xD6）----
+    //      :831-851；FREE_DAQ 是 0xD6）----
     FreeDaq = 0xD6,        ///< 释放 Slave 侧全部 DAQ 资源（FREE_DAQ）
     AllocDaq = 0xD5,       ///< 一次性分配 n 个 DAQ List（ALLOC_DAQ）
     AllocOdt = 0xD4,       ///< 为指定 List 追加 ODT（ALLOC_ODT）

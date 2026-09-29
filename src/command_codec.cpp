@@ -278,6 +278,17 @@ Bytes CommandCodec::EncodeGetDaqListInfo(std::uint16_t daq_list) const {
     return cto;
 }
 
+Bytes CommandCodec::EncodeGetDaqEventInfo(std::uint16_t event_channel) const {
+    // GET_DAQ_EVENT_INFO: [D7][event_channel(WORD)]（XCPlite 实然
+    // xcp.h:817-818：CRO_GET_DAQ_EVENT_INFO_LEN=4、索引 CRO_WORD(1)，
+    // 即字节2..3=事件通道号 WORD，**无** reserved 字节）。
+    Bytes cto;
+    cto.reserve(3);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqEventInfo));
+    WriteU16(cto, event_channel);
+    return cto;
+}
+
 Bytes CommandCodec::EncodeGetDaqProcessorInfo() const {
     // GET_DAQ_PROCESSOR_INFO: [DA]（1 字节无参；xcp.h:789）
     Bytes cto;

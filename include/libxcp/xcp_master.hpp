@@ -366,6 +366,18 @@ public:
         std::uint16_t daq_list);
 
     /**
+     * @brief 查询单个事件通道的运行时信息（GET_DAQ_EVENT_INFO，v0.3，Optional）
+     * @param event_channel 事件通道号（uint16_t）
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时为 std::nullopt
+     * @details 事件通道号**不在响应中回显**（调用方持有入参）。v0.4
+     *          MeasurementPlanner 据此做 DAQ List 分配与 time_cycle/time_unit/
+     *          priority 取证。事件名主体经 UPLOAD 通路按 MTA 读取，本方法只拿
+     *          name_length 等六字段（见 GetDaqEventInfoResponse）。
+     */
+    [[nodiscard]] std::optional<GetDaqEventInfoResponse> QueryDaqEventInfo(
+        std::uint16_t event_channel);
+
+    /**
      * @brief 回读指定位置的 ODT Entry（SET_DAQ_PTR + READ_DAQ）
      * @param daq_list DAQ List 号（EPK）
      * @param odt_number ODT 号（0 基）
@@ -377,6 +389,10 @@ public:
     [[nodiscard]] std::optional<ReadDaqResponse> ReadDaqEntryAt(
         std::uint16_t daq_list, std::uint8_t odt_number,
         std::uint8_t odt_entry);
+
+    /// @brief 测量会话（v0.5）需要读取时间戳宽度取证缓存用于规划与解码；
+    ///        该口径不外扩为公共 API，故以 friend 授权（不改变其余可见性）。
+    friend class MeasurementSession;
 
 private:
     std::unique_ptr<IXcpTransport> m_transport_;  ///< 拥有的 Transport

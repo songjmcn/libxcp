@@ -232,6 +232,17 @@ public:
     [[nodiscard]] Bytes EncodeGetDaqListInfo(std::uint16_t daq_list) const;
 
     /**
+     * @brief 编码 GET_DAQ_EVENT_INFO 命令（v0.3；XCPlite 实然 xcp.h:817-818：
+     *        CRO_GET_DAQ_EVENT_INFO_LEN=4，索引 CRO_WORD(1)：事件通道号 WORD，
+     *        **无** reserved 字节，与 GET_DAQ_LIST_INFO 的 [reserved] 不同）
+     * @param event_channel 事件通道号（uint16_t）
+     * @return CTO: [0xD7][event_lo][event_hi]（3+… 实际 4 字节含 PID 头部逻辑）
+     * @details 响应六字节数据见 ResponseParser::ParseGetDaqEventInfoRes；
+     *          事件通道号**不在响应中回显**。
+     */
+    [[nodiscard]] Bytes EncodeGetDaqEventInfo(std::uint16_t event_channel) const;
+
+    /**
      * @brief 编码 GET_DAQ_PROCESSOR_INFO 命令（docs L2285-2311；Optional）
      * @return CTO: [0xDA]（1 字节无参；thirdparty/XCPlite/src/xcp.h:789）
      * @details DAQ 能力查询的首要命令：DAQ_PROPERTIES / MAX_DAQ /

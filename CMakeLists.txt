@@ -87,7 +87,12 @@ target_sources(libxcp PRIVATE
         src/udp_transport.cpp
         src/command_executor.cpp
         src/memory_access.cpp
-        src/xcp_master.cpp)
+        src/xcp_master.cpp
+        src/daq/dto_envelope_decoder.cpp
+        src/daq/dto_payload_decoder.cpp
+        src/daq/daq_timestamp.cpp
+        src/measurement/measurement_planner.cpp
+        src/measurement/measurement_session.cpp)
 
 target_include_directories(libxcp
         PUBLIC
@@ -168,6 +173,18 @@ if(LIBXCP_BUILD_A2L)
       IMPORTED_LOCATION "${LIBXCP_A2LBRIDGE_LIBRARY}"
       INTERFACE_INCLUDE_DIRECTORIES "${LIBXCP_A2LBRIDGE_INCLUDE_DIR}"
       INTERFACE_LINK_LIBRARIES liba2l::liba2l)
+
+  # 测量适配器（v0.5，测量子系统代码增长计划 §5.5 / D1）：
+  # 独立顶层目录 adapter/a2l + 独立 target libxcp_measurement_adapter。
+  # 副产物不并入 libxcp；adapter/*.cpp 是核心<->桥接层唯一接触点
+  # （A2lIsolation S2 仅扫描 include/ 与 src/，本目录不在扫描范围）。
+  add_library(libxcp_measurement_adapter STATIC
+          adapter/a2l/a2l_measurement_database.cpp)
+  target_include_directories(libxcp_measurement_adapter PUBLIC
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/adapter>)
+  target_link_libraries(libxcp_measurement_adapter PUBLIC
+          libxcp::libxcp libxcp::a2lbridge)
 endif()
 
 # ----------------------------------------------------------------------------

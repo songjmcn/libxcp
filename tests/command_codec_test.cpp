@@ -255,6 +255,16 @@ TEST(CommandCodecGolden, DaqQueryCommandsHaveNoReservedByte) {
     ExpectBytes(codec.EncodeGetDaqListInfo(7), {0xD8, 0x00, 0x07, 0x00});
 }
 
+TEST(CommandCodecGolden, GetDaqEventInfoHasNoReservedByte) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // GET_DAQ_EVENT_INFO（v0.3）：[D7][事件通道 WORD]（XCPlite 实然
+    // xcp.h:817-818 CRO_GET_DAQ_EVENT_INFO_LEN=4、CRO_WORD(1)，**无**
+    // reserved 字节，与 GET_DAQ_LIST_INFO 的 [D8][reserved][DAQ] 不同）
+    ExpectBytes(codec.EncodeGetDaqEventInfo(0x0102),
+                {0xD7, 0x02, 0x01});
+    ExpectBytes(codec.EncodeGetDaqEventInfo(7), {0xD7, 0x07, 0x00});
+}
+
 TEST(CommandCodecGolden, DownloadAndShortDownloadLayouts) {
     const CommandCodec codec(ByteOrder::Intel);
     // DOWNLOAD: [F0][SIZE][data...]（xcp.h:578-581）

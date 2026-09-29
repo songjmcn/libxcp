@@ -115,6 +115,29 @@ struct GetDaqListInfoResponse {
 };
 
 /**
+ * @brief GET_DAQ_EVENT_INFO 响应解析结果（v0.3；xCPlite 实然布局
+ *        xcp.h:819-825，CRO_GET_DAQ_EVENT_INFO_LEN=4 / CRM_LEN=7）
+ * @details RES 数据（去掉 0xFF 后）为 6 字节，**事件通道号不在响应中回显**
+ *          （调用方已持有入参 event_channel）：
+ *          [PROPERTIES][MAX_DAQ_LISTS][NAME_LENGTH][TIME_CYCLE][TIME_UNIT]
+ *          [PRIORITY]。
+ *          - NAME_LENGTH：事件名长度（XCP 1.3.0 §7.5.4.11 可选字段；事件名主体
+ *            经 UPLOAD 通路按 MTA 取自本地缓冲区，本解析器只取长度）。
+ *          - time_cycle / time_unit：周期与单位码；time_unit 的实然含义（XCPlite
+ *            xcplite.c:2543-：1ns=0,10ns=1,100ns=2,1us=3,…,1ms=6）
+ *            写入调用方语义层，本结构只保留原码。
+ *          可选优先级仅在事件信息存在 EXTENDED 属性时有效（XCPlite 恒给）。
+ */
+struct GetDaqEventInfoResponse {
+    std::uint8_t properties{0};  ///< EVENT_PROPERTIES 原始位
+    std::uint8_t max_daq_lists{0};  ///< 该事件可用 DAQ List 数（XCPlite 恒 0xFF）
+    std::uint8_t name_length{0};  ///< 事件名长度
+    std::uint8_t time_cycle{0};   ///< 事件周期（缩放单位），原码
+    std::uint8_t time_unit{0};    ///< 周期单位码，原码
+    std::uint8_t priority{0};     ///< 事件优先级（0xFF = 最高）
+};
+
+/**
  * @brief GET_DAQ_PROCESSOR_INFO 响应解析结果（docs L2292-2311；xcp.h:790-795）
  * @details B-16 的 DAQ 侧比对（identification_field_type /
  *          address_extension_mode）唯一的运行时真值来源就是本响应的
@@ -256,6 +279,16 @@ public:
      */
     [[nodiscard]] std::optional<GetDaqListInfoResponse> ParseGetDaqListInfo(
         BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_DAQ_EVENT_INFO 响应（v0.3；XCPlite 实然 xcp.h:819-825，
+     *        CRO_GET_DAQ_EVENT_INFO_LEN=4 / CRM_LEN=7）
+     * @param res_data RES 后的数据（去掉 0xFF 前缀，长度必须 >= 6：
+     *                 PROPERTIES/MAX_DAQ_LISTS/NAME_LENGTH/TIME_CYCLE/
+     *                 TIME_UNIT/PRIORITY；事件通道号不在响应中回显）
+     */
+    [[nodiscard]] std::optional<GetDaqEventInfoResponse>
+    ParseGetDaqEventInfo(BytesView res_data) const;
 
     /**
      * @brief 解析 GET_DAQ_PROCESSOR_INFO 响应（docs L2292-2311；xcp.h:790-795）

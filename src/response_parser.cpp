@@ -29,6 +29,10 @@ constexpr std::size_t kStartStopDaqListResMinSize = 1;
 /// @brief GET_DAQ_LIST_INFO 响应去掉 PID 后的最小长度
 /// （PROPERTIES/MAX_ODT/MAX_ODT_ENTRY/FIXED_EVENT(WORD)）
 constexpr std::size_t kGetDaqListInfoResMinSize = 5;
+/// @brief GET_DAQ_EVENT_INFO 响应去掉 PID 后的最小长度（v0.3；XCPlite 实然
+/// xcp.h:819-825）
+/// （PROPERTIES/MAX_DAQ_LISTS/NAME_LENGTH/TIME_CYCLE/TIME_UNIT/PRIORITY）
+constexpr std::size_t kGetDaqEventInfoResMinSize = 6;
 /// @brief GET_DAQ_RESOLUTION_INFO 响应去掉 PID 后的最小长度
 /// （DAQ 粒度+上限、STIM 粒度+上限、TIMESTAMP_MODE、TIMESTAMP_TICKS(WORD)）
 constexpr std::size_t kGetDaqResolutionInfoResMinSize = 7;
@@ -302,6 +306,25 @@ std::optional<GetDaqListInfoResponse> ResponseParser::ParseGetDaqListInfo(
         return std::nullopt;
     }
     resp.fixed_event = *fixed_event;
+    return resp;
+}
+
+std::optional<GetDaqEventInfoResponse> ResponseParser::ParseGetDaqEventInfo(
+    BytesView res_data) const {
+    // GET_DAQ_EVENT_INFO RES（去掉 0xFF）：[PROPERTIES][MAX_DAQ_LISTS]
+    //   [NAME_LENGTH][TIME_CYCLE][TIME_UNIT][PRIORITY]（XCPlite 实然
+    //   xcp.h:819-825，CRM_LEN=7 含 0xFF → 数据 6 字节）。
+    // 注意：事件通道号**不在响应中回显**（调用方持有入参 event_channel）。
+    if (res_data.size() < kGetDaqEventInfoResMinSize) {
+        return std::nullopt;
+    }
+    GetDaqEventInfoResponse resp;
+    resp.properties = res_data[0];
+    resp.max_daq_lists = res_data[1];
+    resp.name_length = res_data[2];
+    resp.time_cycle = res_data[3];
+    resp.time_unit = res_data[4];
+    resp.priority = res_data[5];
     return resp;
 }
 

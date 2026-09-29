@@ -28,7 +28,9 @@
  *  - 事件通道不硬编码（D18：OPTION_ENABLE_PERSISTENCE 可能令 id 跨运行继承），
  *    从 Slave 运行时生成的 A2L EVENT 段解析 testev 的通道号。
  *
- * 批次20 不动 DtoPacket→桥接解码（记录 §3 降级条款）：envelope 手工切分断言。
+ * v0.9：信封切分统一走核心 DtoEnvelopeDecoder（A2L-free），不再保留测试专用
+ * 手工拆包（原 SplitEnvelope 已删除）；RelativeByte + 首 ODT 才带时间戳的
+ * XCPlite 实然（D13）经 DtoFrameLayout::timestamp_relative_first_only 表达。
  * 每用例独立 Slave 进程（夹具 SetUp/TearDown），流污染不跨用例。
  */
 
@@ -48,6 +50,7 @@
 #include <gtest/gtest.h>
 
 #include "libxcp/command_executor.hpp"
+#include "libxcp/daq/dto_envelope_decoder.hpp"
 #include "libxcp/protocol_types.hpp"
 #include "libxcp/xcp_error.hpp"
 #include "libxcp/xcp_master.hpp"
@@ -131,38 +134,34 @@ bool BytesPrefixEq(BytesView payload, BytesView want) {
            std::memcmp(payload.data(), want.data(), want.size()) == 0;
 }
 
-/// @brief XCPlite DTO 信封切分结果（D13）
-struct EnvelopeView {
-    std::uint8_t odt_rel{0};     ///< b0：事件内 ODT 相对号（0=本事件首 ODT）
-    std::uint16_t daq{0};        ///< b2..3：DAQ List 绝对号（WORD LE）
-    std::uint32_t timestamp{0};  ///< 首 ODT 帧的 4B 时间戳（1ns tick）；其余 0
-    bool has_timestamp{false};
-    BytesView payload{};  ///< 信封后的净荷
-};
+/// @brief XCPlite 信封的运行时布局取证（D6/D13：DAQ_KEY_BYTE=0xC0 方言）
+/// @details [ODTrel(b0)][0xAA(b1)][DAQ16 LE(b2..3)] 识别字段 4 字节；
+///          4 字节 LE 时间戳只随**本事件首 ODT 帧**出现
+///          （timestamp_relative_first_only=true，v0.9 解码器新增表达）。
+///          与已删除的测试专用手工拆包等价，走核心统一入口。
+DtoFrameLayout MakeXcpliteEnvelopeLayout() {
+    DtoFrameLayout layout;
+    layout.identification_field_type = IdentificationFieldType::RelativeByte;
+    layout.first_odt = 0;
+    layout.counter_enabled = false;
+    layout.timestamp_enabled = true;
+    layout.timestamp_size_bits = 32U;
+    layout.timestamp_relative_first_only = true;
+    layout.header_bytes = 4U;
+    return layout;
+}
 
-/// @brief 切分 [ODTrel][0xAA][DAQ16]（+首 ODT 的 4B ts）；不合法返回 nullopt
-std::optional<EnvelopeView> SplitEnvelope(const Bytes& frame) {
-    if (frame.size() < 4U || frame[1] != 0xAAU) {
+/// @brief 用核心 DtoEnvelopeDecoder 切分一个 DTO 帧；非法形态返回 nullopt
+/// @details identity.odt = first_odt + ODTrel = 相对号（first_odt=0）；
+///          identity.daq_list 为 DAQ16 绝对号；payload 指向 frame 内部。
+std::optional<DtoEnvelope> DecodeFrame(const Bytes& frame) {
+    static const DtoEnvelopeDecoder decoder(ByteOrder::Intel);
+    static const DtoFrameLayout layout = MakeXcpliteEnvelopeLayout();
+    try {
+        return decoder.Decode(BytesView{frame}, layout);
+    } catch (const XcpException&) {
         return std::nullopt;
     }
-    EnvelopeView v;
-    v.odt_rel = frame[0];
-    v.daq = static_cast<std::uint16_t>(
-        frame[2] | (static_cast<std::uint16_t>(frame[3]) << 8U));
-    std::size_t off = 4U;
-    if (v.odt_rel == 0U) {
-        if (frame.size() < 8U) {
-            return std::nullopt;
-        }
-        v.timestamp = static_cast<std::uint32_t>(frame[4]) |
-                      (static_cast<std::uint32_t>(frame[5]) << 8U) |
-                      (static_cast<std::uint32_t>(frame[6]) << 16U) |
-                      (static_cast<std::uint32_t>(frame[7]) << 24U);
-        v.has_timestamp = true;
-        off = 8U;
-    }
-    v.payload = BytesView(frame).subspan(off);
-    return v;
 }
 
 /**
@@ -255,15 +254,15 @@ TEST_F(XcpliteDaqTest, DynamicAcqEndToEnd) {
         int odt0_hits = 0;
         int odt1_hits = 0;
         for (const auto& f : frames) {
-            const auto v = SplitEnvelope(f);
+            const auto v = DecodeFrame(f);
             ASSERT_TRUE(v.has_value()) << "帧非 XCPlite 信封形态（D13）";
-            EXPECT_EQ(v->daq, 0U) << "DAQ16 绝对号应为唯一列表 0";
-            if (v->odt_rel == 0U) {
+            EXPECT_EQ(v->identity.daq_list, 0U) << "DAQ16 绝对号应为唯一列表 0";
+            if (v->identity.odt == 0U) {
                 // 首 ODT：4B 头 + 4B ts + 4B 净荷 =
                 // 12（对齐无补白，仍按前缀核）
                 ASSERT_GE(f.size(), 12U);
                 ASSERT_LE(f.size(), 15U);
-                EXPECT_TRUE(v->has_timestamp);
+                EXPECT_TRUE(v->raw_timestamp.has_value());
                 if (BytesPrefixEq(v->payload,
                                   BytesView(LeBytes(kExpectBasicU32)))) {
                     ++odt0_hits;
@@ -273,7 +272,7 @@ TEST_F(XcpliteDaqTest, DynamicAcqEndToEnd) {
                 // 前缀核
                 ASSERT_GE(f.size(), 5U);
                 ASSERT_LE(f.size(), 8U);
-                EXPECT_FALSE(v->has_timestamp);
+                EXPECT_FALSE(v->raw_timestamp.has_value());
                 if (!v->payload.empty() && v->payload[0] == kExpectBasicU8) {
                     ++odt1_hits;
                 }
@@ -292,8 +291,8 @@ TEST_F(XcpliteDaqTest, DynamicAcqEndToEnd) {
             std::chrono::steady_clock::now() + std::chrono::seconds(2);
         while (std::chrono::steady_clock::now() < deadline) {
             for (const auto& f : collector.Snapshot()) {
-                const auto v = SplitEnvelope(f);
-                if (v && v->odt_rel == 0U &&
+                const auto v = DecodeFrame(f);
+                if (v && v->identity.odt == 0U &&
                     BytesPrefixEq(v->payload, BytesView(LeBytes(magic)))) {
                     return true;
                 }
@@ -341,11 +340,11 @@ TEST_F(XcpliteDaqTest, DynamicAcqEndToEnd) {
         bool combo_hit = false;
         for (auto it = frames.begin() + static_cast<long>(base);
              it != frames.end(); ++it) {
-            const auto v = SplitEnvelope(*it);
+            const auto v = DecodeFrame(*it);
             ASSERT_TRUE(v.has_value());
-            // 新布局只配了 1 个 ODT → 每帧都是 odt_rel 0；13B=4+4+4+1
+            // 新布局只配了 1 个 ODT → 每帧都是相对 ODT 0；13B=4+4+4+1
             // 线上补白成 16B（D21），净荷按 5B 前缀核
-            EXPECT_EQ(v->odt_rel, 0U);
+            EXPECT_EQ(v->identity.odt, 0U);
             if (v->payload.size() >= 5U) {
                 Bytes want = LeBytes(magic);
                 want.push_back(kExpectBasicU8);
@@ -413,8 +412,8 @@ TEST_F(XcpliteDaqTest, RunningReconfigureStopsStreamAndRebuilds) {
     const auto frames = collector.Snapshot();
     for (auto it = frames.begin() + static_cast<long>(base); it != frames.end();
          ++it) {
-        const auto v = SplitEnvelope(*it);
-        if (v && v->odt_rel == 0U &&
+        const auto v = DecodeFrame(*it);
+        if (v && v->identity.odt == 0U &&
             BytesPrefixEq(v->payload, BytesView(LeBytes(kExpectBasicU32)))) {
             value_ok = true;
         }

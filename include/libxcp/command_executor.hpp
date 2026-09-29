@@ -340,6 +340,20 @@ public:
         std::uint16_t daq_list);
 
     /**
+     * @brief 执行 GET_DAQ_EVENT_INFO（v0.3；**Optional**，XCPlite 实然
+     *        xcp.h:816-825：CRO 4 字节 = [D7][事件通道 WORD]，RES 六字段）
+     * @param event_channel 事件通道号（uint16_t）
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
+     *         （docs L1631：未实现的可选命令必回 ERR_CMD_UNKNOWN 且无副作用）
+     * @details 事件信息用于 v0.4 MeasurementPlanner 的 DAQ List 分配与
+     *          time_cycle/time_unit/priority 取证；事件通道号**不在响应中
+     *          回显**（调用方持有入参）。
+     * @throws XcpException 超时、其他协议错误或恢复失败
+     */
+    [[nodiscard]] std::optional<GetDaqEventInfoResponse> ExecuteGetDaqEventInfo(
+        std::uint16_t event_channel);
+
+    /**
      * @brief 执行 GET_DAQ_PROCESSOR_INFO（docs L2285-2311；**Optional**）
      * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
      * @details B-16 的 identification_field_type / address_extension_mode

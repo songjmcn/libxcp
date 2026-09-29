@@ -830,6 +830,31 @@ std::optional<GetDaqListInfoResponse> CommandExecutor::ExecuteGetDaqListInfo(
     return parsed;
 }
 
+std::optional<GetDaqEventInfoResponse> CommandExecutor::ExecuteGetDaqEventInfo(
+    std::uint16_t event_channel) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetDaqEventInfo(event_channel);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetDaqEventInfo, encoded);
+    } catch (const XcpException& e) {
+        // Optional 命令未实现 → ERR_CMD_UNKNOWN 且无副作用（docs L1631）：
+        // 视为"能力缺失"，由调用方回落，不当作链路故障
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetDaqEventInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_DAQ_EVENT_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 6）");
+    }
+    return parsed;
+}
+
 std::optional<GetDaqProcessorInfoResponse>
 CommandExecutor::ExecuteGetDaqProcessorInfo() {
     EnsureCodec(m_session_.GetByteOrder());

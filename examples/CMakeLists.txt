@@ -10,3 +10,9 @@
 enable_testing()
 
 add_subdirectory(xcp_master_udp)
+
+# 测量子系统端到端示例（v0.9，测量子系统代码增长计划 交付物3）：
+# UPLOAD A2L → 桥接 → 适配器 → MeasurementSession → 物理值帧。
+# 另需 xcp_test_slave 目标（LIBXCP_BUILD_TESTS=ON，其目录在根构建中先于本
+# 目录加入），缺位在子目录 CONFIGURE 期 FATAL_ERROR 明示。
+add_subdirectory(measurement_demo)

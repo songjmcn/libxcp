@@ -646,6 +646,11 @@ std::optional<GetDaqListInfoResponse> XcpMaster::QueryDaqListInfo(
     return m_executor_->ExecuteGetDaqListInfo(daq_list);
 }
 
+std::optional<GetDaqEventInfoResponse> XcpMaster::QueryDaqEventInfo(
+    std::uint16_t event_channel) {
+    return m_executor_->ExecuteGetDaqEventInfo(event_channel);
+}
+
 std::optional<ReadDaqResponse> XcpMaster::ReadDaqEntryAt(
     std::uint16_t daq_list, std::uint8_t odt_number, std::uint8_t odt_entry) {
     // 先定位再回读：不依赖隐含指针的自增状态（docs L2172 指针不可查询）
