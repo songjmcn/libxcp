@@ -31,8 +31,13 @@ target_link_libraries(measurement_demo PRIVATE
         libxcp_measurement_adapter)
 # Slave 可执行文件路径经 CMake 注入，禁止硬编码
 # （沿用 examples/xcp_master_udp/CMakeLists.txt:37-41 先例）
+# XCP_104.aml 路径经 CMake 注入（照抄 examples/xcp_master_udp/CMakeLists.txt:18,41
+# 先例）：cpp_demo 生成的 A2L 含 `/include "XCP_104.aml"`，示例在 run-dir 预置副本
+# 保证桥接 include 链可解析（xcp_test_slave 自写 AML，预置块以 skip_existing 让位）。
+set(XCPLITE_A2L_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/thirdparty/XCPlite")
 target_compile_definitions(measurement_demo PRIVATE
-        XCP_TEST_SLAVE_EXECUTABLE="$<TARGET_FILE:xcp_test_slave>")
+        XCP_TEST_SLAVE_EXECUTABLE="$<TARGET_FILE:xcp_test_slave>"
+        XCP_104_AML_FILE="${XCPLITE_A2L_INCLUDE_DIR}/XCP_104.aml")
 # demo_process.hpp 的搜索路径（与 xcp_master_udp 共享实现）
 target_include_directories(measurement_demo PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../xcp_master_udp")
