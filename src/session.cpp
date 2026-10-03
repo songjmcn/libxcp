@@ -93,6 +93,8 @@ void Session::EstablishConnection(const ConnectResponse& connect_response) {
         // 新会话：DAQ 运行态与配置代际一并归零（批次14，T14-07 一致性要求）
         m_daq_running_lists_.clear();
         m_daq_generation_ = 0U;
+        // 变量标定批次：PAG 缓存跨会话作废（旧 ECU 的 Segment 上限不可信）
+        m_pag_processor_info_.reset();
         m_state_ = SessionState::Connected;
         m_pending_command_.reset();
         m_fail_reason_.clear();
@@ -116,6 +118,7 @@ void Session::CompleteDisconnection() {
     // "看起来还在跑"的伪状态（调用方已无法再发 STOP）
     m_daq_running_lists_.clear();
     m_daq_generation_ = 0U;
+    m_pag_processor_info_.reset();  // 变量标定批次：PAG 缓存一并作废
     m_pending_command_.reset();
     m_state_ = SessionState::Disconnected;
 }
@@ -144,6 +147,7 @@ void Session::Fail(std::string_view reason) {
     // 会话已不可用：DAQ 运行态同步清零（再发 STOP 也没有通道）
     m_daq_running_lists_.clear();
     m_daq_generation_ = 0U;
+    m_pag_processor_info_.reset();  // 变量标定批次：PAG 缓存一并作废
     m_pending_command_.reset();
 }
 
@@ -153,6 +157,7 @@ void Session::Reset() {
     m_params_ = SessionParameters{};
     m_daq_running_lists_.clear();
     m_daq_generation_ = 0U;
+    m_pag_processor_info_.reset();  // 变量标定批次：PAG 缓存一并作废
     m_pending_command_.reset();
     m_fail_reason_.clear();
 }
@@ -268,6 +273,16 @@ std::uint32_t Session::DaqConfigGeneration() const {
 void Session::BumpDaqConfigGeneration() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
     ++m_daq_generation_;
+}
+
+void Session::SetPagProcessorInfo(const GetPagProcessorInfoResponse& info) {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_pag_processor_info_ = info;
+}
+
+std::optional<GetPagProcessorInfoResponse> Session::PagProcessorInfo() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_pag_processor_info_;
 }
 
 }  // namespace calmcar::xcp

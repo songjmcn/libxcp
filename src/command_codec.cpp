@@ -402,4 +402,151 @@ Bytes CommandCodec::EncodeShortDownload(ElementCount number_of_elements,
     return cto;
 }
 
+Bytes CommandCodec::EncodeModifyBits(std::uint8_t shift,
+                                     std::uint16_t and_mask,
+                                     std::uint16_t xor_mask) const {
+    // MODIFY_BITS: [EC][shift][AND Mask(WORD)][XOR Mask(WORD)]
+    // （xcp.h CRO_MODIFY_BITS_LEN=6：SHIFT=CRO_BYTE(1)、AND=CRO_WORD(2)、
+    //  XOR=CRO_WORD(3)→字节4..5）；Shift 有效范围 0..16（docs §7.5.2.5，
+    // 超出 Slave 回 ERR_OUT_OF_RANGE，本地预检直接拒绝）
+    if (shift > kModifyBitsMaxShift) {
+        throw detail::MakeInvalidArgument(
+            "MODIFY_BITS Shift Value 超出范围 0..16: " +
+            std::to_string(shift));
+    }
+    Bytes cto;
+    cto.reserve(6);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::ModifyBits));
+    cto.push_back(shift);
+    WriteU16(cto, and_mask);
+    WriteU16(cto, xor_mask);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeSetCalPage(CalPageModeBit mode,
+                                     std::uint8_t segment,
+                                     std::uint8_t page) const {
+    // SET_CAL_PAGE: [EB][mode][segment][page]（xcp.h CRO_SET_CAL_PAGE_LEN=4）
+    // mode 至少含 ECU/XCP 之一才有意义；仅 ALL 或全零组合 Slave 无法执行，
+    // 本地预检拒绝（ERR_MODE_NOT_VALID 的语义前置到调用方）
+    if (!HasCalPageMode(mode, CalPageModeBit::kEcu | CalPageModeBit::kXcp)) {
+        throw detail::MakeInvalidArgument(
+            "SET_CAL_PAGE Mode 必须包含 ECU(0x01) 或 XCP(0x02) 位: 0x" +
+            std::to_string(static_cast<unsigned>(mode)));
+    }
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::SetCalPage));
+    cto.push_back(static_cast<std::uint8_t>(mode));
+    cto.push_back(segment);
+    cto.push_back(page);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetCalPage(CalPageAccessMode access_mode,
+                                     std::uint8_t segment) const {
+    // GET_CAL_PAGE: [EA][access_mode][segment]（xcp.h CRO_GET_CAL_PAGE_LEN=3）
+    // Access Mode 仅允许 0x01(ECU)/0x02(XCP)，其他 Slave 回
+    // ERR_MODE_NOT_VALID（docs §7.5.3.2），本地预检拒绝
+    if (access_mode != CalPageAccessMode::Ecu &&
+        access_mode != CalPageAccessMode::Xcp) {
+        throw detail::MakeInvalidArgument(
+            "GET_CAL_PAGE Access Mode 仅允许 0x01(ECU)/0x02(XCP): 0x" +
+            std::to_string(static_cast<unsigned>(access_mode)));
+    }
+    Bytes cto;
+    cto.reserve(3);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetCalPage));
+    cto.push_back(static_cast<std::uint8_t>(access_mode));
+    cto.push_back(segment);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetPagProcessorInfo() const {
+    // GET_PAG_PROCESSOR_INFO: [E9]（1 字节无参；xcp.h
+    // CRO_GET_PAG_PROCESSOR_INFO_LEN=1）
+    Bytes cto;
+    cto.reserve(1);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetPagProcessorInfo));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetSegmentInfo(SegmentInfoMode mode,
+                                         std::uint8_t segment,
+                                         SegmentInfoSelector info,
+                                         std::uint8_t mapping_index) const {
+    // GET_SEGMENT_INFO: [E8][mode][segment][segment_info][mapping_index]
+    // （xcp.h CRO_GET_SEGMENT_INFO_LEN=5）；mode/info 越界 Slave 回
+    // ERR_OUT_OF_RANGE，本地预检拒绝
+    const auto mode_raw = static_cast<std::uint8_t>(mode);
+    const auto info_raw = static_cast<std::uint8_t>(info);
+    if (mode_raw > 2U) {
+        throw detail::MakeInvalidArgument(
+            "GET_SEGMENT_INFO Mode 仅允许 0/1/2: " +
+            std::to_string(mode_raw));
+    }
+    if (info_raw > 2U) {
+        throw detail::MakeInvalidArgument(
+            "GET_SEGMENT_INFO SegmentInfo 仅允许 0/1/2: " +
+            std::to_string(info_raw));
+    }
+    Bytes cto;
+    cto.reserve(5);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetSegmentInfo));
+    cto.push_back(mode_raw);
+    cto.push_back(segment);
+    cto.push_back(info_raw);
+    cto.push_back(mapping_index);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetPageInfo(std::uint8_t segment,
+                                      std::uint8_t page) const {
+    // GET_PAGE_INFO: [E7][reserved][segment][page]（xcp.h
+    // CRO_GET_PAGE_INFO_LEN=4）
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetPageInfo));
+    cto.push_back(0x00U);  // reserved
+    cto.push_back(segment);
+    cto.push_back(page);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeSetSegmentMode(SegmentModeBit mode,
+                                         std::uint8_t segment) const {
+    // SET_SEGMENT_MODE: [E6][mode][segment]（xcp.h CRO_SET_SEGMENT_MODE_LEN=3）
+    // mode 仅 bit0 FREEZE 有定义，其余位原样透传由 Slave 判定
+    Bytes cto;
+    cto.reserve(3);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::SetSegmentMode));
+    cto.push_back(static_cast<std::uint8_t>(mode));
+    cto.push_back(segment);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetSegmentMode(std::uint8_t segment) const {
+    // GET_SEGMENT_MODE: [E5][reserved][segment]（xcp.h
+    // CRO_GET_SEGMENT_MODE_LEN=3）
+    Bytes cto;
+    cto.reserve(3);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetSegmentMode));
+    cto.push_back(0x00U);  // reserved
+    cto.push_back(segment);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeCopyCalPage(const CopyCalPageRequest& request) const {
+    // COPY_CAL_PAGE: [E4][src_segment][src_page][dst_segment][dst_page]
+    // （xcp.h CRO_COPY_CAL_PAGE_LEN=5）
+    Bytes cto;
+    cto.reserve(5);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::CopyCalPage));
+    cto.push_back(request.src_segment);
+    cto.push_back(request.src_page);
+    cto.push_back(request.dst_segment);
+    cto.push_back(request.dst_page);
+    return cto;
+}
+
 }  // namespace calmcar::xcp

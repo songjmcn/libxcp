@@ -446,6 +446,11 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
         if (cmd == CommandCode::Upload || cmd == CommandCode::Download) {
             RestoreUploadMta();
         }
+        // MODIFY_BITS 同样从隐含 MTA 起算（docs §7.5.2.5：操作对象为 MTA
+        // 指向的 32-bit 位置，命令本身不带地址）——恢复后必须重放 SET_MTA
+        if (cmd == CommandCode::ModifyBits) {
+            RestoreUploadMta();
+        }
         // WRITE_DAQ / READ_DAQ 从隐含 DAQ 指针起算：docs L2783 要求恢复后
         // 重新 SET_DAQ_PTR（指针不可查询，只能重放本端记录）
         if (cmd == CommandCode::WriteDaq || cmd == CommandCode::ReadDaq) {
@@ -942,6 +947,161 @@ void CommandExecutor::ExecuteShortDownload(ElementCount number_of_elements,
     // 写回必须有确认：ERR_CMD_UNKNOWN 不降级为成功，原样上抛由
     // MemoryAccess 回落 SET_MTA + DOWNLOAD 通路
     (void)RunCommand(CommandCode::ShortDownload, encoded);
+}
+
+// ---------------------------------------------------------------------------
+// 变量标定批次：MODIFY_BITS + Page Switching（docs §7.5.2.5 / §7.5.3）
+// ---------------------------------------------------------------------------
+
+void CommandExecutor::ExecuteModifyBits(std::uint8_t shift,
+                                        std::uint16_t and_mask,
+                                        std::uint16_t xor_mask) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded =
+        m_codec_->EncodeModifyBits(shift, and_mask, xor_mask);
+    // CRM 仅 RES（xcp.h CRM_MODIFY_BITS_LEN=1），无数据字段可解析。
+    // MTA 隐含依赖与恢复重放由 RunCommand 的 ModifyBits 分支处理。
+    (void)RunCommand(CommandCode::ModifyBits, encoded);
+}
+
+void CommandExecutor::ExecuteSetCalPage(CalPageModeBit mode,
+                                       std::uint8_t segment,
+                                       std::uint8_t page) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeSetCalPage(mode, segment, page);
+    (void)RunCommand(CommandCode::SetCalPage, encoded);
+}
+
+std::optional<GetCalPageResponse> CommandExecutor::ExecuteGetCalPage(
+    CalPageAccessMode access_mode, std::uint8_t segment) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetCalPage(access_mode, segment);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetCalPage, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;  // Optional 命令，Slave 不支持 Paging
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetCalPage(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_CAL_PAGE 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 3）");
+    }
+    return parsed;
+}
+
+std::optional<GetPagProcessorInfoResponse>
+CommandExecutor::ExecuteGetPagProcessorInfo() {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetPagProcessorInfo();
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetPagProcessorInfo, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;  // Slave 不支持 Page Switching
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetPagProcessorInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_PAG_PROCESSOR_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 2）");
+    }
+    return parsed;
+}
+
+std::optional<GetSegmentInfoResponse> CommandExecutor::ExecuteGetSegmentInfo(
+    SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
+    std::uint8_t mapping_index) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded =
+        m_codec_->EncodeGetSegmentInfo(mode, segment, info, mapping_index);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetSegmentInfo, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    // 变长响应：把请求 Mode 传给 Parser 决定布局（计划 §11 风险 1）
+    auto parsed = m_parser_->ParseGetSegmentInfo(BytesView{res.data}, mode);
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_SEGMENT_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) +
+            " 字节，Mode 0/2 期望 >= 4、Mode 1 期望 >= 5）");
+    }
+    return parsed;
+}
+
+std::optional<GetPageInfoResponse> CommandExecutor::ExecuteGetPageInfo(
+    std::uint8_t segment, std::uint8_t page) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetPageInfo(segment, page);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetPageInfo, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetPageInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_PAGE_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 2）");
+    }
+    return parsed;
+}
+
+void CommandExecutor::ExecuteSetSegmentMode(SegmentModeBit mode,
+                                           std::uint8_t segment) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeSetSegmentMode(mode, segment);
+    (void)RunCommand(CommandCode::SetSegmentMode, encoded);
+}
+
+std::optional<GetSegmentModeResponse> CommandExecutor::ExecuteGetSegmentMode(
+    std::uint8_t segment) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetSegmentMode(segment);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetSegmentMode, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetSegmentMode(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_SEGMENT_MODE 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 2）");
+    }
+    return parsed;
+}
+
+void CommandExecutor::ExecuteCopyCalPage(const CopyCalPageRequest& request) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeCopyCalPage(request);
+    (void)RunCommand(CommandCode::CopyCalPage, encoded);
 }
 
 }  // namespace calmcar::xcp

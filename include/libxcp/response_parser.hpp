@@ -322,6 +322,53 @@ public:
     [[nodiscard]] std::optional<GetIdResponse> ParseGetId(
         BytesView res_data) const;
 
+    // ---- 变量标定批次：Calibration / Page Switching 响应（docs §7.5.2.5 /
+    //      §7.5.3；CRM 布局对照 thirdparty/XCPlite/src/xcp.h:604-660）----
+
+    /**
+     * @brief 解析 GET_CAL_PAGE 响应（docs §7.5.3.2；xcp.h CRM_GET_CAL_PAGE_LEN=4）
+     * @param res_data RES 后的数据（长度必须 >= 3：reserved×2 + PAGE_NUMBER）
+     * @note 布局 [FF][reserved][reserved][page]，剥 FF 后 page 在偏移 2。
+     */
+    [[nodiscard]] std::optional<GetCalPageResponse> ParseGetCalPage(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_PAG_PROCESSOR_INFO 响应（docs §7.5.3.3；
+     *        xcp.h CRM_GET_PAG_PROCESSOR_INFO_LEN=3）
+     * @param res_data RES 后的数据（长度必须 >= 2：MAX_SEGMENT/PAG_PROPERTIES）
+     */
+    [[nodiscard]] std::optional<GetPagProcessorInfoResponse>
+    ParseGetPagProcessorInfo(BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_SEGMENT_INFO 响应（docs §7.5.3.4；变长，按 Mode 分支）
+     * @param res_data RES 后的数据
+     * @param mode 请求时使用的 SegmentInfoMode（决定响应布局与最小长度）
+     * @details Mode 0/2：[DWORD@0..3]（长度 >= 4）；
+     *          Mode 1：[MAX_PAGES][ADDRESS_EXTENSION][MAX_MAPPING]
+     *                   [COMPRESSION][ENCRYPTION]（长度 >= 5）。
+     *          Slave 可能返回更长的兼容响应，多余字节安全忽略。
+     */
+    [[nodiscard]] std::optional<GetSegmentInfoResponse> ParseGetSegmentInfo(
+        BytesView res_data, SegmentInfoMode mode) const;
+
+    /**
+     * @brief 解析 GET_PAGE_INFO 响应（docs §7.5.3.5；xcp.h CRM_GET_PAGE_INFO_LEN=3）
+     * @param res_data RES 后的数据（长度必须 >= 2：PAGE_PROPERTIES/INIT_SEGMENT）
+     */
+    [[nodiscard]] std::optional<GetPageInfoResponse> ParseGetPageInfo(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_SEGMENT_MODE 响应（docs §7.5.3.7；
+     *        xcp.h CRM_GET_SEGMENT_MODE_LEN=3）
+     * @param res_data RES 后的数据（长度必须 >= 2：reserved + MODE）
+     * @note 布局 [FF][reserved][mode]，剥 FF 后 mode 在偏移 1。
+     */
+    [[nodiscard]] std::optional<GetSegmentModeResponse> ParseGetSegmentMode(
+        BytesView res_data) const;
+
 private:
     /// @brief CONNECT 协商出的 Session 字节序，决定多字节字段的读取方向
     ByteOrder m_byte_order_;

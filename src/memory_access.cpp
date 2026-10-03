@@ -295,4 +295,35 @@ void MemoryAccess::WriteBytes(Address address, AddressExtension extension,
     DownloadChunked(address, extension, data);
 }
 
+// ---------------------------------------------------------------------------
+// 变量标定批次：MODIFY_BITS（docs §7.5.2.5）——SET_MTA + MODIFY_BITS 序列
+// ---------------------------------------------------------------------------
+
+void MemoryAccess::ModifyBits(Address address, AddressExtension extension,
+                              std::uint8_t shift, std::uint16_t and_mask,
+                              std::uint16_t xor_mask) {
+    if (!m_session_.IsConnected()) {
+        throw detail::MakeInvalidState("位修改前必须先建立 XCP 连接");
+    }
+    if (shift > kModifyBitsMaxShift) {
+        throw detail::MakeInvalidArgument(
+            "MODIFY_BITS Shift Value 超出范围 0..16: " +
+            std::to_string(shift));
+    }
+    // 32-bit 操作对象按 DWORD 校验地址溢出（与 ValidateRead/Write 同口径）
+    const auto end_exclusive =
+        static_cast<std::uint64_t>(address) + 4ULL;
+    if (end_exclusive > 0x100000000ULL) {
+        throw detail::MakeInvalidArgument(
+            "MODIFY_BITS 目标地址 0x" + std::to_string(address) +
+            " + 4 Byte 越过 32 位边界");
+    }
+
+    // MODIFY_BITS 不带地址，操作对象是隐含 MTA 指向的 32-bit 位置；
+    // SET_MTA 成功后 CommandExecutor 记录 m_last_mta_，超时恢复自动重放。
+    m_executor_.ExecuteSetMta(extension, address);
+    m_executor_.ExecuteModifyBits(shift, and_mask, xor_mask);
+    // docs §7.5.2.5：执行后 MTA 不变，无需调整本端记录
+}
+
 }  // namespace calmcar::xcp

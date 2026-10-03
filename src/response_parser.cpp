@@ -418,4 +418,106 @@ std::optional<GetIdResponse> ResponseParser::ParseGetId(
     return resp;
 }
 
+std::optional<GetCalPageResponse> ResponseParser::ParseGetCalPage(
+    BytesView res_data) const {
+    // GET_CAL_PAGE RES: [FF][reserved][reserved][PAGE_NUMBER]
+    // （xcp.h CRM_GET_CAL_PAGE_LEN=4；docs §7.5.3.2 返回逻辑 Page Number）
+    if (res_data.size() < 3U) {
+        return std::nullopt;
+    }
+    GetCalPageResponse resp;
+    const auto page = ReadU8(res_data, 2);
+    if (!page) {
+        return std::nullopt;
+    }
+    resp.page = *page;
+    return resp;
+}
+
+std::optional<GetPagProcessorInfoResponse>
+ResponseParser::ParseGetPagProcessorInfo(BytesView res_data) const {
+    // GET_PAG_PROCESSOR_INFO RES: [FF][MAX_SEGMENT][PAG_PROPERTIES]
+    // （xcp.h CRM_GET_PAG_PROCESSOR_INFO_LEN=3；docs §7.5.3.3）
+    if (res_data.size() < 2U) {
+        return std::nullopt;
+    }
+    GetPagProcessorInfoResponse resp;
+    resp.max_segment = res_data[0];
+    resp.properties = static_cast<PagPropertyBit>(res_data[1]);
+    return resp;
+}
+
+std::optional<GetSegmentInfoResponse> ResponseParser::ParseGetSegmentInfo(
+    BytesView res_data, SegmentInfoMode mode) const {
+    // GET_SEGMENT_INFO RES（docs §7.5.3.4，变长按 Mode 分支）：
+    //   Mode 0/2: [DWORD@0..3]（xcp.h CRM_GET_SEGMENT_INFO_MODE0_LEN=8 →
+    //             剥 FF 后数据 4 字节 DWORD，剩余填充字节忽略）
+    //   Mode 1:   [MAX_PAGES][ADDRESS_EXTENSION][MAX_MAPPING]
+    //             [COMPRESSION][ENCRYPTION]（xcp.h LEN=6 → 数据 5 字节）
+    GetSegmentInfoResponse resp;
+    resp.mode = mode;
+    switch (mode) {
+        case SegmentInfoMode::BasicInfo:
+        case SegmentInfoMode::MappingInfo: {
+            if (res_data.size() < 4U) {
+                return std::nullopt;
+            }
+            const auto value = ReadU32(res_data, 0);
+            if (!value) {
+                return std::nullopt;
+            }
+            SegmentBasicInfo basic;
+            basic.value = *value;
+            if (mode == SegmentInfoMode::MappingInfo) {
+                SegmentMappingInfo mapping;
+                mapping.value = *value;
+                resp.data = mapping;
+            } else {
+                resp.data = basic;
+            }
+            return resp;
+        }
+        case SegmentInfoMode::StandardProperties: {
+            if (res_data.size() < 5U) {
+                return std::nullopt;
+            }
+            SegmentStandardProperties props;
+            props.max_pages = res_data[0];
+            props.address_extension = res_data[1];
+            props.max_mapping = res_data[2];
+            props.compression_method = res_data[3];
+            props.encryption_method = res_data[4];
+            resp.data = props;
+            return resp;
+        }
+    }
+    // 请求 Mode 非法（编码层已拦截 >2；此处防御性拒绝）
+    return std::nullopt;
+}
+
+std::optional<GetPageInfoResponse> ResponseParser::ParseGetPageInfo(
+    BytesView res_data) const {
+    // GET_PAGE_INFO RES: [FF][PAGE_PROPERTIES][INIT_SEGMENT]
+    // （xcp.h CRM_GET_PAGE_INFO_LEN=3；docs §7.5.3.5）
+    if (res_data.size() < 2U) {
+        return std::nullopt;
+    }
+    GetPageInfoResponse resp;
+    resp.properties = ParsePageProperties(res_data[0]);
+    resp.init_segment = res_data[1];
+    return resp;
+}
+
+std::optional<GetSegmentModeResponse> ResponseParser::ParseGetSegmentMode(
+    BytesView res_data) const {
+    // GET_SEGMENT_MODE RES: [FF][reserved][MODE]
+    // （xcp.h CRM_GET_SEGMENT_MODE_LEN=3；docs §7.5.3.7）
+    if (res_data.size() < 2U) {
+        return std::nullopt;
+    }
+    GetSegmentModeResponse resp;
+    resp.mode = static_cast<SegmentModeBit>(res_data[1]);
+    return resp;
+}
+
 }  // namespace calmcar::xcp

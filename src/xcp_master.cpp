@@ -158,6 +158,8 @@ void XcpMaster::Connect() {
     m_daq_processor_properties_.reset();
     m_daq_resolution_info_queried_ = false;
     m_daq_timestamp_bytes_.reset();
+    m_pag_processor_info_queried_ = false;
+    m_pag_processor_info_.reset();
 
     // Transport.Open 的监听器即 CommandExecutor；Open 之后接收线程立即开始回调
     m_transport_->Open(m_executor_->AsListener());
@@ -184,6 +186,23 @@ void XcpMaster::Connect() {
 
         // GET_STATUS 为 Mandatory，失败即视为连接失败
         (void)m_executor_->ExecuteGetStatus();
+
+        // 变量标定批次：CONNECT 协商出 CAL/PAG 资源时探测 Paging 子系统
+        // （GET_PAG_PROCESSOR_INFO，Optional）。Slave 不支持（nullopt）或
+        // 查询超时等错误只降级缓存、不阻断连接——Page 命令本身仍是逐条
+        // Optional，由调用方按需触发懒查（QueryPagProcessorInfo）。
+        if (HasCalPagResource()) {
+            m_pag_processor_info_queried_ = true;
+            try {
+                m_pag_processor_info_ =
+                    m_executor_->ExecuteGetPagProcessorInfo();
+                if (m_pag_processor_info_) {
+                    m_session_.SetPagProcessorInfo(*m_pag_processor_info_);
+                }
+            } catch (const XcpException&) {
+                m_pag_processor_info_.reset();
+            }
+        }
     } catch (const XcpException&) {
         cleanup_on_failure();
         throw;
@@ -753,6 +772,101 @@ UnlockResult XcpMaster::Unlock(Resource resource,
     } while (offset < key.size());
 
     return UnlockResult{false, last.resource_protection};
+}
+
+// ---------------------------------------------------------------------------
+// 变量标定批次：Calibration / Page Switching（docs §7.5.2.5 / §7.5.3）
+// ---------------------------------------------------------------------------
+
+bool XcpMaster::HasCalPagResource() const {
+    const auto params = m_session_.Parameters();
+    return HasResource(params.connect.resource_mask, Resource::CalPag);
+}
+
+std::optional<GetPagProcessorInfoResponse> XcpMaster::QueryPagProcessorInfo() {
+    if (!IsConnected()) {
+        throw detail::MakeInvalidState("查询 PAG 处理器信息前必须先建立 XCP 连接");
+    }
+    if (!HasCalPagResource()) {
+        throw detail::MakeUnsupportedFeature(
+            "Slave 的 CONNECT RESOURCE 未声明 CAL/PAG 资源，Page Switching "
+            "不可用");
+    }
+    // 一次性取证缓存：Connect() 已探测过则直接返回；nullopt 也可能来自
+    // "尚未探测"（构造后未 Connect 的路径），懒补一次
+    if (m_pag_processor_info_queried_) {
+        return m_pag_processor_info_;
+    }
+    m_pag_processor_info_queried_ = true;
+    m_pag_processor_info_ = m_executor_->ExecuteGetPagProcessorInfo();
+    if (m_pag_processor_info_) {
+        m_session_.SetPagProcessorInfo(*m_pag_processor_info_);
+    }
+    return m_pag_processor_info_;
+}
+
+/// @brief 标定命令统一入口预检：已连接 + Slave 声明 CAL/PAG 资源
+namespace {
+void RequireCalPag(bool connected, bool has_cal_pag) {
+    if (!connected) {
+        throw detail::MakeInvalidState("执行标定命令前必须先建立 XCP 连接");
+    }
+    if (!has_cal_pag) {
+        throw detail::MakeUnsupportedFeature(
+            "Slave 的 CONNECT RESOURCE 未声明 CAL/PAG 资源，标定命令不可用");
+    }
+}
+}  // namespace
+
+void XcpMaster::SetCalPage(CalPageModeBit mode, std::uint8_t segment,
+                           std::uint8_t page) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    m_executor_->ExecuteSetCalPage(mode, segment, page);
+}
+
+std::optional<GetCalPageResponse> XcpMaster::GetCalPage(
+    CalPageAccessMode access_mode, std::uint8_t segment) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    return m_executor_->ExecuteGetCalPage(access_mode, segment);
+}
+
+std::optional<GetSegmentInfoResponse> XcpMaster::GetSegmentInfo(
+    SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
+    std::uint8_t mapping_index) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    return m_executor_->ExecuteGetSegmentInfo(mode, segment, info,
+                                              mapping_index);
+}
+
+std::optional<GetPageInfoResponse> XcpMaster::GetPageInfo(
+    std::uint8_t segment, std::uint8_t page) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    return m_executor_->ExecuteGetPageInfo(segment, page);
+}
+
+void XcpMaster::SetSegmentFreeze(bool freeze, std::uint8_t segment) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    m_executor_->ExecuteSetSegmentMode(
+        freeze ? SegmentModeBit::kFreeze : SegmentModeBit::kNone, segment);
+}
+
+std::optional<GetSegmentModeResponse> XcpMaster::GetSegmentMode(
+    std::uint8_t segment) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    return m_executor_->ExecuteGetSegmentMode(segment);
+}
+
+void XcpMaster::CopyCalPage(const CopyCalPageRequest& request) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    m_executor_->ExecuteCopyCalPage(request);
+}
+
+void XcpMaster::ModifyBits(Address address, AddressExtension extension,
+                           std::uint8_t shift, std::uint16_t and_mask,
+                           std::uint16_t xor_mask) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    m_memory_access_->ModifyBits(address, extension, shift, and_mask,
+                                 xor_mask);
 }
 
 }  // namespace calmcar::xcp

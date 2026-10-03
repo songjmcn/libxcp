@@ -166,6 +166,18 @@ public:
     /// @brief 递增配置代际（CLEAR_DAQ_LIST 成功后调用）
     void BumpDaqConfigGeneration();
 
+    // ---- 变量标定批次：PAG Processor 信息缓存 ----
+
+    /**
+     * @brief 写入 GET_PAG_PROCESSOR_INFO 的解析结果（Connect 探测成功后调用）
+     * @param info 已解析的 PAG Processor 信息（MAX_SEGMENT / PAG_PROPERTIES）
+     */
+    void SetPagProcessorInfo(const GetPagProcessorInfoResponse& info);
+
+    /// @brief 缓存的 PAG Processor 信息；未探测或不支持时返回 std::nullopt
+    [[nodiscard]] std::optional<GetPagProcessorInfoResponse>
+    PagProcessorInfo() const;
+
 private:
     mutable std::mutex m_mutex_;                        ///< 保护以下全部字段
     SessionState m_state_{SessionState::Disconnected};  ///< 当前状态
@@ -181,6 +193,15 @@ private:
     std::vector<std::uint16_t> m_daq_running_lists_;
     /// @brief DAQ 配置代际（CLEAR_DAQ_LIST 或重连时递增；陈旧账本识别用）
     std::uint32_t m_daq_generation_ = 0U;
+    /**
+     * @brief GET_PAG_PROCESSOR_INFO 缓存（变量标定批次）
+     * @details Connect 阶段仅当 CONNECT 响应 CAL_PAG 资源置位时探测填充；
+     *          Slave 回 ERR_CMD_UNKNOWN（不支持 Paging）时保持 nullopt。
+     *          会话级清理四处（EstablishConnection / CompleteDisconnection /
+     *          Fail / Reset）必须一并清空，避免跨会话残留旧 ECU 的 Segment
+     *          上限。
+     */
+    std::optional<GetPagProcessorInfoResponse> m_pag_processor_info_;
 
     /**
      * @brief 校验 CONNECT 参数合法性（调用方须已持锁）

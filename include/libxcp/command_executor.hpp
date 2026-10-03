@@ -410,6 +410,100 @@ public:
                               AddressExtension extension, Address address,
                               BytesView data);
 
+    // ---- 变量标定批次：MODIFY_BITS + Page Switching（docs §7.5.2.5/§7.5.3）----
+
+    /**
+     * @brief 执行 MODIFY_BITS（docs §7.5.2.5；**Optional**，需 CAL/PAG 权限）
+     * @param shift Shift Value S（0..16，Codec 层预检）
+     * @param and_mask AND Mask（16-bit，零扩展后左移 S 作用于 32-bit MTA 位置）
+     * @param xor_mask XOR Mask（同上）
+     * @details 命令本身不设地址——操作对象是当前隐含 MTA，故调用方
+     *          （MemoryAccess::ModifyBits）必须先 SET_MTA；超时恢复时本层
+     *          与 UPLOAD/DOWNLOAD 一样重放 m_last_mta_。
+     * @throws XcpException 超时、协议错误（Shift 越界 Slave 回 ERR_OUT_OF_RANGE）
+     */
+    void ExecuteModifyBits(std::uint8_t shift, std::uint16_t and_mask,
+                           std::uint16_t xor_mask);
+
+    /**
+     * @brief 执行 SET_CAL_PAGE（docs §7.5.3.1；**Optional**）
+     * @param mode ECU/XCP/ALL 位组合（Codec 预检须含 ECU|XCP 之一）
+     * @param segment Segment Number（mode 含 ALL 时被 Slave 忽略）
+     * @param page Page Number
+     * @throws XcpException 超时、ERR_MODE_NOT_VALID / ERR_PAGE_NOT_VALID /
+     *         ERR_SEGMENT_NOT_VALID 等协议错误
+     */
+    void ExecuteSetCalPage(CalPageModeBit mode, std::uint8_t segment,
+                           std::uint8_t page);
+
+    /**
+     * @brief 执行 GET_CAL_PAGE（docs §7.5.3.2；**Optional**）
+     * @param access_mode 仅允许 Ecu(0x01)/Xcp(0x02)
+     * @param segment Segment Number
+     * @return 当前激活的逻辑 Page Number；Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetCalPageResponse> ExecuteGetCalPage(
+        CalPageAccessMode access_mode, std::uint8_t segment);
+
+    /**
+     * @brief 执行 GET_PAG_PROCESSOR_INFO（docs §7.5.3.3；**Optional**）
+     * @return MAX_SEGMENT/PAG_PROPERTIES；Slave 不支持 Paging 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetPagProcessorInfoResponse>
+    ExecuteGetPagProcessorInfo();
+
+    /**
+     * @brief 执行 GET_SEGMENT_INFO（docs §7.5.3.4；**Optional**，变长响应）
+     * @param mode 决定响应布局（BasicInfo/StandardProperties/MappingInfo）
+     * @param segment Segment Number
+     * @param info Mode 0: Address/Length；Mode 2: SrcAddr/DstAddr/Length
+     * @param mapping_index 仅 Mode 2 使用
+     * @return 按 Mode 填充的 variant 响应；ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetSegmentInfoResponse> ExecuteGetSegmentInfo(
+        SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
+        std::uint8_t mapping_index = 0U);
+
+    /**
+     * @brief 执行 GET_PAGE_INFO（docs §7.5.3.5；**Optional**）
+     * @param segment Segment Number
+     * @param page Page Number
+     * @return PAGE_PROPERTIES（已拆解三组访问者类型）+ INIT_SEGMENT；
+     *         ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetPageInfoResponse> ExecuteGetPageInfo(
+        std::uint8_t segment, std::uint8_t page);
+
+    /**
+     * @brief 执行 SET_SEGMENT_MODE（docs §7.5.3.6；**Optional**）
+     * @param mode bit0 FREEZE（置 1 后该 Segment 进入随后 STORE_CAL_REQ
+     *             的冻结处理范围）
+     * @param segment Segment Number
+     * @throws XcpException 超时或协议错误
+     */
+    void ExecuteSetSegmentMode(SegmentModeBit mode, std::uint8_t segment);
+
+    /**
+     * @brief 执行 GET_SEGMENT_MODE（docs §7.5.3.7；**Optional**）
+     * @param segment Segment Number
+     * @return 当前 Segment Mode（主要查 FREEZE）；ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetSegmentModeResponse> ExecuteGetSegmentMode(
+        std::uint8_t segment);
+
+    /**
+     * @brief 执行 COPY_CAL_PAGE（docs §7.5.3.8；**Optional**）
+     * @param request 源/目标 Segment+Page 四元组
+     * @details 目标区域写保护（Flash）时 Slave 回 ERR_WRITE_PROTECTED，
+     *          应改走 Flash Programming 流程（本计划外）。
+     * @throws XcpException 超时或协议错误
+     */
+    void ExecuteCopyCalPage(const CopyCalPageRequest& request);
 private:
     /// @brief 单条命令的执行流程：状态检查 -> 发送 -> 等待 -> 错误分派 ->
     /// 恢复重试

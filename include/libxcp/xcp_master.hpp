@@ -390,6 +390,124 @@ public:
         std::uint16_t daq_list, std::uint8_t odt_number,
         std::uint8_t odt_entry);
 
+    // ---- 变量标定批次：Calibration / Page Switching（docs §7.5.2.5 / §7.5.3）----
+
+    /**
+     * @brief CONNECT 后 Slave 是否声明 CAL/PAG 资源（Resource bit0）
+     * @return false 时以下全部标定 API 均本地拒绝（UnsupportedFeature），
+     *         不发送命令
+     */
+    [[nodiscard]] bool HasCalPagResource() const;
+
+    /**
+     * @brief 本会话 GET_PAG_PROCESSOR_INFO 的一次性取证缓存
+     * @details nullopt = Slave 不支持该 Optional 命令（ERR_CMD_UNKNOWN）或
+     *          未声明 CAL/PAG 资源；区分"尚未查询"由内部布尔记录。
+     *          MAX_SEGMENT/PAG_PROPERTIES 是 Page/Segment 预校验的唯一
+     *          运行时真值，**不猜**（B-3 口径）。
+     */
+    [[nodiscard]] std::optional<GetPagProcessorInfoResponse>
+    QueryPagProcessorInfo();
+
+    /**
+     * @brief 切换标定页（SET_CAL_PAGE）
+     * @param mode ECU/XCP/ALL 位组合（须含 ECU|XCP 之一）
+     * @param segment Segment Number（mode 含 ALL 时被 Slave 忽略）
+     * @param page Page Number
+     * @throws XcpException(UnsupportedFeature) Slave 未声明 CAL/PAG 资源
+     * @throws XcpException(InvalidArgument) Mode 组合非法
+     * @throws XcpException 协议错误（ERR_MODE_NOT_VALID/ERR_PAGE_NOT_VALID/
+     *         ERR_SEGMENT_NOT_VALID/ERR_ACCESS_LOCKED）、超时或恢复失败
+     */
+    void SetCalPage(CalPageModeBit mode, std::uint8_t segment,
+                    std::uint8_t page);
+
+    /**
+     * @brief 查询当前激活标定页（GET_CAL_PAGE）
+     * @param access_mode Ecu(0x01)=Application 侧 / Xcp(0x02)=Master 侧
+     * @param segment Segment Number
+     * @return 逻辑 Page Number；Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] std::optional<GetCalPageResponse> GetCalPage(
+        CalPageAccessMode access_mode, std::uint8_t segment);
+
+    /**
+     * @brief 查询 Segment 信息（GET_SEGMENT_INFO，变长响应按 Mode 分支）
+     * @param mode BasicInfo（地址/长度）/StandardProperties/MappingInfo
+     * @param segment Segment Number
+     * @param info Mode 0: Address/Length；Mode 2: SrcAddr/DstAddr/Length
+     * @param mapping_index 仅 Mode 2 使用（0..MAX_MAPPING-1）
+     * @return variant 响应；Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] std::optional<GetSegmentInfoResponse> GetSegmentInfo(
+        SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
+        std::uint8_t mapping_index = 0U);
+
+    /**
+     * @brief 查询 Page 访问属性与初始化来源（GET_PAGE_INFO）
+     * @param segment Segment Number
+     * @param page Page Number
+     * @return PAGE_PROPERTIES（三组访问者类型已拆解）+ INIT_SEGMENT；
+     *         Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] std::optional<GetPageInfoResponse> GetPageInfo(
+        std::uint8_t segment, std::uint8_t page);
+
+    /**
+     * @brief 设置 Segment FREEZE 模式（SET_SEGMENT_MODE）
+     * @param freeze true=冻结该 Segment（进入随后 STORE_CAL_REQ 的冻结
+     *               处理范围）；false=取消冻结
+     * @param segment Segment Number
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void SetSegmentFreeze(bool freeze, std::uint8_t segment);
+
+    /**
+     * @brief 读取 Segment 当前 Mode（GET_SEGMENT_MODE，主要查 FREEZE）
+     * @param segment Segment Number
+     * @return Mode 位域；HasSegmentMode(*r, kFreeze) 判断冻结态；
+     *         Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] std::optional<GetSegmentModeResponse> GetSegmentMode(
+        std::uint8_t segment);
+
+    /**
+     * @brief 复制标定页（COPY_CAL_PAGE）
+     * @param request 源/目标 Segment+Page 四元组
+     * @details 目标区域写保护（Flash）时 Slave 回 ERR_WRITE_PROTECTED，
+     *          应改走 Flash Programming 流程（本计划外）。
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void CopyCalPage(const CopyCalPageRequest& request);
+
+    /**
+     * @brief 对指定地址的 32-bit 位置执行原子 AND/XOR 位修改（MODIFY_BITS）
+     * @param address 32 位地址（操作对象为 MTA 指向的 DWORD）
+     * @param extension 地址扩展
+     * @param shift Shift Value S（0..16）
+     * @param and_mask AND Mask（16-bit，零扩展后左移 S 清位）
+     * @param xor_mask XOR Mask（同上，翻转置位）
+     * @details 内部编排 SET_MTA + MODIFY_BITS（docs §7.5.2.5：命令本身
+     *          不带地址）；超时恢复自动重放 MTA。
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException(InvalidArgument) Shift 越界/地址溢出
+     * @throws XcpException 协议错误（含 ERR_ACCESS_LOCKED——需先 Unlock
+     *         Resource::CalPag）、超时或恢复失败
+     */
+    void ModifyBits(Address address, AddressExtension extension,
+                    std::uint8_t shift, std::uint16_t and_mask,
+                    std::uint16_t xor_mask);
+
     /// @brief 测量会话（v0.5）需要读取时间戳宽度取证缓存用于规划与解码；
     ///        该口径不外扩为公共 API，故以 friend 授权（不改变其余可见性）。
     friend class MeasurementSession;
@@ -424,6 +542,14 @@ private:
      */
     bool m_daq_resolution_info_queried_{false};
     std::optional<std::uint8_t> m_daq_timestamp_bytes_;
+
+    /**
+     * @brief 本会话 GET_PAG_PROCESSOR_INFO 的一次性取证缓存（变量标定批次）
+     * @details nullopt = Slave 不支持该 Optional 命令或未声明 CAL/PAG 资源；
+     *          布尔值区分"尚未查询"和"已知不支持"（仿 DAQ 处理器信息缓存）。
+     */
+    bool m_pag_processor_info_queried_{false};
+    std::optional<GetPagProcessorInfoResponse> m_pag_processor_info_;
 
     /**
      * @brief 懒查 GET_DAQ_RESOLUTION_INFO 并缓存 Slave 声明的时间戳字节宽

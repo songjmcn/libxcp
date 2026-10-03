@@ -337,6 +337,99 @@ public:
                                             Address address,
                                             BytesView data) const;
 
+    // ---- 变量标定批次：MODIFY_BITS + Page Switching 命令组（docs §7.5.2.5 /
+    //      §7.5.3；CRO 布局对照 thirdparty/XCPlite/src/xcp.h:604-660）----
+
+    /**
+     * @brief 编码 MODIFY_BITS 命令（docs §7.5.2.5；Optional，需 CAL/PAG）
+     * @param shift Shift Value S（有效范围 0..16）
+     * @param and_mask AND Mask（16bit，零扩展后左移 S 与目标相与）
+     * @param xor_mask XOR Mask（16bit，零扩展后左移 S 与目标相异或）
+     * @return CTO: [0xEC][shift][and_mask(WORD)][xor_mask(WORD)]（6 字节）
+     * @throws XcpException(InvalidArgument) shift > 16
+     * @note 操作对象为当前 MTA 指向的 32-bit 位置；MTA 由前置 SET_MTA 决定，
+     *       执行后 MTA 不变。AND/XOR Mask 字段按 Session Byte Order 编码。
+     */
+    [[nodiscard]] Bytes EncodeModifyBits(std::uint8_t shift,
+                                         std::uint16_t and_mask,
+                                         std::uint16_t xor_mask) const;
+
+    /**
+     * @brief 编码 SET_CAL_PAGE 命令（docs §7.5.3.1；Optional，需 CAL/PAG）
+     * @param mode Mode 位组合（ECU 0x01 / XCP 0x02 / ALL 0x80，可叠加）
+     * @param segment Segment Number（mode 含 ALL 时被 Slave 忽略，仍原样发送）
+     * @param page Page Number
+     * @return CTO: [0xEB][mode][segment][page]（4 字节）
+     * @throws XcpException(InvalidArgument) mode 不含任何 ECU/XCP 位
+     */
+    [[nodiscard]] Bytes EncodeSetCalPage(CalPageModeBit mode,
+                                         std::uint8_t segment,
+                                         std::uint8_t page) const;
+
+    /**
+     * @brief 编码 GET_CAL_PAGE 命令（docs §7.5.3.2；Optional，需 CAL/PAG）
+     * @param access_mode Access Mode：仅 0x01(ECU)/0x02(XCP)
+     * @param segment Segment Number
+     * @return CTO: [0xEA][access_mode][segment]（3 字节）
+     * @throws XcpException(InvalidArgument) access_mode 非 ECU/XCP
+     */
+    [[nodiscard]] Bytes EncodeGetCalPage(CalPageAccessMode access_mode,
+                                         std::uint8_t segment) const;
+
+    /**
+     * @brief 编码 GET_PAG_PROCESSOR_INFO 命令（docs §7.5.3.3；Optional）
+     * @return CTO: [0xE9]（1 字节无参；xcp.h CRO_GET_PAG_PROCESSOR_INFO_LEN=1）
+     */
+    [[nodiscard]] Bytes EncodeGetPagProcessorInfo() const;
+
+    /**
+     * @brief 编码 GET_SEGMENT_INFO 命令（docs §7.5.3.4；Optional）
+     * @param mode 信息类别（0=基本信息/1=标准属性/2=Address Mapping）
+     * @param segment Segment Number
+     * @param info SEGMENT_INFO 选择子（Mode 0: 0=地址/1=长度；Mode 2:
+     *             0=源地址/1=目的地址/2=长度；Mode 1 不使用，发 0）
+     * @param mapping_index Mapping Index（仅 Mode 2 使用）
+     * @return CTO: [0xE8][mode][segment][info][mapping_index]（5 字节）
+     * @throws XcpException(InvalidArgument) mode > 2 或 info > 2
+     */
+    [[nodiscard]] Bytes EncodeGetSegmentInfo(SegmentInfoMode mode,
+                                             std::uint8_t segment,
+                                             SegmentInfoSelector info,
+                                             std::uint8_t mapping_index) const;
+
+    /**
+     * @brief 编码 GET_PAGE_INFO 命令（docs §7.5.3.5；Optional）
+     * @param segment Segment Number
+     * @param page Page Number
+     * @return CTO: [0xE7][reserved][segment][page]（4 字节）
+     */
+    [[nodiscard]] Bytes EncodeGetPageInfo(std::uint8_t segment,
+                                          std::uint8_t page) const;
+
+    /**
+     * @brief 编码 SET_SEGMENT_MODE 命令（docs §7.5.3.6；Optional）
+     * @param mode Mode 位（FREEZE 0x01；不置位即取消冻结）
+     * @param segment Segment Number
+     * @return CTO: [0xE6][mode][segment]（3 字节）
+     */
+    [[nodiscard]] Bytes EncodeSetSegmentMode(SegmentModeBit mode,
+                                             std::uint8_t segment) const;
+
+    /**
+     * @brief 编码 GET_SEGMENT_MODE 命令（docs §7.5.3.7；Optional）
+     * @param segment Segment Number
+     * @return CTO: [0xE5][reserved][segment]（3 字节）
+     */
+    [[nodiscard]] Bytes EncodeGetSegmentMode(std::uint8_t segment) const;
+
+    /**
+     * @brief 编码 COPY_CAL_PAGE 命令（docs §7.5.3.8；Optional）
+     * @param request 源/目标 Segment 与 Page
+     * @return CTO: [0xE4][src_segment][src_page][dst_segment][dst_page]
+     *         （5 字节）
+     */
+    [[nodiscard]] Bytes EncodeCopyCalPage(const CopyCalPageRequest& request) const;
+
 private:
     /// @brief 构造时确定的 Session 字节序
     ByteOrder m_byte_order_;
