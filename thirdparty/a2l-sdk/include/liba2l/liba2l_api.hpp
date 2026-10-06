@@ -136,7 +136,7 @@ enum class ArrayOrderDto : std::int32_t {
 /** COMPU_METHOD 的转换类别。 */
 enum class ConversionKindDto : std::int32_t {
     kIdentical = 0,  ///< IDENTICAL：物理值 == 原始值
-    kLinear = 1,     ///< LINEAR：p = f + i*C + i*O
+    kLinear = 1,     ///< LINEAR：p = f + i*C + O
     kRatFunc = 2,  ///< RAT_FUNC：p = (N1*i^2 + N2*i + N3)/(D1*i^2 + D2*i + D3)
     kTabIntp = 3,  ///< TAB_INTP：查表线性插值
     kTabNoIntp = 4,           ///< TAB_NOINTP：查表取阶梯
@@ -206,8 +206,8 @@ struct DimensionDto {
 
 /** 线性/有理函数系数包（LINEAR: [C,O,F]；RAT_FUNC: [N1,N2,N3,D1,D2,D3]）。 */
 struct NumericCoefficientsDto {
-    double c = 0.0;   ///< LINEAR 比例项系数
-    double o = 0.0;   ///< LINEAR 偏移项（加在 i*O 上）
+    double c = 0.0;   ///< LINEAR 比例项系数（COEFFS_LINEAR 首项 factor）
+    double o = 0.0;   ///< LINEAR 加法偏移（COEFFS_LINEAR 次项 offset）
     double f = 0.0;   ///< LINEAR 常数项
     double n1 = 0.0;  ///< RAT_FUNC 分子二次项
     double n2 = 0.0;  ///< RAT_FUNC 分子一次项

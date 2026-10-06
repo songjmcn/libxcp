@@ -21,6 +21,7 @@
 #include <fstream>
 #include <future>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -262,7 +263,8 @@ TEST_F(A2lGoldenTest, RequireIfDataXcpControlsMissingIfData) {
     ASSERT_NE(b->XcpInfo(), nullptr);
     EXPECT_FALSE(b->XcpInfo()->ok);
     ASSERT_NE(b->Database(), nullptr);
-    EXPECT_EQ(b->Database()->Count().Value(), 11u);
+    // 原 11 个符号 + 4 个独立 LINEAR 系数用例。
+    EXPECT_EQ(b->Database()->Count().Value(), 15u);
 }
 
 TEST_F(A2lGoldenTest, MalformedButLegalVariantsParse) {
@@ -529,6 +531,52 @@ TEST_F(A2lGoldenTest, SupportedConversionMatrix) {
     ASSERT_TRUE(verb.HasValue());
     ASSERT_TRUE(std::holds_alternative<std::string>(verb.Value()));
     EXPECT_EQ(std::get<std::string>(verb.Value()), "on");
+}
+
+TEST_F(A2lGoldenTest, LinearUsesFactorThenAdditiveOffset) {
+    LoadOptions require_off;
+    require_off.require_if_data_xcp = false;
+    auto b = LoadOk(Golden("golden_convert.a2l"), require_off);
+    ASSERT_NE(b, nullptr);
+    const IA2lDatabase* db = b->Database();
+    ASSERT_NE(db, nullptr);
+
+    const auto check_linear = [&](std::string_view name, std::uint16_t raw,
+                                  double expected) {
+        const Bytes raw_bytes{static_cast<std::uint8_t>(raw & 0xFFU),
+                              static_cast<std::uint8_t>(raw >> 8U)};
+        const auto physical = db->ToPhysical(name, raw_bytes);
+        ASSERT_TRUE(physical.HasValue()) << name;
+        ASSERT_TRUE(std::holds_alternative<double>(physical.Value())) << name;
+        EXPECT_DOUBLE_EQ(std::get<double>(physical.Value()), expected) << name;
+
+        const auto encoded = db->FromPhysical(name, PhysicalValue{expected});
+        ASSERT_TRUE(encoded.HasValue()) << name;
+        EXPECT_EQ(encoded.Value(), raw_bytes) << name;
+    };
+
+    // 独立算式 oracle：PHYS = factor * INT + offset。
+    check_linear("CONV_ECU::M_TEMP_LINEAR", 50U, 0.0);
+    check_linear("CONV_ECU::M_SCALE_LINEAR", 25U, 0.0);
+    check_linear("CONV_ECU::M_NEGATIVE_LINEAR", 20U, 0.0);
+    check_linear("CONV_ECU::M_LINEAR", 200U, 100.0);
+
+    const auto temp_zero =
+        db->ToPhysical("CONV_ECU::M_TEMP_LINEAR", Bytes{0x00, 0x00});
+    ASSERT_TRUE(temp_zero.HasValue());
+    ASSERT_TRUE(std::holds_alternative<double>(temp_zero.Value()));
+    EXPECT_DOUBLE_EQ(std::get<double>(temp_zero.Value()), -50.0);
+
+    // factor=0 是常数映射，可正算但不能唯一逆算。
+    const auto constant =
+        db->ToPhysical("CONV_ECU::M_ZERO_LINEAR", Bytes{0x07, 0x00});
+    ASSERT_TRUE(constant.HasValue());
+    ASSERT_TRUE(std::holds_alternative<double>(constant.Value()));
+    EXPECT_DOUBLE_EQ(std::get<double>(constant.Value()), 5.0);
+    const auto inverse =
+        db->FromPhysical("CONV_ECU::M_ZERO_LINEAR", PhysicalValue{5.0});
+    ASSERT_FALSE(inverse.HasValue());
+    EXPECT_EQ(inverse.ErrorInfo().code, ErrorCode::ConversionNotInvertible);
 }
 
 TEST_F(A2lGoldenTest, ConversionFailureIsStructured) {

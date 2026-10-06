@@ -93,3 +93,7 @@ measurement_demo.exe --slave build-v09/examples/xcp_master_udp/Release/cpp_demo.
 measurement_demo 参数化完成且默认零回归；cpp_demo 现成主从组合可执行 L4 九步中除"异构方言"外的全部步骤，600s 长采回绕自洽、零丢弃、零解码错误、动态值逐符号可证。**L4 冒烟在 XCPlite 同族等价意义上闭环**；真硬件 ECU 的差异化验证仍按 §6 清单留待交付现场。
 
 证据索引：`build-v09\l4smoke.txt`（600s 正式）、`build-v09\l4quick30.txt`（30s 快验）、`build-v09\l4smoke\cpp_demo_uploaded.a2l`（UPLOAD 落盘）、进度存档 `libxcp_测量子系统_L4冒烟_cpp_demo_进度存档.md`。
+
+## 8. 后续规范更正（保留历史结论）
+
+后续 R0 核证更正本记录 §5 缺陷①中的系数顺序判断：ASAM LINEAR 为 `PHYS=a*INT+b`，`COEFFS_LINEAR a b` 顺序是 factor、offset。XCPlite 写端按此顺序输出；旧 SDK 导出器把首值映射为 O、次值映射为 C，Bridge 正/逆算也错误地将 O 纳入斜率。本轮修复标准 `COEFFS_LINEAR` 映射与公式，并用原版 cpp_demo 同帧 temperature 断言及 Windows Release ON/OFF 回归验证。历史记录描述的是当时判断，不代表本轮修复前结论正确；规范证据和完整数字见 `code-plan/XCPlite_cpp_demo_基础测量标定闭环_修复实施记录.md`。

@@ -41,7 +41,7 @@ target_compile_definitions(measurement_demo PRIVATE
 # demo_process.hpp 的搜索路径（与 xcp_master_udp 共享实现）
 target_include_directories(measurement_demo PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../xcp_master_udp")
-add_dependencies(measurement_demo xcp_test_slave)
+add_dependencies(measurement_demo xcp_test_slave cpp_demo)
 if(MSVC)
   target_compile_options(measurement_demo PRIVATE /utf-8)
 endif()
@@ -58,5 +58,34 @@ add_custom_command(TARGET measurement_demo POST_BUILD
 add_test(NAME ExampleMeasurementDemo
         COMMAND measurement_demo --run-dir "${CMAKE_CURRENT_BINARY_DIR}/ctest_run")
 set_tests_properties(ExampleMeasurementDemo PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 180)
+
+# 原版 XCPlite cpp_demo 专项回归：检验同一 DAQ 样本的 raw 与物理值换算，
+# 避免仅依赖上方默认使用 xcp_test_slave 的冒烟测试。
+add_test(NAME ExampleCppDemoMeasurement
+        COMMAND measurement_demo
+                --slave "$<TARGET_FILE:cpp_demo>"
+                --run-dir "${CMAKE_CURRENT_BINARY_DIR}/cpp_demo_ctest_run"
+                --port 5555 --project cpp_demo
+                --symbols temperature,speed,counter,sum,SigGen1.value_,SigGen2.value_
+                --event mainloop --mode dynamic
+                --range temperature=-50:100 --range speed=0:250
+                --range counter=0:65535 --range sum=-100:100
+                --range SigGen1.value_=-100:100 --range SigGen2.value_=-100:100
+                --seconds 4)
+set_tests_properties(ExampleCppDemoMeasurement PROPERTIES
+        RUN_SERIAL TRUE
+        TIMEOUT 180)
+
+# 在线标定效果专项：独立 run-dir、同一 DAQ 会话中改变 counter_max 并恢复。
+add_test(NAME ExampleCppDemoCalibration
+        COMMAND measurement_demo
+                --slave "$<TARGET_FILE:cpp_demo>"
+                --run-dir "${CMAKE_CURRENT_BINARY_DIR}/cpp_demo_calibration_ctest_run"
+                --port 5555 --project cpp_demo --symbols temperature,counter
+                --event mainloop --mode dynamic --range temperature=-50:100
+                --range counter=0:1000 --seconds 4 --calibration-probe)
+set_tests_properties(ExampleCppDemoCalibration PROPERTIES
         RUN_SERIAL TRUE
         TIMEOUT 180)

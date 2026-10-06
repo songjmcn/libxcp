@@ -581,15 +581,15 @@ ConversionDto BuildConversion(const a2l::CompuMethod* cm,
     // 单位：RefUnit 名直接透出（UNIT 对象在 bridge 侧不需要更多结构）
     out.unit = cm->RefUnit();
 
-    // LINEAR：语法 COEFFS_LINEAR offset factor 两参数；兼容退化的 COEFFS
-    // 前两位。
+    // 标准 COEFFS_LINEAR 依次为 factor（C）和 additive offset（O）。
+    // 非标准 COEFFS fallback 保留既有 offset/factor 解释；本批不重定义其方言语义。
     if (out.kind == ConversionKindDto::kLinear) {
         const auto& lin = cm->CoeffsLinear();
         const auto& co = cm->Coeffs();
         if (lin.size() >= 2) {
-            out.coeffs.o = lin[0];  // 偏移 O
-            out.coeffs.c = lin[1];  // 比例 C
-            out.coeffs.f = 0.0;     // LINEAR 无独立常数项来源
+            out.coeffs.c = lin[0];  // 比例 factor
+            out.coeffs.o = lin[1];  // 加法偏移
+            out.coeffs.f = 0.0;     // 标准 LINEAR 不提供独立 F 项
         } else if (co.size() >= 2) {
             out.coeffs.o = co[0];
             out.coeffs.c = co[1];

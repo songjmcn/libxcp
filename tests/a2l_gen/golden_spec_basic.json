@@ -10,7 +10,7 @@
       "compu_methods": [
         {"name": "CM_IDENT", "desc": "identity", "type": "IDENTICAL"},
         {"name": "CM_LINEAR", "desc": "p = i/2", "type": "LINEAR",
-         "format": "%9", "unit": "V", "coeffs_linear": [0.0, 0.5]}
+         "format": "%9", "unit": "V", "coeffs_linear": [0.5, 0.0]}
       ],
       "measurements": [
         {"name": "M_ARRAY", "desc": "smoke M_ARRAY", "datatype": "UWORD",

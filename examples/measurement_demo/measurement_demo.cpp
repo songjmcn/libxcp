@@ -34,6 +34,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -93,6 +94,7 @@ struct Options {
     std::string event = "testev";          ///< 回退命名事件（EVENT 段取证）。
     std::string a2lName = "uploaded.a2l";  ///< 上传 A2L 落盘文件名。
     bool dynamicMode = false;              ///< --mode dynamic（L4 冒烟口径）。
+    bool calibrationProbe = false;         ///< 本地 cpp_demo 在线标定→DAQ 闭环。
     std::uint64_t expect = 0xDEADBEEFU;    ///< fixed 模式首符号期望定标值。
     /// short_name → [min, max]（物理值域，dynamic 模式可选断言）。
     std::map<std::string, std::pair<double, double>> ranges;
@@ -231,13 +233,15 @@ class FrameSink {
 public:
     static constexpr std::size_t kKeepFrames = 2000;
     static constexpr std::size_t kMaxKeys = 8;
+    static constexpr std::size_t kMaxRawTrace = 100000;
 
     /// @brief 单符号滚动聚合（锁内更新）。
     struct SymbolAgg {
         std::uint64_t seen{0};       ///< 样本出现次数（含无效）
         std::uint64_t valid{0};      ///< 有效样本次数
         std::set<std::string> keys;  ///< 不同原始字节（截断到 kMaxKeys）
-        bool hasRange{false};        ///< 已有可比物理值
+        std::vector<std::uint64_t> rawTrace;  ///< 有界的数值原始样本序列。
+        bool hasRange{false};                 ///< 已有可比物理值
         double minV{0.0};
         double maxV{0.0};
     };
@@ -258,6 +262,16 @@ public:
             if (agg.keys.size() < kMaxKeys) {
                 agg.keys.emplace(reinterpret_cast<const char*>(s.raw.data()),
                                  s.raw.size());
+            }
+            if (!s.raw.empty() && s.raw.size() <= sizeof(std::uint64_t) &&
+                agg.rawTrace.size() < kMaxRawTrace) {
+                std::uint64_t raw = 0;
+                for (std::size_t i = 0; i < s.raw.size(); ++i) {
+                    raw |= static_cast<std::uint64_t>(
+                               static_cast<unsigned char>(s.raw[i]))
+                           << (8U * i);
+                }
+                agg.rawTrace.push_back(raw);
             }
             double v = 0.0;
             if (ToDoubleView(s.value, v)) {
@@ -357,6 +371,79 @@ public:
             }
             if (v == value) {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    /// @brief 检查同一帧样本的原始字节与 A2L 物理值满足线性公式。
+    bool SawLinearPair(std::string_view name, double factor,
+                       double offset) const {
+        std::lock_guard<std::mutex> lock(m_mutex_);
+        for (const MeasurementFrame& frame : m_frames_) {
+            for (const MeasurementSample& sample : frame.samples) {
+                if (sample.name != name || !sample.valid ||
+                    sample.raw.size() != 1U) {
+                    continue;
+                }
+                double physical = 0.0;
+                if (!ToDoubleView(sample.value, physical)) {
+                    continue;
+                }
+                const double raw = static_cast<unsigned char>(sample.raw[0]);
+                const double expected = factor * raw + offset;
+                if (std::abs(physical - expected) <= 1e-9) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    void ResetRawTrace(std::string_view name) {
+        std::lock_guard<std::mutex> lock(m_mutex_);
+        const auto it = m_agg_.find(std::string(name));
+        if (it != m_agg_.end()) {
+            it->second.rawTrace.clear();
+        }
+    }
+
+    bool SawRawAbove(std::string_view name, std::uint64_t threshold) const {
+        std::lock_guard<std::mutex> lock(m_mutex_);
+        const auto it = m_agg_.find(std::string(name));
+        return it != m_agg_.end() &&
+               std::any_of(
+                   it->second.rawTrace.begin(), it->second.rawTrace.end(),
+                   [threshold](std::uint64_t raw) { return raw > threshold; });
+    }
+
+    /// @brief 找到至少 N 次完整的 0..ceiling 周期，忽略写入前排队的旧 DTO。
+    bool SawRepeatedWrapsWithin(std::string_view name, std::uint64_t ceiling,
+                                std::size_t required_wraps) const {
+        std::lock_guard<std::mutex> lock(m_mutex_);
+        const auto it = m_agg_.find(std::string(name));
+        if (it == m_agg_.end()) {
+            return false;
+        }
+        const auto& trace = it->second.rawTrace;
+        for (std::size_t start = 0; start < trace.size(); ++start) {
+            if (trace[start] != 0U) {
+                continue;
+            }
+            std::uint64_t previous = 0U;
+            std::size_t wraps = 0U;
+            for (std::size_t i = start + 1U; i < trace.size(); ++i) {
+                const std::uint64_t raw = trace[i];
+                if (raw > ceiling) {
+                    break;  // 此零点之后仍是旧队列，尝试更晚的零点。
+                }
+                if (raw < previous) {
+                    ++wraps;
+                }
+                previous = raw;
+                if (wraps >= required_wraps) {
+                    return true;
+                }
             }
         }
         return false;
@@ -584,6 +671,7 @@ bool ParseArgs(int argc, char** argv, Options& opt) {
                 "NAME]\n"
                 "          [--a2l-name FILE] [--mode fixed|dynamic]\n"
                 "          [--expect 0xHEX] [--range NAME=min:max]...\n"
+                "          [--calibration-probe]（仅本地 cpp_demo）\n"
                 "零参数 = v0.9 xcp_test_slave 旧行为（fixed/2s/0xDEADBEEF）。\n"
                 "cpp_demo L4 冒烟示例：\n"
                 "  measurement_demo --slave <cpp_demo.exe> --port 5555 \\\n"
@@ -660,8 +748,21 @@ bool ParseArgs(int argc, char** argv, Options& opt) {
                 return false;
             }
             opt.ranges[name] = range;
+        } else if (arg == "--calibration-probe") {
+            opt.calibrationProbe = true;
         } else {
             std::printf("[usage] 未知参数 %s（--help 查看用法）\n", argv[i]);
+            return false;
+        }
+    }
+    if (opt.calibrationProbe) {
+        const auto symbols = opt.Symbols();
+        if (opt.project != "cpp_demo" || !opt.dynamicMode ||
+            std::find(symbols.begin(), symbols.end(), "counter") ==
+                symbols.end()) {
+            std::printf(
+                "[usage] --calibration-probe 仅支持 cpp_demo dynamic 且包含 "
+                "counter\n");
             return false;
         }
     }
@@ -688,6 +789,168 @@ public:
 private:
     MeasurementSession& m_session_;
 };
+
+std::uint64_t DecodeLittleEndian(const Bytes& bytes) {
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < bytes.size() && i < 8U; ++i) {
+        value |= static_cast<std::uint64_t>(bytes[i]) << (8U * i);
+    }
+    return value;
+}
+
+Bytes EncodeU16LittleEndian(std::uint16_t value) {
+    return {static_cast<std::uint8_t>(value & 0xFFU),
+            static_cast<std::uint8_t>((value >> 8U) & 0xFFU)};
+}
+
+/// @brief cpp_demo 本地 CAL 写入→算法行为→恢复闭环（只操作本次 A2L 确认的
+/// U16）。
+bool RunCounterCalibrationProbe(XcpMaster& master,
+                                A2lMeasurementDatabase& database,
+                                FrameSink& sink, Checker& check,
+                                std::string_view project_prefix) {
+    constexpr std::uint16_t kOriginal = 1000U;
+    constexpr std::uint16_t kReduced = 20U;
+    const std::string counter_name = std::string(project_prefix) + "counter";
+    const std::string calibration_name =
+        std::string(project_prefix) + "kParameters.counter_max";
+
+    const auto calibration = database.Find(calibration_name);
+    if (!calibration.HasValue()) {
+        std::printf("[cal] A2L 未解析成员叶 %s：%s\n", calibration_name.c_str(),
+                    calibration.ErrorInfo().message.c_str());
+        check.Check(false, "A2L 找到 counter_max 成员叶");
+        return false;
+    }
+    const MeasurementSymbolInfo& symbol = calibration.Value();
+    const bool layout_ok =
+        symbol.element_size_bytes == 2U && symbol.element_count == 1U;
+    check.Check(layout_ok, "A2L 核实 counter_max 为标量 U16（2 字节）");
+    if (!layout_ok) {
+        return false;
+    }
+
+    const Address address = symbol.address;
+    const AddressExtension extension = symbol.extension;
+    Bytes original_bytes;
+    try {
+        original_bytes = master.ReadMemoryBytes(address, extension, 2U);
+    } catch (const std::exception& ex) {
+        std::printf("[cal] 读取 counter_max 原值失败：%s\n", ex.what());
+        check.Check(false, "读取 counter_max 原值");
+        return false;
+    }
+    if (original_bytes.size() != 2U) {
+        check.Check(false, "counter_max 原值读取长度为 2");
+        return false;
+    }
+    const std::uint64_t original_value = DecodeLittleEndian(original_bytes);
+    check.Check(original_value == kOriginal,
+                "独立 run-dir 初始 counter_max == 1000");
+    if (original_value != kOriginal) {
+        std::printf(
+            "[cal] 初始值为 %llu，不符合干净 cpp_demo 默认参数；不写入\n",
+            static_cast<unsigned long long>(original_value));
+        return false;
+    }
+
+    sink.ResetRawTrace(counter_name);
+    const bool baseline_above_limit = sink.WaitUntil(
+        [&] { return sink.SawRawAbove(counter_name, kReduced); }, 3s);
+    check.Check(baseline_above_limit,
+                "CAL 基线：counter 在默认上限下观测到 >20");
+    if (!baseline_above_limit) {
+        return false;
+    }
+
+    const Bytes reduced_bytes = EncodeU16LittleEndian(kReduced);
+    bool write_returned = false;
+    try {
+        master.WriteMemoryBytes(address, extension, reduced_bytes);
+        write_returned = true;
+    } catch (const std::exception& ex) {
+        // 写超时可能已执行；不重发。先通过独立 UPLOAD 查询当前值。
+        std::printf("[cal] threshold 写命令异常（不重放，先读回）：%s\n",
+                    ex.what());
+    }
+
+    Bytes current_bytes;
+    try {
+        current_bytes = master.ReadMemoryBytes(address, extension, 2U);
+    } catch (const std::exception& ex) {
+        std::printf("[cal] threshold 写后无法查询状态：%s\n", ex.what());
+        check.Check(false, "threshold 写后可查询状态");
+        return false;
+    }
+    if (current_bytes.size() != 2U) {
+        std::printf("[cal] threshold 写后读回长度异常；状态不确定，终止\n");
+        check.Check(false, "threshold 写后状态长度为 2");
+        return false;
+    }
+    const bool reduced_applied = current_bytes == reduced_bytes;
+    check.Check(reduced_applied,
+                write_returned
+                    ? "写入 counter_max=20 且 UPLOAD 读回一致"
+                    : "写响应异常后 UPLOAD 证明 counter_max=20 已执行");
+
+    bool behavior_ok = false;
+    if (reduced_applied) {
+        sink.ResetRawTrace(counter_name);
+        behavior_ok = sink.WaitUntil(
+            [&] {
+                return sink.SawRepeatedWrapsWithin(counter_name, kReduced, 2U);
+            },
+            3s);
+        check.Check(behavior_ok, "DAQ 证明 counter 进入 0..20 并至少两次回绕");
+    } else if (current_bytes != original_bytes &&
+               current_bytes.size() == original_bytes.size()) {
+        std::printf(
+            "[cal] threshold 读回为非预期值 %llu；状态已知，将恢复原始字节\n",
+            static_cast<unsigned long long>(DecodeLittleEndian(current_bytes)));
+    }
+
+    // 对任何已知且不同于原值的状态执行一次补偿恢复；若 WRITE 响应未知，
+    // 先前的 UPLOAD 查询已证明当前状态，绝不盲目重发同一 threshold 值。
+    bool restore_needed = current_bytes != original_bytes &&
+                          current_bytes.size() == original_bytes.size();
+    bool restored = !restore_needed;
+    if (restore_needed) {
+        bool restore_returned = false;
+        try {
+            master.WriteMemoryBytes(address, extension, original_bytes);
+            restore_returned = true;
+        } catch (const std::exception& ex) {
+            std::printf("[cal] 恢复写命令异常（不重放，查询原值）：%s\n",
+                        ex.what());
+        }
+        try {
+            const Bytes verified =
+                master.ReadMemoryBytes(address, extension, 2U);
+            restored = verified == original_bytes;
+            check.Check(restored,
+                        restore_returned
+                            ? "恢复 counter_max 原始字节并读回验证"
+                            : "恢复响应异常后 UPLOAD 证明原始字节已恢复");
+        } catch (const std::exception& ex) {
+            std::printf("[cal] 恢复状态无法确认：%s\n", ex.what());
+            check.Check(false, "恢复后可查询并证明原始字节");
+        }
+    } else {
+        check.Check(true, "counter_max 保持原始字节（低阈值未生效）");
+    }
+
+    if (!restored) {
+        std::printf("[cal] 恢复未获证明；终止本次 Slave 测试进程\n");
+        return false;
+    }
+
+    sink.ResetRawTrace(counter_name);
+    const bool restored_behavior = sink.WaitUntil(
+        [&] { return sink.SawRawAbove(counter_name, kReduced); }, 3s);
+    check.Check(restored_behavior,
+                "恢复原值后 DAQ counter 再次观测到 >20");
+    return reduced_applied && behavior_ok && restored && restored_behavior;
+}
 
 }  // namespace
 
@@ -717,6 +980,16 @@ int main(int argc, char** argv) {
         std::printf("[env] 无法创建 run-dir %s：%s\n",
                     opt.runDir.string().c_str(), ec.message().c_str());
         return 2;
+    }
+    if (opt.calibrationProbe) {
+        ec.clear();
+        fs::remove(opt.runDir / "cpp_demo_V201.bin", ec);
+        if (ec) {
+            std::printf("[env] 无法清理测试专用 cpp_demo 持久化文件：%s\n",
+                        ec.message().c_str());
+            return 2;
+        }
+        std::printf("[cal] 已清理本测试 run-dir 的 cpp_demo_V201.bin\n");
     }
     if (!fs::exists(opt.slaveExe, ec) || ec) {
         std::printf("[env] Slave 可执行不存在：%s\n",
@@ -952,6 +1225,18 @@ int main(int argc, char** argv) {
         const auto startAt = std::chrono::steady_clock::now();
         session.Start(MeasurementCallback(
             [&sink](const MeasurementFrame& f) { sink(f); }));
+        if (opt.calibrationProbe &&
+            !RunCounterCalibrationProbe(*master, adapter, sink, check,
+                                        projectPrefix)) {
+            try {
+                session.Stop();
+                master->Disconnect();
+            } catch (const std::exception& ex) {
+                std::printf("[cal] 失败清理会话异常：%s\n", ex.what());
+            }
+            slave.Stop();
+            return 1;
+        }
 
         // —— 5) 采集 sampleSeconds 秒并断言 ——
         const std::string firstSymbol = Qualified(symbols.front());
@@ -1037,6 +1322,13 @@ int main(int argc, char** argv) {
                                     mm->second <= rng->second.second + tol,
                                 msg);
                 }
+            }
+            if (opt.project == "cpp_demo" &&
+                std::find(symbols.begin(), symbols.end(), "temperature") !=
+                    symbols.end()) {
+                check.Check(
+                    sink.SawLinearPair(Qualified("temperature"), 1.0, -50.0),
+                    "temperature 同帧 raw/physical 满足 PHYS=1*INT-50");
             }
         }
 

@@ -64,3 +64,7 @@
 - 手工跑 demo 必须 PATH 前置 `build-v09\examples\measurement_demo\Release;build-v09\Release`（liba2l.dll），run-dir 用显式可写路径。
 - 5555 端口若被残留 cpp_demo 占用，demo 预检会拒跑（先杀进程）。
 - 时间戳方言：XCPlite 族 4B tick（mode 0x0C）⇒ ≈4.295s 一回绕；10min≈140×流数 圈为预期，wraps>0 是正确实然。
+
+## 7. 后续规范更正（保留历史结论）
+
+后续 R0 核证更正本存档 §4 对 LINEAR 系数顺序的判断：标准 `COEFFS_LINEAR a b` 为 factor、offset，对应 `PHYS=a*INT+b`。旧 SDK 导出映射和 Bridge 公式均有误；本轮只对标准 `COEFFS_LINEAR` 修正，并保留非标准旧 `COEFFS` fallback 的既有行为。此前存档内容记录的是当时结论，不改写其历史语境；R0 来源、修复范围、原版 cpp_demo 与 ON/OFF 全量回归数字见 `code-plan/XCPlite_cpp_demo_基础测量标定闭环_修复实施记录.md`。
