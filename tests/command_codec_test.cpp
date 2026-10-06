@@ -50,27 +50,29 @@ TEST(CommandCodecGolden, TwoByteCommands) {
 }
 
 // --------------------------------------------------------------------------
-// SET_MTA：地址按 Session Byte Order，扩展在 Byte 2
+// SET_MTA：XCP 1.3 CRO 布局 [F6][MODE][reserved][EXT@3][ADDR@4..7]（8 字节）
+// 与 SHORT_UPLOAD 地址域同构；XCPlite 对手端协议调试核证（旧 7 字节布局被
+// 真实 Slave 以 ERR_CMD_SYNTAX 拒绝）。
 // --------------------------------------------------------------------------
 
 TEST(CommandCodecGolden, SetMtaIntel) {
     const CommandCodec codec(ByteOrder::Intel);
-    // 地址 0x70012340, EXT=0x02 => [F6][00][02][40][23][01][70]
+    // 地址 0x70012340, EXT=0x02 => [F6][00][00][02][40][23][01][70]
     ExpectBytes(codec.EncodeSetMta(0x02, 0x70012340U),
-                {0xF6, 0x00, 0x02, 0x40, 0x23, 0x01, 0x70});
+                {0xF6, 0x00, 0x00, 0x02, 0x40, 0x23, 0x01, 0x70});
 }
 
 TEST(CommandCodecGolden, SetMtaMotorola) {
     const CommandCodec codec(ByteOrder::Motorola);
     // 同一地址在大端会话下 MSB 先出
     ExpectBytes(codec.EncodeSetMta(0x02, 0x70012340U),
-                {0xF6, 0x00, 0x02, 0x70, 0x01, 0x23, 0x40});
+                {0xF6, 0x00, 0x00, 0x02, 0x70, 0x01, 0x23, 0x40});
 }
 
 TEST(CommandCodecGolden, SetMtaZeroExtension) {
     const CommandCodec codec(ByteOrder::Intel);
     ExpectBytes(codec.EncodeSetMta(0x00, 0x00000060U),
-                {0xF6, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00});
+                {0xF6, 0x00, 0x00, 0x00, 0x60, 0x00, 0x00, 0x00});
 }
 
 // --------------------------------------------------------------------------
@@ -253,6 +255,15 @@ TEST(CommandCodecGolden, DaqQueryCommandsHaveNoReservedByte) {
     ExpectBytes(codec.EncodeGetDaqListInfo(7), {0xD8, 0x00, 0x07, 0x00});
 }
 
+TEST(CommandCodecGolden, GetDaqEventInfoHasReservedByteBeforeWord) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // xcp.h:817-818: CRO_LEN=4 and CRO_WORD(1) means bytes 2..3;
+    // byte 1 is reserved, as with GET_DAQ_LIST_INFO.
+    ExpectBytes(codec.EncodeGetDaqEventInfo(0x0102),
+                {0xD7, 0x00, 0x02, 0x01});
+    ExpectBytes(codec.EncodeGetDaqEventInfo(7), {0xD7, 0x00, 0x07, 0x00});
+}
+
 TEST(CommandCodecGolden, DownloadAndShortDownloadLayouts) {
     const CommandCodec codec(ByteOrder::Intel);
     // DOWNLOAD: [F0][SIZE][data...]（xcp.h:578-581）
@@ -287,9 +298,10 @@ TEST(CommandCodecBoundary, DownloadRejectsEmptyAndOutOfRangeElements) {
 }
 
 TEST(CommandCodecBehavior, GoldenLengthsMatchMaxCtoEightLayout) {
-    // MAX_CTO=8 的典型 Slave：SET_MTA 与 SHORT_UPLOAD 恰好占满 8/7 字节
+    // MAX_CTO=8 的典型 Slave：SET_MTA 与 SHORT_UPLOAD 均为 8 字节（地址域
+    // 同构：ext@3、addr@4-7；XCPlite 对手端协议调试核证）
     const CommandCodec codec(ByteOrder::Intel);
-    EXPECT_EQ(codec.EncodeSetMta(0, 0).size(), 7U);
+    EXPECT_EQ(codec.EncodeSetMta(0, 0).size(), 8U);
     EXPECT_EQ(codec.EncodeShortUpload(1, 0, 0).size(), 8U);
     EXPECT_EQ(codec.EncodeConnect().size(), 2U);
     EXPECT_EQ(codec.EncodeUpload(1).size(), 2U);
@@ -308,6 +320,141 @@ TEST(CommandCodecBehavior, GoldenLengthsMatchMaxCtoEightLayout) {
     EXPECT_EQ(codec.EncodeSetDaqPtr(0, 0, 0).size(), 6U);
     EXPECT_EQ(codec.EncodeDownload(1, BytesOf({0x11})).size(), 3U);
     EXPECT_EQ(codec.EncodeShortDownload(1, 0, 0, BytesOf({0x11})).size(), 9U);
+}
+
+// ---- 变量标定批次：Calibration / Page Switching 黄金报文（docs §7.5.2.5 /
+//      §7.5.3；CRO 布局对照 thirdparty/XCPlite/src/xcp.h:604-660）----
+
+TEST(CommandCodecGolden, ModifyBitsIntelAndMotorola) {
+    const CommandCodec intel(ByteOrder::Intel);
+    // MODIFY_BITS: [EC][shift][AND Mask(WORD)][XOR Mask(WORD)]
+    ExpectBytes(intel.EncodeModifyBits(8, 0x00FFU, 0xFF00U),
+                {0xEC, 0x08, 0xFF, 0x00, 0x00, 0xFF});
+    const CommandCodec moto(ByteOrder::Motorola);
+    ExpectBytes(moto.EncodeModifyBits(8, 0x00FFU, 0xFF00U),
+                {0xEC, 0x08, 0x00, 0xFF, 0xFF, 0x00});
+    // Shift 边界 0/16 合法
+    EXPECT_EQ(intel.EncodeModifyBits(0, 0xFFFFU, 0x0000U).size(), 6U);
+    EXPECT_EQ(intel.EncodeModifyBits(16, 0x0000U, 0xFFFFU).size(), 6U);
+}
+
+TEST(CommandCodecBoundary, ModifyBitsRejectsShiftOverSixteen) {
+    const CommandCodec codec(ByteOrder::Intel);
+    try {
+        (void)codec.EncodeModifyBits(17, 0xFFFFU, 0x0000U);
+        FAIL() << "Shift=17 超出 docs §7.5.2.5 范围 0..16，应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+}
+
+TEST(CommandCodecGolden, SetCalPageLayouts) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // SET_CAL_PAGE: [EB][mode][segment][page]
+    ExpectBytes(codec.EncodeSetCalPage(CalPageModeBit::kEcu, 1, 2),
+                {0xEB, 0x01, 0x01, 0x02});
+    ExpectBytes(codec.EncodeSetCalPage(CalPageModeBit::kXcp, 0, 255),
+                {0xEB, 0x02, 0x00, 0xFF});
+    ExpectBytes(
+        codec.EncodeSetCalPage(CalPageModeBit::kEcu | CalPageModeBit::kXcp,
+                               3, 7),
+        {0xEB, 0x03, 0x03, 0x07});
+    // ALL 位与 ECU|XCP 组合透传（docs：ALL=0x80 时 Slave 忽略 Segment）
+    ExpectBytes(codec.EncodeSetCalPage(
+                    CalPageModeBit::kEcu | CalPageModeBit::kAll, 9, 4),
+                {0xEB, 0x81, 0x09, 0x04});
+}
+
+TEST(CommandCodecBoundary, SetCalPageRejectsModeWithoutEcuOrXcp) {
+    const CommandCodec codec(ByteOrder::Intel);
+    try {
+        (void)codec.EncodeSetCalPage(CalPageModeBit::kNone, 0, 0);
+        FAIL() << "Mode 不含 ECU/XCP 位应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+    try {
+        (void)codec.EncodeSetCalPage(CalPageModeBit::kAll, 0, 0);
+        FAIL() << "仅 ALL 位（无 ECU/XCP）应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+}
+
+TEST(CommandCodecGolden, GetCalPageLayouts) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // GET_CAL_PAGE: [EA][access_mode][segment]
+    ExpectBytes(codec.EncodeGetCalPage(CalPageAccessMode::Ecu, 5),
+                {0xEA, 0x01, 0x05});
+    ExpectBytes(codec.EncodeGetCalPage(CalPageAccessMode::Xcp, 0),
+                {0xEA, 0x02, 0x00});
+}
+
+TEST(CommandCodecBoundary, GetCalPageRejectsIllegalAccessMode) {
+    const CommandCodec codec(ByteOrder::Intel);
+    try {
+        (void)codec.EncodeGetCalPage(static_cast<CalPageAccessMode>(0x00), 1);
+        FAIL() << "Access Mode 0x00 非法应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+    try {
+        (void)codec.EncodeGetCalPage(static_cast<CalPageAccessMode>(0x03), 1);
+        FAIL() << "Access Mode 0x03 非法应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+}
+
+TEST(CommandCodecGolden, PagQueryAndPageInfoLayouts) {
+    const CommandCodec codec(ByteOrder::Intel);
+    // GET_PAG_PROCESSOR_INFO: [E9] 单字节无参
+    ExpectBytes(codec.EncodeGetPagProcessorInfo(), {0xE9});
+    // GET_SEGMENT_INFO: [E8][mode][segment][segment_info][mapping_index]
+    ExpectBytes(codec.EncodeGetSegmentInfo(SegmentInfoMode::BasicInfo, 1,
+                                           SegmentInfoSelector::SegmentAddress,
+                                           0),
+                {0xE8, 0x00, 0x01, 0x00, 0x00});
+    ExpectBytes(codec.EncodeGetSegmentInfo(
+                    SegmentInfoMode::StandardProperties, 2,
+                    SegmentInfoSelector::SegmentAddress, 0),
+                {0xE8, 0x01, 0x02, 0x00, 0x00});
+    ExpectBytes(codec.EncodeGetSegmentInfo(SegmentInfoMode::MappingInfo, 3,
+                                           SegmentInfoSelector::MappingLength,
+                                           7),
+                {0xE8, 0x02, 0x03, 0x02, 0x07});
+    // GET_PAGE_INFO: [E7][reserved][segment][page]
+    ExpectBytes(codec.EncodeGetPageInfo(1, 2), {0xE7, 0x00, 0x01, 0x02});
+    // SET_SEGMENT_MODE: [E6][mode][segment]
+    ExpectBytes(codec.EncodeSetSegmentMode(SegmentModeBit::kFreeze, 4),
+                {0xE6, 0x01, 0x04});
+    ExpectBytes(codec.EncodeSetSegmentMode(SegmentModeBit::kNone, 4),
+                {0xE6, 0x00, 0x04});
+    // GET_SEGMENT_MODE: [E5][reserved][segment]
+    ExpectBytes(codec.EncodeGetSegmentMode(6), {0xE5, 0x00, 0x06});
+    // COPY_CAL_PAGE: [E4][src_segment][src_page][dst_segment][dst_page]
+    ExpectBytes(codec.EncodeCopyCalPage(CopyCalPageRequest{1, 2, 3, 4}),
+                {0xE4, 0x01, 0x02, 0x03, 0x04});
+}
+
+TEST(CommandCodecBoundary, GetSegmentInfoRejectsOutOfRangeModeAndInfo) {
+    const CommandCodec codec(ByteOrder::Intel);
+    try {
+        (void)codec.EncodeGetSegmentInfo(static_cast<SegmentInfoMode>(3), 0,
+                                         SegmentInfoSelector::SegmentAddress,
+                                         0);
+        FAIL() << "Mode=3 超出 0..2 应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+    try {
+        (void)codec.EncodeGetSegmentInfo(SegmentInfoMode::BasicInfo, 0,
+                                         static_cast<SegmentInfoSelector>(3),
+                                         0);
+        FAIL() << "SegmentInfo=3 超出 0..2 应抛 InvalidArgument";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
 }
 
 }  // namespace

@@ -111,6 +111,27 @@ public:
     void DownloadChunked(Address address, AddressExtension extension,
                          BytesView data);
 
+    // ---- 变量标定批次：MODIFY_BITS（docs §7.5.2.5）----
+
+    /**
+     * @brief 对指定地址的 32-bit 位置执行原子 AND/XOR 位修改
+     * @param address 32 位起始地址（须 AG 对齐；MODIFY_BITS 操作对象为
+     *        MTA 指向的 32-bit 位置，故先 SET_MTA 再 MODIFY_BITS）
+     * @param extension 地址扩展
+     * @param shift Shift Value S（0..16，Codec 层预检）
+     * @param and_mask AND Mask（16-bit，零扩展后左移 S 清位）
+     * @param xor_mask XOR Mask（同上，置位/翻转）
+     * @details Slave 端计算 `Result = (Value & (AND<<S)) ^ (XOR<<S)`；
+     *          执行后 MTA 不变。SET_MTA 与 MODIFY_BITS 之间有隐含状态依赖，
+     *          超时恢复由 CommandExecutor 重放 m_last_mta_（见其 ModifyBits
+     *          分支）。
+     * @throws XcpException(InvalidArgument) 未连接、地址溢出或 Shift 越界
+     * @throws XcpException 协议错误/超时/恢复失败
+     */
+    void ModifyBits(Address address, AddressExtension extension,
+                    std::uint8_t shift, std::uint16_t and_mask,
+                    std::uint16_t xor_mask);
+
 private:
     /// @brief 命令执行器（非拥有）
     CommandExecutor& m_executor_;

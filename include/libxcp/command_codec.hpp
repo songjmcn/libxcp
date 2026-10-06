@@ -120,6 +120,15 @@ public:
                                           AddressExtension extension,
                                           Address address) const;
 
+    /// @brief 编码 GET_ID 命令（批次 21 21-2；XCPlite 实然线格式）
+    /// @param identification_type IDT 编号（0=ASCII、1=ASAM_NAME、2=PATH、
+    ///        3=URL、4=ASAM_UPLOAD 文件上传、5=EPK；xcp.h:248-258）
+    /// @return CTO: [0xFA][identification_type]
+    /// @note 实然优先：XCPlite 在 byte1 直接读 IDT（CRO_GET_ID_TYPE=
+    ///       CRO_BYTE(1)，xcp.h:519-520），无规范 §7.5.1.6 的 MODE/reserved
+    ///       布局；对接规范严格实现的对端时需另开通路（本批不做）。
+    [[nodiscard]] Bytes EncodeGetId(std::uint8_t identification_type) const;
+
     /// @brief 编码 GET_SEED 命令（读取解锁 Seed 的指定分段）
     /// @param resource 要解锁的资源（协议要求恰为单个资源位）
     /// @param mode First=首段（响应含 Seed 总长度）；Remainder=续取后续分段
@@ -223,6 +232,17 @@ public:
     [[nodiscard]] Bytes EncodeGetDaqListInfo(std::uint16_t daq_list) const;
 
     /**
+     * @brief 编码 GET_DAQ_EVENT_INFO 命令（v0.3；XCPlite 实然 xcp.h:817-818：
+     *        CRO_GET_DAQ_EVENT_INFO_LEN=4，索引 CRO_WORD(1)：事件通道号 WORD，
+     *        **无** reserved 字节，与 GET_DAQ_LIST_INFO 的 [reserved] 不同）
+     * @param event_channel 事件通道号（uint16_t）
+     * @return CTO: [0xD7][event_lo][event_hi]（3+… 实际 4 字节含 PID 头部逻辑）
+     * @details 响应六字节数据见 ResponseParser::ParseGetDaqEventInfoRes；
+     *          事件通道号**不在响应中回显**。
+     */
+    [[nodiscard]] Bytes EncodeGetDaqEventInfo(std::uint16_t event_channel) const;
+
+    /**
      * @brief 编码 GET_DAQ_PROCESSOR_INFO 命令（docs L2285-2311；Optional）
      * @return CTO: [0xDA]（1 字节无参；thirdparty/XCPlite/src/xcp.h:789）
      * @details DAQ 能力查询的首要命令：DAQ_PROPERTIES / MAX_DAQ /
@@ -237,6 +257,53 @@ public:
      * @return CTO: [0xD9]（1 字节，无参；thirdparty/XCPlite/src/xcp.h:798）
      */
     [[nodiscard]] Bytes EncodeGetDaqResolutionInfo() const;
+
+    // ---- 批次20：动态 DAQ 分配命令组（docs §7.5.4.6-§7.5.4.9；
+    //      CRO 布局对照 thirdparty/XCPlite/src/xcp.h:831-851；
+    //      四条命令响应均为纯 RES，CRM_*_LEN=1）----
+
+    /**
+     * @brief 编码 FREE_DAQ 命令
+     * @return CTO: [0xD6]（1 字节无参；xcp.h:832 CRO_FREE_DAQ_LEN=1）
+     * @details 释放 Slave 侧全部 DAQ 资源（List/ODT/Entry），用于动态配置的
+     *          第一步。XCPlite：DAQ 运行中调用 → CRC_DAQ_ACTIVE
+     *          （xcplite.c:2567），调用方必须先停。
+     */
+    [[nodiscard]] Bytes EncodeFreeDaq() const;
+
+    /**
+     * @brief 编码 ALLOC_DAQ 命令
+     * @param count 要分配的 DAQ List 数（>=1；0 → Slave 回 CRC_OUT_OF_RANGE）
+     * @return CTO: [0xD5][reserved][count(WORD)]（4 字节；xcp.h:836-838）
+     * @details XCPlite 的 XcpAllocDaq 要求 odt/entry 计数为零（否则
+     *          CRC_SEQUENCE，xcplite.c:1148），因此**一次调用分配本次编排的
+     *          全部 List 数**，不得分批追加。
+     */
+    [[nodiscard]] Bytes EncodeAllocDaq(std::uint16_t count) const;
+
+    /**
+     * @brief 编码 ALLOC_ODT 命令
+     * @param daq_list 目标 DAQ List 号
+     * @param count 为该 List 追加的 ODT 数（1..0xFB）
+     * @return CTO: [0xD4][reserved][daq(WORD)][count]（5 字节；xcp.h:841-844）
+     * @details 任何 ALLOC_ODT_ENTRY 之前必须完成全部 List 的 ODT 分配
+     *          （XcpAllocOdt 要求 odt_entry_count==0，xcplite.c:1176）。
+     */
+    [[nodiscard]] Bytes EncodeAllocOdt(std::uint16_t daq_list,
+                                       std::uint8_t count) const;
+
+    /**
+     * @brief 编码 ALLOC_ODT_ENTRY 命令
+     * @param daq_list 目标 DAQ List 号
+     * @param odt_number 该 List 内的相对 ODT 号（0 基）
+     * @param count 为该 ODT 分配的 Entry 槽数（>=1）
+     * @return CTO: [0xD3][reserved][daq(WORD)][odt][count]
+     *         （6 字节；xcp.h:847-851）
+     * @details 分配出的 Entry 槽 size=0，仍需 WRITE_DAQ 填充地址后才可用。
+     */
+    [[nodiscard]] Bytes EncodeAllocOdtEntry(std::uint16_t daq_list,
+                                            std::uint8_t odt_number,
+                                            std::uint8_t count) const;
 
     /**
      * @brief 编码 DOWNLOAD 命令（docs L1979-1987；Mandatory，CAL/PAG 可用时）
@@ -269,6 +336,99 @@ public:
                                             AddressExtension extension,
                                             Address address,
                                             BytesView data) const;
+
+    // ---- 变量标定批次：MODIFY_BITS + Page Switching 命令组（docs §7.5.2.5 /
+    //      §7.5.3；CRO 布局对照 thirdparty/XCPlite/src/xcp.h:604-660）----
+
+    /**
+     * @brief 编码 MODIFY_BITS 命令（docs §7.5.2.5；Optional，需 CAL/PAG）
+     * @param shift Shift Value S（有效范围 0..16）
+     * @param and_mask AND Mask（16bit，零扩展后左移 S 与目标相与）
+     * @param xor_mask XOR Mask（16bit，零扩展后左移 S 与目标相异或）
+     * @return CTO: [0xEC][shift][and_mask(WORD)][xor_mask(WORD)]（6 字节）
+     * @throws XcpException(InvalidArgument) shift > 16
+     * @note 操作对象为当前 MTA 指向的 32-bit 位置；MTA 由前置 SET_MTA 决定，
+     *       执行后 MTA 不变。AND/XOR Mask 字段按 Session Byte Order 编码。
+     */
+    [[nodiscard]] Bytes EncodeModifyBits(std::uint8_t shift,
+                                         std::uint16_t and_mask,
+                                         std::uint16_t xor_mask) const;
+
+    /**
+     * @brief 编码 SET_CAL_PAGE 命令（docs §7.5.3.1；Optional，需 CAL/PAG）
+     * @param mode Mode 位组合（ECU 0x01 / XCP 0x02 / ALL 0x80，可叠加）
+     * @param segment Segment Number（mode 含 ALL 时被 Slave 忽略，仍原样发送）
+     * @param page Page Number
+     * @return CTO: [0xEB][mode][segment][page]（4 字节）
+     * @throws XcpException(InvalidArgument) mode 不含任何 ECU/XCP 位
+     */
+    [[nodiscard]] Bytes EncodeSetCalPage(CalPageModeBit mode,
+                                         std::uint8_t segment,
+                                         std::uint8_t page) const;
+
+    /**
+     * @brief 编码 GET_CAL_PAGE 命令（docs §7.5.3.2；Optional，需 CAL/PAG）
+     * @param access_mode Access Mode：仅 0x01(ECU)/0x02(XCP)
+     * @param segment Segment Number
+     * @return CTO: [0xEA][access_mode][segment]（3 字节）
+     * @throws XcpException(InvalidArgument) access_mode 非 ECU/XCP
+     */
+    [[nodiscard]] Bytes EncodeGetCalPage(CalPageAccessMode access_mode,
+                                         std::uint8_t segment) const;
+
+    /**
+     * @brief 编码 GET_PAG_PROCESSOR_INFO 命令（docs §7.5.3.3；Optional）
+     * @return CTO: [0xE9]（1 字节无参；xcp.h CRO_GET_PAG_PROCESSOR_INFO_LEN=1）
+     */
+    [[nodiscard]] Bytes EncodeGetPagProcessorInfo() const;
+
+    /**
+     * @brief 编码 GET_SEGMENT_INFO 命令（docs §7.5.3.4；Optional）
+     * @param mode 信息类别（0=基本信息/1=标准属性/2=Address Mapping）
+     * @param segment Segment Number
+     * @param info SEGMENT_INFO 选择子（Mode 0: 0=地址/1=长度；Mode 2:
+     *             0=源地址/1=目的地址/2=长度；Mode 1 不使用，发 0）
+     * @param mapping_index Mapping Index（仅 Mode 2 使用）
+     * @return CTO: [0xE8][mode][segment][info][mapping_index]（5 字节）
+     * @throws XcpException(InvalidArgument) mode > 2 或 info > 2
+     */
+    [[nodiscard]] Bytes EncodeGetSegmentInfo(SegmentInfoMode mode,
+                                             std::uint8_t segment,
+                                             SegmentInfoSelector info,
+                                             std::uint8_t mapping_index) const;
+
+    /**
+     * @brief 编码 GET_PAGE_INFO 命令（docs §7.5.3.5；Optional）
+     * @param segment Segment Number
+     * @param page Page Number
+     * @return CTO: [0xE7][reserved][segment][page]（4 字节）
+     */
+    [[nodiscard]] Bytes EncodeGetPageInfo(std::uint8_t segment,
+                                          std::uint8_t page) const;
+
+    /**
+     * @brief 编码 SET_SEGMENT_MODE 命令（docs §7.5.3.6；Optional）
+     * @param mode Mode 位（FREEZE 0x01；不置位即取消冻结）
+     * @param segment Segment Number
+     * @return CTO: [0xE6][mode][segment]（3 字节）
+     */
+    [[nodiscard]] Bytes EncodeSetSegmentMode(SegmentModeBit mode,
+                                             std::uint8_t segment) const;
+
+    /**
+     * @brief 编码 GET_SEGMENT_MODE 命令（docs §7.5.3.7；Optional）
+     * @param segment Segment Number
+     * @return CTO: [0xE5][reserved][segment]（3 字节）
+     */
+    [[nodiscard]] Bytes EncodeGetSegmentMode(std::uint8_t segment) const;
+
+    /**
+     * @brief 编码 COPY_CAL_PAGE 命令（docs §7.5.3.8；Optional）
+     * @param request 源/目标 Segment 与 Page
+     * @return CTO: [0xE4][src_segment][src_page][dst_segment][dst_page]
+     *         （5 字节）
+     */
+    [[nodiscard]] Bytes EncodeCopyCalPage(const CopyCalPageRequest& request) const;
 
 private:
     /// @brief 构造时确定的 Session 字节序

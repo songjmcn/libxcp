@@ -151,6 +151,13 @@ public:
     /// @throws XcpException 超时、协议错误、响应长度不符或恢复失败
     [[nodiscard]] Bytes ExecuteUpload(ElementCount number_of_elements);
 
+    /// @brief 执行 GET_ID 命令（批次 21 21-2；XCPlite 实然方言：byte1=IDT，
+    ///        无规范 §7.5.1.6 的 MODE/reserved 字节）
+    /// @param identification_type IDT 编号（4=ASAM_UPLOAD：对端 A2L 文件）
+    /// @return 解析结果（MODE / LENGTH / 响应内 DATA）
+    /// @throws XcpException 超时、协议错误或恢复失败
+    [[nodiscard]] GetIdResponse ExecuteGetId(std::uint8_t identification_type);
+
     /// @brief 执行 SHORT_UPLOAD 命令（一次命令完成定址读取，不改动 MTA）
     /// @param number_of_elements 元素数
     /// @param extension 地址扩展（8 位）
@@ -250,6 +257,46 @@ public:
      */
     void ExecuteClearDaqList(std::uint16_t daq_list);
 
+    // ---- 批次20：动态 DAQ 分配命令组（FREE/ALLOC 三件套；XCPlite 实然
+    //      见 xcplite.c:2562-2591，响应均为纯 RES）----
+
+    /**
+     * @brief 执行 FREE_DAQ（释放 Slave 侧全部 DAQ 资源）
+     * @details 动态配置的第一步：一次性作废 LIST/ODT/ENTRY 全部对象；
+     *          隐含指针记录随全表失效一并清空（口径与 ExecuteClearDaqList
+     *          一致，只是作用域是全表）。运行中调用 → CRC_DAQ_ACTIVE
+     *          （xcplite.c:2567），编排层必须先停。
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    void ExecuteFreeDaq();
+
+    /**
+     * @brief 执行 ALLOC_DAQ（动态分配 count 个 DAQ List）
+     * @param count 本次分配的 List 数（>=1；XCPlite 侧 0 → CRC_OUT_OF_RANGE）
+     * @details XcpAllocDaq 要求既有 odt/entry 计数为零（xcplite.c:1148），
+     *          故一次编排必须**一次给足总数**，不得在 ODT 分配后追加。
+     * @throws XcpException 超时、协议错误（CRC_SEQUENCE/CRC_DAQ_ACTIVE）
+     *         或恢复失败
+     */
+    void ExecuteAllocDaq(std::uint16_t count);
+
+    /**
+     * @brief 执行 ALLOC_ODT（为指定 List 追加 count 个 ODT）
+     * @details 顺序硬门：任何 ALLOC_ODT_ENTRY 之前必须完成**全表所有 List**
+     *          的 ODT 分配（XcpAllocOdt 要求 odt_entry_count==0，
+     *          xcplite.c:1176）——由编排层保证，本方法不越权替 Slave 校验。
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    void ExecuteAllocOdt(std::uint16_t daq_list, std::uint8_t count);
+
+    /**
+     * @brief 执行 ALLOC_ODT_ENTRY（为指定 ODT 分配 count 个 Entry 槽）
+     * @details 分配出的槽位 size=0、地址为空，仍需 WRITE_DAQ 填充后方可用。
+     * @throws XcpException 超时、协议错误或恢复失败
+     */
+    void ExecuteAllocOdtEntry(std::uint16_t daq_list, std::uint8_t odt_number,
+                              std::uint8_t count);
+
     /**
      * @brief 执行 SET_DAQ_LIST_MODE（docs L2174-2204；Mandatory）
      * @param mode MODE 位组合
@@ -291,6 +338,20 @@ public:
      */
     [[nodiscard]] std::optional<GetDaqListInfoResponse> ExecuteGetDaqListInfo(
         std::uint16_t daq_list);
+
+    /**
+     * @brief 执行 GET_DAQ_EVENT_INFO（v0.3；**Optional**，XCPlite 实然
+     *        xcp.h:816-825：CRO 4 字节 = [D7][事件通道 WORD]，RES 六字段）
+     * @param event_channel 事件通道号（uint16_t）
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
+     *         （docs L1631：未实现的可选命令必回 ERR_CMD_UNKNOWN 且无副作用）
+     * @details 事件信息用于 v0.4 MeasurementPlanner 的 DAQ List 分配与
+     *          time_cycle/time_unit/priority 取证；事件通道号**不在响应中
+     *          回显**（调用方持有入参）。
+     * @throws XcpException 超时、其他协议错误或恢复失败
+     */
+    [[nodiscard]] std::optional<GetDaqEventInfoResponse> ExecuteGetDaqEventInfo(
+        std::uint16_t event_channel);
 
     /**
      * @brief 执行 GET_DAQ_PROCESSOR_INFO（docs L2285-2311；**Optional**）
@@ -349,9 +410,103 @@ public:
                               AddressExtension extension, Address address,
                               BytesView data);
 
+    // ---- 变量标定批次：MODIFY_BITS + Page Switching（docs §7.5.2.5/§7.5.3）----
+
+    /**
+     * @brief 执行 MODIFY_BITS（docs §7.5.2.5；**Optional**，需 CAL/PAG 权限）
+     * @param shift Shift Value S（0..16，Codec 层预检）
+     * @param and_mask AND Mask（16-bit，零扩展后左移 S 作用于 32-bit MTA 位置）
+     * @param xor_mask XOR Mask（同上）
+     * @details 命令本身不设地址——操作对象是当前隐含 MTA，故调用方
+     *          （MemoryAccess::ModifyBits）必须先 SET_MTA；超时恢复时本层
+     *          与 UPLOAD/DOWNLOAD 一样重放 m_last_mta_。
+     * @throws XcpException 超时、协议错误（Shift 越界 Slave 回 ERR_OUT_OF_RANGE）
+     */
+    void ExecuteModifyBits(std::uint8_t shift, std::uint16_t and_mask,
+                           std::uint16_t xor_mask);
+
+    /**
+     * @brief 执行 SET_CAL_PAGE（docs §7.5.3.1；**Optional**）
+     * @param mode ECU/XCP/ALL 位组合（Codec 预检须含 ECU|XCP 之一）
+     * @param segment Segment Number（mode 含 ALL 时被 Slave 忽略）
+     * @param page Page Number
+     * @throws XcpException 超时、ERR_MODE_NOT_VALID / ERR_PAGE_NOT_VALID /
+     *         ERR_SEGMENT_NOT_VALID 等协议错误
+     */
+    void ExecuteSetCalPage(CalPageModeBit mode, std::uint8_t segment,
+                           std::uint8_t page);
+
+    /**
+     * @brief 执行 GET_CAL_PAGE（docs §7.5.3.2；**Optional**）
+     * @param access_mode 仅允许 Ecu(0x01)/Xcp(0x02)
+     * @param segment Segment Number
+     * @return 当前激活的逻辑 Page Number；Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetCalPageResponse> ExecuteGetCalPage(
+        CalPageAccessMode access_mode, std::uint8_t segment);
+
+    /**
+     * @brief 执行 GET_PAG_PROCESSOR_INFO（docs §7.5.3.3；**Optional**）
+     * @return MAX_SEGMENT/PAG_PROPERTIES；Slave 不支持 Paging 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetPagProcessorInfoResponse>
+    ExecuteGetPagProcessorInfo();
+
+    /**
+     * @brief 执行 GET_SEGMENT_INFO（docs §7.5.3.4；**Optional**，变长响应）
+     * @param mode 决定响应布局（BasicInfo/StandardProperties/MappingInfo）
+     * @param segment Segment Number
+     * @param info Mode 0: Address/Length；Mode 2: SrcAddr/DstAddr/Length
+     * @param mapping_index 仅 Mode 2 使用
+     * @return 按 Mode 填充的 variant 响应；ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetSegmentInfoResponse> ExecuteGetSegmentInfo(
+        SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
+        std::uint8_t mapping_index = 0U);
+
+    /**
+     * @brief 执行 GET_PAGE_INFO（docs §7.5.3.5；**Optional**）
+     * @param segment Segment Number
+     * @param page Page Number
+     * @return PAGE_PROPERTIES（已拆解三组访问者类型）+ INIT_SEGMENT；
+     *         ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetPageInfoResponse> ExecuteGetPageInfo(
+        std::uint8_t segment, std::uint8_t page);
+
+    /**
+     * @brief 执行 SET_SEGMENT_MODE（docs §7.5.3.6；**Optional**）
+     * @param mode bit0 FREEZE（置 1 后该 Segment 进入随后 STORE_CAL_REQ
+     *             的冻结处理范围）
+     * @param segment Segment Number
+     * @throws XcpException 超时或协议错误
+     */
+    void ExecuteSetSegmentMode(SegmentModeBit mode, std::uint8_t segment);
+
+    /**
+     * @brief 执行 GET_SEGMENT_MODE（docs §7.5.3.7；**Optional**）
+     * @param segment Segment Number
+     * @return 当前 Segment Mode（主要查 FREEZE）；ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException 超时或其他协议错误
+     */
+    [[nodiscard]] std::optional<GetSegmentModeResponse> ExecuteGetSegmentMode(
+        std::uint8_t segment);
+
+    /**
+     * @brief 执行 COPY_CAL_PAGE（docs §7.5.3.8；**Optional**）
+     * @param request 源/目标 Segment+Page 四元组
+     * @details 目标区域写保护（Flash）时 Slave 回 ERR_WRITE_PROTECTED，
+     *          应改走 Flash Programming 流程（本计划外）。
+     * @throws XcpException 超时或协议错误
+     */
+    void ExecuteCopyCalPage(const CopyCalPageRequest& request);
 private:
     /// @brief 单条命令的执行流程：状态检查 -> 发送 -> 等待 -> 错误分派 ->
-    /// 恢复重试
+    /// 恢复重试；MODIFY_BITS 超时不重放并报告 OperationOutcomeUnknown
     [[nodiscard]] ParsedPacket RunCommand(CommandCode cmd,
                                           const Bytes& encoded_packet);
     /// @brief 一次发送-等待尝试：占用 Outstanding Command 槽位后发送并等待

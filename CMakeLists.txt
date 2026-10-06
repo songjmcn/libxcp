@@ -87,7 +87,12 @@ target_sources(libxcp PRIVATE
         src/udp_transport.cpp
         src/command_executor.cpp
         src/memory_access.cpp
-        src/xcp_master.cpp)
+        src/xcp_master.cpp
+        src/daq/dto_envelope_decoder.cpp
+        src/daq/dto_payload_decoder.cpp
+        src/daq/daq_timestamp.cpp
+        src/measurement/measurement_planner.cpp
+        src/measurement/measurement_session.cpp)
 
 target_include_directories(libxcp
         PUBLIC
@@ -168,6 +173,43 @@ if(LIBXCP_BUILD_A2L)
       IMPORTED_LOCATION "${LIBXCP_A2LBRIDGE_LIBRARY}"
       INTERFACE_INCLUDE_DIRECTORIES "${LIBXCP_A2LBRIDGE_INCLUDE_DIR}"
       INTERFACE_LINK_LIBRARIES liba2l::liba2l)
+
+  # 测量适配器（v0.5，测量子系统代码增长计划 §5.5 / D1）：
+  # 独立顶层目录 adapter/a2l + 独立 target libxcp_measurement_adapter。
+  # 副产物不并入 libxcp；adapter/*.cpp 是核心<->桥接层唯一接触点
+  # （A2lIsolation S2 仅扫描 include/ 与 src/，本目录不在扫描范围）。
+  add_library(libxcp_measurement_adapter STATIC
+          adapter/a2l/a2l_measurement_database.cpp
+          adapter/a2l/measurement_runtime_profile.cpp)
+  target_include_directories(libxcp_measurement_adapter PUBLIC
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/adapter>)
+  target_link_libraries(libxcp_measurement_adapter PUBLIC
+          libxcp::libxcp libxcp::a2lbridge)
+endif()
+
+# ----------------------------------------------------------------------------
+# XCPlite 协议调试集成（code-plan/XCPlite_Slave_协议调试集成计划.md）
+#
+# 默认 OFF：不改变原构建。开启时把 thirdparty/XCPlite 作为子项目仅构建库
+# 目标（不建示例/测试/工具/安装），并在此后由 tests 子目录挂接测试 Slave
+# 可执行文件与 XCPlite 集成测试。不修改 XCPlite 任何源文件，全部配置通过
+# 其公开的 CMake 变量（CMP0077 正常变量）控制。
+# ----------------------------------------------------------------------------
+option(LIBXCP_BUILD_XCPLITE_SLAVE
+       "Build the XCPlite-based test slave and protocol-debug integration tests"
+       OFF)
+
+if(LIBXCP_BUILD_XCPLITE_SLAVE)
+  # default 配置含 A2L 运行时生成 + UDP/TCP 传输，满足协议调试需要
+  set(XCPLITE_CONFIGURATION "default")
+  set(XCPLITE_BUILD_EXAMPLES OFF)
+  set(XCPLITE_BUILD_TESTS OFF)
+  set(XCPLITE_BUILD_TOOLS OFF)
+  set(XCPLITE_BUILD_RUST_TOOLS OFF)
+  set(XCPLITE_BUILD_BPF_DEMO OFF)
+  set(XCPLITE_INSTALL OFF)
+  add_subdirectory(thirdparty/XCPlite)
 endif()
 
 # ----------------------------------------------------------------------------
@@ -176,4 +218,31 @@ endif()
 if(LIBXCP_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# ----------------------------------------------------------------------------
+# 示例程序目录（批次22：examples/xcp_master_udp）
+#
+# 默认 OFF——不改变既有构建。前置门 = LIBXCP_BUILD_XCPLITE_SLAVE=ON（xcplite
+# 库与上游示例源的来源，见上方子项目段）且 LIBXCP_BUILD_A2L=ON（示例经桥接层
+# 加载 A2L，libxcp::a2lbridge 的来源）；任一未满足在 CONFIGURE 期 FATAL_ERROR
+# 明确提示，不静默降级、不二次 add_subdirectory(thirdparty/XCPlite)。
+# 计划：code-plan/XCPlite_cpp_demo_示例对手端计划.md（v2.1）。
+# ----------------------------------------------------------------------------
+option(LIBXCP_BUILD_EXAMPLES
+       "Build the standalone example programs under examples/"
+       OFF)
+
+if(LIBXCP_BUILD_EXAMPLES)
+  if(NOT LIBXCP_BUILD_XCPLITE_SLAVE)
+    message(FATAL_ERROR
+            "LIBXCP_BUILD_EXAMPLES=ON requires LIBXCP_BUILD_XCPLITE_SLAVE=ON "
+            "(the xcplite library and the cpp_demo opponent come from that subproject gate)")
+  endif()
+  if(NOT LIBXCP_BUILD_A2L)
+    message(FATAL_ERROR
+            "LIBXCP_BUILD_EXAMPLES=ON requires LIBXCP_BUILD_A2L=ON "
+            "(the example loads A2L through the bridge; libxcp::a2lbridge is required)")
+  endif()
+  add_subdirectory(examples)
 endif()

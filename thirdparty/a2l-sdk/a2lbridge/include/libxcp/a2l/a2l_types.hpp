@@ -114,7 +114,7 @@ using PhysicalValue =
 /// @brief COMPU_METHOD 的归一化类别（B-8）
 enum class ConversionKind : std::uint8_t {
     Identical,           ///< 物理值 == 原始值
-    Linear,              ///< p = f + i*C + i*O
+    Linear,              ///< p = f + i*C + O
     RatFunc,             ///< p = (N1 i² + N2 i + N3)/(D1 i² + D2 i + D3)
     TabIntp,             ///< 查表线性插值
     TabNoIntp,           ///< 查表取阶梯
@@ -123,10 +123,10 @@ enum class ConversionKind : std::uint8_t {
     None,                ///< 无 COMPU_METHOD
 };
 
-/// @brief 线性系数（顺序与 A2L LINEAR 一致：C 比例、O 偏移、F 常数）
+/// @brief 线性系数：PHYS = F + C * INT + O；A2L 顺序为 factor、offset
 struct LinearCoefficients {
-    double c = 0.0;  ///< 比例项系数
-    double o = 0.0;  ///< 偏移项（加在 i*O 上）
+    double c = 0.0;  ///< 比例项系数（factor）
+    double o = 0.0;  ///< 加法偏移（offset）
     double f = 0.0;  ///< 常数项
 };
 

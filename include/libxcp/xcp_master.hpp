@@ -243,6 +243,59 @@ public:
     void ConfigureDaqList(const DaqListSpec& spec);
 
     /**
+     * @brief 动态 DAQ 整表编排（批次20，T20-01b）：FREE_DAQ → ALLOC_DAQ →
+     *        ALLOC_ODT → ALLOC_ODT_ENTRY → SET_DAQ_PTR/WRITE_DAQ →
+     *        SET_DAQ_LIST_MODE
+     * @param specs 整表快照：每个 DaqListSpec 一个 List；XCPlite 由 ALLOC_DAQ
+     *        按分配序自增编号，daq_list 必须严格等于下标 0..N-1（docs
+     *        §7.5.4.7：n=2 产生 List 0 与 1）
+     * @details Slave 侧时序硬门（xcplite.c:1148/1176）：ALLOC_DAQ 一次性给出
+     *          List 总数；全表 ODT 分配完才开始分 Entry；ALLOC 出的 Entry 槽
+     *          size=0，必须再 WRITE_DAQ 填。FREE_DAQ 作用域是整张表：旧账本
+     *          快照后全表重建，未出现在 specs 里的 List 一并删除、代际递增；
+     *          失败则账本回滚到调用前快照（不留半份账，B-6）。
+     * @note  只适用于声明 DAQ_PROPERTY_CONFIG_TYPE=DYNAMIC 的 Slave；SET_DAQ_
+     *          LIST_MODE 位与 prescaler 按 spec 透传，不替 Slave 强制
+     *          TIMESTAMP（XCPlite 缺 TIMESTAMP 位回 CRC_CMD_SYNTAX，错误如实
+     *          上浮，B-16）。pid 不回填：本路径识别字段非 Absolute，动态启动
+     *          请走 StartDaqSync()（D12：XCPlite 拒绝单列表 START(mode=1)）。
+     * @throws XcpException(InvalidArgument) specs 空 / daq_list 非下标序 /
+     *         spec 字段非法（同 ConfigureDaqList 口径）/ Slave 不支持
+     *         动态分配 / 单 ODT 超 MAX_DTO（含时间戳信封预检，G3 修正）
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void ConfigureDaqListsDynamic(const std::vector<DaqListSpec>& specs);
+
+    /**
+     * @brief 动态列表的同步启动：逐 List Select → START_STOP_SYNCH(Start
+     *        Selected)（批次20，T20-01b）
+     * @details 绕开拒绝单列表 START(mode=1) 的 Slave（D12：xcplite.c:2668-
+     *          2671 TEST_CHECKS 下回 CRC_MODE_NOT_VALID）。Select 响应的
+     *          FIRST_PID 不回填账本（本路径识别字段非 Absolute，docs
+     *          L2228）。运行态由 Session 登记（Disconnect 自动收尾）。
+     * @throws XcpException(InvalidState) 账本中无任何 List
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void StartDaqSync();
+
+    /**
+     * @brief 经 GET_ID(IDT_ASAM_UPLOAD=4) + 连续 UPLOAD 拉取对端 A2L 文件
+     *        （批次21 21-2）
+     * @details XCPlite 实然线格式：GET_ID CRO 只有 2 字节（byte1 直接是
+     *          IDT，无规范 §7.5.1.6 的 MODE/reserved 字节，xcp.h:519-520）；
+     *          响应 LENGTH 是 DWORD@b4..7。对端打开 run 目录里的
+     *          <a2l名>.a2l 进入 FILE MTA 后是**纯顺序读**（xcpappl.c:
+     *          546-596，无 fseek），必须按 LENGTH 严格连续分块 UPLOAD
+     *          （单块 ≤ MAX_CTO-1 且 ≤ 255）；中途失败对端 closeFile，
+     *          需重发 GET_ID 重开文件再整读。
+     * @return A2L 文件的完整字节流（与盘上文件逐字节一致）
+     * @throws XcpException(UnsupportedFeature) 对端上报长度 0（无上传
+     *         能力/.a2l 缺失）或 MODE≠0（非 UPLOAD 通路）
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] Bytes FetchA2lViaUpload();
+
+    /**
      * @brief 启动一个已配置的 DAQ List（START_STOP_DAQ_LIST(Start)）
      * @param daq_list DAQ List 号（EPK）
      * @return Slave 响应的 FIRST_PID（Absolute ODT Number 模式，docs L2222）
@@ -313,6 +366,18 @@ public:
         std::uint16_t daq_list);
 
     /**
+     * @brief 查询单个事件通道的运行时信息（GET_DAQ_EVENT_INFO，v0.3，Optional）
+     * @param event_channel 事件通道号（uint16_t）
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时为 std::nullopt
+     * @details 事件通道号**不在响应中回显**（调用方持有入参）。v0.4
+     *          MeasurementPlanner 据此做 DAQ List 分配与 time_cycle/time_unit/
+     *          priority 取证。事件名主体经 UPLOAD 通路按 MTA 读取，本方法只拿
+     *          name_length 等六字段（见 GetDaqEventInfoResponse）。
+     */
+    [[nodiscard]] std::optional<GetDaqEventInfoResponse> QueryDaqEventInfo(
+        std::uint16_t event_channel);
+
+    /**
      * @brief 回读指定位置的 ODT Entry（SET_DAQ_PTR + READ_DAQ）
      * @param daq_list DAQ List 号（EPK）
      * @param odt_number ODT 号（0 基）
@@ -324,6 +389,128 @@ public:
     [[nodiscard]] std::optional<ReadDaqResponse> ReadDaqEntryAt(
         std::uint16_t daq_list, std::uint8_t odt_number,
         std::uint8_t odt_entry);
+
+    // ---- 变量标定批次：Calibration / Page Switching（docs §7.5.2.5 / §7.5.3）----
+
+    /**
+     * @brief CONNECT 后 Slave 是否声明 CAL/PAG 资源（Resource bit0）
+     * @return false 时以下全部标定 API 均本地拒绝（UnsupportedFeature），
+     *         不发送命令
+     */
+    [[nodiscard]] bool HasCalPagResource() const;
+
+    /**
+     * @brief 本会话 GET_PAG_PROCESSOR_INFO 的一次性取证缓存
+     * @details nullopt = Slave 不支持该 Optional 命令（ERR_CMD_UNKNOWN）或
+     *          未声明 CAL/PAG 资源；区分"尚未查询"由内部布尔记录。
+     *          MAX_SEGMENT/PAG_PROPERTIES 是 Page/Segment 预校验的唯一
+     *          运行时真值，**不猜**（B-3 口径）。
+     */
+    [[nodiscard]] std::optional<GetPagProcessorInfoResponse>
+    QueryPagProcessorInfo();
+
+    /**
+     * @brief 切换标定页（SET_CAL_PAGE）
+     * @param mode ECU/XCP/ALL 位组合（须含 ECU|XCP 之一）
+     * @param segment Segment Number（mode 含 ALL 时被 Slave 忽略）
+     * @param page Page Number
+     * @throws XcpException(UnsupportedFeature) Slave 未声明 CAL/PAG 资源
+     * @throws XcpException(InvalidArgument) Mode 组合非法
+     * @throws XcpException 协议错误（ERR_MODE_NOT_VALID/ERR_PAGE_NOT_VALID/
+     *         ERR_SEGMENT_NOT_VALID/ERR_ACCESS_LOCKED）、超时或恢复失败
+     */
+    void SetCalPage(CalPageModeBit mode, std::uint8_t segment,
+                    std::uint8_t page);
+
+    /**
+     * @brief 查询当前激活标定页（GET_CAL_PAGE）
+     * @param access_mode Ecu(0x01)=Application 侧 / Xcp(0x02)=Master 侧
+     * @param segment Segment Number
+     * @return 逻辑 Page Number；Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] std::optional<GetCalPageResponse> GetCalPage(
+        CalPageAccessMode access_mode, std::uint8_t segment);
+
+    /**
+     * @brief 查询 Segment 信息（GET_SEGMENT_INFO，变长响应按 Mode 分支）
+     * @param mode BasicInfo（地址/长度）/StandardProperties/MappingInfo
+     * @param segment Segment Number
+     * @param info Mode 0: Address/Length；Mode 2: SrcAddr/DstAddr/Length
+     * @param mapping_index 仅 Mode 2 使用（0..MAX_MAPPING-1）
+     * @return variant 响应；Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] std::optional<GetSegmentInfoResponse> GetSegmentInfo(
+        SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
+        std::uint8_t mapping_index = 0U);
+
+    /**
+     * @brief 查询 Page 访问属性与初始化来源（GET_PAGE_INFO）
+     * @param segment Segment Number
+     * @param page Page Number
+     * @return PAGE_PROPERTIES（三组访问者类型已拆解）+ INIT_SEGMENT；
+     *         Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] std::optional<GetPageInfoResponse> GetPageInfo(
+        std::uint8_t segment, std::uint8_t page);
+
+    /**
+     * @brief 设置 Segment FREEZE 模式（SET_SEGMENT_MODE）
+     * @param freeze true=冻结该 Segment（进入随后 STORE_CAL_REQ 的冻结
+     *               处理范围）；false=取消冻结
+     * @param segment Segment Number
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void SetSegmentFreeze(bool freeze, std::uint8_t segment);
+
+    /**
+     * @brief 读取 Segment 当前 Mode（GET_SEGMENT_MODE，主要查 FREEZE）
+     * @param segment Segment Number
+     * @return Mode 位域；HasSegmentMode(*r, kFreeze) 判断冻结态；
+     *         Slave 回 ERR_CMD_UNKNOWN 时 nullopt
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    [[nodiscard]] std::optional<GetSegmentModeResponse> GetSegmentMode(
+        std::uint8_t segment);
+
+    /**
+     * @brief 复制标定页（COPY_CAL_PAGE）
+     * @param request 源/目标 Segment+Page 四元组
+     * @details 目标区域写保护（Flash）时 Slave 回 ERR_WRITE_PROTECTED，
+     *          应改走 Flash Programming 流程（本计划外）。
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void CopyCalPage(const CopyCalPageRequest& request);
+
+    /**
+     * @brief 对指定地址的 32-bit 位置执行原子 AND/XOR 位修改（MODIFY_BITS）
+     * @param address 32 位地址（操作对象为 MTA 指向的 DWORD）
+     * @param extension 地址扩展
+     * @param shift Shift Value S（0..16）
+     * @param and_mask AND Mask（16-bit，零扩展后左移 S 清位）
+     * @param xor_mask XOR Mask（同上，翻转置位）
+     * @details 内部编排 SET_MTA + MODIFY_BITS（docs §7.5.2.5：命令本身
+     *          不带地址）；超时恢复自动重放 MTA。
+     * @throws XcpException(UnsupportedFeature) 未声明 CAL/PAG 资源
+     * @throws XcpException(InvalidArgument) Shift 越界/地址溢出
+     * @throws XcpException 协议错误（含 ERR_ACCESS_LOCKED——需先 Unlock
+     *         Resource::CalPag）、超时或恢复失败
+     */
+    void ModifyBits(Address address, AddressExtension extension,
+                    std::uint8_t shift, std::uint16_t and_mask,
+                    std::uint16_t xor_mask);
+
+    /// @brief 测量会话（v0.5）需要读取时间戳宽度取证缓存用于规划与解码；
+    ///        该口径不外扩为公共 API，故以 friend 授权（不改变其余可见性）。
+    friend class MeasurementSession;
 
 private:
     std::unique_ptr<IXcpTransport> m_transport_;  ///< 拥有的 Transport
@@ -345,6 +532,37 @@ private:
      */
     bool m_daq_processor_info_queried_{false};
     std::optional<std::uint8_t> m_daq_processor_properties_;
+
+    /**
+     * @brief 本会话 GET_DAQ_RESOLUTION_INFO 的一次性取证缓存（批次20，G3）
+     * @details 仅供信封预检：时间戳宽度计入 header（XCPlite 每事件首 ODT
+     *          带 4B 时间戳，此前按纯 PID 口径预检会放行超限配置）。
+     *          nullopt = Slave 不支持该 Optional 命令或未声明宽度，按 0 计——
+     *          **不猜**（B-3/B-16）。
+     */
+    bool m_daq_resolution_info_queried_{false};
+    std::optional<std::uint8_t> m_daq_timestamp_bytes_;
+
+    /**
+     * @brief 本会话 GET_PAG_PROCESSOR_INFO 的一次性取证缓存（变量标定批次）
+     * @details nullopt = Slave 不支持该 Optional 命令或未声明 CAL/PAG 资源；
+     *          布尔值区分"尚未查询"和"已知不支持"（仿 DAQ 处理器信息缓存）。
+     */
+    bool m_pag_processor_info_queried_{false};
+    std::optional<GetPagProcessorInfoResponse> m_pag_processor_info_;
+
+    /**
+     * @brief 懒查 GET_DAQ_RESOLUTION_INFO 并缓存 Slave 声明的时间戳字节宽
+     *        （批次20，G3）。未声明/Optional 不支持 → 0——宽度**不猜**（B-3）。
+     * @note 调用时机由信封预检决定：仅当 spec.timestamp 开启才查询，不给
+     *       既有静态路径加命令；FIXED 时间戳 Slave 与 spec.timestamp=false
+     *       的组合本就与 Slave 的 MODE 校验冲突，错误由 Slave 侧如实上浮。
+     */
+    [[nodiscard]] std::size_t DaqTimestampBytesCached();
+
+    /// @brief 动态编排中途失败后的清理：整表 FREE_DAQ 尽力恢复到干净空表，
+    ///        二次失败只尽力不掩盖原异常；账本/解码代际同步作废（批次20）
+    void ClearDynamicTableBestEffort();
 };
 
 }  // namespace calmcar::xcp

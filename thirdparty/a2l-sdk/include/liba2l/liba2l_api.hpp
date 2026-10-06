@@ -45,8 +45,15 @@ namespace liba2l {
 //               只存不展开）；新 DTO StructInfoDto/StructMemberDto；
 //               SymbolDto +record_layout_kind（B-4/B-12 RL 可执行性判定接线）；
 //               Progress() 由"完成即 100"改为**阶段进度**实算（无接口变化）。
+// v5（批次15）：StructInfoDto +address_extension（F5：INSTANCE 的
+//               ECU_ADDRESS_EXTENSION 原值；此前分段地址实例丢扩展位）。
+// v6（批次18）：IDoc +ListTypedefMeasurements（STRUCTLEAF 16-A：导出
+//               TYPEDEF_MEASUREMENT 上游事实，供桥接层解析结构体成员叶子的
+//               元素类型/换算引用/边界；SDK 不做任何递归或地址推导）；
+//               StructInfoDto +matrix_dim（16-B：INSTANCE 的 MATRIX_DIM 原值，
+//               结构体数组实例逐元素展开的前提）。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 5u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 6u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -129,7 +136,7 @@ enum class ArrayOrderDto : std::int32_t {
 /** COMPU_METHOD 的转换类别。 */
 enum class ConversionKindDto : std::int32_t {
     kIdentical = 0,  ///< IDENTICAL：物理值 == 原始值
-    kLinear = 1,     ///< LINEAR：p = f + i*C + i*O
+    kLinear = 1,     ///< LINEAR：p = f + i*C + O
     kRatFunc = 2,  ///< RAT_FUNC：p = (N1*i^2 + N2*i + N3)/(D1*i^2 + D2*i + D3)
     kTabIntp = 3,  ///< TAB_INTP：查表线性插值
     kTabNoIntp = 4,           ///< TAB_NOINTP：查表取阶梯
@@ -199,8 +206,8 @@ struct DimensionDto {
 
 /** 线性/有理函数系数包（LINEAR: [C,O,F]；RAT_FUNC: [N1,N2,N3,D1,D2,D3]）。 */
 struct NumericCoefficientsDto {
-    double c = 0.0;   ///< LINEAR 比例项系数
-    double o = 0.0;   ///< LINEAR 偏移项（加在 i*O 上）
+    double c = 0.0;   ///< LINEAR 比例项系数（COEFFS_LINEAR 首项 factor）
+    double o = 0.0;   ///< LINEAR 加法偏移（COEFFS_LINEAR 次项 offset）
     double f = 0.0;   ///< LINEAR 常数项
     double n1 = 0.0;  ///< RAT_FUNC 分子二次项
     double n2 = 0.0;  ///< RAT_FUNC 分子一次项
@@ -452,10 +459,55 @@ struct StructInfoDto {
     ///          code-plan/A2L_集成_R4_遗留修复计划_批次15.md §1 L5）。
     ///          TYPEDEF_STRUCTURE 无地址，本字段对它恒 0。
     std::uint8_t address_extension = 0;
-    std::uint8_t address_type = 0;         ///< A2lAddressType 原始码
-    std::uint8_t layout = 0;               ///< A2lLayout 原始码
-    bool read_write = false;               ///< INSTANCE 的 READ_WRITE 声明
+    std::uint8_t address_type = 0;  ///< A2lAddressType 原始码
+    std::uint8_t layout = 0;        ///< A2lLayout 原始码
+    bool read_write = false;        ///< INSTANCE 的 READ_WRITE 声明
+    /// @brief INSTANCE 的 MATRIX_DIM 原值（批次18，STRUCTLEAF 16-B；v6 起有值）
+    /// @details 上游 A2lObject::MatrixDim() 对 INSTANCE 同样生效
+    ///          （src/a2lparser.y:871 的实例属性规则显式接收 MATRIX_DIM）。
+    ///          v5 的 DTO 丢了这一事实，导致"结构体数组实例"只剩第 0 个元素
+    ///          可寻址 —— 桥接层的叶子展开必须有它。声明顺序即线性索引顺序
+    ///          （INDEX_MAP 暂不解析，与标量成员数组同一口径）。
+    ///          TYPEDEF_STRUCTURE 无本属性，对它恒空。
+    std::vector<std::uint64_t> matrix_dim;
     std::vector<StructMemberDto> members;  ///< 成员元数据（不展开）
+};
+
+/**
+ * @brief TYPEDEF_MEASUREMENT 事实快照（批次18，STRUCTLEAF 16-A）。
+ * @details 只保存上游声明本身可证的事实（类型/换算/边界/维度等）；
+ *          conversion 内嵌快照与 SymbolDto 同一口径（BuildConversion 复用），
+ *          **不**推导成员地址、**不**递归结构体 —— 叶子展开归桥接层
+ *          StructureLayoutResolver（批次16 §2 职责划分）。
+ *          18-A′ 起，TYPEDEF_CHARACTERISTIC 也复用本 DTO 并入同一标量事实
+ *          注册表（CalSeg 校准段成员只写 typedef characteristic，不并入则
+ *          永远解不出叶子）：其中和类型相关的可证事实按同一 B-3/B-4 口径
+ *          导出，data_type/element_size 的宽度由 Deposit 指向的 RECORD_LAYOUT
+ *          FNC_VALUES 证明；不可证时为 kUnknown/0，交 resolver 拒绝。
+ */
+struct TypedefMeasurementDto {
+    std::string name;         ///< TYPEDEF_MEASUREMENT 名（如 M_word_field）
+    std::string description;  ///< 描述文本（可空）
+    std::string module_name;  ///< 所属 MODULE（B-17 module scope）
+    AsamDataTypeDto data_type =
+        AsamDataTypeDto::kUnknown;  ///< 数据类型（MapDataType 同口径）
+    std::uint8_t element_size_bytes =
+        0;  ///< 单元素字节宽（B-3 显式映射；0 = 未知，禁止猜）
+    std::string compu_method_name;  ///< COMPU_METHOD 引用名（原样，可空）
+    ConversionDto conversion;       ///< 内嵌换算快照（与 SymbolDto 同口径）
+    std::string phys_unit;          ///< PHYS_UNIT 原文（可空）
+    ByteOrderDto byte_order =
+        ByteOrderDto::kUnknown;  ///< 块内 BYTE_ORDER 声明（UNKNOWN=继承模块）
+    std::vector<std::uint64_t> matrix_dim;  ///< MATRIX_DIM（原样透传，可空）
+    std::uint64_t resolution = 0;           ///< RESOLUTION 原值
+    double accuracy = 0.0;                  ///< ACCURACY 原值
+    bool have_limit = false;                ///< 是否给出 LIMITS
+    double lower_limit = 0.0;               ///< 下界（have_limit 时有效）
+    double upper_limit = 0.0;               ///< 上界（have_limit 时有效）
+    std::uint64_t bit_mask = 0;             ///< BIT_MASK（0 = 未标注）
+    std::uint8_t address_type = 0;          ///< A2lAddressType 原始码
+    std::uint8_t layout = 0;                ///< A2lLayout 原始码
+    bool read_write = false;                ///< READ_WRITE 声明
 };
 
 // ----------------------------------------------------------------------------
@@ -607,6 +659,16 @@ public:
      */
     virtual ErrorCode ListStructures(
         std::vector<StructInfoDto>* out) const noexcept = 0;
+
+    /**
+     * @brief 列出全部 TYPEDEF_MEASUREMENT 事实快照（批次18，STRUCTLEAF 16-A）。
+     * @param out 输出向量（DLL 侧先 clear 再填充）。
+     * @details 只导出上游声明可证的事实（见 TypedefMeasurementDto 注释）；
+     *          成员叶子展开与寻址归桥接层。排序稳定：按 (MODULE, 名) 升序。
+     * @return kOk（无该块时输出空向量）/ kNotInitialized / kBadArgument。
+     */
+    virtual ErrorCode ListTypedefMeasurements(
+        std::vector<TypedefMeasurementDto>* out) const noexcept = 0;
 
     /**
      * @brief 按 COMPU_METHOD 名取转换快照（含 TAB_* 引用的 COMPU_TAB）。

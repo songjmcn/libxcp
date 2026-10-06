@@ -732,6 +732,67 @@ TEST(SeedKeyEndToEnd, UnlockProtectedResourceRestoresRead) {
     slave.Stop();
 }
 
+TEST(SeedKeyEndToEnd, ProtectedCalibrationWriteRequiresUnlockAndRelocks) {
+    test::UdpTestSlave slave;
+    slave.SetProtectedResources(
+        static_cast<ResourceMask>(Resource::CalPag));
+    slave.SetDaqSimulationEnabled(true);
+
+    constexpr Address kCalAddress = 0x70012340;
+    const Bytes original = BytesOf({0x10, 0x20, 0x30, 0x40});
+    const Bytes updated = BytesOf({0xA1, 0xB2, 0xC3, 0xD4});
+    slave.SetMemory(kCalAddress, original);
+    slave.Start();
+
+    auto master = MakeMaster(slave.Port());
+    master->Connect();
+
+    const GetStatusResponse locked_status = master->QueryStatus();
+    EXPECT_EQ(locked_status.resource_protection,
+              static_cast<ResourceMask>(Resource::CalPag));
+
+    try {
+        master->WriteMemoryBytes(kCalAddress, 0x00, updated);
+        FAIL() << "锁定的 CAL 区域不应允许写入";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
+        EXPECT_EQ(e.GetErrorCode(),
+                  std::optional<ErrorCode>(ErrorCode::AccessLocked));
+    }
+
+    const UnlockResult result =
+        master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+    EXPECT_FALSE(result.was_already_unlocked);
+    ASSERT_TRUE(result.resource_protection.has_value());
+    EXPECT_EQ(*result.resource_protection, 0U);
+
+    EXPECT_EQ(master->ReadMemoryBytes(kCalAddress, 0x00, 4), original)
+        << "拒绝的写请求不应改变 CAL 原值";
+    master->WriteMemoryBytes(kCalAddress, 0x00, updated);
+    EXPECT_EQ(master->ReadMemoryBytes(kCalAddress, 0x00, 4), updated);
+
+    master->Disconnect();
+    master.reset();
+
+    auto reconnected_master = MakeMaster(slave.Port());
+    reconnected_master->Connect();
+    const GetStatusResponse reconnected_status =
+        reconnected_master->QueryStatus();
+    EXPECT_EQ(reconnected_status.resource_protection,
+              static_cast<ResourceMask>(Resource::CalPag));
+    try {
+        (void)reconnected_master->ReadMemoryBytes(kCalAddress, 0x00, 4);
+        FAIL() << "重连后 CAL 资源应恢复锁定";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
+        EXPECT_EQ(e.GetErrorCode(),
+                  std::optional<ErrorCode>(ErrorCode::AccessLocked));
+    }
+
+    reconnected_master->Disconnect();
+    slave.Stop();
+}
+
 TEST(SeedKeyEndToEnd, MultiSegmentSeedKeyOverRealSocket) {
     test::UdpTestSlave slave;
     slave.SetProtectedResources(static_cast<ResourceMask>(Resource::CalPag));

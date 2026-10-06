@@ -48,6 +48,42 @@ bool IsCmdUnknown(const XcpException& e) {
            *e.GetErrorCode() == ErrorCode::CmdUnknown;
 }
 
+/// @brief 判断响应超时后不可安全重放的标定变更命令。
+/// @details 响应缺失无法证明 Slave 未执行；内存写、页面切换/冻结及页面复制
+///          若被重放，可能覆盖并发变化或重复产生副作用。
+bool HasUnknownOutcomeOnTimeout(CommandCode cmd) {
+    switch (cmd) {
+        case CommandCode::ModifyBits:
+        case CommandCode::Download:
+        case CommandCode::ShortDownload:
+        case CommandCode::SetCalPage:
+        case CommandCode::SetSegmentMode:
+        case CommandCode::CopyCalPage:
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::string_view NonReplayableCommandName(CommandCode cmd) {
+    switch (cmd) {
+        case CommandCode::ModifyBits:
+            return "MODIFY_BITS";
+        case CommandCode::Download:
+            return "DOWNLOAD";
+        case CommandCode::ShortDownload:
+            return "SHORT_DOWNLOAD";
+        case CommandCode::SetCalPage:
+            return "SET_CAL_PAGE";
+        case CommandCode::SetSegmentMode:
+            return "SET_SEGMENT_MODE";
+        case CommandCode::CopyCalPage:
+            return "COPY_CAL_PAGE";
+        default:
+            return "标定变更命令";
+    }
+}
+
 }  // namespace
 
 CommandExecutor::CommandExecutor(IXcpTransport& transport, Session& session,
@@ -431,7 +467,36 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
             return DispatchResponse(cmd, *response);
         }
 
-        // 超时或 Transport 关闭：进入 SYNCH 恢复并有限重试（计划 §6.2）
+        // 这些标定变更命令可能已在 Slave 生效；响应超时后即便 SYNCH 恢复
+        // 成功也不得重放，否则可能重复写入或覆盖并发状态变化。报告结果未知，
+        // 由调用方读回/对账。
+        if (HasUnknownOutcomeOnTimeout(cmd)) {
+            const std::string command_name(NonReplayableCommandName(cmd));
+            if (retries >= m_timeouts_.max_retries) {
+                throw XcpException(
+                    ErrorCategory::OperationOutcomeUnknown,
+                    command_name +
+                        " 响应超时，执行结果未知；恢复次数已耗尽，未重放命令",
+                    cmd, std::nullopt, retries);
+            }
+            ++retries;
+            try {
+                PerformRecovery(cmd);
+            } catch (const XcpException& e) {
+                throw XcpException(
+                    ErrorCategory::OperationOutcomeUnknown,
+                    command_name + " 响应超时，执行结果未知；SYNCH 恢复失败：" +
+                        std::string(e.what()),
+                    cmd, std::nullopt, retries, std::string(e.TransportError()));
+            }
+            throw XcpException(
+                ErrorCategory::OperationOutcomeUnknown,
+                command_name +
+                    " 响应超时，执行结果未知；SYNCH 已恢复，命令未重放",
+                cmd, std::nullopt, retries);
+        }
+
+        // 其他支持重试的命令超时：进入 SYNCH 恢复并有限重试（计划 §6.2）
         if (retries >= m_timeouts_.max_retries) {
             throw XcpException(ErrorCategory::RecoveryFailed,
                                "命令超时且恢复重试已耗尽（" +
@@ -440,12 +505,12 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
         }
         ++retries;
         PerformRecovery(cmd);
-        // UPLOAD / DOWNLOAD 都从隐含 MTA 起算（docs L1907 / L1983）：重试前
-        // 必须重建 MTA。函数名沿用 RestoreUploadMta（当时只有 UPLOAD），
-        // 语义已扩展到 DOWNLOAD —— 为不动既有已验证代码而不改名。
-        if (cmd == CommandCode::Upload || cmd == CommandCode::Download) {
+        // 可安全重试的 UPLOAD 依赖隐含 MTA，恢复后须重建 MTA（docs L1907）。
+        // DOWNLOAD 在上方被归为不可重放命令，不会进入此恢复重试分支。
+        if (cmd == CommandCode::Upload) {
             RestoreUploadMta();
         }
+        // 标定变更命令在上方统一返回 OperationOutcomeUnknown，不得在此重放。
         // WRITE_DAQ / READ_DAQ 从隐含 DAQ 指针起算：docs L2783 要求恢复后
         // 重新 SET_DAQ_PTR（指针不可查询，只能重放本端记录）
         if (cmd == CommandCode::WriteDaq || cmd == CommandCode::ReadDaq) {
@@ -609,6 +674,22 @@ Bytes CommandExecutor::ExecuteShortUpload(ElementCount number_of_elements,
     return std::move(res.data);
 }
 
+GetIdResponse CommandExecutor::ExecuteGetId(std::uint8_t identification_type) {
+    // GET_ID 在 XCPlite 侧是同步命令、无副作用恢复语义之外的分支：直接复用
+    // RunCommand 的 SYNCH 恢复通路。
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetId(identification_type);
+    auto response = RunCommand(CommandCode::GetId, encoded);
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetId(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket("GET_ID 响应长度不足（RES 数据 " +
+                                          std::to_string(res.data.size()) +
+                                          " 字节）");
+    }
+    return *parsed;
+}
+
 GetSeedResponse CommandExecutor::ExecuteGetSeed(Resource resource,
                                                 SeedMode mode) {
     EnsureCodec(m_session_.GetByteOrder());
@@ -717,6 +798,46 @@ void CommandExecutor::ExecuteClearDaqList(std::uint16_t daq_list) {
     }
 }
 
+void CommandExecutor::ExecuteFreeDaq() {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeFreeDaq();
+    (void)RunCommand(CommandCode::FreeDaq, encoded);
+    // 全表作废：隐含指针记录一律失效（口径与 ExecuteClearDaqList 一致，
+    // 只是作用域是全部 List）
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_last_daq_ptr_.reset();
+    }
+}
+
+void CommandExecutor::ExecuteAllocDaq(std::uint16_t count) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeAllocDaq(count);
+    (void)RunCommand(CommandCode::AllocDaq, encoded);
+    // 全表已被 FREE_DAQ 清空后才会走到这里（编排层时序，D9）；防御性地
+    // 再作废一次隐含指针，保证本方法单独调用也留干净状态
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_last_daq_ptr_.reset();
+    }
+}
+
+void CommandExecutor::ExecuteAllocOdt(std::uint16_t daq_list,
+                                      std::uint8_t count) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeAllocOdt(daq_list, count);
+    (void)RunCommand(CommandCode::AllocOdt, encoded);
+}
+
+void CommandExecutor::ExecuteAllocOdtEntry(std::uint16_t daq_list,
+                                           std::uint8_t odt_number,
+                                           std::uint8_t count) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded =
+        m_codec_->EncodeAllocOdtEntry(daq_list, odt_number, count);
+    (void)RunCommand(CommandCode::AllocOdtEntry, encoded);
+}
+
 void CommandExecutor::ExecuteSetDaqListMode(DaqListModeBit mode,
                                             std::uint16_t daq_list,
                                             std::uint16_t event_channel,
@@ -770,6 +891,31 @@ std::optional<GetDaqListInfoResponse> CommandExecutor::ExecuteGetDaqListInfo(
         throw detail::MakeMalformedPacket(
             "GET_DAQ_LIST_INFO 响应长度不足（RES 数据 " +
             std::to_string(res.data.size()) + " 字节，期望 >= 5）");
+    }
+    return parsed;
+}
+
+std::optional<GetDaqEventInfoResponse> CommandExecutor::ExecuteGetDaqEventInfo(
+    std::uint16_t event_channel) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetDaqEventInfo(event_channel);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetDaqEventInfo, encoded);
+    } catch (const XcpException& e) {
+        // Optional 命令未实现 → ERR_CMD_UNKNOWN 且无副作用（docs L1631）：
+        // 视为"能力缺失"，由调用方回落，不当作链路故障
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetDaqEventInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_DAQ_EVENT_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 6）");
     }
     return parsed;
 }
@@ -861,6 +1007,161 @@ void CommandExecutor::ExecuteShortDownload(ElementCount number_of_elements,
     // 写回必须有确认：ERR_CMD_UNKNOWN 不降级为成功，原样上抛由
     // MemoryAccess 回落 SET_MTA + DOWNLOAD 通路
     (void)RunCommand(CommandCode::ShortDownload, encoded);
+}
+
+// ---------------------------------------------------------------------------
+// 变量标定批次：MODIFY_BITS + Page Switching（docs §7.5.2.5 / §7.5.3）
+// ---------------------------------------------------------------------------
+
+void CommandExecutor::ExecuteModifyBits(std::uint8_t shift,
+                                        std::uint16_t and_mask,
+                                        std::uint16_t xor_mask) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded =
+        m_codec_->EncodeModifyBits(shift, and_mask, xor_mask);
+    // CRM 仅 RES（xcp.h CRM_MODIFY_BITS_LEN=1），无数据字段可解析。
+    // MTA 不变；响应超时后的执行结果由 RunCommand 标记为未知且不重放。
+    (void)RunCommand(CommandCode::ModifyBits, encoded);
+}
+
+void CommandExecutor::ExecuteSetCalPage(CalPageModeBit mode,
+                                       std::uint8_t segment,
+                                       std::uint8_t page) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeSetCalPage(mode, segment, page);
+    (void)RunCommand(CommandCode::SetCalPage, encoded);
+}
+
+std::optional<GetCalPageResponse> CommandExecutor::ExecuteGetCalPage(
+    CalPageAccessMode access_mode, std::uint8_t segment) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetCalPage(access_mode, segment);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetCalPage, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;  // Optional 命令，Slave 不支持 Paging
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetCalPage(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_CAL_PAGE 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 3）");
+    }
+    return parsed;
+}
+
+std::optional<GetPagProcessorInfoResponse>
+CommandExecutor::ExecuteGetPagProcessorInfo() {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetPagProcessorInfo();
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetPagProcessorInfo, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;  // Slave 不支持 Page Switching
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetPagProcessorInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_PAG_PROCESSOR_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 2）");
+    }
+    return parsed;
+}
+
+std::optional<GetSegmentInfoResponse> CommandExecutor::ExecuteGetSegmentInfo(
+    SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
+    std::uint8_t mapping_index) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded =
+        m_codec_->EncodeGetSegmentInfo(mode, segment, info, mapping_index);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetSegmentInfo, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    // 变长响应：把请求 Mode 传给 Parser 决定布局（计划 §11 风险 1）
+    auto parsed = m_parser_->ParseGetSegmentInfo(BytesView{res.data}, mode);
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_SEGMENT_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) +
+            " 字节，Mode 0/2 期望 >= 4、Mode 1 期望 >= 5）");
+    }
+    return parsed;
+}
+
+std::optional<GetPageInfoResponse> CommandExecutor::ExecuteGetPageInfo(
+    std::uint8_t segment, std::uint8_t page) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetPageInfo(segment, page);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetPageInfo, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetPageInfo(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_PAGE_INFO 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 2）");
+    }
+    return parsed;
+}
+
+void CommandExecutor::ExecuteSetSegmentMode(SegmentModeBit mode,
+                                           std::uint8_t segment) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeSetSegmentMode(mode, segment);
+    (void)RunCommand(CommandCode::SetSegmentMode, encoded);
+}
+
+std::optional<GetSegmentModeResponse> CommandExecutor::ExecuteGetSegmentMode(
+    std::uint8_t segment) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeGetSegmentMode(segment);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetSegmentMode, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetSegmentMode(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_SEGMENT_MODE 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 2）");
+    }
+    return parsed;
+}
+
+void CommandExecutor::ExecuteCopyCalPage(const CopyCalPageRequest& request) {
+    EnsureCodec(m_session_.GetByteOrder());
+    const Bytes encoded = m_codec_->EncodeCopyCalPage(request);
+    (void)RunCommand(CommandCode::CopyCalPage, encoded);
 }
 
 }  // namespace calmcar::xcp

@@ -352,7 +352,7 @@ Result<PhysicalValue> ConvertForward(const SymbolInfo& symbol,
             return PhysicalValue{raw_value};
         case ConversionKind::Linear: {
             const auto& c = std::get<LinearCoefficients>(conv.payload);
-            return PhysicalValue{c.f + raw_value * c.c + raw_value * c.o};
+            return PhysicalValue{c.f + raw_value * c.c + c.o};
         }
         case ConversionKind::RatFunc: {
             const auto& r = std::get<RatFuncCoefficients>(conv.payload);
@@ -396,12 +396,11 @@ Result<double> ConvertInverse(const SymbolInfo& symbol,
             return p;
         case ConversionKind::Linear: {
             const auto& c = std::get<LinearCoefficients>(conv.payload);
-            const double slope = c.c + c.o;  // p = f + i*(C+O)
-            if (slope == 0.0) {
+            if (c.c == 0.0) {
                 return ConvError(ErrorCode::ConversionNotInvertible, symbol,
-                                 "LINEAR 斜率为零，逆解不唯一（B-15）");
+                                 "LINEAR 比例系数为零，逆解不唯一（B-15）");
             }
-            return (p - c.f) / slope;
+            return (p - c.f - c.o) / c.c;
         }
         case ConversionKind::RatFunc: {
             const auto& r = std::get<RatFuncCoefficients>(conv.payload);

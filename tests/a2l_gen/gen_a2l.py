@@ -89,8 +89,9 @@ def emit_compu_methods(mod):
             f'    /begin COMPU_METHOD {cm["name"]} "{cm.get("desc", "")}" '
             f'{cm["type"]} "{cm.get("format", "%6.2")}" "{cm.get("unit", "")}"')
         if "coeffs_linear" in cm:
-            o, f = cm["coeffs_linear"]
-            lines.append(f'      COEFFS_LINEAR {fmt_num(o)} {fmt_num(f)}')
+            factor, offset = cm["coeffs_linear"]
+            lines.append(
+                f'      COEFFS_LINEAR {fmt_num(factor)} {fmt_num(offset)}')
         elif "coeffs" in cm:
             lines.append('      COEFFS ' + ' '.join(fmt_num(c) for c in cm["coeffs"]))
         elif "tab_ref" in cm:
@@ -488,8 +489,8 @@ def build_expected(spec):
             cm = methods.get(m.get("compu", "CM_IDENT"))
             item["sample_raw_int"] = raw
             if cm and cm["type"] == "LINEAR":
-                o, f = cm["coeffs_linear"]
-                item["sample_phys"] = (0.0 + raw * f) + raw * o
+                factor, offset = cm["coeffs_linear"]
+                item["sample_phys"] = (0.0 + raw * factor) + offset
             else:
                 item["sample_phys"] = raw
         symbols[m["name"]] = item

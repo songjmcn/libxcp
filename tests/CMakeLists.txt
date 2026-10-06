@@ -48,7 +48,13 @@ add_executable(libxcp_tests
         xcp_master_integration_test.cpp
         xcp_daq_test.cpp
         xcp_udp_loopback_test.cpp
-        udp_test_slave.cpp)
+        udp_test_slave.cpp
+        dto_envelope_decoder_test.cpp
+        get_daq_event_info_test.cpp
+        measurement_planner_test.cpp
+        measurement_session_test.cpp
+        daq_timestamp_test.cpp
+        measurement_session_hardening_test.cpp)
 
 target_link_libraries(libxcp_tests PRIVATE
         libxcp::libxcp
@@ -64,6 +70,59 @@ endif()
 
 include(GoogleTest)
 gtest_discover_tests(libxcp_tests DISCOVERY_TIMEOUT 60)
+
+# ----------------------------------------------------------------------------
+# XCPlite 协议调试集成测试（code-plan/XCPlite_Slave_协议调试集成计划.md）
+#
+# 仅 LIBXCP_BUILD_XCPLITE_SLAVE=ON 时构建：
+#   xcp_test_slave        —— 基于 XCPlite 的 Slave 独立进程（tests/xcp_test_slave/）
+#   XcpliteIntegration    —— 真实 UDP + 真实 Slave 的集成测试（子进程由夹具管理）
+# A2L 读取用例（xcplite_a2l_read_test.cpp）额外依赖桥接层，
+# 仅当 LIBXCP_BUILD_A2L 同时开启时编入。
+# ----------------------------------------------------------------------------
+if(LIBXCP_BUILD_XCPLITE_SLAVE)
+  add_subdirectory(xcp_test_slave)
+
+  add_executable(XcpliteIntegration
+          xcplite_slave_fixture.cpp
+          xcplite_slave_fixture_test.cpp
+          udp_test_slave.cpp
+          xcplite_protocol_test.cpp
+          xcplite_write_test.cpp
+          xcplite_daq_test.cpp)
+  target_compile_features(XcpliteIntegration PRIVATE cxx_std_20)
+  target_link_libraries(XcpliteIntegration PRIVATE
+          libxcp::libxcp
+          GTest::gtest
+          GTest::gtest_main)
+  # 夹具与共享类型头的搜索路径（tests/ 与 tests/xcp_test_slave/）
+  target_include_directories(XcpliteIntegration PRIVATE
+          ${CMAKE_CURRENT_SOURCE_DIR})
+  # Slave 可执行文件路径经 CMake 注入，禁止硬编码
+  target_compile_definitions(XcpliteIntegration PRIVATE
+          XCPLITE_SLAVE_EXECUTABLE="$<TARGET_FILE:xcp_test_slave>")
+  add_dependencies(XcpliteIntegration xcp_test_slave)
+  if(MSVC)
+    target_compile_options(XcpliteIntegration PRIVATE /utf-8)
+  endif()
+
+  # A2L 读取用例：依赖桥接层（libxcp::a2lbridge + 运行期 liba2l.dll）
+  if(LIBXCP_BUILD_A2L)
+    target_sources(XcpliteIntegration PRIVATE xcplite_a2l_read_test.cpp)
+    # 测量子系统 L3 全链路（v0.9）：桥接 + 适配器 + MeasurementSession
+    target_sources(XcpliteIntegration PRIVATE xcplite_measurement_test.cpp)
+    target_link_libraries(XcpliteIntegration PRIVATE
+            libxcp::a2lbridge libxcp_measurement_adapter)
+    target_compile_definitions(XcpliteIntegration PRIVATE
+            LIBXCP_HAS_A2LBRIDGE=1)
+    add_custom_command(TARGET XcpliteIntegration POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:liba2l::liba2l>"
+                    "$<TARGET_FILE_DIR:XcpliteIntegration>")
+  endif()
+
+  gtest_discover_tests(XcpliteIntegration DISCOVERY_TIMEOUT 120)
+endif()
 
 # ----------------------------------------------------------------------------
 # A2lSmoke —— A2L 最小开发验证集（code-plan/A2L_CMake最小开发验证集_R4.md §5）
@@ -147,6 +206,28 @@ if(LIBXCP_BUILD_A2L)
   add_test(NAME A2lE2E COMMAND A2lE2E)
   set_tests_properties(A2lE2E PROPERTIES FIXTURES_REQUIRED A2lGolden
           TIMEOUT 300)
+
+  # ----------------------------------------------------------------------------
+  # MeasurementAdapterTest —— A2L 测量数据库适配器（v0.5）：
+  # 用内存 Fake IA2lDatabase 校验 Find/ToPhysical 的桥接层→核心映射与错误透传。
+  # 链接 libxcp_measurement_adapter（适配器副产物），不并入 libxcp_tests。
+  # ----------------------------------------------------------------------------
+  add_executable(MeasurementAdapterTest measurement_adapter_test.cpp)
+  target_compile_features(MeasurementAdapterTest PRIVATE cxx_std_20)
+  target_link_libraries(MeasurementAdapterTest PRIVATE
+          libxcp_measurement_adapter
+          GTest::gtest
+          GTest::gtest_main)
+  target_include_directories(MeasurementAdapterTest PRIVATE
+          ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR})
+  if(MSVC)
+    target_compile_options(MeasurementAdapterTest PRIVATE /utf-8)
+  endif()
+  add_custom_command(TARGET MeasurementAdapterTest POST_BUILD
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                  "$<TARGET_FILE:liba2l::liba2l>"
+                  "$<TARGET_FILE_DIR:MeasurementAdapterTest>")
+  gtest_discover_tests(MeasurementAdapterTest DISCOVERY_TIMEOUT 60)
 
   # ----------------------------------------------------------------------------
   # T9 性能基线（批次13 T13-16/T13-17）：≥5 MB 合成 A2L，**只记基线不设 SLA**。

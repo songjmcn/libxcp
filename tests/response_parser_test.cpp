@@ -476,5 +476,120 @@ TEST(ParseDaqResponses, DaqKeyByteParserIsPureBitMath) {
     EXPECT_FALSE(HasDaqMode(DaqListModeBit::kStim, DaqListModeBit::kPidOff));
 }
 
+// --------------------------------------------------------------------------
+// 变量标定批次：Calibration / Page Switching 响应（docs §7.5.2.5 / §7.5.3；
+// CRM 布局对照 thirdparty/XCPlite/src/xcp.h:604-660）
+// --------------------------------------------------------------------------
+
+TEST(ParseCalibrationResponses, GetCalPageCarriesLogicalPage) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [reserved][reserved][PAGE_NUMBER]（xcp.h CRM_GET_CAL_PAGE_LEN=4）
+    const auto resp = parser.ParseGetCalPage(BytesOf({0x00, 0x00, 0x07}));
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->page, 0x07U);
+    // 截断（少于 3 字节）拒绝
+    EXPECT_FALSE(parser.ParseGetCalPage(BytesOf({0x00, 0x01})).has_value());
+}
+
+TEST(ParseCalibrationResponses, GetPagProcessorInfoDecodesSegmentAndProps) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [MAX_SEGMENT][PAG_PROPERTIES]（FREEZE_SUPPORTED=bit0）
+    const auto resp = parser.ParseGetPagProcessorInfo(BytesOf({0x04, 0x01}));
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->max_segment, 0x04U);
+    EXPECT_TRUE(HasPagProperty(resp->properties, PagPropertyBit::kFreezeSupported));
+    const auto no_freeze =
+        parser.ParseGetPagProcessorInfo(BytesOf({0x01, 0x00}));
+    ASSERT_TRUE(no_freeze.has_value());
+    EXPECT_FALSE(
+        HasPagProperty(no_freeze->properties, PagPropertyBit::kFreezeSupported));
+    EXPECT_FALSE(parser.ParseGetPagProcessorInfo(BytesOf({0x04})).has_value());
+}
+
+TEST(ParseCalibrationResponses, GetSegmentInfoMode0ReadsDwordIntel) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // Mode 0/2 剥 FF 后为 DWORD@0..3（CRM 总长 8，多余填充忽略）
+    const auto addr = parser.ParseGetSegmentInfo(
+        BytesOf({0x00, 0x31, 0x00, 0x00, 0x00, 0x00}),
+        SegmentInfoMode::BasicInfo);
+    ASSERT_TRUE(addr.has_value());
+    const auto* basic = std::get_if<SegmentBasicInfo>(&addr->data);
+    ASSERT_NE(basic, nullptr);
+    EXPECT_EQ(basic->value, 0x00003100U);
+    // 截断（<4 字节）拒绝
+    EXPECT_FALSE(parser
+                     .ParseGetSegmentInfo(BytesOf({0x00, 0x31, 0x00}),
+                                          SegmentInfoMode::BasicInfo)
+                     .has_value());
+}
+
+TEST(ParseCalibrationResponses, GetSegmentInfoMode0MotorolaByteOrder) {
+    const ResponseParser parser(ByteOrder::Motorola);
+    const auto len = parser.ParseGetSegmentInfo(
+        BytesOf({0x00, 0x01, 0x00, 0x00}), SegmentInfoMode::BasicInfo);
+    ASSERT_TRUE(len.has_value());
+    const auto* basic = std::get_if<SegmentBasicInfo>(&len->data);
+    ASSERT_NE(basic, nullptr);
+    EXPECT_EQ(basic->value, 0x00010000U);
+}
+
+TEST(ParseCalibrationResponses, GetSegmentInfoMode1StandardProperties) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [MAX_PAGES][ADDRESS_EXTENSION][MAX_MAPPING][COMPRESSION][ENCRYPTION]
+    const auto resp = parser.ParseGetSegmentInfo(
+        BytesOf({0x08, 0x02, 0x03, 0x01, 0x00}),
+        SegmentInfoMode::StandardProperties);
+    ASSERT_TRUE(resp.has_value());
+    const auto* props = std::get_if<SegmentStandardProperties>(&resp->data);
+    ASSERT_NE(props, nullptr);
+    EXPECT_EQ(props->max_pages, 0x08U);
+    EXPECT_EQ(props->address_extension, 0x02U);
+    EXPECT_EQ(props->max_mapping, 0x03U);
+    EXPECT_EQ(props->compression_method, 0x01U);
+    EXPECT_EQ(props->encryption_method, 0x00U);
+    // Mode 1 最小长度 5，截断拒绝
+    EXPECT_FALSE(parser
+                     .ParseGetSegmentInfo(BytesOf({0x08, 0x02, 0x03, 0x01}),
+                                          SegmentInfoMode::StandardProperties)
+                     .has_value());
+}
+
+TEST(ParseCalibrationResponses, GetSegmentInfoMode2YieldsMappingVariant) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto resp =
+        parser.ParseGetSegmentInfo(BytesOf({0x10, 0x20, 0x00, 0x00}),
+                                   SegmentInfoMode::MappingInfo);
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_TRUE(std::holds_alternative<SegmentMappingInfo>(resp->data));
+    EXPECT_EQ(std::get<SegmentMappingInfo>(resp->data).value, 0x00002010U);
+}
+
+TEST(ParseCalibrationResponses, GetPageInfoSplitsPageProperties) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // PAGE_PROPERTIES: ECU_ACCESS=3(bits0-1)、XCP_READ=1(bits2-3)、
+    //                  XCP_WRITE=2(bits4-5) → 0b10_01_11 = 0x27
+    const auto resp = parser.ParseGetPageInfo(BytesOf({0x27, 0x05}));
+    ASSERT_TRUE(resp.has_value());
+    EXPECT_EQ(resp->properties.ecu_access, PageAccessType::DontCare);
+    EXPECT_EQ(resp->properties.xcp_read_access,
+              PageAccessType::WithoutOtherAccess);
+    EXPECT_EQ(resp->properties.xcp_write_access,
+              PageAccessType::WithConcurrentAccess);
+    EXPECT_EQ(resp->init_segment, 0x05U);
+    EXPECT_FALSE(parser.ParseGetPageInfo(BytesOf({0x27})).has_value());
+}
+
+TEST(ParseCalibrationResponses, GetSegmentModeReadsModeAtOffsetOne) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // [reserved][MODE]（xcp.h CRM_GET_SEGMENT_MODE_LEN=3）
+    const auto frozen = parser.ParseGetSegmentMode(BytesOf({0x00, 0x01}));
+    ASSERT_TRUE(frozen.has_value());
+    EXPECT_TRUE(HasSegmentMode(frozen->mode, SegmentModeBit::kFreeze));
+    const auto running = parser.ParseGetSegmentMode(BytesOf({0x00, 0x00}));
+    ASSERT_TRUE(running.has_value());
+    EXPECT_FALSE(HasSegmentMode(running->mode, SegmentModeBit::kFreeze));
+    EXPECT_FALSE(parser.ParseGetSegmentMode(BytesOf({0x00})).has_value());
+}
+
 }  // namespace
 }  // namespace calmcar::xcp

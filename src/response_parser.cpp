@@ -29,6 +29,10 @@ constexpr std::size_t kStartStopDaqListResMinSize = 1;
 /// @brief GET_DAQ_LIST_INFO 响应去掉 PID 后的最小长度
 /// （PROPERTIES/MAX_ODT/MAX_ODT_ENTRY/FIXED_EVENT(WORD)）
 constexpr std::size_t kGetDaqListInfoResMinSize = 5;
+/// @brief GET_DAQ_EVENT_INFO 响应去掉 PID 后的最小长度（v0.3；XCPlite 实然
+/// xcp.h:819-825）
+/// （PROPERTIES/MAX_DAQ_LISTS/NAME_LENGTH/TIME_CYCLE/TIME_UNIT/PRIORITY）
+constexpr std::size_t kGetDaqEventInfoResMinSize = 6;
 /// @brief GET_DAQ_RESOLUTION_INFO 响应去掉 PID 后的最小长度
 /// （DAQ 粒度+上限、STIM 粒度+上限、TIMESTAMP_MODE、TIMESTAMP_TICKS(WORD)）
 constexpr std::size_t kGetDaqResolutionInfoResMinSize = 7;
@@ -305,6 +309,25 @@ std::optional<GetDaqListInfoResponse> ResponseParser::ParseGetDaqListInfo(
     return resp;
 }
 
+std::optional<GetDaqEventInfoResponse> ResponseParser::ParseGetDaqEventInfo(
+    BytesView res_data) const {
+    // GET_DAQ_EVENT_INFO RES（去掉 0xFF）：[PROPERTIES][MAX_DAQ_LISTS]
+    //   [NAME_LENGTH][TIME_CYCLE][TIME_UNIT][PRIORITY]（XCPlite 实然
+    //   xcp.h:819-825，CRM_LEN=7 含 0xFF → 数据 6 字节）。
+    // 注意：事件通道号**不在响应中回显**（调用方持有入参 event_channel）。
+    if (res_data.size() < kGetDaqEventInfoResMinSize) {
+        return std::nullopt;
+    }
+    GetDaqEventInfoResponse resp;
+    resp.properties = res_data[0];
+    resp.max_daq_lists = res_data[1];
+    resp.name_length = res_data[2];
+    resp.time_cycle = res_data[3];
+    resp.time_unit = res_data[4];
+    resp.priority = res_data[5];
+    return resp;
+}
+
 std::optional<GetDaqProcessorInfoResponse>
 ResponseParser::ParseGetDaqProcessorInfo(BytesView res_data) const {
     // GET_DAQ_PROCESSOR_INFO RES: [FF][PROPERTIES][MAX_DAQ(WORD)]
@@ -366,6 +389,134 @@ std::optional<ReadDaqResponse> ResponseParser::ParseReadDaq(
         return std::nullopt;
     }
     resp.address = *address;
+    return resp;
+}
+
+std::optional<GetIdResponse> ResponseParser::ParseGetId(
+    BytesView res_data) const {
+    // GET_ID RES（XCPlite 实然 xcp.h:521-525）：剥 0xFF 后
+    // [MODE@0][reserved×2][LENGTH DWORD@3..6][DATA@7..]；规范 §7.5.1.6
+    // 的 LENGTH 为 WORD 且偏移不同——实然优先（批次21 21-2）。
+    if (res_data.size() < 7U) {
+        return std::nullopt;
+    }
+    GetIdResponse resp;
+    resp.transfer_mode = res_data[0];
+    const auto length = ReadU32(res_data, 3);
+    if (!length) {
+        return std::nullopt;
+    }
+    resp.length = *length;
+    if (res_data.size() > 7U) {
+        const std::size_t avail = res_data.size() - 7U;
+        const std::size_t take =
+            avail < resp.length ? avail : static_cast<std::size_t>(resp.length);
+        resp.identification_data.assign(
+            res_data.begin() + 7,
+            res_data.begin() + 7 + static_cast<std::ptrdiff_t>(take));
+    }
+    return resp;
+}
+
+std::optional<GetCalPageResponse> ResponseParser::ParseGetCalPage(
+    BytesView res_data) const {
+    // GET_CAL_PAGE RES: [FF][reserved][reserved][PAGE_NUMBER]
+    // （xcp.h CRM_GET_CAL_PAGE_LEN=4；docs §7.5.3.2 返回逻辑 Page Number）
+    if (res_data.size() < 3U) {
+        return std::nullopt;
+    }
+    GetCalPageResponse resp;
+    const auto page = ReadU8(res_data, 2);
+    if (!page) {
+        return std::nullopt;
+    }
+    resp.page = *page;
+    return resp;
+}
+
+std::optional<GetPagProcessorInfoResponse>
+ResponseParser::ParseGetPagProcessorInfo(BytesView res_data) const {
+    // GET_PAG_PROCESSOR_INFO RES: [FF][MAX_SEGMENT][PAG_PROPERTIES]
+    // （xcp.h CRM_GET_PAG_PROCESSOR_INFO_LEN=3；docs §7.5.3.3）
+    if (res_data.size() < 2U) {
+        return std::nullopt;
+    }
+    GetPagProcessorInfoResponse resp;
+    resp.max_segment = res_data[0];
+    resp.properties = static_cast<PagPropertyBit>(res_data[1]);
+    return resp;
+}
+
+std::optional<GetSegmentInfoResponse> ResponseParser::ParseGetSegmentInfo(
+    BytesView res_data, SegmentInfoMode mode) const {
+    // GET_SEGMENT_INFO RES（docs §7.5.3.4，变长按 Mode 分支）：
+    //   Mode 0/2: [DWORD@0..3]（xcp.h CRM_GET_SEGMENT_INFO_MODE0_LEN=8 →
+    //             剥 FF 后数据 4 字节 DWORD，剩余填充字节忽略）
+    //   Mode 1:   [MAX_PAGES][ADDRESS_EXTENSION][MAX_MAPPING]
+    //             [COMPRESSION][ENCRYPTION]（xcp.h LEN=6 → 数据 5 字节）
+    GetSegmentInfoResponse resp;
+    resp.mode = mode;
+    switch (mode) {
+        case SegmentInfoMode::BasicInfo:
+        case SegmentInfoMode::MappingInfo: {
+            if (res_data.size() < 4U) {
+                return std::nullopt;
+            }
+            const auto value = ReadU32(res_data, 0);
+            if (!value) {
+                return std::nullopt;
+            }
+            SegmentBasicInfo basic;
+            basic.value = *value;
+            if (mode == SegmentInfoMode::MappingInfo) {
+                SegmentMappingInfo mapping;
+                mapping.value = *value;
+                resp.data = mapping;
+            } else {
+                resp.data = basic;
+            }
+            return resp;
+        }
+        case SegmentInfoMode::StandardProperties: {
+            if (res_data.size() < 5U) {
+                return std::nullopt;
+            }
+            SegmentStandardProperties props;
+            props.max_pages = res_data[0];
+            props.address_extension = res_data[1];
+            props.max_mapping = res_data[2];
+            props.compression_method = res_data[3];
+            props.encryption_method = res_data[4];
+            resp.data = props;
+            return resp;
+        }
+    }
+    // 请求 Mode 非法（编码层已拦截 >2；此处防御性拒绝）
+    return std::nullopt;
+}
+
+std::optional<GetPageInfoResponse> ResponseParser::ParseGetPageInfo(
+    BytesView res_data) const {
+    // GET_PAGE_INFO RES: [FF][PAGE_PROPERTIES][INIT_SEGMENT]
+    // （xcp.h CRM_GET_PAGE_INFO_LEN=3；docs §7.5.3.5）
+    if (res_data.size() < 2U) {
+        return std::nullopt;
+    }
+    GetPageInfoResponse resp;
+    resp.properties = ParsePageProperties(res_data[0]);
+    resp.init_segment = res_data[1];
+    return resp;
+}
+
+std::optional<GetSegmentModeResponse> ResponseParser::ParseGetSegmentMode(
+    BytesView res_data) const {
+    // GET_SEGMENT_MODE RES: [FF][reserved][MODE]
+    // （xcp.h CRM_GET_SEGMENT_MODE_LEN=3；docs §7.5.3.7）
+    if (res_data.size() < 2U) {
+        return std::nullopt;
+    }
+    GetSegmentModeResponse resp;
+    resp.mode = static_cast<SegmentModeBit>(res_data[1]);
     return resp;
 }
 

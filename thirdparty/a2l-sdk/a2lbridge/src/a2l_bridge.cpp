@@ -16,6 +16,7 @@
 
 #include "a2l_database_impl.hpp"
 #include "a2l_dto_map.hpp"
+#include "structure_layout.hpp"
 #include "libxcp/a2l/a2l_bridge.hpp"
 
 namespace calmcar::xcp::a2l {
@@ -78,6 +79,27 @@ struct A2lBridge::Impl {
                                              "枚举结构体元数据失败");
             return false;
         }
+        // 批次18（STRUCTLEAF 16-B）：TYPEDEF_MEASUREMENT 事实 +
+        // TYPEDEF_STRUCTURE/INSTANCE 拆分 → 解析成员叶子。
+        // "没有 typedef / 没有实例"返回空向量，不是错误（与 structs 同纪律）。
+        std::vector<liba2l::TypedefMeasurementDto> typedefs;
+        const liba2l::ErrorCode tm_rc = doc->ListTypedefMeasurements(&typedefs);
+        if (tm_rc != liba2l::ErrorCode::kOk) {
+            last_error = detail::MapSdkError(tm_rc, Phase::Load,
+                                             "枚举 TYPEDEF_MEASUREMENT 失败");
+            return false;
+        }
+        std::vector<liba2l::StructInfoDto> struct_typedefs;
+        std::vector<liba2l::StructInfoDto> instances;
+        for (const liba2l::StructInfoDto& s : structs) {
+            if (s.is_instance) {
+                instances.push_back(s);
+            } else {
+                struct_typedefs.push_back(s);
+            }
+        }
+        const detail::StructureLayoutResult layout =
+            detail::BuildStructureLeaves(struct_typedefs, instances, typedefs);
         // 批次13（R3 接线）：SDK 给出了 RECORD_LAYOUT 类别的 CHARACTERISTIC
         // 才进判定器表；无类别的符号不进（"无信息"≠"不可执行"）。
         std::unordered_map<std::string, RecordLayoutInfo> record_layouts;
@@ -89,8 +111,9 @@ struct A2lBridge::Impl {
                     std::move(info));
             }
         }
-        database = detail::MakeDatabase(std::move(symbols), std::move(structs),
-                                        std::move(record_layouts));
+        database = detail::MakeDatabase(
+            std::move(symbols), std::move(structs), std::move(record_layouts),
+            std::move(layout.leaves), std::move(layout.warnings));
 
         Result<IfDataXcpInfo> xcp =
             detail::BuildIfDataXcp(*doc, require_if_data);
@@ -114,7 +137,8 @@ struct A2lBridge::Impl {
             warning.phase = Phase::Layout;
             warning.subject = "DAQ_LIST " + std::to_string(list.number);
             warning.message =
-                "A2L 未声明 FIRST_PID，解码按列表号回退（未经实际取证，弱权威）";
+                "A2L 未声明 "
+                "FIRST_PID，解码按列表号回退（未经实际取证，弱权威）";
             load_warnings.push_back(std::move(warning));
         }
         // 快照至此完整：database/xcp_info 同时可见（无半发布窗口——
@@ -324,9 +348,9 @@ Result<std::unique_ptr<IDaqLayout>> A2lBridge::CreateDaqLayout() const {
             continue;
         }
         for (std::size_t i = 0; i < l.odts.size(); ++i) {
-            snapshot.routes.push_back(DaqOdtRoute{
-                static_cast<std::uint8_t>(*l.first_pid + i), l.number,
-                static_cast<std::uint8_t>(i)});
+            snapshot.routes.push_back(
+                DaqOdtRoute{static_cast<std::uint8_t>(*l.first_pid + i),
+                            l.number, static_cast<std::uint8_t>(i)});
         }
     }
     return detail::MakeDaqLayout(std::move(snapshot), m_impl_->database.get());

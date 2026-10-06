@@ -115,6 +115,29 @@ struct GetDaqListInfoResponse {
 };
 
 /**
+ * @brief GET_DAQ_EVENT_INFO 响应解析结果（v0.3；xCPlite 实然布局
+ *        xcp.h:819-825，CRO_GET_DAQ_EVENT_INFO_LEN=4 / CRM_LEN=7）
+ * @details RES 数据（去掉 0xFF 后）为 6 字节，**事件通道号不在响应中回显**
+ *          （调用方已持有入参 event_channel）：
+ *          [PROPERTIES][MAX_DAQ_LISTS][NAME_LENGTH][TIME_CYCLE][TIME_UNIT]
+ *          [PRIORITY]。
+ *          - NAME_LENGTH：事件名长度（XCP 1.3.0 §7.5.4.11 可选字段；事件名主体
+ *            经 UPLOAD 通路按 MTA 取自本地缓冲区，本解析器只取长度）。
+ *          - time_cycle / time_unit：周期与单位码；time_unit 的实然含义（XCPlite
+ *            xcplite.c:2543-：1ns=0,10ns=1,100ns=2,1us=3,…,1ms=6）
+ *            写入调用方语义层，本结构只保留原码。
+ *          可选优先级仅在事件信息存在 EXTENDED 属性时有效（XCPlite 恒给）。
+ */
+struct GetDaqEventInfoResponse {
+    std::uint8_t properties{0};  ///< EVENT_PROPERTIES 原始位
+    std::uint8_t max_daq_lists{0};  ///< 该事件可用 DAQ List 数（XCPlite 恒 0xFF）
+    std::uint8_t name_length{0};  ///< 事件名长度
+    std::uint8_t time_cycle{0};   ///< 事件周期（缩放单位），原码
+    std::uint8_t time_unit{0};    ///< 周期单位码，原码
+    std::uint8_t priority{0};     ///< 事件优先级（0xFF = 最高）
+};
+
+/**
  * @brief GET_DAQ_PROCESSOR_INFO 响应解析结果（docs L2292-2311；xcp.h:790-795）
  * @details B-16 的 DAQ 侧比对（identification_field_type /
  *          address_extension_mode）唯一的运行时真值来源就是本响应的
@@ -153,6 +176,18 @@ struct ReadDaqResponse {
     std::uint8_t size{0};                   ///< SIZE（以 AG 为单位的元素数）
     AddressExtension address_extension{0};  ///< 地址扩展
     Address address{0};                     ///< 32 位地址
+};
+
+/**
+ * @brief GET_ID 响应解析结果（批次 21 21-2；XCPlite 实然布局 xcp.h:521-525）
+ * @details CRM：MODE=b1（0x00=走 UPLOAD、0x01=响应内含数据）、
+ *          LENGTH=DWORD@b4..7、DATA=b8..。规范 §7.5.1.6 的 LENGTH 为 WORD
+ *          且偏移不同——实然优先。res_data 已剥 0xFF，索引全体 -1。
+ */
+struct GetIdResponse {
+    std::uint8_t transfer_mode{0};  ///< 传输模式（b1 原码）
+    std::uint32_t length{0};        ///< LENGTH：标识数据/文件的字节长
+    Bytes identification_data;  ///< MODE=0x01 时的响应内数据（MODE=0 为空）
 };
 
 /// @brief 解析后的 Packet 联合类型
@@ -246,6 +281,16 @@ public:
         BytesView res_data) const;
 
     /**
+     * @brief 解析 GET_DAQ_EVENT_INFO 响应（v0.3；XCPlite 实然 xcp.h:819-825，
+     *        CRO_GET_DAQ_EVENT_INFO_LEN=4 / CRM_LEN=7）
+     * @param res_data RES 后的数据（去掉 0xFF 前缀，长度必须 >= 6：
+     *                 PROPERTIES/MAX_DAQ_LISTS/NAME_LENGTH/TIME_CYCLE/
+     *                 TIME_UNIT/PRIORITY；事件通道号不在响应中回显）
+     */
+    [[nodiscard]] std::optional<GetDaqEventInfoResponse>
+    ParseGetDaqEventInfo(BytesView res_data) const;
+
+    /**
      * @brief 解析 GET_DAQ_PROCESSOR_INFO 响应（docs L2292-2311；xcp.h:790-795）
      * @param res_data RES 后的数据（长度必须 >= 7：PROPERTIES/MAX_DAQ(WORD)/
      *                 MAX_EVENT_CHANNEL(WORD)/MIN_DAQ/DAQ_KEY_BYTE）
@@ -266,6 +311,62 @@ public:
      * @param res_data RES 后的数据（长度必须 >= 7：BITOFFSET/SIZE/EXT/ADDR）
      */
     [[nodiscard]] std::optional<ReadDaqResponse> ParseReadDaq(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_ID 响应（批次 21 21-2；XCPlite 实然布局，
+     *        见 GetIdResponse）
+     * @param res_data RES 后的数据（长度必须 >= 7：MODE + reserved×2 +
+     *                 LENGTH(DWORD)）
+     */
+    [[nodiscard]] std::optional<GetIdResponse> ParseGetId(
+        BytesView res_data) const;
+
+    // ---- 变量标定批次：Calibration / Page Switching 响应（docs §7.5.2.5 /
+    //      §7.5.3；CRM 布局对照 thirdparty/XCPlite/src/xcp.h:604-660）----
+
+    /**
+     * @brief 解析 GET_CAL_PAGE 响应（docs §7.5.3.2；xcp.h CRM_GET_CAL_PAGE_LEN=4）
+     * @param res_data RES 后的数据（长度必须 >= 3：reserved×2 + PAGE_NUMBER）
+     * @note 布局 [FF][reserved][reserved][page]，剥 FF 后 page 在偏移 2。
+     */
+    [[nodiscard]] std::optional<GetCalPageResponse> ParseGetCalPage(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_PAG_PROCESSOR_INFO 响应（docs §7.5.3.3；
+     *        xcp.h CRM_GET_PAG_PROCESSOR_INFO_LEN=3）
+     * @param res_data RES 后的数据（长度必须 >= 2：MAX_SEGMENT/PAG_PROPERTIES）
+     */
+    [[nodiscard]] std::optional<GetPagProcessorInfoResponse>
+    ParseGetPagProcessorInfo(BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_SEGMENT_INFO 响应（docs §7.5.3.4；变长，按 Mode 分支）
+     * @param res_data RES 后的数据
+     * @param mode 请求时使用的 SegmentInfoMode（决定响应布局与最小长度）
+     * @details Mode 0/2：[DWORD@0..3]（长度 >= 4）；
+     *          Mode 1：[MAX_PAGES][ADDRESS_EXTENSION][MAX_MAPPING]
+     *                   [COMPRESSION][ENCRYPTION]（长度 >= 5）。
+     *          Slave 可能返回更长的兼容响应，多余字节安全忽略。
+     */
+    [[nodiscard]] std::optional<GetSegmentInfoResponse> ParseGetSegmentInfo(
+        BytesView res_data, SegmentInfoMode mode) const;
+
+    /**
+     * @brief 解析 GET_PAGE_INFO 响应（docs §7.5.3.5；xcp.h CRM_GET_PAGE_INFO_LEN=3）
+     * @param res_data RES 后的数据（长度必须 >= 2：PAGE_PROPERTIES/INIT_SEGMENT）
+     */
+    [[nodiscard]] std::optional<GetPageInfoResponse> ParseGetPageInfo(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_SEGMENT_MODE 响应（docs §7.5.3.7；
+     *        xcp.h CRM_GET_SEGMENT_MODE_LEN=3）
+     * @param res_data RES 后的数据（长度必须 >= 2：reserved + MODE）
+     * @note 布局 [FF][reserved][mode]，剥 FF 后 mode 在偏移 1。
+     */
+    [[nodiscard]] std::optional<GetSegmentModeResponse> ParseGetSegmentMode(
         BytesView res_data) const;
 
 private:

@@ -30,8 +30,9 @@ enum class ErrorCategory {
     Timeout,             ///< 规定时间内没有最终响应
     MalformedPacket,     ///< PID、长度、对齐或字段非法
     ProtocolError,       ///< Slave 返回 ERR
-    UnsupportedFeature,  ///< 本阶段未实现的功能（如 DAQ、块模式）
-    RecoveryFailed,      ///< SYNCH 恢复或重试耗尽
+    UnsupportedFeature,      ///< 本阶段未实现的功能（如 DAQ、块模式）
+    RecoveryFailed,          ///< SYNCH 恢复或重试耗尽
+    OperationOutcomeUnknown, ///< 命令可能已生效但响应丢失，无法确认最终结果
 };
 
 /// @brief 将错误分类转为字符串

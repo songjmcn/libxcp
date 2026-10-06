@@ -840,6 +840,22 @@ TEST(UdpTransportConfigValidation, BindFailureReportedAsTransportError) {
     slave.Stop();
 }
 
+TEST(UdpTransportConfigValidation, ZeroReceivePollIntervalIsRejected) {
+    auto cfg = MakeConfig(12345U);
+    cfg.receive_poll_interval_ms = 0U;
+    UdpTransport transport(cfg);
+    RecordingListener listener;
+
+    try {
+        transport.Open(listener);
+        FAIL() << "零接收轮询间隔应在创建 Socket 前被拒绝";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+        EXPECT_NE(std::string(e.what()).find("receive_poll_interval_ms"),
+                  std::string::npos);
+    }
+}
+
 // --------------------------------------------------------------------------
 // 关闭 / 取消语义
 // --------------------------------------------------------------------------
@@ -849,7 +865,7 @@ TEST(UdpTransportClose, CloseWhileBlockedReturnsPromptly) {
     slave.Start();
     auto cfg = MakeConfig(slave.Port());
     cfg.receive_poll_interval_ms =
-        1000;  // 故意放大轮询周期，验证不依赖轮询也能及时退出
+        1000;  // 放大轮询周期，确认 Close 最迟在一个轮询周期内退出
     UdpTransport transport(cfg);
     RecordingListener listener;
     transport.Open(listener);

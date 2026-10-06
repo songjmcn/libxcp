@@ -1,0 +1,1 @@
+/* libxcp 协议调试空壳 AML（供 include 链解析，与 xcp_test_slave 行为一致）*/

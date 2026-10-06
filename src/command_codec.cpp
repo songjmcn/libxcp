@@ -91,9 +91,17 @@ Bytes CommandCodec::EncodeGetCommModeInfo() const {
 
 Bytes CommandCodec::EncodeSetMta(AddressExtension extension,
                                  Address address) const {
+    // SET_MTA CRO（XCP 1.3 §7.5.1.10，Table CRO 布局）：
+    //   byte0=0xF6  byte1=MODE(本库恒 0=normal)  byte2=reserved
+    //   byte3=Address Extension  byte4..7=Address(32bit)
+    // 与 SHORT_UPLOAD 的地址域同构（ext@3/addr@4-7）。批次协议调试（XCPlite
+    // 对手端）核证：旧实现把 ext 放 byte2 且总长 7，真实 Slave 按规范回
+    // ERR_CMD_SYNTAX（XCPlite xcp.h CRO_SET_MTA_LEN=8, CRO_SET_MTA_EXT=byte3,
+    // CRO_SET_MTA_ADDR=dw[1]=byte4-7）。
     Bytes cto;
-    cto.reserve(7);
+    cto.reserve(8);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::SetMta));
+    cto.push_back(0x00U);  // MODE：0 = normal（Functional Mode 属后续里程碑）
     cto.push_back(0x00U);  // reserved
     cto.push_back(extension);
     WriteU32(cto, address);
@@ -129,6 +137,16 @@ Bytes CommandCodec::EncodeShortUpload(ElementCount number_of_elements,
     cto.push_back(0x00U);  // reserved
     cto.push_back(extension);
     WriteU32(cto, address);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetId(std::uint8_t identification_type) const {
+    // GET_ID（XCPlite 实然）：[FA][IDT]，2 字节（xcp.h:519-520）；
+    // 单字节字段与 Session Byte Order 无关。
+    Bytes cto;
+    cto.reserve(2);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetId));
+    cto.push_back(identification_type);
     return cto;
 }
 
@@ -260,6 +278,17 @@ Bytes CommandCodec::EncodeGetDaqListInfo(std::uint16_t daq_list) const {
     return cto;
 }
 
+Bytes CommandCodec::EncodeGetDaqEventInfo(std::uint16_t event_channel) const {
+    // GET_DAQ_EVENT_INFO: [D7][reserved][event_channel(WORD)]；
+    // xcp.h:817-818 declares CRO_LEN=4 and CRO_WORD(1), i.e. bytes 2..3.
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqEventInfo));
+    cto.push_back(0x00U);
+    WriteU16(cto, event_channel);
+    return cto;
+}
+
 Bytes CommandCodec::EncodeGetDaqProcessorInfo() const {
     // GET_DAQ_PROCESSOR_INFO: [DA]（1 字节无参；xcp.h:789）
     Bytes cto;
@@ -274,6 +303,58 @@ Bytes CommandCodec::EncodeGetDaqResolutionInfo() const {
     Bytes cto;
     cto.reserve(1);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqResolutionInfo));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeFreeDaq() const {
+    // FREE_DAQ: [D6]（1 字节无参；xcp.h:832 CRO_FREE_DAQ_LEN=1，
+    // xcplite.c:2562）。释放全部动态表，运行中发→CRC_DAQ_ACTIVE（D9）
+    Bytes cto;
+    cto.reserve(1);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::FreeDaq));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeAllocDaq(std::uint16_t count) const {
+    // ALLOC_DAQ: [D5][reserved][count(WORD)]
+    // （xcp.h:836-838：LEN4、COUNT=CRO_WORD(1)→字节2..3；xcplite.c:2567）。
+    // 时序硬门（D9/XcpAllocDaq xcplite.c:1148）：odt/entry 计数非零时再发
+    // →CRC_SEQUENCE，故编排层必须"一次 alloc 全部 list 数"
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::AllocDaq));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, count);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeAllocOdt(std::uint16_t daq_list,
+                                   std::uint8_t count) const {
+    // ALLOC_ODT: [D4][reserved][daq(WORD)][count]（xcp.h:841-844：LEN5、
+    // DAQ=CRO_WORD(1)→2..3、COUNT=CRO_BYTE(4)；xcplite.c:2574）。
+    // 同一 list 的多个 ODT 必须连续分配后再动 entry（游标语义）
+    Bytes cto;
+    cto.reserve(5);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::AllocOdt));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, daq_list);
+    cto.push_back(count);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeAllocOdtEntry(std::uint16_t daq_list,
+                                        std::uint8_t odt_number,
+                                        std::uint8_t count) const {
+    // ALLOC_ODT_ENTRY: [D3][reserved][daq(WORD)][odt][count]
+    // （xcp.h:847-851：LEN6、DAQ=CRO_WORD(1)→2..3、ODT=CRO_BYTE(4)、
+    // COUNT=CRO_BYTE(5)；xcplite.c:2583）。odt 为该 list 内相对号
+    Bytes cto;
+    cto.reserve(6);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::AllocOdtEntry));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, daq_list);
+    cto.push_back(odt_number);
+    cto.push_back(count);
     return cto;
 }
 
@@ -318,6 +399,153 @@ Bytes CommandCodec::EncodeShortDownload(ElementCount number_of_elements,
     cto.push_back(extension);
     WriteU32(cto, address);
     cto.insert(cto.end(), data.begin(), data.end());
+    return cto;
+}
+
+Bytes CommandCodec::EncodeModifyBits(std::uint8_t shift,
+                                     std::uint16_t and_mask,
+                                     std::uint16_t xor_mask) const {
+    // MODIFY_BITS: [EC][shift][AND Mask(WORD)][XOR Mask(WORD)]
+    // （xcp.h CRO_MODIFY_BITS_LEN=6：SHIFT=CRO_BYTE(1)、AND=CRO_WORD(2)、
+    //  XOR=CRO_WORD(3)→字节4..5）；Shift 有效范围 0..16（docs §7.5.2.5，
+    // 超出 Slave 回 ERR_OUT_OF_RANGE，本地预检直接拒绝）
+    if (shift > kModifyBitsMaxShift) {
+        throw detail::MakeInvalidArgument(
+            "MODIFY_BITS Shift Value 超出范围 0..16: " +
+            std::to_string(shift));
+    }
+    Bytes cto;
+    cto.reserve(6);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::ModifyBits));
+    cto.push_back(shift);
+    WriteU16(cto, and_mask);
+    WriteU16(cto, xor_mask);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeSetCalPage(CalPageModeBit mode,
+                                     std::uint8_t segment,
+                                     std::uint8_t page) const {
+    // SET_CAL_PAGE: [EB][mode][segment][page]（xcp.h CRO_SET_CAL_PAGE_LEN=4）
+    // mode 至少含 ECU/XCP 之一才有意义；仅 ALL 或全零组合 Slave 无法执行，
+    // 本地预检拒绝（ERR_MODE_NOT_VALID 的语义前置到调用方）
+    if (!HasCalPageMode(mode, CalPageModeBit::kEcu | CalPageModeBit::kXcp)) {
+        throw detail::MakeInvalidArgument(
+            "SET_CAL_PAGE Mode 必须包含 ECU(0x01) 或 XCP(0x02) 位: 0x" +
+            std::to_string(static_cast<unsigned>(mode)));
+    }
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::SetCalPage));
+    cto.push_back(static_cast<std::uint8_t>(mode));
+    cto.push_back(segment);
+    cto.push_back(page);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetCalPage(CalPageAccessMode access_mode,
+                                     std::uint8_t segment) const {
+    // GET_CAL_PAGE: [EA][access_mode][segment]（xcp.h CRO_GET_CAL_PAGE_LEN=3）
+    // Access Mode 仅允许 0x01(ECU)/0x02(XCP)，其他 Slave 回
+    // ERR_MODE_NOT_VALID（docs §7.5.3.2），本地预检拒绝
+    if (access_mode != CalPageAccessMode::Ecu &&
+        access_mode != CalPageAccessMode::Xcp) {
+        throw detail::MakeInvalidArgument(
+            "GET_CAL_PAGE Access Mode 仅允许 0x01(ECU)/0x02(XCP): 0x" +
+            std::to_string(static_cast<unsigned>(access_mode)));
+    }
+    Bytes cto;
+    cto.reserve(3);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetCalPage));
+    cto.push_back(static_cast<std::uint8_t>(access_mode));
+    cto.push_back(segment);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetPagProcessorInfo() const {
+    // GET_PAG_PROCESSOR_INFO: [E9]（1 字节无参；xcp.h
+    // CRO_GET_PAG_PROCESSOR_INFO_LEN=1）
+    Bytes cto;
+    cto.reserve(1);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetPagProcessorInfo));
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetSegmentInfo(SegmentInfoMode mode,
+                                         std::uint8_t segment,
+                                         SegmentInfoSelector info,
+                                         std::uint8_t mapping_index) const {
+    // GET_SEGMENT_INFO: [E8][mode][segment][segment_info][mapping_index]
+    // （xcp.h CRO_GET_SEGMENT_INFO_LEN=5）；mode/info 越界 Slave 回
+    // ERR_OUT_OF_RANGE，本地预检拒绝
+    const auto mode_raw = static_cast<std::uint8_t>(mode);
+    const auto info_raw = static_cast<std::uint8_t>(info);
+    if (mode_raw > 2U) {
+        throw detail::MakeInvalidArgument(
+            "GET_SEGMENT_INFO Mode 仅允许 0/1/2: " +
+            std::to_string(mode_raw));
+    }
+    if (info_raw > 2U) {
+        throw detail::MakeInvalidArgument(
+            "GET_SEGMENT_INFO SegmentInfo 仅允许 0/1/2: " +
+            std::to_string(info_raw));
+    }
+    Bytes cto;
+    cto.reserve(5);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetSegmentInfo));
+    cto.push_back(mode_raw);
+    cto.push_back(segment);
+    cto.push_back(info_raw);
+    cto.push_back(mapping_index);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetPageInfo(std::uint8_t segment,
+                                      std::uint8_t page) const {
+    // GET_PAGE_INFO: [E7][reserved][segment][page]（xcp.h
+    // CRO_GET_PAGE_INFO_LEN=4）
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetPageInfo));
+    cto.push_back(0x00U);  // reserved
+    cto.push_back(segment);
+    cto.push_back(page);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeSetSegmentMode(SegmentModeBit mode,
+                                         std::uint8_t segment) const {
+    // SET_SEGMENT_MODE: [E6][mode][segment]（xcp.h CRO_SET_SEGMENT_MODE_LEN=3）
+    // mode 仅 bit0 FREEZE 有定义，其余位原样透传由 Slave 判定
+    Bytes cto;
+    cto.reserve(3);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::SetSegmentMode));
+    cto.push_back(static_cast<std::uint8_t>(mode));
+    cto.push_back(segment);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetSegmentMode(std::uint8_t segment) const {
+    // GET_SEGMENT_MODE: [E5][reserved][segment]（xcp.h
+    // CRO_GET_SEGMENT_MODE_LEN=3）
+    Bytes cto;
+    cto.reserve(3);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetSegmentMode));
+    cto.push_back(0x00U);  // reserved
+    cto.push_back(segment);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeCopyCalPage(const CopyCalPageRequest& request) const {
+    // COPY_CAL_PAGE: [E4][src_segment][src_page][dst_segment][dst_page]
+    // （xcp.h CRO_COPY_CAL_PAGE_LEN=5）
+    Bytes cto;
+    cto.reserve(5);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::CopyCalPage));
+    cto.push_back(request.src_segment);
+    cto.push_back(request.src_page);
+    cto.push_back(request.dst_segment);
+    cto.push_back(request.dst_page);
     return cto;
 }
 

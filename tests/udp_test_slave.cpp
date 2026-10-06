@@ -1013,15 +1013,17 @@ void UdpTestSlave::HandleCommand(BytesView xcp_packet,
             destination =
                 std::make_pair(*m_connect_source_ip_, *m_connect_source_port_);
         } else if (cmd == static_cast<std::uint8_t>(CommandCode::SetMta)) {
-            if (xcp_packet.size() < 7U) {
+            // SET_MTA: [F6][MODE][reserved][EXT@3][ADDR@4..7]（XCP 1.3
+            // 布局，与 SHORT_UPLOAD 地址域同构；XCPlite 对手端核证）
+            if (xcp_packet.size() < 8U) {
                 response = MakeErr(ErrorCode::CmdSyntax);
             } else {
-                m_mta_extension_ = xcp_packet[2];
+                m_mta_extension_ = xcp_packet[3];
                 // Address 按 Session Byte Order（测试 Slave 固定 Intel 小端）
-                m_mta_ = static_cast<Address>(xcp_packet[3]) |
-                         (static_cast<Address>(xcp_packet[4]) << 8) |
-                         (static_cast<Address>(xcp_packet[5]) << 16) |
-                         (static_cast<Address>(xcp_packet[6]) << 24);
+                m_mta_ = static_cast<Address>(xcp_packet[4]) |
+                         (static_cast<Address>(xcp_packet[5]) << 8) |
+                         (static_cast<Address>(xcp_packet[6]) << 16) |
+                         (static_cast<Address>(xcp_packet[7]) << 24);
                 response = MakeRes({});
             }
             destination =

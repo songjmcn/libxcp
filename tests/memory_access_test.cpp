@@ -79,17 +79,19 @@ Address ParseShortUploadAddress(BytesView packet, ByteOrder order) {
 }
 
 /// @brief 从 SET_MTA 请求中解出 addr
+/// @details XCP 1.3 布局 [F6][MODE][rsv][EXT@3][ADDR@4..7]（与 SHORT_UPLOAD
+///          地址域同构；XCPlite 对手端协议调试核证）。
 Address ParseSetMtaAddress(BytesView packet, ByteOrder order) {
     if (order == ByteOrder::Intel) {
-        return static_cast<Address>(packet[3]) |
-               (static_cast<Address>(packet[4]) << 8) |
-               (static_cast<Address>(packet[5]) << 16) |
-               (static_cast<Address>(packet[6]) << 24);
+        return static_cast<Address>(packet[4]) |
+               (static_cast<Address>(packet[5]) << 8) |
+               (static_cast<Address>(packet[6]) << 16) |
+               (static_cast<Address>(packet[7]) << 24);
     }
-    return static_cast<Address>(packet[6]) |
-           (static_cast<Address>(packet[5]) << 8) |
-           (static_cast<Address>(packet[4]) << 16) |
-           (static_cast<Address>(packet[3]) << 24);
+    return static_cast<Address>(packet[7]) |
+           (static_cast<Address>(packet[6]) << 8) |
+           (static_cast<Address>(packet[5]) << 16) |
+           (static_cast<Address>(packet[4]) << 24);
 }
 
 /**
@@ -179,7 +181,7 @@ public:
                 return Bytes{static_cast<std::uint8_t>(PacketType::Res)};
             case CommandCode::SetMta:
                 m_mta_ = ParseSetMtaAddress(packet, m_order_);
-                m_mta_ext_ = packet[2];
+                m_mta_ext_ = packet[3];  // EXT 在 byte3（XCP 1.3 布局）
                 return Bytes{static_cast<std::uint8_t>(PacketType::Res)};
             case CommandCode::Upload:
                 return handleUpload(packet);

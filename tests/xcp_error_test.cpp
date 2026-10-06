@@ -68,6 +68,18 @@ TEST(ErrorCategoryName, CoversAllCategories) {
               "UnsupportedFeature");
     EXPECT_EQ(ErrorCategoryName(ErrorCategory::RecoveryFailed),
               "RecoveryFailed");
+    EXPECT_EQ(ErrorCategoryName(ErrorCategory::OperationOutcomeUnknown),
+              "OperationOutcomeUnknown");
+}
+
+TEST(XcpException, KeepsOperationOutcomeUnknownCategory) {
+    const XcpException ex(ErrorCategory::OperationOutcomeUnknown,
+                          "MODIFY_BITS outcome unknown",
+                          CommandCode::ModifyBits);
+    EXPECT_EQ(ex.Category(), ErrorCategory::OperationOutcomeUnknown);
+    EXPECT_EQ(ex.GetCommandCode(),
+              std::optional<CommandCode>(CommandCode::ModifyBits));
+    EXPECT_FALSE(ex.GetErrorCode().has_value());
 }
 
 TEST(DetailFactories, SetCategoryAndPayload) {

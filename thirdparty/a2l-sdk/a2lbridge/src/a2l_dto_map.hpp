@@ -102,11 +102,16 @@ class A2lDatabaseImpl;
  * @param structs TYPEDEF_STRUCTURE/INSTANCE 元数据快照（批次13，B-12）
  * @param record_layouts 规范键 → RECORD_LAYOUT 元数据（批次13 R3 接线；
  *        只含 SDK 给出类别的 CHARACTERISTIC）
+ * @param leaf_symbols 结构体成员叶子（批次18，STRUCTLEAF；由
+ *        BuildStructureLeaves 解析产出）
+ * @param leaf_warnings 叶子解析的不可证拒绝告警（批次18，随快照发布）
  */
 [[nodiscard]] std::unique_ptr<A2lDatabaseImpl> MakeDatabase(
     std::vector<liba2l::SymbolDto> dtos,
     std::vector<liba2l::StructInfoDto> structs,
-    std::unordered_map<std::string, RecordLayoutInfo> record_layouts);
+    std::unordered_map<std::string, RecordLayoutInfo> record_layouts,
+    std::vector<SymbolInfo> leaf_symbols,
+    std::vector<LoadWarning> leaf_warnings);
 
 /// @brief 按基地址反查规范符号名；无匹配或歧义地址返回空串（禁止猜测归属）
 [[nodiscard]] std::string FindByAddress(const A2lDatabaseImpl& db,

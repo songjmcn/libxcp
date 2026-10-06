@@ -25,6 +25,94 @@ constexpr ResourceMask kValidUnlockResources =
     static_cast<ResourceMask>(Resource::Stim) |
     static_cast<ResourceMask>(Resource::Pgm);
 
+/// @brief TIMESTAMP_MODE 低 3 位位宽码 → 字节数（批次20，G3）
+/// @details docs §7.5.4.10：Timestamp Size ∈ {0,1,2,4} 字节；其余码值为
+///          未定义组合——返回 0（不计入），**不猜**（B-3）。
+///          XCPlite TIMESTAMP_MODE=0x0C → size_code=4、fixed=bit3 ✓。
+constexpr std::size_t TimestampModeSizeBytes(std::uint8_t size_code) noexcept {
+    switch (size_code) {
+        case 1U:
+            return 1U;
+        case 2U:
+            return 2U;
+        case 4U:
+            return 4U;
+        default:
+            return 0U;
+    }
+}
+
+/// @brief DaqListSpec 入参预检（批次20 从静态通路抽出，STATIC/DYNAMIC 共用；
+///        报错文案与批次14/15 逐字一致）
+void PreflightDaqListSpec(const DaqListSpec& spec) {
+    if (spec.odts.empty()) {
+        throw detail::MakeInvalidArgument("DAQ List 至少要有 1 个 ODT");
+    }
+    if (spec.odts.size() > 0xFFU) {
+        throw detail::MakeInvalidArgument(
+            "ODT 数超过 SET_DAQ_PTR 单字节字段上限 255: " +
+            std::to_string(spec.odts.size()));
+    }
+    for (const auto& odt : spec.odts) {
+        if (odt.entries.empty()) {
+            throw detail::MakeInvalidArgument("ODT 至少要有 1 个 Entry");
+        }
+        if (odt.entries.size() > 0xFFU) {
+            throw detail::MakeInvalidArgument(
+                "ODT Entry 数超过 255: " + std::to_string(odt.entries.size()));
+        }
+        for (const auto& e : odt.entries) {
+            if (e.size == 0U) {
+                throw detail::MakeInvalidArgument(
+                    "WRITE_DAQ 的 Size 不得为 0（以 AG 为单位的元素数）");
+            }
+        }
+    }
+    if (spec.pid_off) {
+        throw detail::MakeInvalidArgument(
+            "PID_OFF 配置被拒绝：当前 DTO 解码器没有 Transport 层列表关联能力");
+    }
+}
+
+/// @brief spec 布尔标志 → SET_DAQ_LIST_MODE 位（docs L2190-2196；两路共用）
+DaqListModeBit DaqModeBitsFromSpec(const DaqListSpec& spec) {
+    DaqListModeBit mode = DaqListModeBit::kNone;
+    if (spec.stim_direction) {
+        mode = mode | DaqListModeBit::kStim;
+    }
+    if (spec.dto_counter) {
+        mode = mode | DaqListModeBit::kDtoCounter;
+    }
+    if (spec.timestamp) {
+        mode = mode | DaqListModeBit::kTimestamp;
+    }
+    if (spec.pid_off) {
+        mode = mode | DaqListModeBit::kPidOff;
+    }
+    return mode;
+}
+
+/// @brief 逐 ODT 的 MAX_DTO 信封预检（两路共用；文案与批次14 逐字一致）
+void ValidateDaqListAgainstMaxDto(const DaqListSpec& spec,
+                                  std::size_t header_bytes,
+                                  std::size_t ag_bytes, std::size_t max_dto) {
+    for (std::size_t odt_index = 0; odt_index < spec.odts.size(); ++odt_index) {
+        std::size_t payload_bytes = 0U;
+        for (const auto& e : spec.odts[odt_index].entries) {
+            payload_bytes += static_cast<std::size_t>(e.size) * ag_bytes;
+        }
+        const std::size_t total_bytes = header_bytes + payload_bytes;
+        if (total_bytes > max_dto) {
+            throw detail::MakeInvalidArgument(
+                "DAQ List " + std::to_string(spec.daq_list) + " 的 ODT " +
+                std::to_string(odt_index) + " 超过 MAX_DTO：header(" +
+                std::to_string(header_bytes) + ") + payload(" +
+                std::to_string(payload_bytes) + ") = " +
+                std::to_string(total_bytes) + " > " + std::to_string(max_dto));
+        }
+    }
+}
+
 }  // namespace
 
 XcpMaster::XcpMaster(std::unique_ptr<IXcpTransport> transport,
@@ -68,6 +156,10 @@ void XcpMaster::Connect() {
     m_daq_ledger_.clear();
     m_daq_processor_info_queried_ = false;
     m_daq_processor_properties_.reset();
+    m_daq_resolution_info_queried_ = false;
+    m_daq_timestamp_bytes_.reset();
+    m_pag_processor_info_queried_ = false;
+    m_pag_processor_info_.reset();
 
     // Transport.Open 的监听器即 CommandExecutor；Open 之后接收线程立即开始回调
     m_transport_->Open(m_executor_->AsListener());
@@ -94,6 +186,23 @@ void XcpMaster::Connect() {
 
         // GET_STATUS 为 Mandatory，失败即视为连接失败
         (void)m_executor_->ExecuteGetStatus();
+
+        // 变量标定批次：CONNECT 协商出 CAL/PAG 资源时探测 Paging 子系统
+        // （GET_PAG_PROCESSOR_INFO，Optional）。Slave 不支持（nullopt）或
+        // 查询超时等错误只降级缓存、不阻断连接——Page 命令本身仍是逐条
+        // Optional，由调用方按需触发懒查（QueryPagProcessorInfo）。
+        if (HasCalPagResource()) {
+            m_pag_processor_info_queried_ = true;
+            try {
+                m_pag_processor_info_ =
+                    m_executor_->ExecuteGetPagProcessorInfo();
+                if (m_pag_processor_info_) {
+                    m_session_.SetPagProcessorInfo(*m_pag_processor_info_);
+                }
+            } catch (const XcpException&) {
+                m_pag_processor_info_.reset();
+            }
+        }
     } catch (const XcpException&) {
         cleanup_on_failure();
         throw;
@@ -170,36 +279,8 @@ void XcpMaster::WriteMemoryBytes(Address address, AddressExtension extension,
 // ---------------------------------------------------------------------------
 
 void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
-    // ---- 1) 入参预检（非法不发命令；字段宽度上限来自 SET_DAQ_PTR 单字节字段）
-    if (spec.odts.empty()) {
-        throw detail::MakeInvalidArgument("DAQ List 至少要有 1 个 ODT");
-    }
-    if (spec.odts.size() > 0xFFU) {
-        throw detail::MakeInvalidArgument(
-            "ODT 数超过 SET_DAQ_PTR 单字节字段上限 255: " +
-            std::to_string(spec.odts.size()));
-    }
-    for (const auto& odt : spec.odts) {
-        if (odt.entries.empty()) {
-            throw detail::MakeInvalidArgument("ODT 至少要有 1 个 Entry");
-        }
-        if (odt.entries.size() > 0xFFU) {
-            throw detail::MakeInvalidArgument(
-                "ODT Entry 数超过 255: " + std::to_string(odt.entries.size()));
-        }
-        for (const auto& e : odt.entries) {
-            if (e.size == 0U) {
-                throw detail::MakeInvalidArgument(
-                    "WRITE_DAQ 的 Size 不得为 0（以 AG 为单位的元素数）");
-            }
-        }
-    }
-
-    // ---- 1b) 解码能力与 DTO 容量前置校验（批次15，F7/D8） ----
-    if (spec.pid_off) {
-        throw detail::MakeInvalidArgument(
-            "PID_OFF 配置被拒绝：当前 DTO 解码器没有 Transport 层列表关联能力");
-    }
+    // ---- 1) 入参预检 + 解码能力校验（批次20 抽出共享函数，文案不变）
+    PreflightDaqListSpec(spec);
     if (!m_daq_processor_info_queried_) {
         m_daq_processor_info_queried_ = true;
         const auto processor = m_executor_->ExecuteGetDaqProcessorInfo();
@@ -212,30 +293,20 @@ void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
             static_cast<DaqProcessorPropertyBit>(*m_daq_processor_properties_),
             DaqProcessorPropertyBit::kConfigType)) {
         throw detail::MakeUnsupportedFeature(
-            "Slave 声明 DAQ_PROPERTY_CONFIG_TYPE=DYNAMIC，当前只支持 STATIC "
-            "DAQ");
+            "Slave 声明 DAQ_PROPERTY_CONFIG_TYPE=DYNAMIC，静态通路不适用；"
+            "请改用 ConfigureDaqListsDynamic 做动态整表编排");
     }
 
     const std::size_t ag_bytes = AgToBytes(m_session_.GetAddressGranularity());
-    // 当前 DaqListSpec 未携带 TIMESTAMP_SIZE；只对已有明确字节数的 PID
-    // 与 DTO_COUNTER 计入预检，不能凭空把时间戳猜成 4 字节而拒绝既有配置。
-    const std::size_t header_bytes = 1U + (spec.dto_counter ? 1U : 0U);
-    for (std::size_t odt_index = 0; odt_index < spec.odts.size(); ++odt_index) {
-        std::size_t payload_bytes = 0U;
-        for (const auto& e : spec.odts[odt_index].entries) {
-            payload_bytes += static_cast<std::size_t>(e.size) * ag_bytes;
-        }
-        const std::size_t total_bytes = header_bytes + payload_bytes;
-        if (total_bytes > m_session_.MaxDto()) {
-            throw detail::MakeInvalidArgument(
-                "DAQ List " + std::to_string(spec.daq_list) + " 的 ODT " +
-                std::to_string(odt_index) + " 超过 MAX_DTO：header(" +
-                std::to_string(header_bytes) + ") + payload(" +
-                std::to_string(payload_bytes) +
-                ") = " + std::to_string(total_bytes) + " > " +
-                std::to_string(m_session_.MaxDto()));
-        }
+    // G3 修正（批次20）：spec.timestamp 开启时把 Slave 经
+    // GET_DAQ_RESOLUTION_INFO 声明的时间戳宽度计入信封预检；未声明按 0 计
+    // ——不猜（B-3），对不声明时间戳的 Slave 行为与旧口径完全一致。
+    std::size_t header_bytes = 1U + (spec.dto_counter ? 1U : 0U);
+    if (spec.timestamp) {
+        header_bytes += DaqTimestampBytesCached();
     }
+    ValidateDaqListAgainstMaxDto(spec, header_bytes, ag_bytes,
+                                 m_session_.MaxDto());
 
     // ---- 2) 下发；任何一步失败都回滚账本（B-6：解码只信完整账本） ----
     const std::size_t ledger_mark = m_daq_ledger_.size();
@@ -347,6 +418,228 @@ void XcpMaster::ClearDaqList(std::uint16_t daq_list) {
         m_daq_ledger_.end());
 }
 
+std::size_t XcpMaster::DaqTimestampBytesCached() {
+    // 一次性取证（G3）：GET_DAQ_RESOLUTION_INFO 属 Optional 面——Slave 不支持
+    // （CMD_UNKNOWN→nullopt）时按 0 字节计，不猜宽度（B-3）；结果缓存，
+    // Connect() 重置（D16）。
+    if (!m_daq_resolution_info_queried_) {
+        m_daq_resolution_info_queried_ = true;
+        const auto resolution = m_executor_->ExecuteGetDaqResolutionInfo();
+        if (resolution.has_value()) {
+            const std::size_t bytes =
+                TimestampModeSizeBytes(resolution->timestamp_mode.size_code);
+            if (bytes > 0U) {
+                m_daq_timestamp_bytes_ = static_cast<std::uint8_t>(bytes);
+            }
+        }
+    }
+    return m_daq_timestamp_bytes_.value_or(0U);
+}
+
+void XcpMaster::ClearDynamicTableBestEffort() {
+    // FREE 之后事务失败：Slave 半表不可复用、旧表已不存在——本地账本必须
+    // 同步清零（Decode 只信完整账本，B-6），代际同步作废。再 FREE 一次尽力
+    // 复位；二次失败吞掉，绝不掩盖首个异常。
+    m_daq_ledger_.clear();
+    m_session_.ClearStartedDaqLists();
+    m_session_.BumpDaqConfigGeneration();
+    try {
+        m_executor_->ExecuteFreeDaq();
+    } catch (...) {
+        // 尽力而为：下次 ConfigureDaqListsDynamic 开头的 FREE 会再次收口
+    }
+}
+
+void XcpMaster::ConfigureDaqListsDynamic(
+    const std::vector<DaqListSpec>& specs) {
+    // ---- 1) 入参预检（非法不发命令；整表 FREE 之前一切本地可拦的错误
+    //         都不该让 Slave 的既有表白白陪葬）----
+    if (specs.empty()) {
+        throw detail::MakeInvalidArgument(
+            "动态 DAQ 编排至少需要一个 List（ALLOC_DAQ 的 n 不得为 0，"
+            "xcplite.c:1148）");
+    }
+    if (specs.size() > 0xFFFFU) {
+        throw detail::MakeInvalidArgument(
+            "ALLOC_DAQ 的 n 超出 WORD 上限 65535: " +
+            std::to_string(specs.size()));
+    }
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        if (specs[i].daq_list != static_cast<std::uint16_t>(i)) {
+            throw detail::MakeInvalidArgument(
+                "ALLOC_DAQ 按分配顺序从 0 编号（MIN_DAQ=0，Slave 侧 daq_count "
+                "自增）：specs[" +
+                std::to_string(i) + "] 的 daq_list 必须等于其下标 " +
+                std::to_string(i) + "，实际为 " +
+                std::to_string(specs[i].daq_list));
+        }
+        PreflightDaqListSpec(specs[i]);
+    }
+
+    // ---- 2) 能力门：动态整表只放行正向声明 DYNAMIC 的 Slave（B-16 不猜；
+    //         XCPlite PROPERTIES=0x11 实证，D9/G1）----
+    if (!m_daq_processor_info_queried_) {
+        m_daq_processor_info_queried_ = true;
+        const auto processor = m_executor_->ExecuteGetDaqProcessorInfo();
+        if (processor.has_value()) {
+            m_daq_processor_properties_ = processor->properties;
+        }
+    }
+    if (!m_daq_processor_properties_.has_value() ||
+        !HasDaqProcessorProperty(
+            static_cast<DaqProcessorPropertyBit>(*m_daq_processor_properties_),
+            DaqProcessorPropertyBit::kConfigType)) {
+        throw detail::MakeUnsupportedFeature(
+            "Slave 未声明 DAQ_PROPERTY_CONFIG_TYPE=DYNAMIC（或不支持 "
+            "GET_DAQ_PROCESSOR_INFO），动态整表通路不适用；STATIC 表请改用 "
+            "ConfigureDaqList");
+    }
+    // ---- 2b) G3 修正：动态信封识别字段后跟随 Slave 声明的时间戳。XCPlite
+    //          强制 TIMESTAMP 模式位（D11）⇒ Slave 必回带时间戳，据此预检
+    //          ODT 预算；未声明（Optional 面缺失）按 0 字节计，不猜（B-3）。
+    const std::size_t timestamp_bytes = DaqTimestampBytesCached();
+    const std::size_t ag_bytes = AgToBytes(m_session_.GetAddressGranularity());
+    for (const auto& spec : specs) {
+        const std::size_t header_bytes =
+            1U + (spec.dto_counter ? 1U : 0U) + timestamp_bytes;
+        ValidateDaqListAgainstMaxDto(spec, header_bytes, ag_bytes,
+                                     m_session_.MaxDto());
+    }
+
+    // ---- 3) 整表重建事务：FREE → ALLOC_DAQ → ALLOC_ODT* → ALLOC_ODT_ENTRY*
+    //         → (SET_DAQ_PTR+WRITE_DAQ)* → SET_DAQ_LIST_MODE*。时序硬门
+    //         （xcplite.c:1143-1186）：ALLOC_DAQ 一次给足总数；一个 List 的
+    //         全部 ODT 分配完才能开始分 Entry。失败：整表 FREE 复位+账本清零。
+    m_executor_->ExecuteFreeDaq();
+    // FREE 成功即全表作废（含此前静态通路的登记）：代际推进、运行态清零
+    m_daq_ledger_.clear();
+    m_session_.ClearStartedDaqLists();
+    m_session_.BumpDaqConfigGeneration();
+
+    try {
+        m_executor_->ExecuteAllocDaq(static_cast<std::uint16_t>(specs.size()));
+        for (const auto& spec : specs) {
+            m_executor_->ExecuteAllocOdt(
+                spec.daq_list, static_cast<std::uint8_t>(spec.odts.size()));
+        }
+        for (const auto& spec : specs) {
+            std::uint8_t odt_no = 0U;
+            for (const auto& odt : spec.odts) {
+                m_executor_->ExecuteAllocOdtEntry(
+                    spec.daq_list, odt_no,
+                    static_cast<std::uint8_t>(odt.entries.size()));
+                ++odt_no;
+            }
+        }
+        for (const auto& spec : specs) {
+            std::uint8_t odt_no = 0U;
+            for (const auto& odt : spec.odts) {
+                std::uint8_t entry_no = 0U;
+                for (const auto& e : odt.entries) {
+                    m_executor_->ExecuteSetDaqPtr(spec.daq_list, odt_no,
+                                                  entry_no);
+                    m_executor_->ExecuteWriteDaq(e.bit_offset, e.size,
+                                                 e.extension, e.address);
+                    DaqLedgerEntry rec;
+                    rec.daq_list = spec.daq_list;
+                    rec.odt_number = odt_no;
+                    rec.odt_entry = entry_no;
+                    rec.address = e.address;
+                    rec.extension = e.extension;
+                    rec.size = e.size;
+                    rec.bit_offset = e.bit_offset;
+                    // rec.pid 留 nullopt：XCPlite 识别字段是
+                    // ODT(rel)+0xAA(FIL)+DAQ16（DAQ_KEY=0xC0），
+                    // FIRST_PID/Absolute 推导不成立（docs L2228，D19）
+                    m_daq_ledger_.push_back(rec);
+                    ++entry_no;
+                }
+                ++odt_no;
+            }
+        }
+        for (const auto& spec : specs) {
+            // mode 位按 spec 构造并强制 kTimestamp（XCPlite 缺位回
+            // CRC_CMD_SYNTAX，D11）；stim/dto_counter/pid_off 本地预拒
+            const DaqListModeBit mode =
+                DaqModeBitsFromSpec(spec) | DaqListModeBit::kTimestamp;
+            m_executor_->ExecuteSetDaqListMode(mode, spec.daq_list,
+                                               spec.event_channel,
+                                               spec.prescaler, spec.priority);
+        }
+    } catch (const XcpException&) {
+        ClearDynamicTableBestEffort();
+        throw;
+    } catch (const std::exception& e) {
+        ClearDynamicTableBestEffort();
+        throw detail::MakeTransportError("动态 DAQ 编排过程中发生非协议异常",
+                                         e.what());
+    }
+}
+
+void XcpMaster::StartDaqSync() {
+    // 账本去重取 List 集合（配置顺序即 0..n-1）
+    std::vector<std::uint16_t> lists;
+    for (const auto& e : m_daq_ledger_) {
+        if (std::find(lists.begin(), lists.end(), e.daq_list) == lists.end()) {
+            lists.push_back(e.daq_list);
+        }
+    }
+    if (lists.empty()) {
+        throw detail::MakeInvalidState(
+            "没有任何已配置的 DAQ List（账本为空），拒绝同步启动");
+    }
+    // 逐表 SELECT → START_STOP_SYNCH(START)：XCPlite 下单表 START(mode=1)
+    // 被 TEST_CHECKS 拒为 CRC_MODE_NOT_VALID（D12），SELECT+SYNCH 是唯一
+    // 实证可走的启动路径。不做 FIRST_PID 回填（识别字段非 Absolute，pid
+    // 保持 nullopt，B-16）。
+    for (const std::uint16_t list : lists) {
+        (void)m_executor_->ExecuteStartStopDaqList(DaqListAction::Select, list);
+    }
+    m_executor_->ExecuteStartStopSynch(DaqSynchAction::StartSelected);
+    for (const std::uint16_t list : lists) {
+        m_session_.MarkDaqListStarted(list);
+    }
+}
+
+Bytes XcpMaster::FetchA2lViaUpload() {
+    // 批次21 21-2：IDT 4 = IDT_ASAM_UPLOAD（XCPlite xcp.h:252）。对端响应
+    // MODE=0x00 + LENGTH（DWORD，文件字节数），内容只能靠后续 UPLOAD 从
+    // FILE MTA 顺序取；对端无 A2L 上传（fopen 失败/文件空）时上报 LENGTH=0。
+    if (!m_session_.IsConnected()) {
+        throw detail::MakeInvalidState(
+            "FetchA2lViaUpload 需要先 Connect Slave");
+    }
+    const GetIdResponse id = m_executor_->ExecuteGetId(0x04U);
+    if (id.transfer_mode != 0x00U) {
+        throw detail::MakeUnsupportedFeature(
+            "GET_ID(IDT=4) 返回 MODE=" + std::to_string(id.transfer_mode) +
+            "（非 0），非 UPLOAD 文件通路，本批不编排");
+    }
+    if (id.length == 0U) {
+        throw detail::MakeUnsupportedFeature(
+            "GET_ID(IDT=4) 上报长度 0：Slave 未启用 A2L 上传或 .a2l 文件缺失");
+    }
+    // 对端 FILE 分支是纯顺序读（xcpappl.c:575-596，无 fseek）：必须按上报
+    // LENGTH 严格连续分块；单块 ≤ MAX_CTO-1（RES 占 1 字节）且 ≤ 255
+    // （UPLOAD 元素数为单字节字段）。中途失败对端已 closeFile，直接上抛，
+    // 调用方需重发 GET_ID 重开文件再整读。
+    const std::size_t chunk_max =
+        (std::min)(static_cast<std::size_t>(m_session_.MaxCto()) - 1U,
+                   static_cast<std::size_t>(255U));
+    Bytes file;
+    file.reserve((std::min)(static_cast<std::size_t>(id.length),
+                            std::size_t{1U << 20}));
+    std::size_t remaining = static_cast<std::size_t>(id.length);
+    while (remaining > 0U) {
+        const auto chunk =
+            static_cast<ElementCount>((std::min)(remaining, chunk_max));
+        Bytes part = m_executor_->ExecuteUpload(chunk);
+        file.insert(file.end(), part.begin(), part.end());
+        remaining -= chunk;
+    }
+    return file;
+}
+
 const std::vector<DaqLedgerEntry>& XcpMaster::DaqLedger() const noexcept {
     return m_daq_ledger_;
 }
@@ -370,6 +663,11 @@ XcpMaster::QueryDaqResolutionInfo() {
 std::optional<GetDaqListInfoResponse> XcpMaster::QueryDaqListInfo(
     std::uint16_t daq_list) {
     return m_executor_->ExecuteGetDaqListInfo(daq_list);
+}
+
+std::optional<GetDaqEventInfoResponse> XcpMaster::QueryDaqEventInfo(
+    std::uint16_t event_channel) {
+    return m_executor_->ExecuteGetDaqEventInfo(event_channel);
 }
 
 std::optional<ReadDaqResponse> XcpMaster::ReadDaqEntryAt(
@@ -474,6 +772,101 @@ UnlockResult XcpMaster::Unlock(Resource resource,
     } while (offset < key.size());
 
     return UnlockResult{false, last.resource_protection};
+}
+
+// ---------------------------------------------------------------------------
+// 变量标定批次：Calibration / Page Switching（docs §7.5.2.5 / §7.5.3）
+// ---------------------------------------------------------------------------
+
+bool XcpMaster::HasCalPagResource() const {
+    const auto params = m_session_.Parameters();
+    return HasResource(params.connect.resource_mask, Resource::CalPag);
+}
+
+std::optional<GetPagProcessorInfoResponse> XcpMaster::QueryPagProcessorInfo() {
+    if (!IsConnected()) {
+        throw detail::MakeInvalidState("查询 PAG 处理器信息前必须先建立 XCP 连接");
+    }
+    if (!HasCalPagResource()) {
+        throw detail::MakeUnsupportedFeature(
+            "Slave 的 CONNECT RESOURCE 未声明 CAL/PAG 资源，Page Switching "
+            "不可用");
+    }
+    // 一次性取证缓存：Connect() 已探测过则直接返回；nullopt 也可能来自
+    // "尚未探测"（构造后未 Connect 的路径），懒补一次
+    if (m_pag_processor_info_queried_) {
+        return m_pag_processor_info_;
+    }
+    m_pag_processor_info_queried_ = true;
+    m_pag_processor_info_ = m_executor_->ExecuteGetPagProcessorInfo();
+    if (m_pag_processor_info_) {
+        m_session_.SetPagProcessorInfo(*m_pag_processor_info_);
+    }
+    return m_pag_processor_info_;
+}
+
+/// @brief 标定命令统一入口预检：已连接 + Slave 声明 CAL/PAG 资源
+namespace {
+void RequireCalPag(bool connected, bool has_cal_pag) {
+    if (!connected) {
+        throw detail::MakeInvalidState("执行标定命令前必须先建立 XCP 连接");
+    }
+    if (!has_cal_pag) {
+        throw detail::MakeUnsupportedFeature(
+            "Slave 的 CONNECT RESOURCE 未声明 CAL/PAG 资源，标定命令不可用");
+    }
+}
+}  // namespace
+
+void XcpMaster::SetCalPage(CalPageModeBit mode, std::uint8_t segment,
+                           std::uint8_t page) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    m_executor_->ExecuteSetCalPage(mode, segment, page);
+}
+
+std::optional<GetCalPageResponse> XcpMaster::GetCalPage(
+    CalPageAccessMode access_mode, std::uint8_t segment) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    return m_executor_->ExecuteGetCalPage(access_mode, segment);
+}
+
+std::optional<GetSegmentInfoResponse> XcpMaster::GetSegmentInfo(
+    SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
+    std::uint8_t mapping_index) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    return m_executor_->ExecuteGetSegmentInfo(mode, segment, info,
+                                              mapping_index);
+}
+
+std::optional<GetPageInfoResponse> XcpMaster::GetPageInfo(
+    std::uint8_t segment, std::uint8_t page) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    return m_executor_->ExecuteGetPageInfo(segment, page);
+}
+
+void XcpMaster::SetSegmentFreeze(bool freeze, std::uint8_t segment) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    m_executor_->ExecuteSetSegmentMode(
+        freeze ? SegmentModeBit::kFreeze : SegmentModeBit::kNone, segment);
+}
+
+std::optional<GetSegmentModeResponse> XcpMaster::GetSegmentMode(
+    std::uint8_t segment) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    return m_executor_->ExecuteGetSegmentMode(segment);
+}
+
+void XcpMaster::CopyCalPage(const CopyCalPageRequest& request) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    m_executor_->ExecuteCopyCalPage(request);
+}
+
+void XcpMaster::ModifyBits(Address address, AddressExtension extension,
+                           std::uint8_t shift, std::uint16_t and_mask,
+                           std::uint16_t xor_mask) {
+    RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
+    m_memory_access_->ModifyBits(address, extension, shift, and_mask,
+                                 xor_mask);
 }
 
 }  // namespace calmcar::xcp

@@ -21,6 +21,7 @@
 #include <fstream>
 #include <future>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -262,7 +263,8 @@ TEST_F(A2lGoldenTest, RequireIfDataXcpControlsMissingIfData) {
     ASSERT_NE(b->XcpInfo(), nullptr);
     EXPECT_FALSE(b->XcpInfo()->ok);
     ASSERT_NE(b->Database(), nullptr);
-    EXPECT_EQ(b->Database()->Count().Value(), 11u);
+    // 原 11 个符号 + 4 个独立 LINEAR 系数用例。
+    EXPECT_EQ(b->Database()->Count().Value(), 15u);
 }
 
 TEST_F(A2lGoldenTest, MalformedButLegalVariantsParse) {
@@ -529,6 +531,52 @@ TEST_F(A2lGoldenTest, SupportedConversionMatrix) {
     ASSERT_TRUE(verb.HasValue());
     ASSERT_TRUE(std::holds_alternative<std::string>(verb.Value()));
     EXPECT_EQ(std::get<std::string>(verb.Value()), "on");
+}
+
+TEST_F(A2lGoldenTest, LinearUsesFactorThenAdditiveOffset) {
+    LoadOptions require_off;
+    require_off.require_if_data_xcp = false;
+    auto b = LoadOk(Golden("golden_convert.a2l"), require_off);
+    ASSERT_NE(b, nullptr);
+    const IA2lDatabase* db = b->Database();
+    ASSERT_NE(db, nullptr);
+
+    const auto check_linear = [&](std::string_view name, std::uint16_t raw,
+                                  double expected) {
+        const Bytes raw_bytes{static_cast<std::uint8_t>(raw & 0xFFU),
+                              static_cast<std::uint8_t>(raw >> 8U)};
+        const auto physical = db->ToPhysical(name, raw_bytes);
+        ASSERT_TRUE(physical.HasValue()) << name;
+        ASSERT_TRUE(std::holds_alternative<double>(physical.Value())) << name;
+        EXPECT_DOUBLE_EQ(std::get<double>(physical.Value()), expected) << name;
+
+        const auto encoded = db->FromPhysical(name, PhysicalValue{expected});
+        ASSERT_TRUE(encoded.HasValue()) << name;
+        EXPECT_EQ(encoded.Value(), raw_bytes) << name;
+    };
+
+    // 独立算式 oracle：PHYS = factor * INT + offset。
+    check_linear("CONV_ECU::M_TEMP_LINEAR", 50U, 0.0);
+    check_linear("CONV_ECU::M_SCALE_LINEAR", 25U, 0.0);
+    check_linear("CONV_ECU::M_NEGATIVE_LINEAR", 20U, 0.0);
+    check_linear("CONV_ECU::M_LINEAR", 200U, 100.0);
+
+    const auto temp_zero =
+        db->ToPhysical("CONV_ECU::M_TEMP_LINEAR", Bytes{0x00, 0x00});
+    ASSERT_TRUE(temp_zero.HasValue());
+    ASSERT_TRUE(std::holds_alternative<double>(temp_zero.Value()));
+    EXPECT_DOUBLE_EQ(std::get<double>(temp_zero.Value()), -50.0);
+
+    // factor=0 是常数映射，可正算但不能唯一逆算。
+    const auto constant =
+        db->ToPhysical("CONV_ECU::M_ZERO_LINEAR", Bytes{0x07, 0x00});
+    ASSERT_TRUE(constant.HasValue());
+    ASSERT_TRUE(std::holds_alternative<double>(constant.Value()));
+    EXPECT_DOUBLE_EQ(std::get<double>(constant.Value()), 5.0);
+    const auto inverse =
+        db->FromPhysical("CONV_ECU::M_ZERO_LINEAR", PhysicalValue{5.0});
+    ASSERT_FALSE(inverse.HasValue());
+    EXPECT_EQ(inverse.ErrorInfo().code, ErrorCode::ConversionNotInvertible);
 }
 
 TEST_F(A2lGoldenTest, ConversionFailureIsStructured) {
@@ -1070,6 +1118,215 @@ TEST_F(A2lGoldenTest, StructureMetadataOnly) {
 }
 
 // ============================================================================
+// T5.5 STRUCTLEAF：结构成员叶子展开（批次18，16-A/16-A′/16-B/16-C）
+// ============================================================================
+
+TEST_F(A2lGoldenTest, StructLeafRealCorpusFourForms) {
+    // 语料 = xcp_test_slave 运行时生成 A2L 的源码树定格件（tests/data/a2l/），
+    // 覆盖标量成员/嵌套/结构数组成员/结构数组实例四形态 + CalSeg 校准段。
+    // 符号表基线 42 钉死展开形状：任何成员数、地址或扩展位退化此用例即红。
+    auto b = LoadOk(Data("xcplite_structleaf_corpus.a2l"));
+    ASSERT_NE(b, nullptr);
+    const IA2lDatabase* db = b->Database();
+    ASSERT_NE(db, nullptr);
+
+    // 18-A′ 钉：CalSeg 成员引用 TYPEDEF_CHARACTERISTIC，并入标量事实注册表后
+    // 真实语料告警必须恰好为零（并入逻辑若退化，会退回 2 条 InvalidLayout）
+    EXPECT_EQ(b->ListLoadWarnings().size(), 0u);
+
+    auto all = db->Search("xcp_test_slave::*", 500);
+    ASSERT_TRUE(all.HasValue());
+    EXPECT_EQ(all.Value().size(), 42u) << "符号表基线（26 叶子 + 16 原有符号）";
+
+    struct LeafExpect {
+        const char* path;      ///< 模块限定叶子路径
+        std::uint64_t addr;    ///< 期望 ECU 地址（实例基址 + 各级成员偏移）
+        std::uint8_t ext;      ///< 期望地址扩展（INSTANCE 原值透传，B-1/F5）
+        std::uint8_t esz;      ///< 期望元素宽（B-3 可证值）
+        std::uint8_t rw;       ///< 期望读写位（随 INSTANCE 声明，见下注）
+        std::uint64_t extent;  ///< 数组成员元素数（0 = 标量叶子无 dims）
+    };
+    static constexpr LeafExpect kLeaves[] = {
+        // 形态 1：结构标量成员
+        {"g_simple_struct.simple_u8", 0x19018, 1, 1, 1, 0},
+        {"g_simple_struct.simple_i16", 0x1901A, 1, 2, 1, 0},
+        {"g_simple_struct.simple_u32", 0x1901C, 1, 4, 1, 0},
+        // 形态 2：嵌套结构成员
+        {"g_outer.outer_u8", 0x19040, 1, 1, 1, 0},
+        {"g_outer.nested_struct.simple_u8", 0x19044, 1, 1, 1, 0},
+        {"g_outer.nested_struct.simple_i16", 0x19046, 1, 2, 1, 0},
+        {"g_outer.nested_struct.simple_u32", 0x19048, 1, 4, 1, 0},
+        // 形态 3：结构数组成员（成员级 MATRIX_DIM 逐元素展开）
+        {"g_outer.nested_array[0].simple_u8", 0x1904C, 1, 1, 1, 0},
+        {"g_outer.nested_array[1].simple_i16", 0x19056, 1, 2, 1, 0},
+        {"g_outer.nested_array[1].simple_u32", 0x19058, 1, 4, 1, 0},
+        // 形态 4：标量数组成员（整体寻址叶子，dims 带 extent/stride）
+        {"g_outer.outer_arr", 0x1905C, 1, 1, 1, 4},
+        // 形态 5：结构数组实例（18-B：INSTANCE 级 MATRIX_DIM 透传，
+        // 元素步长 = sizeof(SimpleStruct_t) = 8）
+        {"g_struct_array[0].simple_u8", 0x19060, 1, 1, 1, 0},
+        {"g_struct_array[1].simple_i16", 0x1906A, 1, 2, 1, 0},
+        {"g_struct_array[2].simple_u8", 0x19070, 1, 1, 1, 0},
+        {"g_struct_array[2].simple_u32", 0x19074, 1, 4, 1, 0},
+        // CalSeg（18-A′：TYPEDEF_CHARACTERISTIC 事实；分段地址 ext=0 原样。
+        // rw=0：XCPlite a2l.c 只对绝对/动态寻址的 INSTANCE 打 READ_WRITE
+        // 关键词，
+        // CalSeg 实例走分段相对寻址故缺省只读——物理可写性由批次17 裸地址
+        // 写通路实证，A2L 元数据层不伪造读写位）
+        {"kDefaultCalParams.cal_factor", 0x80010000, 0, 2, 0, 0},
+        {"kDefaultCalParams.cal_offset", 0x80010004, 0, 4, 0, 0},
+    };
+    for (const auto& e : kLeaves) {
+        const std::string key = std::string("xcp_test_slave::") + e.path;
+        auto r = db->Find(key);
+        ASSERT_TRUE(r.HasValue()) << key << ": " << r.ErrorInfo().message;
+        EXPECT_EQ(r.Value().kind, SymbolKind::Measurement) << key;
+        EXPECT_EQ(r.Value().xcp_address, e.addr) << key;
+        EXPECT_EQ(static_cast<unsigned>(r.Value().address_extension),
+                  static_cast<unsigned>(e.ext))
+            << key << "（扩展从 INSTANCE 透传）";
+        EXPECT_EQ(static_cast<unsigned>(r.Value().element_size_bytes),
+                  static_cast<unsigned>(e.esz))
+            << key << "（B-3 宽度可证）";
+        EXPECT_EQ(static_cast<unsigned>(r.Value().read_write),
+                  static_cast<unsigned>(e.rw))
+            << key << "（读写位随 INSTANCE 声明透传）";
+        if (e.extent == 0) {
+            EXPECT_TRUE(r.Value().dimensions.empty()) << key;
+        } else {
+            ASSERT_EQ(r.Value().dimensions.size(), 1u) << key;
+            EXPECT_EQ(r.Value().dimensions[0].extent, e.extent) << key;
+            EXPECT_EQ(r.Value().dimensions[0].byte_stride, e.esz) << key;
+        }
+    }
+
+    // B-1 交叉核证：嵌套数组叶子地址 = 实例基址 + 成员偏移 + 元素步长 +
+    // 字段偏移 （g_outer@0x19040 + nested_array@0xC + 1×8 + simple_i16@2 =
+    // 0x19056）
+    auto outer = db->Find("xcp_test_slave::g_outer");
+    ASSERT_TRUE(outer.HasValue());
+    EXPECT_EQ(outer.Value().xcp_address, 0x19040u);
+
+    // B-12 不动摇：叶子化不放开实例整体读（ INSTANCE 仍只识别不寻址）
+    auto size = db->ByteSizeOf("xcp_test_slave::g_outer");
+    ASSERT_FALSE(size.HasValue());
+    EXPECT_EQ(size.ErrorInfo().code, ErrorCode::UnsupportedOperation);
+    EXPECT_EQ(size.ErrorInfo().phase, Phase::Query);
+
+    // 叶子侧数值门放开：outer_arr 总字节 = 4 元素 × 宽 1
+    auto arr_size = db->ByteSizeOf("xcp_test_slave::g_outer.outer_arr");
+    ASSERT_TRUE(arr_size.HasValue()) << arr_size.ErrorInfo().message;
+    EXPECT_EQ(arr_size.Value(), 4u);
+
+    // 18-A′ 事实透传：C_cal_offset 的 PHYS_UNIT/LIMITS 必须进入叶子（DTO 复用
+    // 无结构变化的前提是事实链完整）
+    auto cal_off = db->Find("xcp_test_slave::kDefaultCalParams.cal_offset");
+    ASSERT_TRUE(cal_off.HasValue());
+    EXPECT_EQ(cal_off.Value().conversion.unit, "mm");
+    EXPECT_TRUE(cal_off.Value().have_limit);
+    EXPECT_DOUBLE_EQ(cal_off.Value().lower_limit, -1000.0);
+    EXPECT_DOUBLE_EQ(cal_off.Value().upper_limit, 1000.0);
+    // 只读门生效（钉实测语义）：分段寻址实例的换算入口被 rw 位拒绝，
+    // 错误码 UnsupportedOperation / Phase::Conversion；上面 have_limit/
+    // lower/upper 元数据仍完整——拒绝发生在换算之前，事实链未断
+    auto bad = db->FromPhysical("xcp_test_slave::kDefaultCalParams.cal_offset",
+                                PhysicalValue{2000.0});
+    ASSERT_FALSE(bad.HasValue());
+    EXPECT_EQ(bad.ErrorInfo().code, ErrorCode::UnsupportedOperation);
+    EXPECT_EQ(bad.ErrorInfo().phase, Phase::Conversion);
+    EXPECT_NE(bad.ErrorInfo().message.find("只读"), std::string::npos)
+        << bad.ErrorInfo().message;
+}
+
+TEST_F(A2lGoldenTest, StructLeafBrokenCorpusWarnsEveryRejection) {
+    // 手写负例：6 种拒绝形态（成员引用缺失类型 / 成员越界 / 类型递归环 /
+    // INSTANCE 引用不存在 TYPEDEF / MATRIX_DIM 含 0 / 元素数超上界）+ 1 个
+    // 对照实例。纪律：每种拒绝恰好一条 LoadWarning（subject 可定位），
+    // 可证部分照常展开——既不静默吞掉，也不整包丢弃。
+    LoadOptions require_off;
+    require_off.require_if_data_xcp = false;
+    auto b = LoadOk(Data("xcplite_leaf_broken.a2l"), require_off);
+    ASSERT_NE(b, nullptr);
+    const IA2lDatabase* db = b->Database();
+    ASSERT_NE(db, nullptr);
+
+    const auto ws = b->ListLoadWarnings();
+    ASSERT_EQ(ws.size(), 7u) << "告警数必须与拒绝形态一一对应";
+    struct WarnExpect {
+        const char* subject;   ///< 告警主体（module::path 限定）
+        const char* fragment;  ///< 消息片段（定位拒绝原因，不钉全文防脆）
+    };
+    static constexpr WarnExpect kWarns[] = {
+        {"LEAF_FIX::big_dim", "1024"},
+        {"LEAF_FIX::cyc.cyc.inner.back", "递归"},
+        {"LEAF_FIX::h_ref", "NoSuchType"},
+        {"LEAF_FIX::ok_ctrl.ghost", "MissingType"},
+        {"LEAF_FIX::ok_ctrl.wide", "越界"},
+        {"LEAF_FIX::oob.big", "越界"},
+        {"LEAF_FIX::zero_dim", "MATRIX_DIM"},
+    };
+    for (const auto& e : kWarns) {
+        const LoadWarning* hit = nullptr;
+        for (const auto& w : ws) {
+            if (w.subject == e.subject) {
+                hit = &w;
+                break;
+            }
+        }
+        ASSERT_TRUE(hit != nullptr) << e.subject << " 无告警（静默丢失回归）";
+        EXPECT_EQ(hit->code, ErrorCode::InvalidLayout) << e.subject;
+        EXPECT_EQ(hit->phase, Phase::Load) << e.subject;
+        EXPECT_NE(hit->message.find(e.fragment), std::string::npos)
+            << e.subject << ": " << hit->message;
+    }
+
+    // 可证叶子不受坏兄弟连坐：对照实例与递归环的可证前缀都还在
+    struct AliveExpect {
+        const char* path;
+        std::uint64_t addr;
+    };
+    static constexpr AliveExpect kAlive[] = {
+        {"ok_ctrl.ok", 0x2000},
+        {"cyc.cyc.v1", 0x6002},
+        {"cyc.cyc.inner.v2",
+         0x6002},  // 递归展开到环闭合前一层，与 v1 同址双路径
+        {"cyc.tail", 0x6004},
+    };
+    for (const auto& e : kAlive) {
+        const std::string key = std::string("LEAF_FIX::") + e.path;
+        auto r = db->Find(key);
+        ASSERT_TRUE(r.HasValue()) << key << ": " << r.ErrorInfo().message;
+        EXPECT_EQ(r.Value().kind, SymbolKind::Measurement) << key;
+        EXPECT_EQ(r.Value().xcp_address, e.addr) << key;
+        EXPECT_EQ(static_cast<unsigned>(r.Value().address_extension), 1u)
+            << key;
+    }
+
+    // 拒绝形态不留叶子（NotFound）：坏成员、坏实例的一切下钻路径
+    for (const char* dead :
+         {"LEAF_FIX::ok_ctrl.ghost", "LEAF_FIX::ok_ctrl.wide",
+          "LEAF_FIX::oob.big", "LEAF_FIX::cyc.cyc.inner.back",
+          "LEAF_FIX::zero_dim.ok", "LEAF_FIX::zero_dim[0].ok",
+          "LEAF_FIX::big_dim[0].ok", "LEAF_FIX::h_ref.any"}) {
+        auto r = db->Find(dead);
+        ASSERT_FALSE(r.HasValue()) << dead << " 不应被展开";
+        EXPECT_EQ(r.ErrorInfo().code, ErrorCode::NotFound) << dead;
+    }
+
+    // 实例本体仍是 B-12 元数据符号（识别层不因展开失败而消失）
+    auto ins = db->Find("LEAF_FIX::zero_dim");
+    ASSERT_TRUE(ins.HasValue());
+    EXPECT_EQ(ins.Value().kind, SymbolKind::Structure);
+    EXPECT_EQ(ins.Value().xcp_address, 0x4000u);
+    EXPECT_EQ(static_cast<unsigned>(ins.Value().address_extension), 1u);
+
+    // 符号计数基线 15 = 5 TYPEDEF + 6 INSTANCE + 4 可证叶子
+    auto all = db->Search("LEAF_FIX::*", 500);
+    ASSERT_TRUE(all.HasValue());
+    EXPECT_EQ(all.Value().size(), 15u);
+}
+
+// ============================================================================
 // T6 DAQ / DTO envelope（B-5/B-7）
 // ============================================================================
 
@@ -1142,7 +1399,8 @@ TEST_F(A2lGoldenTest, DtoEnvelopeMatrix) {
     }
     for (const Case& c : cases) {
         // PID=1：golden_basic 的列表号与 FIRST_PID 都是 1，两种口径同值
-    const Bytes dto = MakeEnvelope(c.frame, 1 /*FIRST_PID+相对 ODT 号*/, payload);
+        const Bytes dto =
+            MakeEnvelope(c.frame, 1 /*FIRST_PID+相对 ODT 号*/, payload);
         auto samples = layout->Decode(c.frame, dto);
         ASSERT_TRUE(samples.HasValue()) << c.name;
         ASSERT_EQ(samples.Value().size(), 2u) << c.name;
@@ -1186,7 +1444,8 @@ TEST_F(A2lGoldenTest, DtoEnvelopeMatrix) {
 
 TEST_F(A2lGoldenTest, StaticPredefinedDaqDecode) {
     // golden_mask 的 DAQ 列表（列表号 2、FIRST_PID=4）：
-    // 批次15 F1 起 PID=FIRST_PID+0=0x04；覆盖 BIT_MASK / BIT_OFFSET / 2D raw 三分支
+    // 批次15 F1 起 PID=FIRST_PID+0=0x04；覆盖 BIT_MASK / BIT_OFFSET / 2D raw
+    // 三分支
     auto b = LoadOk(Golden("golden_mask.a2l"));
     ASSERT_NE(b, nullptr);
     auto layout_r = b->CreateDaqLayout();
@@ -1216,8 +1475,7 @@ TEST_F(A2lGoldenTest, A2lFirstPidRoutesInsteadOfListNumber) {
     const std::unique_ptr<IDaqLayout>& layout = layout_r.Value();
 
     DtoFrameLayout frame;  // Absolute + 1B PID
-    const Bytes body{0x00, 0x0F, 0xAA, 0, 1, 2, 3,
-                     4,    5,    6,    7, 8, 9, 10, 11};
+    const Bytes body{0x00, 0x0F, 0xAA, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
     Bytes by_list_number;
     by_list_number.push_back(0x02);  // 旧的错误口径
     by_list_number.insert(by_list_number.end(), body.begin(), body.end());

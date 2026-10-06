@@ -58,6 +58,19 @@ public:
         m_processor_properties_ = properties;
         m_processor_info_supported_ = true;
     }
+    /// @brief 让 GET_DAQ_RESOLUTION_INFO 可答（TIMESTAMP_MODE=0x0C：4 字节
+    ///        RAW/fixed，XCPlite 实证值；默认 CmdUnknown 走 Optional 降级）
+    void SupportResolutionInfo() { m_resolution_supported_ = true; }
+    /// @brief 让 GET_ID(IDT=4)/UPLOAD 服务一份预置"A2L 文件"（批次21 21-2；
+    ///        FILE MTA 顺序读，越界回 ERR_ACCESS_DENIED；mode=0x01 时数据
+    ///        内嵌在 GET_ID 响应里而非 UPLOAD 通路）
+    void ServeIdentificationFile(const Bytes& file,
+                                 std::uint8_t mode = 0x00U) {
+        m_upload_file_ = file;
+        m_ident_mode_ = mode;
+        m_upload_pos_ = 0;
+        m_upload_ready_ = true;
+    }
     /// @brief 某命令被收到的次数
     [[nodiscard]] int Count(CommandCode cmd) const {
         const auto it = m_counts_.find(cmd);
@@ -110,11 +123,96 @@ public:
                             0x00, 0x00});
             case CommandCode::Synch:
                 return Err(ErrorCode::CmdSynch);
-            case CommandCode::SetMta:
-                if (packet.size() < 7U) {
+            case CommandCode::GetDaqResolutionInfo:
+                if (!m_resolution_supported_) {
+                    return Err(ErrorCode::CmdUnknown);
+                }
+                // GRANULARITY_DAQ=1, MAX_ODT_ENTRY_SIZE=8, GRAN_STIM=1,
+                // MAX_SIZE_STIM=8, TIMESTAMP_MODE（外部设定）, TICKS(WORD)
+                return Res({0x01, 0x08, 0x01, 0x08, m_timestamp_mode_,
+                            m_timestamp_ticks_lo_, 0x00});
+            case CommandCode::FreeDaq:
+                if (packet.size() < 1U) {
                     return Err(ErrorCode::CmdSyntax);
                 }
-                m_mta_ = le32(packet.subspan(3, 4));
+                m_written_.clear();
+                m_ptr_ = Ptr{};
+                m_daq_running_ = false;
+                return Res({});
+            case CommandCode::AllocDaq:
+                // [D5][rsv][n WORD=LE@2..3]：n 个 List
+                // 一次给足（xcplite.c:1148）
+                if (packet.size() < 4U || le16(packet.subspan(2, 2)) == 0U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                return Res({});
+            case CommandCode::AllocOdt:
+                // [D4][rsv][DAQ_LIST WORD@2..3][ODT_COUNT@4]
+                if (packet.size() < 5U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                return Res({});
+            case CommandCode::AllocOdtEntry:
+                // [D3][rsv][DAQ_LIST WORD@2..3][ODT_NUMBER@4][ENTRY_COUNT@5]
+                if (packet.size() < 6U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                return Res({});
+            case CommandCode::GetId: {
+                // [FA][IDT]（XCPlite 实然 2 字节 CRO 方言，xcp.h:519-520）；
+                // 未预置文件时按未实现回 ERR_CMD_UNKNOWN，非 0x04 回
+                // ERR_OUT_OF_RANGE（仿 xcplite.c:2190 default 分支）
+                if (packet.size() < 2U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                if (!m_upload_ready_) {
+                    return Err(ErrorCode::CmdUnknown);
+                }
+                if (packet[1] != 0x04U) {
+                    return Err(ErrorCode::OutOfRange);
+                }
+                m_upload_pos_ = 0;  // 0x04=ASAM_UPLOAD：重开"文件"顺序游标
+                std::vector<std::uint8_t> body{m_ident_mode_, 0xFF, 0xFF};
+                const auto len =
+                    static_cast<std::uint32_t>(m_upload_file_.size());
+                body.push_back(static_cast<std::uint8_t>(len & 0xFFU));
+                body.push_back(static_cast<std::uint8_t>((len >> 8) & 0xFFU));
+                body.push_back(static_cast<std::uint8_t>((len >> 16) & 0xFFU));
+                body.push_back(static_cast<std::uint8_t>((len >> 24) & 0xFFU));
+                if (m_ident_mode_ == 0x01U) {
+                    body.insert(body.end(), m_upload_file_.begin(),
+                                m_upload_file_.end());
+                }
+                return Res(body);
+            }
+            case CommandCode::Upload: {
+                if (packet.size() < 2U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                if (!m_upload_ready_) {
+                    return Err(ErrorCode::CmdUnknown);
+                }
+                const auto n = static_cast<std::size_t>(packet[1]);
+                // FILE MTA 纯顺序读；越界即对端 closeFile + 拒绝
+                // （仿 xcpappl.c:587-592）
+                if (m_upload_pos_ + n > m_upload_file_.size()) {
+                    return Err(ErrorCode::AccessDenied);
+                }
+                std::vector<std::uint8_t> body(
+                    m_upload_file_.begin() +
+                        static_cast<std::ptrdiff_t>(m_upload_pos_),
+                    m_upload_file_.begin() +
+                        static_cast<std::ptrdiff_t>(m_upload_pos_ + n));
+                m_upload_pos_ += n;
+                return Res(body);
+            }
+            case CommandCode::SetMta:
+                // XCP 1.3 布局：[F6][MODE][rsv][EXT@3][ADDR@4..7]（8 字节，
+                // XCPlite 对手端协议调试核证）
+                if (packet.size() < 8U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                m_mta_ = le32(packet.subspan(4, 4));
                 return Res({});
             case CommandCode::ClearDaqList:
                 if (packet.size() < 4U) {
@@ -218,6 +316,9 @@ private:
         return Bytes{static_cast<std::uint8_t>(PacketType::Err),
                      static_cast<std::uint8_t>(code)};
     }
+    static std::uint16_t le16(BytesView two) {
+        return static_cast<std::uint16_t>(two[0] | (two[1] << 8));
+    }
     static Address le32(BytesView four) {
         return static_cast<Address>(four[0]) |
                (static_cast<Address>(four[1]) << 8) |
@@ -232,11 +333,18 @@ private:
     std::uint8_t m_first_pid_{0x20U};
     bool m_processor_info_supported_{false};
     std::uint8_t m_processor_properties_{0U};
+    bool m_resolution_supported_{false};
+    std::uint8_t m_timestamp_mode_{0x0CU};  // XCPlite：size=4B + RAW + fixed
+    std::uint8_t m_timestamp_ticks_lo_{0x01U};
     std::map<CommandCode, int> m_counts_;
     std::map<CommandCode, int> m_drop_times_;
     std::map<CommandCode, ErrorCode> m_errors_;
     std::vector<ExpectedEntry> m_written_;
     std::map<Address, std::uint8_t> m_memory_;
+    Bytes m_upload_file_;
+    std::uint8_t m_ident_mode_{0x00U};
+    std::size_t m_upload_pos_{0};
+    bool m_upload_ready_{false};
 };
 
 /**
@@ -451,20 +559,26 @@ TEST(XcpDaqRecovery, WriteDaqTimeoutReissuesSetDaqPtr) {
     EXPECT_EQ(written[1].entry, 1);
 }
 
-TEST(XcpDaqRecovery, DownloadTimeoutReissuesSetMta) {
+TEST(XcpDaqRecovery, DownloadTimeoutReportsUnknownWithoutRetry) {
     Rig rig;
     rig.slave.FailWith(CommandCode::ShortDownload, ErrorCode::CmdUnknown);
     rig.slave.DropTimes(CommandCode::Download, 1);
     const Bytes data = {0xAA, 0xBB, 0xCC, 0xDD};
-    rig.master->WriteMemoryBytes(0x4000, 0x00, BytesView{data});
+    try {
+        rig.master->WriteMemoryBytes(0x4000, 0x00, BytesView{data});
+        FAIL() << "响应超时后 DOWNLOAD 应报告结果未知";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::OperationOutcomeUnknown);
+        EXPECT_EQ(e.GetCommandCode(),
+                  std::optional<CommandCode>(CommandCode::Download));
+        EXPECT_EQ(e.RetryCount(), 1);
+    }
     EXPECT_EQ(rig.slave.Count(CommandCode::Synch), 1);
-    EXPECT_GE(rig.slave.Count(CommandCode::SetMta), 2)
-        << "每块前都有 SET_MTA，恢复后再来一次（块首地址）";
-    EXPECT_EQ(rig.slave.Count(CommandCode::Download), 2);
-    const auto& mem = rig.slave.Memory();
-    ASSERT_EQ(mem.size(), 4u);
-    EXPECT_EQ(mem.at(0x4000), 0xAAU);
-    EXPECT_EQ(mem.at(0x4003), 0xDDU);
+    EXPECT_EQ(rig.slave.Count(CommandCode::SetMta), 1)
+        << "不确定结果时不得为重放而重建 MTA";
+    EXPECT_EQ(rig.slave.Count(CommandCode::Download), 1);
+    EXPECT_TRUE(rig.slave.Memory().empty())
+        << "该模拟故障发生在命令执行前；结果仍按协议边界报告未知";
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +712,336 @@ TEST(XcpDaqSession, DisconnectKeepsLedgerButClearsRunningState) {
     rig.master->Disconnect();
     EXPECT_EQ(rig.slave.Count(CommandCode::StartStopSynch), 1)
         << "第二次断连不得再补发 START_STOP_SYNCH";
+}
+
+// ---------------------------------------------------------------------------
+// 批次20（T20-01）：动态整表编排 FREE/ALLOC_* 与 StartDaqSync
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// 两份合法动态规格：List0 一个 ODT 两条 Entry，List1 两个 ODT 各一条
+std::vector<DaqListSpec> MakeDynamicSpecs() {
+    DaqListSpec a;
+    a.daq_list = 0;
+    a.event_channel = 0;
+    a.prescaler = 1;
+    a.priority = 0;
+    DaqOdtSpec a0;
+    a0.entries = {
+        {0x3000, 0x00, 2, kDaqBitOffsetNone},
+        {0x3020, 0x00, 1, kDaqBitOffsetNone},
+    };
+    a.odts = {a0};
+
+    DaqListSpec b;
+    b.daq_list = 1;
+    b.event_channel = 0;
+    b.prescaler = 1;
+    b.priority = 0;
+    DaqOdtSpec b0;
+    b0.entries = {{0x4000, 0x00, 1, kDaqBitOffsetNone}};
+    DaqOdtSpec b1;
+    b1.entries = {{0x4010, 0x00, 1, kDaqBitOffsetNone}};
+    b.odts = {b0, b1};
+
+    return {a, b};
+}
+
+/// 首条以指定 opcode 开头的报文下标（找不到返回 -1）
+int FirstIndexOf(const std::vector<Bytes>& sent, std::uint8_t opcode) {
+    for (std::size_t i = 0; i < sent.size(); ++i) {
+        if (!sent[i].empty() && sent[i][0] == opcode) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void EnableDynamic(DaqSlave& slave) {
+    slave.SetProcessorProperties(
+        static_cast<std::uint8_t>(DaqProcessorPropertyBit::kConfigType) |
+        static_cast<std::uint8_t>(DaqProcessorPropertyBit::kPrescaler));
+}
+
+}  // namespace
+
+TEST(XcpDaqDynamic, WholeTableOrchestrationIssuesFreeAllocChain) {
+    Rig rig;
+    EnableDynamic(rig.slave);
+    rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs());
+
+    EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::AllocDaq), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::AllocOdt), 2);
+    EXPECT_EQ(rig.slave.Count(CommandCode::AllocOdtEntry), 3);
+    EXPECT_EQ(rig.slave.Count(CommandCode::SetDaqPtr), 4);
+    EXPECT_EQ(rig.slave.Count(CommandCode::WriteDaq), 4);
+    EXPECT_EQ(rig.slave.Count(CommandCode::SetDaqListMode), 2);
+    EXPECT_EQ(rig.slave.Count(CommandCode::ClearDaqList), 0)
+        << "动态通路不得走静态 CLEAR_DAQ_LIST";
+
+    // 时序硬门（xcplite.c:1143-1186）：FREE → ALLOC_DAQ → 全部 ALLOC_ODT
+    // → ALLOC_ODT_ENTRY → WRITE 族 → MODE
+    const std::vector<Bytes> sent = rig.transport->SentPackets();
+    const int free_idx =
+        FirstIndexOf(sent, static_cast<std::uint8_t>(CommandCode::FreeDaq));
+    const int alloc_daq_idx =
+        FirstIndexOf(sent, static_cast<std::uint8_t>(CommandCode::AllocDaq));
+    const int alloc_odt_idx =
+        FirstIndexOf(sent, static_cast<std::uint8_t>(CommandCode::AllocOdt));
+    const int alloc_entry_idx = FirstIndexOf(
+        sent, static_cast<std::uint8_t>(CommandCode::AllocOdtEntry));
+    const int write_idx =
+        FirstIndexOf(sent, static_cast<std::uint8_t>(CommandCode::WriteDaq));
+    const int mode_idx = FirstIndexOf(
+        sent, static_cast<std::uint8_t>(CommandCode::SetDaqListMode));
+    ASSERT_GE(free_idx, 0);
+    ASSERT_GE(mode_idx, 0);
+    EXPECT_LT(free_idx, alloc_daq_idx);
+    EXPECT_LT(alloc_daq_idx, alloc_odt_idx);
+    EXPECT_LT(alloc_odt_idx, alloc_entry_idx);
+    EXPECT_LT(alloc_entry_idx, write_idx);
+    EXPECT_LT(write_idx, mode_idx);
+    for (std::size_t i = 0; i < sent.size(); ++i) {
+        if (!sent[i].empty() &&
+            sent[i][0] == static_cast<std::uint8_t>(CommandCode::AllocOdt)) {
+            EXPECT_LT(static_cast<int>(i), alloc_entry_idx)
+                << "ALLOC_ODT 必须全部先于 ALLOC_ODT_ENTRY（odt_entry_count==0 "
+                   "门）";
+        }
+    }
+
+    // 字节精确：ALLOC_DAQ n=2（WORD LE）；逐表 ALLOC_ODT（list0 先，1 个 ODT）
+    EXPECT_EQ(sent[static_cast<std::size_t>(alloc_daq_idx)],
+              (Bytes{0xD5, 0x00, 0x02, 0x00}));
+    EXPECT_EQ(sent[static_cast<std::size_t>(alloc_odt_idx)],
+              (Bytes{0xD4, 0x00, 0x00, 0x00, 0x01}));
+    EXPECT_EQ(sent[static_cast<std::size_t>(alloc_odt_idx) + 1].empty(), false);
+
+    // SET_DAQ_LIST_MODE：CRO byte1 强制带 0x10（XCPlite 缺 TIMESTAMP 位回
+    // CRC_CMD_SYNTAX，D11），即使 spec.timestamp=false
+    for (const auto& pkt : sent) {
+        if (!pkt.empty() &&
+            pkt[0] == static_cast<std::uint8_t>(CommandCode::SetDaqListMode)) {
+            EXPECT_EQ(pkt[1] & 0x10U, 0x10U);
+        }
+    }
+}
+
+TEST(XcpDaqDynamic, LedgerCarriesFullTriplesWithoutPid) {
+    Rig rig;
+    EnableDynamic(rig.slave);
+    rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs());
+
+    const auto& ledger = rig.master->DaqLedger();
+    ASSERT_EQ(ledger.size(), 4u);
+    struct {
+        std::uint16_t list;
+        std::uint8_t odt;
+        std::uint8_t entry;
+    } expect[] = {{0, 0, 0}, {0, 0, 1}, {1, 0, 0}, {1, 1, 0}};
+    for (std::size_t i = 0; i < 4; ++i) {
+        EXPECT_EQ(ledger[i].daq_list, expect[i].list);
+        EXPECT_EQ(ledger[i].odt_number, expect[i].odt);
+        EXPECT_EQ(ledger[i].odt_entry, expect[i].entry);
+        EXPECT_FALSE(ledger[i].pid.has_value())
+            << "RELATIVE 识别字段下 FIRST_PID 推导不成立，pid 不猜（B-16）";
+    }
+    EXPECT_EQ(ledger[3].address, 0x4010u);
+    // Slave 侧指针三元组逐条对上（每 Entry 显式 SET_DAQ_PTR）
+    const auto& written = rig.slave.Written();
+    ASSERT_EQ(written.size(), 4u);
+    EXPECT_EQ(written[2].daq, 1);
+    EXPECT_EQ(written[3].odt, 1);
+    EXPECT_EQ(written[3].entry, 0);
+}
+
+TEST(XcpDaqDynamic, StaticSlaveRefusesDynamicOrchestrationBeforeFree) {
+    Rig rig;
+    rig.slave.SetProcessorProperties(
+        static_cast<std::uint8_t>(DaqProcessorPropertyBit::kPrescaler));
+    EXPECT_THROW(rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs()),
+                 XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetDaqProcessorInfo), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0)
+        << "能力门必须先于 FREE：未声明 DYNAMIC 的 Slave 一表不动";
+}
+
+TEST(XcpDaqDynamic, MisnumberedOrEmptySpecsRejectedBeforeWire) {
+    Rig rig;
+    EnableDynamic(rig.slave);
+    EXPECT_THROW(rig.master->ConfigureDaqListsDynamic({}), XcpException);
+
+    auto specs = MakeDynamicSpecs();
+    specs[1].daq_list = 5;  // 动态建表 daq_list 必须等于下标
+    EXPECT_THROW(rig.master->ConfigureDaqListsDynamic(specs), XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
+    EXPECT_EQ(rig.slave.Count(CommandCode::AllocDaq), 0);
+}
+
+TEST(XcpDaqDynamic, MidTransactionFailureFreesWholeTableAndDropsLedger) {
+    Rig rig;
+    EnableDynamic(rig.slave);
+    const std::uint32_t gen_before = rig.master->DaqConfigGeneration();
+    rig.slave.FailWith(CommandCode::SetDaqListMode, ErrorCode::ModeNotValid);
+    try {
+        rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs());
+        FAIL() << "SET_DAQ_LIST_MODE 被拒必须上抛";
+    } catch (const XcpException& e) {
+        ASSERT_TRUE(e.GetErrorCode().has_value());
+        EXPECT_EQ(*e.GetErrorCode(), ErrorCode::ModeNotValid);
+    }
+    EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 2)
+        << "事务失败后尽力 FREE 复位半表（首个 FREE + 清理 FREE）";
+    EXPECT_TRUE(rig.master->DaqLedger().empty()) << "B-6：账本不留半份";
+    EXPECT_GT(rig.master->DaqConfigGeneration(), gen_before)
+        << "半表不可复用，代际必须作废旧快照";
+}
+
+TEST(XcpDaqDynamic, FreeRejectionWhileRunningPropagatesAndKeepsTable) {
+    Rig rig;
+    EnableDynamic(rig.slave);
+    rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs());
+    rig.master->StartDaqSync();
+    // 注入式故障：真实 XCPlite 的 FREE 无运行门（实然 xcplite.c:2562-2564，见
+    // E2E RunningReconfigureStopsStreamAndRebuilds），此例锁定 Slave 若回错时
+    // master 止步
+    rig.slave.FailWith(CommandCode::FreeDaq, ErrorCode::DaqActive);
+    try {
+        rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs());
+        FAIL() << "FREE 被拒（注入）必须止步，不得继续 ALLOC";
+    } catch (const XcpException& e) {
+        ASSERT_TRUE(e.GetErrorCode().has_value());
+        EXPECT_EQ(*e.GetErrorCode(), ErrorCode::DaqActive);
+    }
+    EXPECT_EQ(rig.slave.Count(CommandCode::AllocDaq), 1)
+        << "FREE 被拒就到此为止，不得继续分配";
+    EXPECT_EQ(rig.master->DaqLedger().size(), 4u)
+        << "FREE 失败不动本地账本（Slave 表仍在，口径一致）";
+}
+
+TEST(XcpDaqDynamic, StartDaqSyncSelectsEveryListThenSynchStarts) {
+    Rig rig;
+    EnableDynamic(rig.slave);
+    rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs());
+    rig.master->StartDaqSync();
+
+    // 单表 START(mode=1) 被 TEST_CHECKS 拒（D12）：只允许 SELECT×n + SYNCH
+    EXPECT_EQ(rig.slave.Count(CommandCode::StartStopDaqList), 2);
+    EXPECT_EQ(rig.slave.Count(CommandCode::StartStopSynch), 1);
+    const std::vector<Bytes> sent = rig.transport->SentPackets();
+    for (const auto& pkt : sent) {
+        if (!pkt.empty() && pkt[0] == static_cast<std::uint8_t>(
+                                          CommandCode::StartStopDaqList)) {
+            EXPECT_EQ(pkt[1], 0x02U) << "START_STOP_DAQ_LIST 只允许 SELECT";
+        }
+    }
+    const int synch_idx = FirstIndexOf(
+        sent, static_cast<std::uint8_t>(CommandCode::StartStopSynch));
+    ASSERT_GE(synch_idx, 0);
+    EXPECT_EQ(sent[static_cast<std::size_t>(synch_idx)][1], 0x01U);
+    const GetStatusResponse status = rig.master->QueryStatus();
+    EXPECT_TRUE(status.daq_running);
+    // pid 不回填：RELATIVE 推导不成立
+    for (const auto& e : rig.master->DaqLedger()) {
+        EXPECT_FALSE(e.pid.has_value());
+    }
+}
+
+TEST(XcpDaqDynamic, StartDaqSyncWithoutLedgerRefused) {
+    Rig rig;
+    EXPECT_THROW(rig.master->StartDaqSync(), XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::StartStopDaqList), 0);
+    EXPECT_EQ(rig.slave.Count(CommandCode::StartStopSynch), 0);
+}
+
+TEST(XcpDaqDynamic, StaticTimestampPrecheckUsesDeclaredWidthOnly) {
+    // G3：Slave 经 GET_DAQ_RESOLUTION_INFO 声明 4B 时间戳后，静态预检必须把
+    // 它计入信封；未声明时保持旧口径（不猜宽度，B-3）
+    Rig rig;  // MAX_DTO=8
+    rig.slave.SetProcessorProperties(
+        static_cast<std::uint8_t>(DaqProcessorPropertyBit::kTimestamp));
+    rig.slave.SupportResolutionInfo();  // TIMESTAMP_MODE=0x0C：size=4B fixed
+    DaqListSpec spec = MakeSpec();
+    spec.timestamp = true;
+    spec.dto_counter = false;
+    spec.odts[0].entries = {
+        {0x3000, 0x00, 2, kDaqBitOffsetNone},
+        {0x3020, 0x00, 2, kDaqBitOffsetNone},
+    };
+    // header 1+4=5 + payload 4 = 9 > 8 → 必须在下发前拦下
+    EXPECT_THROW(rig.master->ConfigureDaqList(spec), XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetDaqResolutionInfo), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::ClearDaqList), 0);
+
+    // 对照：同一 Slave 不声明时间戳宽度时按 0 计 → 1+4=5 ≤ 8 → 放行
+    Rig plain;
+    plain.slave.SetProcessorProperties(
+        static_cast<std::uint8_t>(DaqProcessorPropertyBit::kTimestamp));
+    plain.master->ConfigureDaqList(spec);
+    EXPECT_EQ(plain.slave.Count(CommandCode::GetDaqResolutionInfo), 1);
+    EXPECT_EQ(plain.slave.Count(CommandCode::ClearDaqList), 1);
+}
+
+// ---------------------------------------------------------------------------
+// 批次21 21-2：GET_ID(IDT_ASAM_UPLOAD=4) + UPLOAD 顺序分块的 A2L 上传编排
+// （XCPlite 实然方言：2 字节 CRO [FA][IDT]、4 字节 LE LENGTH、FILE MTA 纯顺序读）
+// ---------------------------------------------------------------------------
+
+Bytes MakeIdentFile() {
+    Bytes f;
+    for (std::uint8_t i = 0; i < 40U; ++i) {
+        f.push_back(static_cast<std::uint8_t>(0x41U + i));
+    }
+    return f;
+}
+
+TEST(XcpGetIdUpload, FetchA2lSplitsIntoSequentialUploadChunks) {
+    Rig rig;  // MAX_CTO=16 → 单块上限 15 字节，40 字节 = 15+15+10
+    rig.slave.ServeIdentificationFile(MakeIdentFile());
+    const Bytes got = rig.master->FetchA2lViaUpload();
+    EXPECT_TRUE(got == MakeIdentFile());
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetId), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 3);
+}
+
+TEST(XcpGetIdUpload, MidStreamUploadFailurePropagates) {
+    // FILE MTA 纯顺序读：对端一旦拒绝，本端不做 fseek 重试，异常直接上抛
+    Rig rig;
+    rig.slave.ServeIdentificationFile(MakeIdentFile());
+    rig.slave.FailWith(CommandCode::Upload, ErrorCode::AccessDenied);
+    EXPECT_THROW(static_cast<void>(rig.master->FetchA2lViaUpload()),
+                 XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetId), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 1);
+}
+
+TEST(XcpGetIdUpload, InlineModeRejectedWithoutUpload) {
+    // MODE=0x01（响应内数据）不在本通路支持范围：先于任何 UPLOAD 抛错
+    Rig rig;
+    rig.slave.ServeIdentificationFile(MakeIdentFile(), 0x01U);
+    try {
+        static_cast<void>(rig.master->FetchA2lViaUpload());
+        FAIL() << "MODE=1 应抛 UnsupportedFeature";
+    } catch (const XcpException& e) {
+        EXPECT_TRUE(e.Category() == ErrorCategory::UnsupportedFeature);
+    }
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetId), 1);
+    EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 0);
+}
+
+TEST(XcpGetIdUpload, ZeroLengthRejected) {
+    // openFile 失败时 XCPlite（Release 无 assert）上报 LENGTH=0 → 明确拒绝
+    Rig rig;
+    rig.slave.ServeIdentificationFile(Bytes{});
+    try {
+        static_cast<void>(rig.master->FetchA2lViaUpload());
+        FAIL() << "LENGTH=0 应抛 UnsupportedFeature";
+    } catch (const XcpException& e) {
+        EXPECT_TRUE(e.Category() == ErrorCategory::UnsupportedFeature);
+    }
+    EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 0);
 }
 
 }  // namespace

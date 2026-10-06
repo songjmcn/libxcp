@@ -80,7 +80,18 @@ enum class CommandCode : std::uint8_t {
     DownloadNext = 0xEF,       ///< Block Mode 续传下载
     DownloadMax = 0xEE,        ///< 最大长度下载
     ShortDownload = 0xED,      ///< 带地址的一次性下载
-    ModifyBits = 0xEC,         ///< 位修改
+    // ---- 变量标定批次：MODIFY_BITS（0xEC，位修改）与 Page Switching 命令组
+    //      （0xEB..0xE4；docs §7.5.2.5 / §7.5.3 系列，均为 Optional）。
+    //      CRO/CRM 布局对照 thirdparty/XCPlite/src/xcp.h:604-660。----
+    ModifyBits = 0xEC,          ///< 位修改（对当前 MTA 的 32bit 做 AND/XOR Mask）
+    SetCalPage = 0xEB,          ///< 设置标定页（ECU/XCP/ALL 访问者）
+    GetCalPage = 0xEA,          ///< 查询当前激活标定页
+    GetPagProcessorInfo = 0xE9, ///< 读 Paging 处理器能力（MAX_SEGMENT/PAG_PROPERTIES）
+    GetSegmentInfo = 0xE8,      ///< 读 Segment 信息（Mode 0/1/2 变长响应）
+    GetPageInfo = 0xE7,         ///< 读 Page 属性（PAGE_PROPERTIES/INIT_SEGMENT）
+    SetSegmentMode = 0xE6,      ///< 设置 Segment 模式（FREEZE）
+    GetSegmentMode = 0xE5,      ///< 读 Segment 模式（FREEZE 状态）
+    CopyCalPage = 0xE4,         ///< 复制标定页（源 Segment/Page → 目标）
     // ---- 批次14：DAQ 命令组（0xE3..0xD8；docs §7.5.4 系列） ----
     ClearDaqList = 0xE3,      ///< 清除 DAQ List 的全部 ODT Entry
     SetDaqPtr = 0xE2,         ///< 设置 DAQ 指针（后续 WRITE/READ_DAQ 用）
@@ -92,6 +103,16 @@ enum class CommandCode : std::uint8_t {
     GetDaqResolutionInfo = 0xD9,  ///< 读 ODT Entry 粒度与时间戳信息
     GetDaqProcessorInfo = 0xDA,   ///< 读 DAQ 处理器能力（识别字段/扩展模式）
     GetDaqListInfo = 0xD8,        ///< 读 DAQ List 容量与固定事件信息
+    // ---- v0.3 追加：GET_DAQ_EVENT_INFO（0xD7），单个事件通道的运行时信息；
+    //      原先 :97 记的"0xD7 刻意未收录"在此更正为已收录（测量子系统 v0.3）。----
+    GetDaqEventInfo = 0xD7,  ///< 读事件通道信息（响应六字段，见 response_parser）
+    // ---- 批次20：动态 DAQ 分配命令组（docs §7.5.4.6-§7.5.4.9；
+    //      命令码与 CRO 布局对照 thirdparty/XCPlite/src/xcp.h:87-90、
+    //      :831-851；FREE_DAQ 是 0xD6）----
+    FreeDaq = 0xD6,        ///< 释放 Slave 侧全部 DAQ 资源（FREE_DAQ）
+    AllocDaq = 0xD5,       ///< 一次性分配 n 个 DAQ List（ALLOC_DAQ）
+    AllocOdt = 0xD4,       ///< 为指定 List 追加 ODT（ALLOC_ODT）
+    AllocOdtEntry = 0xD3,  ///< 为指定 ODT 追加 Entry 槽（ALLOC_ODT_ENTRY）
 };
 
 /**
@@ -218,6 +239,128 @@ enum class DaqProcessorPropertyBit : std::uint8_t {
 /// @brief 判断 DAQ 处理器能力是否包含指定掩码
 [[nodiscard]] constexpr bool HasDaqProcessorProperty(
     DaqProcessorPropertyBit props, DaqProcessorPropertyBit mask) noexcept;
+
+// ---------------------------------------------------------------------------
+// 变量标定批次：Calibration / Page Switching 位域常量
+//
+// 取值来源纪律（同批次14）：字段**语义与顺序**取本仓库
+// docs/XCP_1.3.0_document.md（§7.5.2.5 MODIFY_BITS、§7.5.3 Page Switching）；
+// 位值交叉参考只读 thirdparty/XCPlite/src/xcp.h。
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief SET_CAL_PAGE 的 MODE 位（docs L2038-2048）
+ * @details bit0 ECU：该 Page 供 ECU Application 使用；bit1 XCP：该 Page 供
+ *          XCP Driver/Master 访问；两者可同时置位。bit7 ALL：忽略 Segment
+ *          Number，对全部 Segment 应用同一设置。不可行组合 Slave 返回
+ *          ERR_MODE_NOT_VALID。
+ */
+enum class CalPageModeBit : std::uint8_t {
+    kNone = 0x00,   ///< 无标志（非法请求，编码层拒绝）
+    kEcu = 0x01,    ///< bit0 ECU
+    kXcp = 0x02,    ///< bit1 XCP
+    kAll = 0x80,    ///< bit7 ALL（作用于全部 Segment）
+};
+
+/// @brief 合并 SET_CAL_PAGE Mode 位
+[[nodiscard]] constexpr CalPageModeBit operator|(CalPageModeBit lhs,
+                                                 CalPageModeBit rhs) noexcept;
+
+/// @brief Mode 位命中判断
+[[nodiscard]] constexpr bool HasCalPageMode(CalPageModeBit mode,
+                                            CalPageModeBit mask) noexcept;
+
+/**
+ * @brief GET_PAG_PROCESSOR_INFO 响应的 PAG_PROPERTIES 位
+ * @details 位值取自 thirdparty/XCPlite/src/xcp.h（PAG_FREEZE_SUPPORTED）。
+ */
+enum class PagPropertyBit : std::uint8_t {
+    kNone = 0x00,             ///< 无声明能力
+    kFreezeSupported = 0x01,  ///< bit0 FREEZE_SUPPORTED：支持冻结处理
+};
+
+/// @brief 合并 PAG 处理器能力位
+[[nodiscard]] constexpr PagPropertyBit operator|(PagPropertyBit lhs,
+                                                  PagPropertyBit rhs) noexcept;
+
+/// @brief 判断 PAG 处理器能力是否包含指定掩码
+[[nodiscard]] constexpr bool HasPagProperty(PagPropertyBit props,
+                                            PagPropertyBit mask) noexcept;
+
+/**
+ * @brief SET_SEGMENT_MODE / GET_SEGMENT_MODE 的 MODE 位（docs L2108-2122）
+ * @details FREEZE=1 把该 Segment 选入随后 STORE_CAL_REQ 的冻结处理范围。
+ */
+enum class SegmentModeBit : std::uint8_t {
+    kNone = 0x00,     ///< 无标志（即不冻结）
+    kFreeze = 0x01,   ///< bit0 FREEZE
+};
+
+/// @brief 合并 Segment Mode 位
+[[nodiscard]] constexpr SegmentModeBit operator|(SegmentModeBit lhs,
+                                                 SegmentModeBit rhs) noexcept;
+
+/// @brief Segment Mode 位命中判断
+[[nodiscard]] constexpr bool HasSegmentMode(SegmentModeBit mode,
+                                            SegmentModeBit mask) noexcept;
+
+/**
+ * @brief GET_SEGMENT_INFO 的 Mode 字段（docs §7.5.3.4，决定响应布局）
+ */
+enum class SegmentInfoMode : std::uint8_t {
+    BasicInfo = 0,           ///< Mode 0：基本信息（地址或长度，DWORD）
+    StandardProperties = 1,  ///< Mode 1：标准属性（MAX_PAGES 等 5 字节）
+    MappingInfo = 2,         ///< Mode 2：Address Mapping 信息
+};
+
+/**
+ * @brief GET_SEGMENT_INFO 的 SEGMENT_INFO 字段
+ * @details Mode 0：0=Segment Address、1=Segment Length；
+ *          Mode 2：0=Mapping Source Address、1=Mapping Destination Address、
+ *          2=Mapping Length。Mode 1 不使用该字段（发 0）。
+ */
+enum class SegmentInfoSelector : std::uint8_t {
+    SegmentAddress = 0,       ///< Mode 0: Segment Address / Mode 2: Mapping Source Address
+    SegmentLength = 1,        ///< Mode 0: Segment Length / Mode 2: Mapping Dest Address
+    MappingLength = 2,        ///< Mode 2: Mapping Length（仅 Mode 2 有效）
+};
+
+/// @brief MODIFY_BITS 的 Shift Value S 合法上界（docs §7.5.2.5：0..16）
+inline constexpr std::uint8_t kModifyBitsMaxShift = 16;
+
+/**
+ * @brief GET_PAGE_INFO 响应 PAGE_PROPERTIES 的三组访问者类型（各 2 bit）
+ * @details docs §7.5.3.5：ECU_ACCESS_TYPE(bit0-1)、XCP_READ_ACCESS_TYPE
+ *          (bit2-3)、XCP_WRITE_ACCESS_TYPE(bit4-5)。每组 4 档含义相同：
+ *          0=不允许访问；1=仅当对方不访问时允许；2=仅当对方同时访问时允许；
+ *          3=无所谓（任意时刻允许）。bit6-7 保留。
+ */
+enum class PageAccessType : std::uint8_t {
+    NotAllowed = 0,               ///< 不允许该访问者访问
+    WithoutOtherAccess = 1,       ///< 仅当另一访问者不访问时允许
+    WithConcurrentAccess = 2,     ///< 仅当另一访问者同时访问时允许
+    DontCare = 3,                 ///< 无论另一访问者状态如何均允许
+};
+
+/**
+ * @brief GET_PAGE_INFO 响应的 PAGE_PROPERTIES 拆解结果
+ */
+struct PageProperties {
+    std::uint8_t raw = 0;                        ///< 原始字节
+    PageAccessType ecu_access = PageAccessType::NotAllowed;         ///< bits0-1
+    PageAccessType xcp_read_access = PageAccessType::NotAllowed;    ///< bits2-3
+    PageAccessType xcp_write_access = PageAccessType::NotAllowed;   ///< bits4-5
+};
+
+/// @brief GET_CAL_PAGE 的 Access Mode 合法值（docs §7.5.3.2：仅 ECU/XCP）
+enum class CalPageAccessMode : std::uint8_t {
+    Ecu = 0x01,  ///< 查询 ECU Application 侧激活页
+    Xcp = 0x02,  ///< 查询 XCP Master 侧激活页
+};
+
+/// @brief 拆解 PAGE_PROPERTIES 字节（纯位运算；未知位原样保留在 raw）
+[[nodiscard]] constexpr PageProperties ParsePageProperties(
+    std::uint8_t raw) noexcept;
 
 // ---------------------------------------------------------------------------
 // GET_DAQ_RESOLUTION_INFO（docs L2340-2364）：粒度与时间戳
@@ -491,6 +634,115 @@ struct SessionParameters {
 };
 
 // ---------------------------------------------------------------------------
+// 变量标定批次：请求 / 响应结构体
+// ---------------------------------------------------------------------------
+
+/// @brief MODIFY_BITS 请求字段（docs §7.5.2.5；操作对象为当前 MTA 处 32bit）
+struct ModifyBitsRequest {
+    std::uint8_t shift{0};     ///< Shift Value S（有效范围 0..16）
+    std::uint16_t and_mask{0xFFFFU};  ///< AND Mask（左移 S 后与值相与）
+    std::uint16_t xor_mask{0x0000U};  ///< XOR Mask（左移 S 后与值相异或）
+};
+
+/// @brief SET_CAL_PAGE 请求字段（docs §7.5.3.1）
+struct SetCalPageRequest {
+    CalPageModeBit mode{CalPageModeBit::kNone};  ///< ECU/XCP/ALL 位组合
+    std::uint8_t segment{0};                      ///< Segment Number（ALL 置位时忽略）
+    std::uint8_t page{0};                         ///< Page Number
+};
+
+/// @brief GET_CAL_PAGE 请求字段（docs §7.5.3.2）
+struct GetCalPageRequest {
+    std::uint8_t access_mode{0x01};  ///< Access Mode：仅 0x01(ECU)/0x02(XCP)
+    std::uint8_t segment{0};         ///< Segment Number
+};
+
+/// @brief GET_CAL_PAGE 响应解析结果
+struct GetCalPageResponse {
+    std::uint8_t page{0};  ///< 该 Access Mode 下当前激活的逻辑 Page Number
+};
+
+/// @brief GET_PAG_PROCESSOR_INFO 响应解析结果（docs §7.5.3.3）
+struct GetPagProcessorInfoResponse {
+    std::uint8_t max_segment{0};            ///< MAX_SEGMENT（Segment 数上界）
+    PagPropertyBit properties{};            ///< PAG_PROPERTIES（FREEZE_SUPPORTED）
+};
+
+/// @brief GET_SEGMENT_INFO 请求字段（docs §7.5.3.4）
+struct GetSegmentInfoRequest {
+    SegmentInfoMode mode{SegmentInfoMode::BasicInfo};  ///< 决定响应布局
+    std::uint8_t segment{0};                           ///< Segment Number
+    SegmentInfoSelector info{SegmentInfoSelector::SegmentAddress};  ///< SEGMENT_INFO
+    std::uint8_t mapping_index{0};                     ///< Mapping Index（仅 Mode 2）
+};
+
+/// @brief GET_SEGMENT_INFO Mode 0 响应（基本信息：地址或长度）
+struct SegmentBasicInfo {
+    std::uint32_t value{0};  ///< DWORD：Segment Address 或 Length
+};
+
+/// @brief GET_SEGMENT_INFO Mode 1 响应（标准属性）
+struct SegmentStandardProperties {
+    std::uint8_t max_pages{0};             ///< MAX_PAGES
+    std::uint8_t address_extension{0};     ///< ADDRESS_EXTENSION（SET_MTA 用）
+    std::uint8_t max_mapping{0};           ///< MAX_MAPPING（Mapping 条目数）
+    std::uint8_t compression_method{0};    ///< Compression Method（0=不支持）
+    std::uint8_t encryption_method{0};     ///< Encryption Method（0=不支持）
+};
+
+/// @brief GET_SEGMENT_INFO Mode 2 响应（Address Mapping 信息）
+struct SegmentMappingInfo {
+    std::uint32_t value{0};  ///< DWORD：Source/Dest Address 或 Length
+};
+
+/// @brief GET_SEGMENT_INFO 响应解析结果（variant，按请求 Mode 三选一）
+using SegmentInfoData =
+    std::variant<SegmentBasicInfo, SegmentStandardProperties,
+                 SegmentMappingInfo>;
+
+/// @brief GET_SEGMENT_INFO 响应解析结果
+struct GetSegmentInfoResponse {
+    SegmentInfoMode mode{SegmentInfoMode::BasicInfo};  ///< 对应的请求 Mode
+    SegmentInfoData data{SegmentBasicInfo{}};          ///< 按 Mode 填充
+};
+
+/// @brief GET_PAGE_INFO 请求字段（docs §7.5.3.5）
+struct GetPageInfoRequest {
+    std::uint8_t segment{0};  ///< Segment Number
+    std::uint8_t page{0};     ///< Page Number
+};
+
+/// @brief GET_PAGE_INFO 响应解析结果
+struct GetPageInfoResponse {
+    PageProperties properties{};  ///< PAGE_PROPERTIES 拆解
+    std::uint8_t init_segment{0}; ///< INIT_SEGMENT（Page 0 含初始化数据）
+};
+
+/// @brief SET_SEGMENT_MODE 请求字段（docs §7.5.3.6）
+struct SetSegmentModeRequest {
+    SegmentModeBit mode{SegmentModeBit::kNone};  ///< FREEZE 位组合
+    std::uint8_t segment{0};                     ///< Segment Number
+};
+
+/// @brief GET_SEGMENT_MODE 请求字段（docs §7.5.3.7）
+struct GetSegmentModeRequest {
+    std::uint8_t segment{0};  ///< Segment Number
+};
+
+/// @brief GET_SEGMENT_MODE 响应解析结果
+struct GetSegmentModeResponse {
+    SegmentModeBit mode{};  ///< MODE（HasSegmentMode(mode, kFreeze) 判冻结）
+};
+
+/// @brief COPY_CAL_PAGE 请求字段（docs §7.5.3.8）
+struct CopyCalPageRequest {
+    std::uint8_t src_segment{0};  ///< Source Segment Number
+    std::uint8_t src_page{0};     ///< Source Page Number
+    std::uint8_t dst_segment{0};  ///< Destination Segment Number
+    std::uint8_t dst_page{0};     ///< Destination Page Number
+};
+
+// ---------------------------------------------------------------------------
 // constexpr 工具函数实现（声明见上方）
 // ---------------------------------------------------------------------------
 
@@ -539,6 +791,53 @@ constexpr bool HasDaqProcessorProperty(DaqProcessorPropertyBit props,
                                        DaqProcessorPropertyBit mask) noexcept {
     return (static_cast<std::uint8_t>(props) &
             static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr CalPageModeBit operator|(CalPageModeBit lhs,
+                                   CalPageModeBit rhs) noexcept {
+    return static_cast<CalPageModeBit>(static_cast<std::uint8_t>(lhs) |
+                                       static_cast<std::uint8_t>(rhs));
+}
+
+constexpr bool HasCalPageMode(CalPageModeBit mode,
+                              CalPageModeBit mask) noexcept {
+    return (static_cast<std::uint8_t>(mode) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr PagPropertyBit operator|(PagPropertyBit lhs,
+                                   PagPropertyBit rhs) noexcept {
+    return static_cast<PagPropertyBit>(static_cast<std::uint8_t>(lhs) |
+                                       static_cast<std::uint8_t>(rhs));
+}
+
+constexpr bool HasPagProperty(PagPropertyBit props,
+                              PagPropertyBit mask) noexcept {
+    return (static_cast<std::uint8_t>(props) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr SegmentModeBit operator|(SegmentModeBit lhs,
+                                   SegmentModeBit rhs) noexcept {
+    return static_cast<SegmentModeBit>(static_cast<std::uint8_t>(lhs) |
+                                       static_cast<std::uint8_t>(rhs));
+}
+
+constexpr bool HasSegmentMode(SegmentModeBit mode,
+                              SegmentModeBit mask) noexcept {
+    return (static_cast<std::uint8_t>(mode) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr PageProperties ParsePageProperties(std::uint8_t raw) noexcept {
+    // 位段来源：docs §7.5.3.5 PAGE_PROPERTIES（ECU bits0-1 / XCP_READ bits2-3 /
+    // XCP_WRITE bits4-5；bit6-7 保留在 raw 中不解释）
+    PageProperties props;
+    props.raw = raw;
+    props.ecu_access = static_cast<PageAccessType>(raw & 0x03U);
+    props.xcp_read_access = static_cast<PageAccessType>((raw >> 2) & 0x03U);
+    props.xcp_write_access = static_cast<PageAccessType>((raw >> 4) & 0x03U);
+    return props;
 }
 
 constexpr DaqTimestampMode ParseDaqTimestampMode(std::uint8_t raw) noexcept {

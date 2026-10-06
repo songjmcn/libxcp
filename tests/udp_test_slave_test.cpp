@@ -386,8 +386,9 @@ TEST_F(UdpTestSlaveCommands, SetMtaThenUploadReadsSameMemory) {
     const Bytes content = BytesOf({0x11, 0x22, 0x33, 0x44, 0x55});
     slave_.SetMemory(0x2000, BytesView{content});
 
-    ASSERT_TRUE(
-        Request(BytesOf({0xF6, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(
+        BytesOf({0xF6, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x00}),
+        res_));  // SET_MTA addr=0x2000（[F6][MODE][rsv][EXT][ADDR]）
     EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Res));
 
     // UPLOAD(3) => [FF][3 字节数据]（无计数字节）
@@ -406,8 +407,9 @@ TEST_F(UdpTestSlaveCommands, SetMtaThenUploadReadsSameMemory) {
 TEST_F(UdpTestSlaveCommands, UploadBeyondMemoryReturnsAccessDenied) {
     const Bytes content = BytesOf({0x01, 0x02});
     slave_.SetMemory(0x3000, BytesView{content});
-    ASSERT_TRUE(
-        Request(BytesOf({0xF6, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(
+        BytesOf({0xF6, 0x00, 0x00, 0x00, 0x00, 0x30, 0x00, 0x00}),
+        res_));
     ASSERT_TRUE(Request(BytesOf({0xF5, 0x06}), res_));  // 超出内存块范围
     ASSERT_EQ(res_.size(), 2U);
     EXPECT_EQ(res_[0], static_cast<std::uint8_t>(PacketType::Err));
@@ -630,8 +632,8 @@ TEST_F(UdpTestSlaveDaq, GetDaqListInfoReportsCapacityAndNoFirstPid) {
 TEST_F(UdpTestSlaveDaq, DownloadWritesAtMtaAndAdvancesIt) {
     slave_.SetMemory(0x4000, BytesOf({0x00, 0x00, 0x00, 0x00}));
     // SET_MTA(0x4000) → DOWNLOAD 2 元素 → SHORT_UPLOAD 读回
-    ASSERT_TRUE(
-        Request(BytesOf({0xF6, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00}), res_));
+    ASSERT_TRUE(Request(
+        BytesOf({0xF6, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00}), res_));
     ASSERT_TRUE(Request(BytesOf({0xF0, 0x02, 0xAA, 0xBB}), res_));
     ASSERT_EQ(res_.size(), 1U);
     ASSERT_TRUE(Request(
