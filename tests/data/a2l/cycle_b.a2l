@@ -1,0 +1,11 @@
+ASAP2_VERSION 1 61
+/begin PROJECT CycleB "cycle link b, closes the loop back to a"
+
+/include "cycle_a.a2l"
+
+  /begin MODULE CYCLE_B "module b"
+    /begin COMPU_METHOD CM_B "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+  /end MODULE
+
+/end PROJECT

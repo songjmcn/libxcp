@@ -1,0 +1,51 @@
+{
+  "project": "CollisionProj",
+  "project_desc": "load-warning coverage: name collision + DAQ list without FIRST_PID",
+  "modules": [
+    {
+      "name": "COL_ECU",
+      "comment": "F6 告警通道样本（批次15）",
+      "mod_common": true,
+      "mod_par": false,
+      "compu_methods": [{"name": "CM_IDENT", "type": "IDENTICAL"}],
+      "measurements": [
+        {"name": "M_BLOCK", "datatype": "UWORD", "compu": "CM_IDENT",
+         "address": "0x9000", "ext": "0x0"}
+      ],
+      "typedef_measurements": [
+        {"name": "TM_PLAIN", "desc": "结构体成员引用的 typedef",
+         "datatype": "UWORD", "compu": "CM_IDENT"}
+      ],
+      "typedef_structures": [
+        {"name": "M_BLOCK", "desc": "与 MEASUREMENT 同名（触发 B-13 跳过告警）",
+         "size": 4,
+         "members": [
+           {"name": "w", "typedef": "TM_PLAIN", "offset": 0}
+         ]}
+      ],
+      "instances": [],
+      "if_data": [
+        {
+          "protocol": "XCP",
+          "protocol_layer": {"version": "0x100", "max_cto": "0x10",
+                             "max_dto": "0x20"},
+          "byte_order": "MSB_LAST",
+          "address_granularity": "BYTE",
+          "daq": {
+            "type": "STATIC", "max_daq": 4, "max_event": 2, "min_daq": 0,
+            "daq_list": {
+              "number": 7, "odt_number": 1, "type": "DAQ",
+              "max_odt": 1, "max_odt_entries": 2,
+              "first_pid": null,
+              "event_fixed": 1,
+              "entries": [
+                {"number": 1, "address": "0x9000", "ext": "0x0", "size": 2,
+                 "bit_offset": 0}
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

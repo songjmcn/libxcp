@@ -1,0 +1,19 @@
+ASAP2_VERSION 1 61
+/begin PROJECT HandProject "handwritten cross-check sample (A-6 mitigation 2)"
+
+  /begin MODULE HAND_ECU "handwritten module, deliberately different from generator output"
+
+    /begin COMPU_METHOD CM_HW "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+
+    /begin MEASUREMENT HW_TEMP "hand written temperature" UWORD CM_HW 10 0 0 1000
+      BYTE_ORDER MSB_LAST
+      ECU_ADDRESS 0x1234
+      ECU_ADDRESS_EXTENSION 0x0
+      READ_WRITE
+      PHYS_UNIT "degC"
+    /end MEASUREMENT
+
+  /end MODULE
+
+/end PROJECT

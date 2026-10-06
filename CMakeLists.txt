@@ -82,20 +82,26 @@ target_sources(libxcp PRIVATE
         src/xcp_error.cpp
         src/command_codec.cpp
         src/response_parser.cpp
-        src/session.cpp)
-
-# 阶段 3 起启用（UDP Transport 实现）：
-#   src/udp_header_codec.cpp
-#   src/udp_transport.cpp
+        src/session.cpp
+        src/udp_header_codec.cpp
+        src/udp_transport.cpp
+        src/command_executor.cpp
+        src/memory_access.cpp
+        src/xcp_master.cpp)
 
 target_include_directories(libxcp
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
-# 协议核心仅依赖线程库（Session/Executor 内部同步），不依赖任何 Socket API
+# 协议核心仅依赖线程库（Session/Executor 内部同步）；
+# UdpTransport 使用平台 Socket，Windows 需显式链接 ws2_32。
 find_package(Threads REQUIRED)
 target_link_libraries(libxcp PUBLIC Threads::Threads)
+
+if(WIN32)
+  target_link_libraries(libxcp PUBLIC ws2_32)
+endif()
 
 set_target_properties(libxcp PROPERTIES
         OUTPUT_NAME xcp
@@ -108,6 +114,61 @@ install(TARGETS libxcp
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/libxcp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# ----------------------------------------------------------------------------
+# A2L 桥接层（最小开发验证集；见 code-plan/A2L_集成_a2llib选型与适配层详细设计_R4.md）
+#
+# 批次9 起 a2lbridge 并入 thirdparty/a2l-sdk 工程：build-sdk.ps1 一次产出
+# liba2l.dll/lib + libxcp_a2lbridge.lib + include/liba2l 与 include/libxcp 头树。
+# 本工程不编译任何 thirdparty 源码，只创建 IMPORTED target 消费准备根产物。
+# 默认 OFF：不改变原构建。开启时必须显式提供准备根路径
+# （LIBXCP_LIBA2L_ROOT），不做环境变量/注册表/.deps-cache 回退猜测。
+# ----------------------------------------------------------------------------
+option(LIBXCP_BUILD_A2L "Consume the A2L bridge artifacts" OFF)
+set(LIBXCP_LIBA2L_ROOT "" CACHE PATH "Prepared liba2l root")
+
+if(LIBXCP_BUILD_A2L)
+  if(NOT LIBXCP_LIBA2L_ROOT)
+    message(FATAL_ERROR
+            "LIBXCP_BUILD_A2L=ON requires LIBXCP_LIBA2L_ROOT "
+            "(prepared by thirdparty/a2l-sdk/build-sdk.ps1)")
+  endif()
+
+  find_path(LIBXCP_LIBA2L_INCLUDE_DIR
+            NAMES liba2l/liba2l_api.hpp
+            PATHS "${LIBXCP_LIBA2L_ROOT}/include"
+            NO_DEFAULT_PATH REQUIRED)
+  find_library(LIBXCP_LIBA2L_LIBRARY
+               NAMES liba2l
+               PATHS "${LIBXCP_LIBA2L_ROOT}/lib"
+               NO_DEFAULT_PATH REQUIRED)
+  find_file(LIBXCP_LIBA2L_RUNTIME_DLL
+            NAMES liba2l.dll
+            PATHS "${LIBXCP_LIBA2L_ROOT}/bin"
+            NO_DEFAULT_PATH REQUIRED)
+
+  add_library(liba2l::liba2l SHARED IMPORTED GLOBAL)
+  set_target_properties(liba2l::liba2l PROPERTIES
+      IMPORTED_IMPLIB "${LIBXCP_LIBA2L_LIBRARY}"
+      IMPORTED_LOCATION "${LIBXCP_LIBA2L_RUNTIME_DLL}"
+      INTERFACE_INCLUDE_DIRECTORIES "${LIBXCP_LIBA2L_INCLUDE_DIR}")
+
+  # 桥接层：SDK 工程编好的静态库 + 公开头树（IMPORTED 消费，见上注释）。
+  find_path(LIBXCP_A2LBRIDGE_INCLUDE_DIR
+            NAMES libxcp/a2l/a2l_bridge.hpp
+            PATHS "${LIBXCP_LIBA2L_ROOT}/include"
+            NO_DEFAULT_PATH REQUIRED)
+  find_library(LIBXCP_A2LBRIDGE_LIBRARY
+               NAMES libxcp_a2lbridge
+               PATHS "${LIBXCP_LIBA2L_ROOT}/lib"
+               NO_DEFAULT_PATH REQUIRED)
+
+  add_library(libxcp::a2lbridge STATIC IMPORTED GLOBAL)
+  set_target_properties(libxcp::a2lbridge PROPERTIES
+      IMPORTED_LOCATION "${LIBXCP_A2LBRIDGE_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${LIBXCP_A2LBRIDGE_INCLUDE_DIR}"
+      INTERFACE_LINK_LIBRARIES liba2l::liba2l)
+endif()
 
 # ----------------------------------------------------------------------------
 # 测试

@@ -1,0 +1,49 @@
+{
+  "project": "XcpPlusProj",
+  "project_desc": "XCP vs XCPplus priority + conflict report (S6.3-A)",
+  "modules": [
+    {
+      "name": "PLUS_ECU",
+      "comment": "both IF_DATA protocols present, XCPplus wins",
+      "mod_common": true,
+      "mod_par": false,
+      "compu_methods": [{"name": "CM_IDENT", "type": "IDENTICAL"}],
+      "measurements": [
+        {"name": "M_PLUS", "desc": "symbol of plus module", "datatype": "UWORD",
+         "compu": "CM_IDENT", "address": "0x6000", "ext": "0x0"}
+      ],
+      "if_data": [
+        {
+          "protocol": "XCP",
+          "protocol_layer": {"version": "0x100", "max_cto": "0x10",
+                             "max_dto": "0x20"},
+          "udp": {"port": "0x15B7", "host": "localhost",
+                  "packet_alignment": "PACKET_ALIGNMENT_16",
+                  "sub_commands": ["GET_SLAVE_ID_EXTENDED"]}
+        },
+        {
+          "protocol": "XCPplus",
+          "xcpplus_version": 11,
+          "protocol_layer": {"version": "0x100", "max_cto": "0x18",
+                             "max_dto": "0x20"},
+          "udp": {"port": "0x15B7", "host": "localhost",
+                  "packet_alignment": "PACKET_ALIGNMENT_32",
+                  "sub_commands": ["GET_SLAVE_ID_EXTENDED",
+                                   "GET_DAQ_CLOCK_MULTICAST"]},
+          "daq": {
+            "type": "STATIC", "max_daq": 2, "max_event": 1, "min_daq": 0,
+            "daq_list": {
+              "number": 5, "odt_number": 1, "type": "DAQ",
+              "max_odt": 1, "max_odt_entries": 1, "first_pid": 1,
+              "event_fixed": 1,
+              "entries": [
+                {"number": 1, "address": "0x6000", "ext": "0x0", "size": 2,
+                 "bit_offset": 0}
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
