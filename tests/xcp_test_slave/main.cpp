@@ -19,15 +19,19 @@
  *  - IF_DATA XCP 的 TRANSPORT_LAYER 段仅在绑定地址首字节非 0 时写出，
  *    因此必须绑定 127.0.0.1 而不是 0.0.0.0，否则 A2L 无端点信息。
  *
- * 命令行：xcp_test_slave [port]（缺省 5556）。
+ * 命令行：xcp_test_slave [port [startup_delay_ms [ready_token]]]（缺省端口 5556）。
  */
 
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <string>
+#include <thread>
 
 #include "a2l.hpp"     // XCPlite A2L 生成 API（C++ 包装）
 #include "xcplib.hpp"  // XCPlite 应用侧 API（C++ RAII 包装）
@@ -123,13 +127,17 @@ void WriteAmlStub() {
  * @brief Slave 主入口
  * @param argc 参数个数
  * @param argv argv[1] = 监听端口（十进制，可选，默认 5556）
- * @return 0 正常退出；2 XCP Server 启动失败（端口占用等）；3 A2L 初始化失败
+ * @return 0 正常退出；2 XCP Server 启动失败（端口占用等）；3 A2L 初始化失败；4 就绪标记写入失败
  */
 int main(int argc, char** argv) {
     const std::uint16_t port =
         argc > 1
             ? static_cast<std::uint16_t>(std::strtoul(argv[1], nullptr, 10))
             : kXcpliteSlaveDefaultPort;
+    const std::uint32_t startup_delay_ms =
+        argc > 2 ? static_cast<std::uint32_t>(std::strtoul(argv[2], nullptr, 10))
+                 : 0U;
+    const std::string ready_token = argc > 3 ? argv[3] : "";
 
     std::signal(SIGINT, OnSignal);
     std::signal(SIGTERM, OnSignal);
@@ -141,6 +149,11 @@ int main(int argc, char** argv) {
 
     // XCP 单例初始化（LOCAL 模式，无持久化文件依赖，每次启动全新状态）
     XcpInit(kXcpliteSlaveProject, "1.0", XCP_MODE_LOCAL);
+    // 首次启动延迟仅供测试复现：端口已有服务时验证就绪标记不会误认该服务。
+    if (startup_delay_ms > 0U) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(startup_delay_ms));
+    }
 
     // 绑定 127.0.0.1（首字节非 0 → A2L 才会写出 TRANSPORT_LAYER 端点信息）
     const std::uint8_t addr[4] = {127, 0, 0, 1};
@@ -224,8 +237,18 @@ int main(int argc, char** argv) {
     A2lCreateTypedefInstanceArray(g_struct_array, SimpleStruct_t, 3,
                                   "Array of SimpleStruct_t");
 
-    // 显式定稿：A2L 在开始监听之前已完整落盘，测试端探测就绪后可直接加载
+    // 显式定稿：A2L 完整落盘后再写子进程就绪标记。
     A2lFinalize();
+    // 标记携带本次启动 token，防止父进程把同端口的其他 XCP 服务当成子进程。
+    if (!ready_token.empty()) {
+        std::ofstream marker(kXcpliteSlaveReadyMarkerFile,
+                             std::ios::out | std::ios::trunc | std::ios::binary);
+        marker << ready_token << '\n';
+        if (!marker) {
+            std::fprintf(stderr, "xcp_test_slave: failed to write ready marker\n");
+            return 4;
+        }
+    }
     std::printf("xcp_test_slave ready on 127.0.0.1:%u, a2l=%s\n", port,
                 A2lGetFilename());
     std::fflush(stdout);

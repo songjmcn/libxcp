@@ -23,6 +23,10 @@ inline constexpr const char* kXcpliteSlaveProject = "xcp_test_slave";
 /// @brief Slave 默认监听端口（可被命令行参数覆盖）
 inline constexpr std::uint16_t kXcpliteSlaveDefaultPort = 5556;
 
+/// @brief 子进程身份就绪标记文件名（夹具与 Slave 端共享）
+inline constexpr const char* kXcpliteSlaveReadyMarkerFile =
+    "xcp_test_slave.ready";
+
 /// @brief Slave 进程就绪探测的总超时（毫秒）
 inline constexpr std::uint32_t kXcpliteSlaveReadyTimeoutMs = 15000;
 

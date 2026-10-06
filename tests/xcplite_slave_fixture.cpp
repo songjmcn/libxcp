@@ -87,6 +87,8 @@ std::uint32_t CurrentProcessId() {
 struct XcpliteSlaveProcess::Impl {
     std::uint16_t port{0};             ///< 实际使用的端口
     std::filesystem::path work_dir;    ///< Slave 工作目录
+    std::optional<std::uint16_t> first_candidate_port;  ///< 测试指定首选端口
+    std::uint32_t first_attempt_startup_delay_ms{0};    ///< 首次启动测试延迟
     std::atomic<bool> started{false};  ///< 是否已启动（Stop 幂等判定）
 
 #ifdef _WIN32
@@ -163,13 +165,17 @@ struct XcpliteSlaveProcess::Impl {
      * @brief 在指定端口启动 Slave 子进程（工作目录 = dir）
      * @return 成功 true；进程无法创建 false
      */
-    bool Spawn(std::uint16_t use_port, const std::filesystem::path& dir) {
+    bool Spawn(std::uint16_t use_port, const std::filesystem::path& dir,
+               const std::string& ready_token,
+               std::uint32_t startup_delay_ms) {
         port = use_port;
         work_dir = dir;
 #ifdef _WIN32
-        // 命令行：<exe> <port>（路径含空格时加引号）
+        // 命令行：<exe> <port> <delay-ms> <token>（路径含空格时加引号）
         std::string cmdline = std::string("\"") + XCPLITE_SLAVE_EXECUTABLE +
-                              "\" " + std::to_string(use_port);
+                              "\" " + std::to_string(use_port) + " " +
+                              std::to_string(startup_delay_ms) + " " +
+                              ready_token;
         STARTUPINFOA si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
@@ -194,7 +200,9 @@ struct XcpliteSlaveProcess::Impl {
                 _exit(127);
             }
             const std::string port_arg = std::to_string(use_port);
+            const std::string delay_arg = std::to_string(startup_delay_ms);
             execl(XCPLITE_SLAVE_EXECUTABLE, "xcp_test_slave", port_arg.c_str(),
+                  delay_arg.c_str(), ready_token.c_str(),
                   static_cast<char*>(nullptr));
             _exit(126);  // exec 失败
         }
@@ -207,7 +215,13 @@ struct XcpliteSlaveProcess::Impl {
 // XcpliteSlaveProcess
 // ---------------------------------------------------------------------------
 
-XcpliteSlaveProcess::XcpliteSlaveProcess() : impl_(std::make_unique<Impl>()) {}
+XcpliteSlaveProcess::XcpliteSlaveProcess(
+    std::optional<std::uint16_t> first_candidate_port,
+    std::uint32_t first_attempt_startup_delay_ms)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->first_candidate_port = first_candidate_port;
+    impl_->first_attempt_startup_delay_ms = first_attempt_startup_delay_ms;
+}
 
 XcpliteSlaveProcess::~XcpliteSlaveProcess() { Stop(); }
 
@@ -235,6 +249,15 @@ bool ProbeOnce(std::uint16_t port) {
     } catch (const std::exception&) {
         return false;
     }
+}
+
+/// @brief 确认就绪标记由本次启动的子进程生成
+bool HasReadyMarker(const std::filesystem::path& dir,
+                    const std::string& expected_token) {
+    std::ifstream marker(dir / kXcpliteSlaveReadyMarkerFile, std::ios::binary);
+    std::string actual_token;
+    return marker && std::getline(marker, actual_token) &&
+           actual_token == expected_token;
 }
 
 }  // namespace
@@ -270,9 +293,23 @@ void XcpliteSlaveProcess::Start() {
     if (impl_->started.load()) {
         return;  // 幂等
     }
-    // 端口基数混入 pid，游标递增：并发 ctest 进程/用例之间互不重叠
-    const std::uint32_t base =
-        45000U + (CurrentProcessId() % 3000U) + g_port_cursor.fetch_add(1) * 8U;
+    // 普通路径混入 pid 与游标分配端口；测试可注入首选端口以确定性制造冲突。
+    const std::uint32_t allocation_id = g_port_cursor.fetch_add(1);
+    const std::uint32_t base = impl_->first_candidate_port.has_value()
+                                   ? *impl_->first_candidate_port
+                                   : 45000U + (CurrentProcessId() % 3000U) +
+                                         allocation_id * 8U;
+    const auto nonce = std::chrono::steady_clock::now().time_since_epoch().count();
+    const std::string ready_token = std::to_string(CurrentProcessId()) + "-" +
+                                    std::to_string(allocation_id) + "-" +
+                                    std::to_string(nonce);
+
+    constexpr std::uint32_t kLastAttemptOffset =
+        static_cast<std::uint32_t>(kMaxPortAttempts - 1) * 4U;
+    if (base + kLastAttemptOffset > 65535U) {
+        throw std::runtime_error(
+            "XcpliteSlaveProcess::Start 首选端口范围超出 UDP 端口上限");
+    }
 
     std::string last_error;
     // 21-3：顺手回收崩溃/强杀残留的陈旧 run 目录（mtime
@@ -290,12 +327,15 @@ void XcpliteSlaveProcess::Start() {
             last_error = "无法创建 Slave 工作目录: " + ec.message();
             break;  // 环境问题换端口也无济于事
         }
-        if (!impl_->Spawn(port, dir)) {
+        const std::uint32_t startup_delay_ms =
+            attempt == 0 ? impl_->first_attempt_startup_delay_ms : 0U;
+        if (!impl_->Spawn(port, dir, ready_token, startup_delay_ms)) {
             last_error =
                 "无法启动 Slave 进程: " + std::string(XCPLITE_SLAVE_EXECUTABLE);
             break;  // 可执行文件问题换端口无意义
         }
-        // 探测：进程存活 + CONNECT 成功；进程早退（如端口占用）换下一端口
+        // 就绪必须同时满足：进程存活、本次子进程标记已写入、CONNECT 成功。
+        // 仅 CONNECT 会误认同端口上已有的其他 XCP 服务。
         const auto deadline = std::chrono::steady_clock::now() +
                               std::chrono::milliseconds(kProbeTimeoutMs);
         bool ready = false;
@@ -303,7 +343,7 @@ void XcpliteSlaveProcess::Start() {
             if (!impl_->Alive()) {
                 break;  // Slave 早退（端口占用/启动失败）
             }
-            if (ProbeOnce(port)) {
+            if (HasReadyMarker(dir, ready_token) && ProbeOnce(port)) {
                 ready = true;
                 break;
             }

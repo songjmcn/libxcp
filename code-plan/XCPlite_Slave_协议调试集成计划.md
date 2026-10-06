@@ -156,13 +156,16 @@ Slave 程序行为：
 
 > **注意**：结构体/嵌套类型的 A2L 读取能力依赖批次16 STRUCTLEAF 的实现状态。若批次16尚未完成，Phase1-05 中的结构体/嵌套用例先标记为 `GTEST_SKIP`，待批次16完成后启用。基本类型和数组的读取不依赖批次16。
 
-### Phase1-06: 预置 A2L 回归测试
+### Phase1-06: A2L 结构语料与运行时一致性回归（修订）
+
+> **验收口径修订**：运行时 A2L 含镜像基址/OS 布局偏移，不能假定逐字节稳定。原定 `tests/data/a2l/xcplite_test_slave.a2l` 字节基线改为“结构语料 + 现场运行时一致性”双重回归。理由与已落地证据见 `code-plan/XCPlite_Slave_协议调试集成计划_复核记录.md` §3.1；真实结构语料为 `tests/data/a2l/xcplite_structleaf_corpus.a2l`，运行时比较由 `RuntimeConsistencyNoErrors` 覆盖。此修订不表示运行时 A2L 不再测试。
 
 | 步骤 | 内容 |
 |------|------|
-| 06-A | 首次运行 Slave 后将生成的 A2L 复制到 `tests/data/a2l/xcplite_test_slave.a2l` 作为基线 |
-| 06-B | 新增回归测试用例加载该预置 A2L，验证解析结果与运行时生成版本一致 |
-| 06-C | 后续 Slave 变量变更时同步更新基线文件 |
+| 06-A | 使用 `tests/data/a2l/xcplite_structleaf_corpus.a2l` 固定结构/叶子展开语义，不将地址、镜像基址或平台布局作为跨运行字节常量 |
+| 06-B | 保留 `RuntimeConsistencyNoErrors`：每次启动加载运行时生成 A2L 并与解析数据库核对，无 Error（允许已定义的容量 Warning） |
+| 06-C | Slave 变量/结构注册变更时，更新结构语料及符号覆盖断言；若未来能证明某些 A2L 字段稳定，可单独增加规范化快照，但不得直接比较易变地址 |
+| 06-D | 在复核/实施记录中列明语料覆盖范围、运行时一致性用例名及替代逐字节快照的理由 |
 
 ## 3. 第二阶段实施分解
 
@@ -184,14 +187,17 @@ Slave 程序行为：
 | `WriteStructMember` | 写 g_simple_struct.field_b → 读回验证 |
 | `WriteArrayElement` | 写 g_array_i16[2] → 读回验证 |
 | `WriteNestedMember` | 写 g_outer.nested_struct.field_a → 读回验证 |
-| `WriteCalParam` | Unlock(CAL/PAG) → 写 CalParams_t.cal_factor → 读回验证 |
+| `WriteCalParam` | 当前 XCPlite 非保护 CalSeg 用例：定位 `kDefaultCalParams.cal_factor`，WriteMemoryBytes → ReadBack；不调用 Unlock。真实受保护写回不属于本用例，见 Phase2-03 |
 
-### Phase2-03: Seed&Key 解锁 + 写回闭环
+### Phase2-03: Seed&Key 能力边界（XCPlite 不支持；真实闭环另行规划）
 
-| 用例 | 验证内容 |
-|------|----------|
-| `UnlockThenWriteCalSeg` | 完整 Seed&Key → Unlock → Write → Read 闭环 |
-| `WrongKeyRejected` | 错误 Key → Slave 断开 → Session Failed |
+> **结论（批次19 核证）**：vendored XCPlite 的 GET_SEED/UNLOCK 处理器处于 `#if 0` 死代码，配置 override 无法启用；上游亦声明不支持。不得把启用宏作为实施方案，不得修改 thirdparty 绕开此限制。详见 `code-plan/XCPlite_Slave_协议调试_实施记录_批次19_SeedKey设计停止.md`。
+
+| 用例 | 验证内容 | 状态/边界 |
+|------|----------|----------|
+| `UnlockAgainstXcpliteReportsCmdUnknown` | 对真实 XCPlite 请求 Unlock，确认 `ERR_CMD_UNKNOWN` 且 Master 会话仍可用 | 已实现的诚实负例；不是解锁成功 |
+| Master Seed&Key Loopback | 在 UdpTestSlave/模拟对手端验证 GET_SEED/UNLOCK、分段、错误 Key 会话语义 | 仅验证 Master 协议行为，不等同 XCPlite 或 ECU 互操作 |
+| 真实受保护 CAL 写回 | 锁定拒写 → 正确 Seed&Key → 写读回；错误 Key 负例 | 本计划不验收；需有独立支持 Seed&Key 的 Slave/ECU 后另立计划 |
 
 > **注意**：Phase2 的写回测试需要 XCPlite Slave 端开启 Calibration Segment 支持（`OPTION_CAL_SEGMENTS`），且测试 Slave 程序中需将 CalParams_t 注册为 CalSeg。这需要在 Phase1-02 中预留。
 
@@ -203,14 +209,14 @@ Slave 程序行为：
 | XCPlite 默认 TCP，需确认 UDP 模式可用 | `XcpEthServerInit(addr, port, false/*UDP*/, queue_size)`；struct_demo 已有 UDP 示例 |
 | 端口 5556 被占用 | Slave 支持命令行指定端口；Fixture 尝试多个端口或使用 OS 分配 + 反向发现 |
 | A2L 运行时生成路径不确定 | Slave 将 A2L 写到当前工作目录；Fixture 设置明确的工作目录并传递路径 |
-| 批次16 STRUCTLEAF 未完成 | Phase1-05 结构体/嵌套用例条件跳过；基本类型+数组不受影响 |
+| 结构语料与运行时 A2L 地址不稳定 | Phase1-06 使用结构语料锁结构语义，并以现场 RuntimeConsistencyNoErrors 核对；不锁定易变地址 |
 | XCPlite 作为 thirdparty 不可修改 | AGENTS.md 约束遵守；所有适配在 tests/ 侧完成 |
 | 子进程管理跨平台差异 | Windows 用 CreateProcess/TerminateProcess；Linux/macOS 用 fork/exec/sigkill；Fixture 封装平台差异 |
 
 ## 5. 不做的事项
 
 - 不修改 `thirdparty/XCPlite` 的任何源码
-- 不实现 DAQ DTO 实时采集测试（属后续里程碑）
+- 本计划初始阶段不实现 DAQ DTO 实时采集测试（属后续里程碑）；后续已由批次20及测量子系统批次补充真实 XCPlite DAQ/DTO 与物理值端到端测试，见 `tests/xcplite_daq_test.cpp`、`tests/xcplite_measurement_test.cpp` 和 `code-plan/XCPlite_Slave_协议调试_实施记录_批次20_DAQ实时采集.md`。
 - 不实现 STIM 方向测试
 - 不修改现有 UdpTestSlave 相关测试（保持既有测试不变）
 - 不在本计划中处理批次16 STRUCTLEAF 的实现
@@ -223,7 +229,7 @@ Slave 程序行为：
 - `tests/xcplite_protocol_test.cpp`
 - `tests/xcplite_a2l_read_test.cpp`
 - `tests/xcplite_write_test.cpp`（第二阶段）
-- `tests/data/a2l/xcplite_test_slave.a2l`（预置基线）
+- `tests/data/a2l/xcplite_structleaf_corpus.a2l`（结构语义回归语料；运行时 A2L 另由一致性用例核对）
 - 实施记录 markdown（每次修改后按 AGENTS.md 要求输出）
 
 ## 7. 验收标准
@@ -233,18 +239,22 @@ Slave 程序行为：
 1. `cmake -B cmake-build-release -S . -DLIBXCP_BUILD_XCPLITE_SLAVE=ON && cmake --build cmake-build-release` 编译通过
 2. `ctest --test-dir cmake-build-release -R XcpliteProtocol` 全部 PASS
 3. `ctest --test-dir cmake-build-release -R XcpliteA2lRead` 中基本类型+数组用例全部 PASS
-4. 结构体/嵌套用例根据批次16状态要么 PASS 要么 SKIP（不 FAIL）
+4. 结构体/嵌套叶子用例 PASS；结构语料固定解析语义，运行时 A2L `RuntimeConsistencyNoErrors` 无 Error（容量 Warning 可接受）
 5. 既有 `libxcp_tests` 全量测试不受影响（`LIBXCP_BUILD_XCPLITE_SLAVE=OFF` 时构建不变）
-6. 实施记录已写入 `code-plan/`
+6. 实施记录已写入 `code-plan/`；测试结果注明系统/编译器、测试数、跳过项
+7. `tests/data/a2l/xcplite_test_slave.a2l` 逐字节基线已由结构语料 + 运行时一致性取代；验收变更理由见 Phase1-06
 
 ### 第二阶段 DoD
 
-1. `ctest --test-dir cmake-build-release -R XcpliteWrite` 全部 PASS
-2. Seed&Key + 写回闭环验证通过
-3. 实施记录已写入 `code-plan/`
+1. `ctest --test-dir cmake-build-release -R XcpliteWrite` 全部 PASS（包括 CalSeg 写读和 XCPlite 对 Seed&Key 的实际负响应）
+2. 不得将 XCPlite 的 `ERR_CMD_UNKNOWN` 描述为 Seed&Key 解锁成功；Master 侧 Seed&Key 另由 UdpTestSlave/Mock 用例验证
+3. 真实 Seed&Key 受保护写回不属于 XCPlite 本计划的验收项；只有在独立支持该机制的 Slave/ECU 可用时，才可在独立计划中验收
+4. 实施记录已写入 `code-plan/`，区分真实 XCPlite、Mock/Loopback 和未验证的 ECU 互操作结果
 
 ## 8. 变更记录
 
 | 轮次 | 日期 | 内容 |
 |------|------|------|
 | P1 | 2025 | 初始版本：确定独立进程+真实UDP架构、add_subdirectory构建集成、专用测试Slave程序、两阶段分解 |
+| P0 修订 | 2026 | Phase1-06 改为结构语料 + 运行时 A2L 一致性回归；Phase2-03 明确 XCPlite 不支持 Seed&Key，区分实然负例、Master loopback 与真实受保护闭环的边界；修订 DoD/风险口径。实施与验证结果见 `code-plan/XCP_测量标定差距收口_P0实施记录.md` |
+| P0 补充修订 | 2026 | Phase2-02 明确 `WriteCalParam` 是当前 XCPlite 非保护 CalSeg 写读，不调用 Seed&Key；§5 将 DAQ DTO 实时采集表述为初始阶段范围，并链接后续已完成的 DAQ/测量测试，消除历史范围与当前交付状态混淆 |

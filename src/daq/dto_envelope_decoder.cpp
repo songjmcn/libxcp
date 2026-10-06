@@ -108,6 +108,8 @@ DtoEnvelope DtoEnvelopeDecoder::Decode(BytesView dto,
             identity.daq_list = dto[0];
             break;
         }
+        default:
+            ThrowMalformed("未知 DTO identification field 模式");
     }
 
     std::size_t off = field;  // 当前指到 counter/timestamp 段起点

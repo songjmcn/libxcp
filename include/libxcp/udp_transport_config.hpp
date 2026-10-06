@@ -38,7 +38,7 @@ struct UdpTransportConfig {
 
     /**
      * @brief 接收轮询间隔（毫秒），用于内部线程周期性检查关闭标记
-     * @details 实际以 Socket 接收超时实现，不影响上层命令超时；越小关闭越及时。
+     * @details 必须大于 0；实际以 Socket 接收超时实现，不影响上层命令超时；越小关闭越及时。
      */
     std::uint32_t receive_poll_interval_ms = 100;
 

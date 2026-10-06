@@ -142,6 +142,23 @@ public:
         m_drop_nth_[cmd] = n;
     }
 
+    /// @brief 命令执行后丢弃第 n 次响应，模拟操作已生效但应答丢失
+    void DropResponseAfterExecuteNthCall(CommandCode cmd, std::size_t n) {
+        m_drop_response_after_execute_nth_[cmd] = n;
+    }
+
+    /// @brief 设置模拟标定页内容（供 COPY_CAL_PAGE 回归验证）
+    void SetCalibrationPageData(std::uint8_t segment, std::uint8_t page,
+                                 Bytes data) {
+        m_calibration_pages_[{segment, page}] = std::move(data);
+    }
+
+    [[nodiscard]] Bytes CalibrationPageData(std::uint8_t segment,
+                                            std::uint8_t page) const {
+        const auto it = m_calibration_pages_.find({segment, page});
+        return it == m_calibration_pages_.end() ? Bytes{} : it->second;
+    }
+
     /// @brief 变量标定批次：按 MTA 读 4 字节 DWORD（Intel），应用
     ///        Result = Value & (AND<<S) ^ (XOR<<S)，MTA 不变
     ///        （docs §7.5.2.5；xcp.h CRO_MODIFY_BITS_LEN=6）
@@ -240,8 +257,90 @@ public:
                 return upload(packet);
             case CommandCode::ShortUpload:
                 return shortUpload(packet);
-            case CommandCode::ModifyBits:
-                return modifyBits(packet);
+            case CommandCode::Download: {
+                if (packet.size() < 2U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                const auto count = static_cast<std::size_t>(packet[1]) *
+                                   AgToBytes(m_ag_);
+                if (count == 0U || packet.size() < 2U + count) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                for (std::size_t i = 0; i < count; ++i) {
+                    m_memory_[m_mta_ + static_cast<Address>(i)] = packet[2U + i];
+                }
+                m_mta_ += static_cast<Address>(count);
+                return ShouldDropResponseAfterExecute(cmd) ? Bytes{} : Res({});
+            }
+            case CommandCode::ShortDownload: {
+                if (packet.size() < 8U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                const auto count = static_cast<std::size_t>(packet[1]) *
+                                   AgToBytes(m_ag_);
+                if (count == 0U || packet.size() < 8U + count) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                const Address address = decodeAddress(packet.subspan(4, 4));
+                for (std::size_t i = 0; i < count; ++i) {
+                    m_memory_[address + static_cast<Address>(i)] = packet[8U + i];
+                }
+                m_mta_ = address + static_cast<Address>(count);
+                return ShouldDropResponseAfterExecute(cmd) ? Bytes{} : Res({});
+            }
+            case CommandCode::ModifyBits: {
+                const Bytes response = modifyBits(packet);
+                return ShouldDropResponseAfterExecute(cmd) ? Bytes{} : response;
+            }
+            case CommandCode::GetCalPage: {
+                if (packet.size() < 3U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                const auto it = m_active_cal_pages_.find({packet[1], packet[2]});
+                const std::uint8_t page =
+                    it == m_active_cal_pages_.end() ? 0U : it->second;
+                return Res({0x00U, 0x00U, page});
+            }
+            case CommandCode::GetSegmentMode: {
+                if (packet.size() < 3U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                const auto it = m_segment_modes_.find(packet[2]);
+                const std::uint8_t mode =
+                    it == m_segment_modes_.end() ? 0U : it->second;
+                return Res({0x00U, mode});
+            }
+            case CommandCode::SetCalPage: {
+                if (packet.size() < 4U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                const std::uint8_t mode = packet[1];
+                const std::uint8_t segment = packet[2];
+                const std::uint8_t page = packet[3];
+                if ((mode & 0x01U) != 0U) {
+                    m_active_cal_pages_[{0x01U, segment}] = page;
+                }
+                if ((mode & 0x02U) != 0U) {
+                    m_active_cal_pages_[{0x02U, segment}] = page;
+                }
+                return ShouldDropResponseAfterExecute(cmd) ? Bytes{} : Res({});
+            }
+            case CommandCode::SetSegmentMode: {
+                if (packet.size() < 3U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                m_segment_modes_[packet[2]] = packet[1];
+                return ShouldDropResponseAfterExecute(cmd) ? Bytes{} : Res({});
+            }
+            case CommandCode::CopyCalPage: {
+                if (packet.size() < 5U) {
+                    return Err(ErrorCode::CmdSyntax);
+                }
+                const auto source = std::make_pair(packet[1], packet[2]);
+                const auto destination = std::make_pair(packet[3], packet[4]);
+                m_calibration_pages_[destination] = m_calibration_pages_[source];
+                return ShouldDropResponseAfterExecute(cmd) ? Bytes{} : Res({});
+            }
             default:
                 return Err(ErrorCode::CmdUnknown);
         }
@@ -261,6 +360,12 @@ private:
     static Bytes Err(ErrorCode code) {
         return Bytes{static_cast<std::uint8_t>(PacketType::Err),
                      static_cast<std::uint8_t>(code)};
+    }
+
+    [[nodiscard]] bool ShouldDropResponseAfterExecute(CommandCode cmd) const {
+        const auto it = m_drop_response_after_execute_nth_.find(cmd);
+        return it != m_drop_response_after_execute_nth_.end() &&
+               static_cast<std::size_t>(m_counts_.at(cmd)) == it->second;
     }
 
     /// @brief 按 Session 字节序解出 4 字节地址
@@ -377,6 +482,11 @@ private:
     std::map<CommandCode, ErrorCode> m_errors_;
     std::map<CommandCode, Bytes> m_responses_;
     std::map<CommandCode, std::size_t> m_drop_nth_;
+    std::map<CommandCode, std::size_t> m_drop_response_after_execute_nth_;
+    std::map<std::pair<std::uint8_t, std::uint8_t>, std::uint8_t>
+        m_active_cal_pages_;
+    std::map<std::uint8_t, std::uint8_t> m_segment_modes_;
+    std::map<std::pair<std::uint8_t, std::uint8_t>, Bytes> m_calibration_pages_;
     std::set<CommandCode> m_dropped_;
     std::map<CommandCode, int> m_drop_times_;
     std::map<CommandCode, int> m_counts_;
@@ -881,10 +991,8 @@ TEST(XcpCalibration, ModifyBitsAppliesAndXorMasksViaMtaSequence) {
     EXPECT_EQ(got, BytesOf({0x00, 0xFF, 0x0F, 0x00}));
 }
 
-TEST(XcpCalibration, ModifyBitsTimeoutRebuildsMtaBeforeRetry) {
-    // MODIFY_BITS 第 1 次丢包 → SYNCH 恢复 → 重放 SET_MTA → 重发 MODIFY_BITS。
-    // 注意：Master.Connect() 自身会发一次 SET_MTA（既有连接流程），计数基线
-    // 必须取 Connect 之后的已发包数，不能 Reset Transport（Reset 会清空响应脚本）。
+TEST(XcpCalibration, ModifyBitsTimeoutDroppedBeforeExecutionIsNotRetried) {
+    // 命令执行前丢包：执行结果仍按协议边界报告未知，SYNCH 后不重放。
     Rig rig{MockXcpSlave{},
             CommandTimeouts{std::chrono::milliseconds(120),
                             std::chrono::milliseconds(120), 2}};
@@ -893,24 +1001,196 @@ TEST(XcpCalibration, ModifyBitsTimeoutRebuildsMtaBeforeRetry) {
     rig.master->Connect();
     const std::size_t sent_before = rig.transport_ptr->SentPackets().size();
 
-    rig.master->ModifyBits(0x2000, 0x00, /*shift=*/0, /*and=*/0xFFFF,
-                           /*xor=*/0x00F0);
+    try {
+        rig.master->ModifyBits(0x2000, 0x00, /*shift=*/0, /*and=*/0xFFFF,
+                               /*xor=*/0x00F0);
+        FAIL() << "超时的 MODIFY_BITS 应报告结果未知";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::OperationOutcomeUnknown);
+        EXPECT_EQ(e.GetCommandCode(),
+                  std::optional<CommandCode>(CommandCode::ModifyBits));
+        EXPECT_EQ(e.RetryCount(), 1);
+    }
+
     const auto& sent = rig.transport_ptr->SentPackets();
-    // 本轮顺序：SET_MTA(原发) → MODIFY_BITS(超时) → SYNCH → SET_MTA(重建) →
-    //           MODIFY_BITS(重试)
-    ASSERT_EQ(sent.size(), sent_before + 5U);
+    ASSERT_EQ(sent.size(), sent_before + 3U);
     EXPECT_EQ(sent[sent_before][0],
               static_cast<std::uint8_t>(CommandCode::SetMta));
     EXPECT_EQ(sent[sent_before + 1][0],
               static_cast<std::uint8_t>(CommandCode::ModifyBits));
     EXPECT_EQ(sent[sent_before + 2][0],
               static_cast<std::uint8_t>(CommandCode::Synch));
-    EXPECT_EQ(sent[sent_before + 3][0],
+    EXPECT_EQ(rig.slave.Count(CommandCode::ModifyBits), 1);
+    EXPECT_EQ(rig.master->ReadMemoryBytes(0x2000, 0x00, 4),
+              BytesOf({0x00, 0x00, 0x00, 0x00}));
+}
+
+TEST(XcpCalibration, ModifyBitsAppliedResponseLostIsNotReplayed) {
+    // 对手端先应用 XOR，再丢弃响应；若 Master 重放，结果会被翻转回原值。
+    Rig rig{MockXcpSlave{},
+            CommandTimeouts{std::chrono::milliseconds(120),
+                            std::chrono::milliseconds(120), 2}};
+    rig.slave.SetMemory(0x2000, BytesOf({0x00, 0x00, 0x00, 0x00}));
+    rig.slave.DropResponseAfterExecuteNthCall(CommandCode::ModifyBits, 1);
+    rig.master->Connect();
+    const std::size_t sent_before = rig.transport_ptr->SentPackets().size();
+
+    try {
+        rig.master->ModifyBits(0x2000, 0x00, /*shift=*/0, /*and=*/0xFFFF,
+                               /*xor=*/0x00F0);
+        FAIL() << "响应丢失的 MODIFY_BITS 应报告结果未知";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::OperationOutcomeUnknown);
+        EXPECT_EQ(e.GetCommandCode(),
+                  std::optional<CommandCode>(CommandCode::ModifyBits));
+        EXPECT_EQ(e.RetryCount(), 1);
+    }
+
+    const auto& sent = rig.transport_ptr->SentPackets();
+    ASSERT_EQ(sent.size(), sent_before + 3U);
+    EXPECT_EQ(sent[sent_before][0],
               static_cast<std::uint8_t>(CommandCode::SetMta));
-    EXPECT_EQ(sent[sent_before + 4][0],
+    EXPECT_EQ(sent[sent_before + 1][0],
               static_cast<std::uint8_t>(CommandCode::ModifyBits));
-    const Bytes got = rig.master->ReadMemoryBytes(0x2000, 0x00, 4);
-    EXPECT_EQ(got, BytesOf({0xF0, 0x00, 0x00, 0x00}));
+    EXPECT_EQ(sent[sent_before + 2][0],
+              static_cast<std::uint8_t>(CommandCode::Synch));
+    EXPECT_EQ(rig.slave.Count(CommandCode::ModifyBits), 1);
+    EXPECT_EQ(rig.master->ReadMemoryBytes(0x2000, 0x00, 4),
+              BytesOf({0xF0, 0x00, 0x00, 0x00}));
+}
+
+template <typename Operation>
+void ExpectUnknownMutationTimeout(CommandCode command, Operation&& operation) {
+    try {
+        operation();
+        FAIL() << "响应丢失的标定变更应报告 OperationOutcomeUnknown";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::OperationOutcomeUnknown);
+        EXPECT_EQ(e.GetCommandCode(), std::optional<CommandCode>(command));
+        EXPECT_EQ(e.RetryCount(), 1);
+    }
+}
+
+TEST(XcpCalibration, DownloadAppliedResponseLostIsNotReplayed) {
+    Rig rig{MockXcpSlave{},
+            CommandTimeouts{std::chrono::milliseconds(120),
+                            std::chrono::milliseconds(120), 2}};
+    const Bytes data = BytesOf({0x11, 0x22, 0x33, 0x44});
+    rig.slave.SetMemory(0x3000, BytesOf({0x00, 0x00, 0x00, 0x00}));
+    rig.slave.DropResponseAfterExecuteNthCall(CommandCode::Download, 1);
+    rig.master->Connect();
+    const std::size_t sent_before = rig.transport_ptr->SentPackets().size();
+
+    ExpectUnknownMutationTimeout(CommandCode::Download, [&] {
+        rig.master->WriteMemoryBytes(0x3000, 0x00, BytesView{data});
+    });
+
+    const auto& sent = rig.transport_ptr->SentPackets();
+    ASSERT_EQ(sent.size(), sent_before + 3U);
+    EXPECT_EQ(sent[sent_before][0], static_cast<std::uint8_t>(CommandCode::SetMta));
+    EXPECT_EQ(sent[sent_before + 1][0],
+              static_cast<std::uint8_t>(CommandCode::Download));
+    EXPECT_EQ(sent[sent_before + 2][0],
+              static_cast<std::uint8_t>(CommandCode::Synch));
+    EXPECT_EQ(rig.slave.Count(CommandCode::Download), 1);
+    EXPECT_EQ(rig.master->ReadMemoryBytes(0x3000, 0x00, 4), data);
+}
+
+TEST(XcpCalibration, ShortDownloadAppliedResponseLostIsNotReplayed) {
+    Rig rig{MockXcpSlave(AddressGranularity::Byte, ByteOrder::Intel, 16U),
+            CommandTimeouts{std::chrono::milliseconds(120),
+                            std::chrono::milliseconds(120), 2}};
+    const Bytes data = BytesOf({0x51, 0x62, 0x73, 0x84});
+    rig.slave.SetMemory(0x3100, BytesOf({0x00, 0x00, 0x00, 0x00}));
+    rig.slave.DropResponseAfterExecuteNthCall(CommandCode::ShortDownload, 1);
+    rig.master->Connect();
+    const std::size_t sent_before = rig.transport_ptr->SentPackets().size();
+
+    ExpectUnknownMutationTimeout(CommandCode::ShortDownload, [&] {
+        rig.master->WriteMemoryBytes(0x3100, 0x00, BytesView{data});
+    });
+
+    const auto& sent = rig.transport_ptr->SentPackets();
+    ASSERT_EQ(sent.size(), sent_before + 2U);
+    EXPECT_EQ(sent[sent_before][0],
+              static_cast<std::uint8_t>(CommandCode::ShortDownload));
+    EXPECT_EQ(sent[sent_before + 1][0],
+              static_cast<std::uint8_t>(CommandCode::Synch));
+    EXPECT_EQ(rig.slave.Count(CommandCode::ShortDownload), 1);
+    EXPECT_EQ(rig.master->ReadMemoryBytes(0x3100, 0x00, 4), data);
+}
+
+TEST(XcpCalibration, SetCalPageAppliedResponseLostIsNotReplayed) {
+    Rig rig{MockXcpSlave{},
+            CommandTimeouts{std::chrono::milliseconds(120),
+                            std::chrono::milliseconds(120), 2}};
+    rig.slave.DropResponseAfterExecuteNthCall(CommandCode::SetCalPage, 1);
+    rig.master->Connect();
+    const std::size_t sent_before = rig.transport_ptr->SentPackets().size();
+
+    ExpectUnknownMutationTimeout(CommandCode::SetCalPage, [&] {
+        rig.master->SetCalPage(CalPageModeBit::kEcu, 1, 2);
+    });
+
+    const auto& sent = rig.transport_ptr->SentPackets();
+    ASSERT_EQ(sent.size(), sent_before + 2U);
+    EXPECT_EQ(sent[sent_before][0],
+              static_cast<std::uint8_t>(CommandCode::SetCalPage));
+    EXPECT_EQ(sent[sent_before + 1][0],
+              static_cast<std::uint8_t>(CommandCode::Synch));
+    EXPECT_EQ(rig.slave.Count(CommandCode::SetCalPage), 1);
+    const auto page = rig.master->GetCalPage(CalPageAccessMode::Ecu, 1);
+    ASSERT_TRUE(page.has_value());
+    EXPECT_EQ(page->page, 2U);
+}
+
+TEST(XcpCalibration, SetSegmentModeAppliedResponseLostIsNotReplayed) {
+    Rig rig{MockXcpSlave{},
+            CommandTimeouts{std::chrono::milliseconds(120),
+                            std::chrono::milliseconds(120), 2}};
+    rig.slave.DropResponseAfterExecuteNthCall(CommandCode::SetSegmentMode, 1);
+    rig.master->Connect();
+    const std::size_t sent_before = rig.transport_ptr->SentPackets().size();
+
+    ExpectUnknownMutationTimeout(CommandCode::SetSegmentMode, [&] {
+        rig.master->SetSegmentFreeze(true, 2);
+    });
+
+    const auto& sent = rig.transport_ptr->SentPackets();
+    ASSERT_EQ(sent.size(), sent_before + 2U);
+    EXPECT_EQ(sent[sent_before][0],
+              static_cast<std::uint8_t>(CommandCode::SetSegmentMode));
+    EXPECT_EQ(sent[sent_before + 1][0],
+              static_cast<std::uint8_t>(CommandCode::Synch));
+    EXPECT_EQ(rig.slave.Count(CommandCode::SetSegmentMode), 1);
+    const auto mode = rig.master->GetSegmentMode(2);
+    ASSERT_TRUE(mode.has_value());
+    EXPECT_TRUE(HasSegmentMode(mode->mode, SegmentModeBit::kFreeze));
+}
+
+TEST(XcpCalibration, CopyCalPageAppliedResponseLostIsNotReplayed) {
+    Rig rig{MockXcpSlave{},
+            CommandTimeouts{std::chrono::milliseconds(120),
+                            std::chrono::milliseconds(120), 2}};
+    const Bytes source = BytesOf({0xA1, 0xB2, 0xC3});
+    rig.slave.SetCalibrationPageData(0, 0, source);
+    rig.slave.SetCalibrationPageData(0, 1, BytesOf({0x00, 0x00, 0x00}));
+    rig.slave.DropResponseAfterExecuteNthCall(CommandCode::CopyCalPage, 1);
+    rig.master->Connect();
+    const std::size_t sent_before = rig.transport_ptr->SentPackets().size();
+
+    ExpectUnknownMutationTimeout(CommandCode::CopyCalPage, [&] {
+        rig.master->CopyCalPage(CopyCalPageRequest{0, 0, 0, 1});
+    });
+
+    const auto& sent = rig.transport_ptr->SentPackets();
+    ASSERT_EQ(sent.size(), sent_before + 2U);
+    EXPECT_EQ(sent[sent_before][0],
+              static_cast<std::uint8_t>(CommandCode::CopyCalPage));
+    EXPECT_EQ(sent[sent_before + 1][0],
+              static_cast<std::uint8_t>(CommandCode::Synch));
+    EXPECT_EQ(rig.slave.Count(CommandCode::CopyCalPage), 1);
+    EXPECT_EQ(rig.slave.CalibrationPageData(0, 1), source);
 }
 
 TEST(XcpCalibration, SetCalPageGoldenPacketOnWire) {

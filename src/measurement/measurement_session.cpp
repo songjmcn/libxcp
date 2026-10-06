@@ -92,6 +92,24 @@ void MeasurementSession::SetEnvelopeMode(IdentificationFieldType type,
     if (!m_routes_.empty()) {
         ThrowState("MeasurementSession::SetEnvelopeMode 须在 Prepare 前调用");
     }
+    std::size_t minimum_bytes = 0U;
+    switch (type) {
+        case IdentificationFieldType::Absolute:
+            minimum_bytes = 1U;
+            break;
+        case IdentificationFieldType::RelativeByte:
+            minimum_bytes = 4U;
+            break;
+        case IdentificationFieldType::RelativeWord:
+        case IdentificationFieldType::RelativeWordAligned:
+            minimum_bytes = 2U;
+            break;
+        default:
+            ThrowInvalid("MeasurementSession::SetEnvelopeMode 未知识别字段模式");
+    }
+    if (id_field_bytes < minimum_bytes) {
+        ThrowInvalid("MeasurementSession::SetEnvelopeMode 识别字段长度不足");
+    }
     m_id_field_type_ = type;
     m_id_field_bytes_ = id_field_bytes;
 }
@@ -212,6 +230,9 @@ void MeasurementSession::Start(MeasurementCallback callback) {
     }
     if (m_routes_.empty()) {
         ThrowInvalid("MeasurementSession::Start 未 Prepare");
+    }
+    if (m_plan_generation_ != m_master_->DaqConfigGeneration()) {
+        ThrowInvalid("MeasurementSession::Start DAQ 配置已在 Prepare 后变化");
     }
     {
         std::lock_guard<std::mutex> lock(m_run_mutex_);

@@ -39,7 +39,9 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <map>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -66,6 +68,7 @@
 #include <libxcp/xcp_master.hpp>
 
 #include <a2l/a2l_measurement_database.hpp>
+#include <a2l/measurement_runtime_profile.hpp>
 
 #include "demo_process.hpp"
 
@@ -77,21 +80,20 @@ namespace {
 
 /// @brief 命令行配置（全部有默认值，零参数即 v0.9 xcp_test_slave 旧行为）。
 struct Options {
-    fs::path runDir = "measurement_demo_run";  ///< Slave 工作目录。
+    fs::path runDir = "measurement_demo_run";       ///< Slave 工作目录。
     fs::path slaveExe = XCP_TEST_SLAVE_EXECUTABLE;  ///< Slave 可执行（注入）。
-    std::string host = "127.0.0.1";                  ///< XCP 地址。
-    std::uint16_t port = 5556;                       ///< XCP 端口（slave 缺省）。
-    int sampleSeconds = 2;                           ///< 采集时长（秒）。
+    std::string host = "127.0.0.1";                 ///< XCP 地址。
+    std::uint16_t port = 5556;  ///< XCP 端口（slave 缺省）。
+    int sampleSeconds = 2;      ///< 采集时长（秒）。
     std::chrono::milliseconds commandTimeout{2000};  ///< 单命令超时。
     std::string project =
-        "xcp_test_slave";   ///< MODULE 限定名前缀（cpp_demo 即 "cpp_demo"）。
+        "xcp_test_slave";  ///< MODULE 限定名前缀（cpp_demo 即 "cpp_demo"）。
     std::string symbolsSpec =
-        "g_basic_u32,g_basic_f32";       ///< 逗号分隔符号短名。
-    std::string event = "testev";        ///< 回退命名事件（EVENT 段取证）。
+        "g_basic_u32,g_basic_f32";         ///< 逗号分隔符号短名。
+    std::string event = "testev";          ///< 回退命名事件（EVENT 段取证）。
     std::string a2lName = "uploaded.a2l";  ///< 上传 A2L 落盘文件名。
-    bool dynamicMode = false;            ///< --mode dynamic（L4 冒烟口径）。
-    std::uint64_t expect =
-        0xDEADBEEFU;                     ///< fixed 模式首符号期望定标值。
+    bool dynamicMode = false;              ///< --mode dynamic（L4 冒烟口径）。
+    std::uint64_t expect = 0xDEADBEEFU;    ///< fixed 模式首符号期望定标值。
     /// short_name → [min, max]（物理值域，dynamic 模式可选断言）。
     std::map<std::string, std::pair<double, double>> ranges;
 
@@ -126,16 +128,19 @@ public:
     void Check(bool ok, std::string_view what) {
         ++total_;
         if (ok) {
-            std::printf("[ OK ] %.*s\n", static_cast<int>(what.size()), what.data());
+            std::printf("[ OK ] %.*s\n", static_cast<int>(what.size()),
+                        what.data());
         } else {
             ++failed_;
-            std::printf("[FAIL] %.*s\n", static_cast<int>(what.size()), what.data());
+            std::printf("[FAIL] %.*s\n", static_cast<int>(what.size()),
+                        what.data());
         }
     }
 
     /// @brief 打印汇总结论；有失败时返回 false。
     bool Report() const {
-        std::printf("\n==== 断言汇总：%d 项，失败 %d 项 ====\n", total_, failed_);
+        std::printf("\n==== 断言汇总：%d 项，失败 %d 项 ====\n", total_,
+                    failed_);
         return failed_ == 0;
     }
 
@@ -146,20 +151,22 @@ private:
 
 /// @brief 打印 MeasurementValue（核心 variant）为可读文本。
 void PrintValue(const MeasurementValue& value) {
-    std::visit([](const auto& v) {
-        using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, std::string>) {
-            std::printf("\"%s\"", v.c_str());
-        } else if constexpr (std::is_same_v<T, bool>) {
-            std::printf("%s", v ? "true" : "false");
-        } else if constexpr (std::is_same_v<T, double>) {
-            std::printf("%.6g", v);
-        } else if constexpr (std::is_same_v<T, std::uint64_t>) {
-            std::printf("%llu", static_cast<unsigned long long>(v));
-        } else {
-            std::printf("%lld", static_cast<long long>(v));
-        }
-    }, value);
+    std::visit(
+        [](const auto& v) {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, std::string>) {
+                std::printf("\"%s\"", v.c_str());
+            } else if constexpr (std::is_same_v<T, bool>) {
+                std::printf("%s", v ? "true" : "false");
+            } else if constexpr (std::is_same_v<T, double>) {
+                std::printf("%.6g", v);
+            } else if constexpr (std::is_same_v<T, std::uint64_t>) {
+                std::printf("%llu", static_cast<unsigned long long>(v));
+            } else {
+                std::printf("%lld", static_cast<long long>(v));
+            }
+        },
+        value);
 }
 
 /// @brief 物理值取 double 视图（bool/string 视为不可比，返回 false）。
@@ -227,10 +234,10 @@ public:
 
     /// @brief 单符号滚动聚合（锁内更新）。
     struct SymbolAgg {
-        std::uint64_t seen{0};   ///< 样本出现次数（含无效）
-        std::uint64_t valid{0};  ///< 有效样本次数
+        std::uint64_t seen{0};       ///< 样本出现次数（含无效）
+        std::uint64_t valid{0};      ///< 有效样本次数
         std::set<std::string> keys;  ///< 不同原始字节（截断到 kMaxKeys）
-        bool hasRange{false};    ///< 已有可比物理值
+        bool hasRange{false};        ///< 已有可比物理值
         double minV{0.0};
         double maxV{0.0};
     };
@@ -307,7 +314,8 @@ public:
         return it == m_agg_.end() ? 0U : it->second.keys.size();
     }
 
-    std::optional<std::pair<double, double>> MinMax(std::string_view name) const {
+    std::optional<std::pair<double, double>> MinMax(
+        std::string_view name) const {
         std::lock_guard<std::mutex> lock(m_mutex_);
         const auto it = m_agg_.find(std::string(name));
         if (it == m_agg_.end() || !it->second.hasRange) {
@@ -366,7 +374,8 @@ public:
         }
         const SymbolAgg& agg = it->second;
         char buf[256];
-        int used = std::snprintf(buf, sizeof(buf), "[raw ] %-32s seen=%llu valid=%llu keys(",
+        int used = std::snprintf(buf, sizeof(buf),
+                                 "[raw ] %-32s seen=%llu valid=%llu keys(",
                                  std::string(name).c_str(),
                                  static_cast<unsigned long long>(agg.seen),
                                  static_cast<unsigned long long>(agg.valid));
@@ -384,9 +393,9 @@ public:
                 std::snprintf(h, sizeof(h), "%02X", c);
                 hex += h;
             }
-            const int w = std::snprintf(buf + used, static_cast<std::size_t>(n), "%s%s",
-                                        agg.keys.size() > 1 && used > 0 ? "," : "",
-                                        hex.c_str());
+            const int w = std::snprintf(
+                buf + used, static_cast<std::size_t>(n), "%s%s",
+                agg.keys.size() > 1 && used > 0 ? "," : "", hex.c_str());
             // 上面首分隔符判断不可靠（used 恒 >0 于第二次起），补正：
             if (used > 0 && w > 0 && buf[used - 1] != ',') {
                 // 在写入前已带逗号则跳过
@@ -396,8 +405,13 @@ public:
             }
             used += w;
         }
-        std::snprintf(buf + (used < static_cast<int>(sizeof(buf)) - 2 ? used : static_cast<int>(sizeof(buf)) - 2),
-                      sizeof(buf) - static_cast<std::size_t>(used < static_cast<int>(sizeof(buf)) - 2 ? used : sizeof(buf) - 2),
+        std::snprintf(buf + (used < static_cast<int>(sizeof(buf)) - 2
+                                 ? used
+                                 : static_cast<int>(sizeof(buf)) - 2),
+                      sizeof(buf) - static_cast<std::size_t>(
+                                        used < static_cast<int>(sizeof(buf)) - 2
+                                            ? used
+                                            : sizeof(buf) - 2),
                       ") phys[%g,%g]", agg.minV, agg.maxV);
         std::printf("%s\n", buf);
     }
@@ -410,7 +424,8 @@ private:
 };
 
 /// @brief 建立指向 Slave 的 Master（UDP；listener 非拥有，可空）。
-std::unique_ptr<XcpMaster> MakeMaster(const Options& opt, IEventListener* listener) {
+std::unique_ptr<XcpMaster> MakeMaster(const Options& opt,
+                                      IEventListener* listener) {
     UdpTransportConfig cfg;
     cfg.remote_host = opt.host;
     cfg.remote_port = opt.port;
@@ -421,12 +436,13 @@ std::unique_ptr<XcpMaster> MakeMaster(const Options& opt, IEventListener* listen
     timeouts.command_timeout = opt.commandTimeout;
     timeouts.synch_timeout = opt.commandTimeout;
     timeouts.max_retries = 1;
-    return std::make_unique<XcpMaster>(
-        std::make_unique<UdpTransport>(cfg), timeouts, listener);
+    return std::make_unique<XcpMaster>(std::make_unique<UdpTransport>(cfg),
+                                       timeouts, listener);
 }
 
 /// @brief 等待 Slave 达到可 CONNECT 状态；超时返回 nullptr。
-std::unique_ptr<XcpMaster> WaitConnected(const Options& opt, IEventListener* listener,
+std::unique_ptr<XcpMaster> WaitConnected(const Options& opt,
+                                         IEventListener* listener,
                                          std::chrono::milliseconds budget) {
     const auto deadline = std::chrono::steady_clock::now() + budget;
     while (std::chrono::steady_clock::now() < deadline) {
@@ -435,70 +451,117 @@ std::unique_ptr<XcpMaster> WaitConnected(const Options& opt, IEventListener* lis
             master->Connect();
             return master;
         } catch (const std::exception&) {
-            // Slave 尚未监听：短暂等待后重试（listener 非拥有，master 析构安全）
+            // Slave 尚未监听：短暂等待后重试（listener 非拥有，master
+            // 析构安全）
         }
         std::this_thread::sleep_for(200ms);
     }
     return nullptr;
 }
 
-/// @brief 在上传 A2L 文本中取证命名事件通道：匹配 `"<name>" 0x%hex`（EVENT 段）。
-std::optional<std::uint16_t> ResolveEventChannel(std::string_view a2l,
-                                                 std::string_view short_name) {
-    const std::string needle = std::string("\"") + std::string(short_name) + "\" 0x";
-    const std::size_t pos = a2l.find(needle);
-    if (pos == std::string::npos) {
-        return std::nullopt;
+bool ParseUnsignedToken(std::string_view token, std::uint64_t& value) {
+    int base = 10;
+    if (token.starts_with("0x") || token.starts_with("0X")) {
+        token.remove_prefix(2);
+        base = 16;
     }
-    const std::size_t hex_begin = pos + needle.size();
-    std::size_t hex_end = hex_begin;
-    while (hex_end < a2l.size() &&
-           (std::isxdigit(static_cast<unsigned char>(a2l[hex_end])) != 0)) {
-        ++hex_end;
+    if (token.empty()) {
+        return false;
     }
-    std::uint64_t value = 0;
-    const auto [ptr, ec] = std::from_chars(a2l.data() + hex_begin,
-                                           a2l.data() + hex_end, value, 16);
-    if (ec != std::errc{} || ptr != a2l.data() + hex_end) {
-        return std::nullopt;
+    const auto [ptr, ec] =
+        std::from_chars(token.data(), token.data() + token.size(), value, base);
+    return ec == std::errc{} && ptr == token.data() + token.size();
+}
+
+/// @brief 从上传 A2L 的 EVENT 声明提取名字、通道、周期和单位；拒绝坏行。
+std::optional<std::vector<A2lEventMetadata>> ResolveA2lEvents(
+    std::string_view a2l) {
+    std::vector<A2lEventMetadata> events;
+    std::istringstream input{std::string(a2l)};
+    std::string line;
+    while (std::getline(input, line)) {
+        std::istringstream row(line);
+        std::string begin;
+        std::string kind;
+        if (!(row >> begin >> kind) || begin != "/begin" || kind != "EVENT") {
+            continue;
+        }
+        std::string long_name;
+        std::string short_name;
+        std::string channel_token;
+        std::string type;
+        std::string max_daq;
+        std::string cycle_token;
+        std::string unit_token;
+        std::string priority;
+        if (!(row >> std::quoted(long_name) >> std::quoted(short_name) >>
+              channel_token >> type >> max_daq >> cycle_token >> unit_token >>
+              priority)) {
+            return std::nullopt;
+        }
+        std::uint64_t channel = 0;
+        std::uint64_t cycle = 0;
+        std::uint64_t unit = 0;
+        if (!ParseUnsignedToken(channel_token, channel) ||
+            !ParseUnsignedToken(cycle_token, cycle) ||
+            !ParseUnsignedToken(unit_token, unit) ||
+            channel > std::numeric_limits<std::uint16_t>::max() ||
+            cycle > std::numeric_limits<std::uint8_t>::max() ||
+            unit > std::numeric_limits<std::uint8_t>::max()) {
+            return std::nullopt;
+        }
+        events.push_back(A2lEventMetadata{
+            std::move(long_name), std::move(short_name),
+            static_cast<std::uint16_t>(channel),
+            static_cast<std::uint8_t>(cycle), static_cast<std::uint8_t>(unit)});
     }
-    return static_cast<std::uint16_t>(value);
+    return events;
 }
 
 /**
- * @brief 按测量取证事件通道：在 `/begin MEASUREMENT <short> ` 所在行内找
- *        `EVENT 0x<hex>`（XCPlite 生成的 MEASUREMENT 条目单行含 DAQ_EVENT）。
- * @details 多事件 Slave（cpp_demo：SigGen1=0x1 / mainloop=0x2）逐符号通道
- *          只能这样取证；命名事件是全体通道口径，会绑错。
+ * @brief 从 XCPlite MEASUREMENT 行收集所有 EVENT 候选；不能解析时返回 nullopt。
+ * 多个不同通道会由 EventBoundMeasurementDatabase 判为歧义，而不静默取首项。
  */
-std::optional<std::uint16_t> ResolveSymbolEventChannel(std::string_view a2l,
-                                                       std::string_view short_name) {
-    const std::string needle = "/begin MEASUREMENT " + std::string(short_name) + " ";
+std::optional<std::vector<std::uint64_t>> ResolveSymbolEventChannels(
+    std::string_view a2l, std::string_view short_name) {
+    const std::string needle =
+        "/begin MEASUREMENT " + std::string(short_name) + " ";
+    std::vector<std::uint64_t> channels;
     std::size_t pos = 0;
     while ((pos = a2l.find(needle, pos)) != std::string::npos) {
         const std::size_t line_end = a2l.find('\n', pos);
-        const std::size_t span = line_end == std::string::npos
-                                     ? std::string::npos
-                                     : line_end - pos;
-        const std::string_view line = a2l.substr(pos, span);
-        const std::size_t ev = line.find("EVENT 0x");
-        if (ev != std::string_view::npos) {
-            const std::size_t hex_begin = ev + 8U;
-            std::size_t hex_end = hex_begin;
-            while (hex_end < line.size() &&
-                   (std::isxdigit(static_cast<unsigned char>(line[hex_end])) != 0)) {
-                ++hex_end;
+        const std::string_view line = a2l.substr(
+            pos, line_end == std::string_view::npos ? std::string_view::npos
+                                                    : line_end - pos);
+        std::size_t event_pos = 0;
+        while ((event_pos = line.find("EVENT ", event_pos)) !=
+               std::string_view::npos) {
+            const bool standalone =
+                event_pos == 0U || std::isspace(static_cast<unsigned char>(
+                                       line[event_pos - 1U])) != 0;
+            if (!standalone) {
+                event_pos += 6U;
+                continue;
             }
-            std::uint64_t value = 0;
-            const auto [ptr, ec] = std::from_chars(line.data() + hex_begin,
-                                                   line.data() + hex_end, value, 16);
-            if (ec == std::errc{}) {
-                return static_cast<std::uint16_t>(value);
+            const std::size_t token_begin = event_pos + 6U;
+            std::size_t token_end = token_begin;
+            while (token_end < line.size() &&
+                   std::isspace(static_cast<unsigned char>(line[token_end])) ==
+                       0) {
+                ++token_end;
             }
+            std::uint64_t channel = 0;
+            if (!ParseUnsignedToken(
+                    line.substr(token_begin, token_end - token_begin),
+                    channel)) {
+                return std::nullopt;
+            }
+            channels.push_back(channel);
+            break;
         }
         pos += needle.size();
     }
-    return std::nullopt;
+    return channels;
 }
 
 /// @brief 解析 --run-dir/--slave/--host/--port/--seconds/--project/--symbols/
@@ -514,17 +577,21 @@ bool ParseArgs(int argc, char** argv, Options& opt) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         if (arg == "--help" || arg == "-h") {
-            std::printf("用法：measurement_demo [--run-dir DIR] [--slave EXE]\n"
-                        "          [--host H] [--port N] [--seconds N]\n"
-                        "          [--project NAME] [--symbols a,b,...] [--event NAME]\n"
-                        "          [--a2l-name FILE] [--mode fixed|dynamic]\n"
-                        "          [--expect 0xHEX] [--range NAME=min:max]...\n"
-                        "零参数 = v0.9 xcp_test_slave 旧行为（fixed/2s/0xDEADBEEF）。\n"
-                        "cpp_demo L4 冒烟示例：\n"
-                        "  measurement_demo --slave <cpp_demo.exe> --port 5555 \\\n"
-                        "      --project cpp_demo --event mainloop --mode dynamic \\\n"
-                        "      --symbols speed,sum,counter,temperature,SigGen1.value_ \\\n"
-                        "      --range speed=0:250 --range counter=0:65535 --seconds 600\n");
+            std::printf(
+                "用法：measurement_demo [--run-dir DIR] [--slave EXE]\n"
+                "          [--host H] [--port N] [--seconds N]\n"
+                "          [--project NAME] [--symbols a,b,...] [--event "
+                "NAME]\n"
+                "          [--a2l-name FILE] [--mode fixed|dynamic]\n"
+                "          [--expect 0xHEX] [--range NAME=min:max]...\n"
+                "零参数 = v0.9 xcp_test_slave 旧行为（fixed/2s/0xDEADBEEF）。\n"
+                "cpp_demo L4 冒烟示例：\n"
+                "  measurement_demo --slave <cpp_demo.exe> --port 5555 \\\n"
+                "      --project cpp_demo --event mainloop --mode dynamic \\\n"
+                "      --symbols speed,sum,counter,temperature,SigGen1.value_ "
+                "\\\n"
+                "      --range speed=0:250 --range counter=0:65535 --seconds "
+                "600\n");
             return false;
         }
         if (arg == "--run-dir") {
@@ -572,7 +639,8 @@ bool ParseArgs(int argc, char** argv, Options& opt) {
             } else if (mode == "dynamic") {
                 opt.dynamicMode = true;
             } else {
-                std::printf("[usage] --mode 只支持 fixed|dynamic（得到 %s）\n", v);
+                std::printf("[usage] --mode 只支持 fixed|dynamic（得到 %s）\n",
+                            v);
                 return false;
             }
         } else if (arg == "--expect") {
@@ -646,12 +714,13 @@ int main(int argc, char** argv) {
     std::error_code ec;
     fs::create_directories(opt.runDir, ec);
     if (ec) {
-        std::printf("[env] 无法创建 run-dir %s：%s\n", opt.runDir.string().c_str(),
-                    ec.message().c_str());
+        std::printf("[env] 无法创建 run-dir %s：%s\n",
+                    opt.runDir.string().c_str(), ec.message().c_str());
         return 2;
     }
     if (!fs::exists(opt.slaveExe, ec) || ec) {
-        std::printf("[env] Slave 可执行不存在：%s\n", opt.slaveExe.string().c_str());
+        std::printf("[env] Slave 可执行不存在：%s\n",
+                    opt.slaveExe.string().c_str());
         return 2;
     }
 #ifdef XCP_104_AML_FILE
@@ -692,8 +761,10 @@ int main(int argc, char** argv) {
         }
         early.reset();
         if (occupied) {
-            std::printf("[env] 端口 %u 已有 XCP 应答（残留 Slave？）——拒绝在脏端口上取证\n",
-                        opt.port);
+            std::printf(
+                "[env] 端口 %u 已有 XCP 应答（残留 "
+                "Slave？）——拒绝在脏端口上取证\n",
+                opt.port);
             return 2;
         }
     }
@@ -733,82 +804,115 @@ int main(int argc, char** argv) {
         // —— 3) 桥接解析 + 适配器包装（唯一桥接接触点在 adapter/）——
         auto loaded = a2l::A2lBridge::Load(uploadedPath.string());
         if (!loaded.HasValue()) {
-            std::printf("[env] A2L 加载失败：%s\n", loaded.ErrorInfo().message.c_str());
+            std::printf("[env] A2L 加载失败：%s\n",
+                        loaded.ErrorInfo().message.c_str());
             slave.Stop();
             return 2;
         }
         const a2l::IA2lDatabase* db = loaded.Value()->Database();
         A2lMeasurementDatabase adapter(*db);
 
-        // 事件通道按符号从 MEASUREMENT 行取证（多事件 Slave 逐符号通道不同，
-        // 如 cpp_demo SigGen2=0x0/SigGen1=0x1/mainloop=0x2）；取不到时回退
-        // --event 命名事件的 EVENT 段通道。适配器恒回 event_channel=0：
-        // 静态面无事件绑定，运行时通道由本示例（生产即上层）补充。
-        const std::string a2lText(reinterpret_cast<const char*>(uploaded.data()),
-                                  uploaded.size());
-        const auto fallback = ResolveEventChannel(a2lText, opt.event);
-        std::map<std::string, std::uint16_t> channels;
-        std::size_t unresolved = 0;
-        for (const auto& sym : symbols) {
-            const auto ch = ResolveSymbolEventChannel(a2lText, sym);
-            if (ch.has_value()) {
-                channels[Qualified(sym)] = *ch;
-            } else {
-                ++unresolved;
-            }
-        }
-        if (!fallback.has_value() && unresolved > 0U) {
-            std::printf("[env] %zu 个符号未能按 MEASUREMENT 行取证事件通道，且"
-                        "A2L 中无命名事件 \"%s\" 可回退\n",
-                        unresolved, opt.event.c_str());
+        // 建立 A2L EVENT 原始事实表；解析失败不得回退或猜测。
+        const std::string a2lText(
+            reinterpret_cast<const char*>(uploaded.data()), uploaded.size());
+        const auto parsed_events = ResolveA2lEvents(a2lText);
+        if (!parsed_events.has_value()) {
+            std::printf("[env] 无法可靠解析上传 A2L 的 EVENT 元数据\n");
             slave.Stop();
             return 2;
         }
-        for (const auto& sym : symbols) {
-            const auto it = channels.find(Qualified(sym));
-            std::printf("[info] 事件通道：%s = %s\n", Qualified(sym).c_str(),
-                        it != channels.end()
-                            ? std::to_string(it->second).c_str()
-                            : (fallback.has_value()
-                                   ? (std::to_string(*fallback) + "（回退 " + opt.event + "）").c_str()
-                                   : "0（未取证，按无事件组）"));
+
+        std::optional<A2lEventMetadata> fallback_event;
+        for (const A2lEventMetadata& event : *parsed_events) {
+            if (event.name != opt.event && event.short_name != opt.event) {
+                continue;
+            }
+            if (fallback_event.has_value() &&
+                (fallback_event->channel != event.channel ||
+                 fallback_event->time_cycle != event.time_cycle ||
+                 fallback_event->time_unit != event.time_unit)) {
+                std::printf("[env] --event %s 在 A2L 中存在歧义\n",
+                            opt.event.c_str());
+                slave.Stop();
+                return 2;
+            }
+            fallback_event = event;
         }
-        // 通道号合法与否不以非零为判据——取证成功即可（XCPlite 首事件即通道
-        // 0；0 在规划器中按"无事件组"处理，同样能建表出流）。
 
-        // 装饰器：Find 结果补充运行时事件通道（示例内联最小实现）
-        class EventBound final : public IMeasurementDatabase {
-        public:
-            EventBound(IMeasurementDatabase& inner,
-                       std::map<std::string, std::uint16_t> channels,
-                       std::uint16_t fallback)
-                : m_inner_(inner), m_channels_(std::move(channels)),
-                  m_fallback_(fallback) {}
-            MeasurementResult<MeasurementSymbolInfo> Find(
-                std::string_view name) const override {
-                MeasurementResult<MeasurementSymbolInfo> res = m_inner_.Find(name);
-                if (!res.HasValue()) {
-                    return res;
-                }
-                MeasurementSymbolInfo info = res.Value();
-                if (info.event_channel == 0U) {
-                    const auto it = m_channels_.find(std::string(name));
-                    info.event_channel =
-                        it != m_channels_.end() ? it->second : m_fallback_;
-                }
-                return detail::MakeMeasurementOk(info);
+        MeasurementEventBindingCandidates bindings;
+        std::set<std::string> fallback_symbols;
+        for (const auto& sym : symbols) {
+            const auto candidates = ResolveSymbolEventChannels(a2lText, sym);
+            if (!candidates.has_value()) {
+                std::printf("[env] MEASUREMENT 行事件通道格式无效：%s\n",
+                            sym.c_str());
+                slave.Stop();
+                return 2;
             }
-            MeasurementResult<MeasurementValue> ToPhysical(
-                std::string_view name, BytesView raw) const override {
-                return m_inner_.ToPhysical(name, raw);
+            if (!candidates->empty()) {
+                bindings[Qualified(sym)] = *candidates;
+            } else if (fallback_event.has_value()) {
+                // --event 是用户显式指定的回退绑定，不是隐式默认通道。
+                bindings[Qualified(sym)] = {fallback_event->channel};
+                fallback_symbols.insert(Qualified(sym));
+            } else {
+                std::printf(
+                    "[env] %s 无逐符号 EVENT 绑定，且 A2L 无可用 --event "
+                    "回退\n",
+                    Qualified(sym).c_str());
+                slave.Stop();
+                return 2;
             }
+        }
 
-        private:
-            IMeasurementDatabase& m_inner_;
-            std::map<std::string, std::uint16_t> m_channels_;
-            std::uint16_t m_fallback_;
-        };
-        EventBound measurement_db(adapter, channels, fallback.value_or(0U));
+        std::map<std::uint16_t, A2lEventMetadata> events_by_channel;
+        for (const A2lEventMetadata& event : *parsed_events) {
+            const auto [it, inserted] =
+                events_by_channel.emplace(event.channel, event);
+            if (!inserted && (it->second.time_cycle != event.time_cycle ||
+                              it->second.time_unit != event.time_unit)) {
+                std::printf("[env] A2L 同一事件通道声明了冲突的周期/单位：%u\n",
+                            event.channel);
+                slave.Stop();
+                return 2;
+            }
+        }
+        std::set<std::uint16_t> bound_channels;
+        for (const auto& [symbol, candidates] : bindings) {
+            std::set<std::uint64_t> distinct(candidates.begin(),
+                                             candidates.end());
+            if (distinct.size() != 1U ||
+                *distinct.begin() > std::numeric_limits<std::uint16_t>::max()) {
+                std::printf("[env] %s 的事件绑定缺失、歧义或超出范围\n",
+                            symbol.c_str());
+                slave.Stop();
+                return 2;
+            }
+            bound_channels.insert(
+                static_cast<std::uint16_t>(*distinct.begin()));
+        }
+        std::vector<A2lEventMetadata> bound_events;
+        for (const std::uint16_t channel : bound_channels) {
+            const auto event = events_by_channel.find(channel);
+            if (event == events_by_channel.end()) {
+                std::printf("[env] 事件通道 %u 缺少对应 A2L EVENT 声明\n",
+                            channel);
+                slave.Stop();
+                return 2;
+            }
+            bound_events.push_back(event->second);
+        }
+        for (const auto& sym : symbols) {
+            const auto& candidates = bindings.at(Qualified(sym));
+            std::printf("[info] 事件通道：%s = %llu%s\n",
+                        Qualified(sym).c_str(),
+                        static_cast<unsigned long long>(candidates.front()),
+                        fallback_symbols.contains(Qualified(sym))
+                            ? ("（显式回退 " + opt.event + "）").c_str()
+                            : "");
+        }
+        EventBoundMeasurementDatabase measurement_db(adapter,
+                                                     std::move(bindings));
 
         // —— 4) 会话（先构造作监听器 → Bind → Connect → 取证注入）——
         MeasurementSession session(measurement_db);
@@ -816,15 +920,20 @@ int main(int argc, char** argv) {
         session.Bind(*master);
         // CONNECT 已在探测阶段验证可用；正式会话重建并重连
         master->Connect();
-        SessionGuard guard(session);  // 声明于 master 之后：展开时先 Stop 后毁 master
+        SessionGuard guard(
+            session);  // 声明于 master 之后：展开时先 Stop 后毁 master
 
-        // XCPlite 实然取证值（生产环境改从 GET_DAQ_PROCESSOR_INFO /
-        // GET_DAQ_RESOLUTION_INFO / A2L EVENT 取证注入）：
-        //   RelativeByte [ODTrel][0xAA][DAQ16]，头长 4；时间戳仅随事件首
-        //   ODT 帧；1 ns/tick。
-        session.SetEnvelopeMode(IdentificationFieldType::RelativeByte, 4U);
-        session.SetTimestampFirstOdtOnly(true);
-        session.SetTimestampUnit(1);
+        // 由适配层查询 GET_DAQ_PROCESSOR_INFO / GET_DAQ_RESOLUTION_INFO /
+        // GET_DAQ_EVENT_INFO，并与上传 A2L EVENT 元数据逐通道交叉校验。
+        const auto profile =
+            BuildXcpliteMeasurementRuntimeProfile(*master, bound_events);
+        if (!profile.HasValue()) {
+            std::printf("[env] Slave profile 取证失败：%s\n",
+                        profile.ErrorInfo().message.c_str());
+            slave.Stop();
+            return 2;
+        }
+        ApplyMeasurementRuntimeProfile(session, profile.Value());
 
         for (const auto& sym : symbols) {
             session.Add(Qualified(sym));
@@ -848,16 +957,18 @@ int main(int argc, char** argv) {
         const std::string firstSymbol = Qualified(symbols.front());
         char expectMsg[256];
         std::snprintf(expectMsg, sizeof(expectMsg),
-                      "收到 %s 物理值 == 0x%llX（A2L 定标）", firstSymbol.c_str(),
+                      "收到 %s 物理值 == 0x%llX（A2L 定标）",
+                      firstSymbol.c_str(),
                       static_cast<unsigned long long>(opt.expect));
         if (!opt.dynamicMode) {
-            const bool seen =
-                sink.WaitUntil([&] { return sink.SawU64(firstSymbol, opt.expect); },
-                               std::chrono::seconds(opt.sampleSeconds) + 3s);
+            const bool seen = sink.WaitUntil(
+                [&] { return sink.SawU64(firstSymbol, opt.expect); },
+                std::chrono::seconds(opt.sampleSeconds) + 3s);
             check.Check(seen, expectMsg);
         }
 
-        // 采样窗口打满：--seconds 的语义是"至少采集这么长时间"（长稳取证口径），
+        // 采样窗口打满：--seconds
+        // 的语义是"至少采集这么长时间"（长稳取证口径），
         // 而非见到首帧即停——否则统计数字只反映毫秒级瞬时，不构成稳定性证据。
         const auto elapsed = std::chrono::steady_clock::now() - startAt;
         const auto wanted = std::chrono::seconds(opt.sampleSeconds);
@@ -877,10 +988,11 @@ int main(int argc, char** argv) {
         check.Check(hasTimestamped, "首 ODT 帧带出有效时间戳（v0.6 链路）");
 
         std::printf("\n==== 首批帧样例（前 3 帧） ====\n");
-        for (std::size_t i = 0; i < std::min<std::size_t>(3, frames.size()); ++i) {
+        for (std::size_t i = 0; i < std::min<std::size_t>(3, frames.size());
+             ++i) {
             const auto& f = frames[i];
-            std::printf("frame[%zu] list=%u odt=%u ts_valid=%d ts_raw=%llu\n", i,
-                        f.daq_list, f.odt, f.timestamp_valid ? 1 : 0,
+            std::printf("frame[%zu] list=%u odt=%u ts_valid=%d ts_raw=%llu\n",
+                        i, f.daq_list, f.odt, f.timestamp_valid ? 1 : 0,
                         static_cast<unsigned long long>(f.timestamp_raw));
             for (const auto& s : f.samples) {
                 std::printf("  %-40s ", s.name.c_str());
@@ -900,10 +1012,11 @@ int main(int argc, char** argv) {
             for (const auto& sym : symbols) {
                 const std::string q = Qualified(sym);
                 char buf[256];
-                std::snprintf(buf, sizeof(buf), "覆盖：%s 有效样本 ≥1", q.c_str());
-                check.Check(sink.ValidCount(q) >= 1U, buf);
-                std::snprintf(buf, sizeof(buf), "变化性：%s 窗口内 ≥2 个不同原始值",
+                std::snprintf(buf, sizeof(buf), "覆盖：%s 有效样本 ≥1",
                               q.c_str());
+                check.Check(sink.ValidCount(q) >= 1U, buf);
+                std::snprintf(buf, sizeof(buf),
+                              "变化性：%s 窗口内 ≥2 个不同原始值", q.c_str());
                 check.Check(sink.DistinctCount(q) >= 2U, buf);
                 const auto mm = sink.MinMax(q);
                 // 取证：dynamic 模式逐符号转储窗口内实际原始字节（hex）。
@@ -911,12 +1024,14 @@ int main(int argc, char** argv) {
                 sink.DumpRawKeys(q);
                 const auto rng = opt.ranges.find(sym);
                 if (rng != opt.ranges.end()) {
-                    const double tol = 1e-9 + std::abs(rng->second.first) * 1e-9;
+                    const double tol =
+                        1e-9 + std::abs(rng->second.first) * 1e-9;
                     char msg[320];
                     std::snprintf(msg, sizeof(msg),
                                   "值域：%s ∈ [%.6g,%.6g]（观测 [%.6g,%.6g]）",
-                                  q.c_str(), rng->second.first, rng->second.second,
-                                  mm ? mm->first : 0.0, mm ? mm->second : 0.0);
+                                  q.c_str(), rng->second.first,
+                                  rng->second.second, mm ? mm->first : 0.0,
+                                  mm ? mm->second : 0.0);
                     check.Check(mm.has_value() &&
                                     mm->first >= rng->second.first - tol &&
                                     mm->second <= rng->second.second + tol,
@@ -926,18 +1041,21 @@ int main(int argc, char** argv) {
         }
 
         const auto stats = session.Statistics();
-        std::printf("\n[info] 统计：received=%llu dropped=%llu decode_err=%llu wraps=%llu\n",
-                    static_cast<unsigned long long>(stats.dto_received),
-                    static_cast<unsigned long long>(stats.dto_dropped),
-                    static_cast<unsigned long long>(stats.decode_errors),
-                    static_cast<unsigned long long>(stats.timestamp_wraps));
+        std::printf(
+            "\n[info] 统计：received=%llu dropped=%llu decode_err=%llu "
+            "wraps=%llu\n",
+            static_cast<unsigned long long>(stats.dto_received),
+            static_cast<unsigned long long>(stats.dto_dropped),
+            static_cast<unsigned long long>(stats.decode_errors),
+            static_cast<unsigned long long>(stats.timestamp_wraps));
         check.Check(stats.decode_errors == 0U, "全链路零解码错误");
         check.Check(stats.dto_received > 0U, "有 DTO 入队");
         // 长稳口径（--seconds ≥ 30 视为长采窗口）：worker 跟得上事件流 ⇒ 丢包
         // 必须为零（Slave 每 1ms 触发、每帧多 ODT，长窗口下任何持续性掉队都
         // 会体现在 dropped 上）。短冒烟不做此断言：启动瞬态下首拍丢包属正常。
         if (opt.sampleSeconds >= 30) {
-            check.Check(stats.dto_dropped == 0U, "长采窗口零丢包（worker 实时性）");
+            check.Check(stats.dto_dropped == 0U,
+                        "长采窗口零丢包（worker 实时性）");
             // 时间戳回绕口径：Slave 的 32 位时间戳是相对 tick 计数（实测
             // 2^32 tick ≈ 4.3s 一圈），长采窗口内回绕十余次~数百次属正常算术
             // 行为——converter 据此外推 +k·2^32 并累计 WrapCount（v0.6 语义）。
@@ -947,22 +1065,24 @@ int main(int argc, char** argv) {
             check.Check(stats.timestamp_wraps > 0U,
                         "32 位时间戳长采窗口按实然回绕（外推路径生效）");
             if (opt.dynamicMode) {
-                const std::size_t streams = std::max<std::size_t>(1U, sink.Lists().size());
-                const double expected =
-                    static_cast<double>(streams) * opt.sampleSeconds / 4.294967296;
+                const std::size_t streams =
+                    std::max<std::size_t>(1U, sink.Lists().size());
+                const double expected = static_cast<double>(streams) *
+                                        opt.sampleSeconds / 4.294967296;
                 const auto lo = static_cast<std::uint64_t>(expected * 0.4);
                 const auto hi =
                     static_cast<std::uint64_t>(expected * 1.6) + 2U * streams;
                 char msg[256];
-                std::snprintf(msg, sizeof(msg),
-                              "回绕自洽：wraps=%llu ∈ [%llu,%llu]（流数=%zu×%.0fs/4.3s）",
-                              static_cast<unsigned long long>(stats.timestamp_wraps),
-                              static_cast<unsigned long long>(lo),
-                              static_cast<unsigned long long>(hi), streams,
-                              static_cast<double>(opt.sampleSeconds));
-                check.Check(stats.timestamp_wraps >= lo &&
-                                stats.timestamp_wraps <= hi,
-                            msg);
+                std::snprintf(
+                    msg, sizeof(msg),
+                    "回绕自洽：wraps=%llu ∈ [%llu,%llu]（流数=%zu×%.0fs/4.3s）",
+                    static_cast<unsigned long long>(stats.timestamp_wraps),
+                    static_cast<unsigned long long>(lo),
+                    static_cast<unsigned long long>(hi), streams,
+                    static_cast<double>(opt.sampleSeconds));
+                check.Check(
+                    stats.timestamp_wraps >= lo && stats.timestamp_wraps <= hi,
+                    msg);
             }
         }
 
@@ -984,17 +1104,19 @@ int main(int argc, char** argv) {
                         "复 Start 后回绕计数连续（不跨 Stop 清零）");
             check.Check(after.dto_received > statsBefore.dto_received,
                         "复 Start 后继续收流（Stop→Start 可重复性）");
-            std::printf("[info] 复 Start 3s：received %llu→%llu，wraps %llu→%llu\n",
-                        static_cast<unsigned long long>(statsBefore.dto_received),
-                        static_cast<unsigned long long>(after.dto_received),
-                        static_cast<unsigned long long>(statsBefore.timestamp_wraps),
-                        static_cast<unsigned long long>(after.timestamp_wraps));
+            std::printf(
+                "[info] 复 Start 3s：received %llu→%llu，wraps %llu→%llu\n",
+                static_cast<unsigned long long>(statsBefore.dto_received),
+                static_cast<unsigned long long>(after.dto_received),
+                static_cast<unsigned long long>(statsBefore.timestamp_wraps),
+                static_cast<unsigned long long>(after.timestamp_wraps));
         }
 
         // 第 9 步口径：断连（复 Start 之后才做）。断连后无 DAQ 残留由 Stop
         // 路径的 DAQ 复位保证；见 v0.9 §6。
         master->Disconnect();
-        check.Check(!master->IsConnected(), "Disconnect 完成（L4 第 9 步：断连口径）");
+        check.Check(!master->IsConnected(),
+                    "Disconnect 完成（L4 第 9 步：断连口径）");
         slave.Stop();
 
         exitCode = check.Report() ? 0 : 1;

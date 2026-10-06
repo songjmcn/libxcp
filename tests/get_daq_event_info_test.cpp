@@ -163,12 +163,14 @@ TEST(ExecuteGetDaqEventInfo, IssuesD7WithEventChannelWordAndParsesResponse) {
     EXPECT_EQ(res->time_unit, 3);
     EXPECT_EQ(res->priority, 0xFF);
 
-    // CRO 载荷（含命令字节）= [0xD7][0x02][0x01]（Intel LE，事件 0x0102）
+    // CRO 载荷（含命令字节）= [0xD7][0x00][0x02][0x01]；
+    // reserved byte 在事件通道 WORD 之前（Intel LE，事件 0x0102）。
     const Bytes& sent = f.slave.LastCto(CommandCode::GetDaqEventInfo);
-    ASSERT_EQ(sent.size(), 3u);
+    ASSERT_EQ(sent.size(), 4u);
     EXPECT_EQ(sent[0], static_cast<std::uint8_t>(CommandCode::GetDaqEventInfo));
-    EXPECT_EQ(sent[1], 0x02);
-    EXPECT_EQ(sent[2], 0x01);
+    EXPECT_EQ(sent[1], 0x00);
+    EXPECT_EQ(sent[2], 0x02);
+    EXPECT_EQ(sent[3], 0x01);
     EXPECT_EQ(f.slave.Count(CommandCode::GetDaqEventInfo), 1);
 }
 

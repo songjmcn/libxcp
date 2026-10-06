@@ -263,6 +263,30 @@ TEST(MeasurementSessionLifecycle, StartWithoutPrepareThrows) {
   EXPECT_FALSE(rig.session.Running());
 }
 
+TEST(MeasurementSessionLifecycle, RejectsUnknownEnvelopeModeAndShortHeader) {
+  FakeDb db;
+  MeasurementSession session(db);
+  EXPECT_THROW(session.SetEnvelopeMode(
+                   static_cast<IdentificationFieldType>(0xFFU), 4U),
+               XcpException);
+  EXPECT_THROW(session.SetEnvelopeMode(IdentificationFieldType::RelativeByte,
+                                       3U),
+               XcpException);
+}
+
+TEST(MeasurementSessionLifecycle, StartRejectsStaleDaqGeneration) {
+  Rig rig;
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+  rig.master->ClearDaqList(0U);
+
+  FrameCollector collector;
+  EXPECT_THROW(rig.session.Start(MeasurementCallback(
+                   [&collector](const MeasurementFrame& f) { collector(f); })),
+               XcpException);
+  EXPECT_FALSE(rig.session.Running());
+}
+
 TEST(MeasurementSessionLifecycle, AddDuringRunningThrows) {
   Rig rig;
   rig.session.Add("EngineSpeed");
@@ -297,6 +321,54 @@ TEST(MeasurementSessionLifecycle, DtoIgnoredBeforeStartAndAfterStop) {
   rig.transport->InjectPacket(
       BytesView{MakeFrame(0, 0, 2, BytesView{payload})});
   EXPECT_EQ(rig.session.Statistics().dto_received, 0U);
+}
+
+TEST(MeasurementSessionPipeline, BoundedQueueCountsDroppedDtos) {
+  Rig rig;
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+
+  std::mutex gate_mutex;
+  std::condition_variable gate_cv;
+  bool callback_entered = false;
+  bool release_callback = false;
+  bool first_callback = true;
+  rig.session.Start(MeasurementCallback([&](const MeasurementFrame&) {
+    if (!first_callback) {
+      return;
+    }
+    first_callback = false;
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    callback_entered = true;
+    gate_cv.notify_all();
+    gate_cv.wait(lock, [&] { return release_callback; });
+  }));
+
+  const Bytes payload{0x11, 0x22, 0x33, 0x44};
+  DtoPacket first;
+  first.data = MakeFrame(0, 0, 1, BytesView{payload});
+  first.pid = first.data.front();
+  rig.session.OnDto(first);
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    ASSERT_TRUE(gate_cv.wait_for(lock, std::chrono::seconds(2),
+                                 [&] { return callback_entered; }));
+  }
+
+  DtoPacket queued;
+  queued.data = MakeFrame(0, 0, 2, BytesView{payload});
+  queued.pid = queued.data.front();
+  for (std::size_t i = 0; i < 300U; ++i) {
+    rig.session.OnDto(queued);
+  }
+  EXPECT_EQ(rig.session.Statistics().dto_dropped, 44U);
+
+  {
+    std::lock_guard<std::mutex> lock(gate_mutex);
+    release_callback = true;
+  }
+  gate_cv.notify_all();
+  rig.session.Stop();
 }
 
 // ---------------------------------------------------------------------------

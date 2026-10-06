@@ -48,6 +48,42 @@ bool IsCmdUnknown(const XcpException& e) {
            *e.GetErrorCode() == ErrorCode::CmdUnknown;
 }
 
+/// @brief 判断响应超时后不可安全重放的标定变更命令。
+/// @details 响应缺失无法证明 Slave 未执行；内存写、页面切换/冻结及页面复制
+///          若被重放，可能覆盖并发变化或重复产生副作用。
+bool HasUnknownOutcomeOnTimeout(CommandCode cmd) {
+    switch (cmd) {
+        case CommandCode::ModifyBits:
+        case CommandCode::Download:
+        case CommandCode::ShortDownload:
+        case CommandCode::SetCalPage:
+        case CommandCode::SetSegmentMode:
+        case CommandCode::CopyCalPage:
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::string_view NonReplayableCommandName(CommandCode cmd) {
+    switch (cmd) {
+        case CommandCode::ModifyBits:
+            return "MODIFY_BITS";
+        case CommandCode::Download:
+            return "DOWNLOAD";
+        case CommandCode::ShortDownload:
+            return "SHORT_DOWNLOAD";
+        case CommandCode::SetCalPage:
+            return "SET_CAL_PAGE";
+        case CommandCode::SetSegmentMode:
+            return "SET_SEGMENT_MODE";
+        case CommandCode::CopyCalPage:
+            return "COPY_CAL_PAGE";
+        default:
+            return "标定变更命令";
+    }
+}
+
 }  // namespace
 
 CommandExecutor::CommandExecutor(IXcpTransport& transport, Session& session,
@@ -431,7 +467,36 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
             return DispatchResponse(cmd, *response);
         }
 
-        // 超时或 Transport 关闭：进入 SYNCH 恢复并有限重试（计划 §6.2）
+        // 这些标定变更命令可能已在 Slave 生效；响应超时后即便 SYNCH 恢复
+        // 成功也不得重放，否则可能重复写入或覆盖并发状态变化。报告结果未知，
+        // 由调用方读回/对账。
+        if (HasUnknownOutcomeOnTimeout(cmd)) {
+            const std::string command_name(NonReplayableCommandName(cmd));
+            if (retries >= m_timeouts_.max_retries) {
+                throw XcpException(
+                    ErrorCategory::OperationOutcomeUnknown,
+                    command_name +
+                        " 响应超时，执行结果未知；恢复次数已耗尽，未重放命令",
+                    cmd, std::nullopt, retries);
+            }
+            ++retries;
+            try {
+                PerformRecovery(cmd);
+            } catch (const XcpException& e) {
+                throw XcpException(
+                    ErrorCategory::OperationOutcomeUnknown,
+                    command_name + " 响应超时，执行结果未知；SYNCH 恢复失败：" +
+                        std::string(e.what()),
+                    cmd, std::nullopt, retries, std::string(e.TransportError()));
+            }
+            throw XcpException(
+                ErrorCategory::OperationOutcomeUnknown,
+                command_name +
+                    " 响应超时，执行结果未知；SYNCH 已恢复，命令未重放",
+                cmd, std::nullopt, retries);
+        }
+
+        // 其他支持重试的命令超时：进入 SYNCH 恢复并有限重试（计划 §6.2）
         if (retries >= m_timeouts_.max_retries) {
             throw XcpException(ErrorCategory::RecoveryFailed,
                                "命令超时且恢复重试已耗尽（" +
@@ -440,17 +505,12 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
         }
         ++retries;
         PerformRecovery(cmd);
-        // UPLOAD / DOWNLOAD 都从隐含 MTA 起算（docs L1907 / L1983）：重试前
-        // 必须重建 MTA。函数名沿用 RestoreUploadMta（当时只有 UPLOAD），
-        // 语义已扩展到 DOWNLOAD —— 为不动既有已验证代码而不改名。
-        if (cmd == CommandCode::Upload || cmd == CommandCode::Download) {
+        // 可安全重试的 UPLOAD 依赖隐含 MTA，恢复后须重建 MTA（docs L1907）。
+        // DOWNLOAD 在上方被归为不可重放命令，不会进入此恢复重试分支。
+        if (cmd == CommandCode::Upload) {
             RestoreUploadMta();
         }
-        // MODIFY_BITS 同样从隐含 MTA 起算（docs §7.5.2.5：操作对象为 MTA
-        // 指向的 32-bit 位置，命令本身不带地址）——恢复后必须重放 SET_MTA
-        if (cmd == CommandCode::ModifyBits) {
-            RestoreUploadMta();
-        }
+        // 标定变更命令在上方统一返回 OperationOutcomeUnknown，不得在此重放。
         // WRITE_DAQ / READ_DAQ 从隐含 DAQ 指针起算：docs L2783 要求恢复后
         // 重新 SET_DAQ_PTR（指针不可查询，只能重放本端记录）
         if (cmd == CommandCode::WriteDaq || cmd == CommandCode::ReadDaq) {
@@ -960,7 +1020,7 @@ void CommandExecutor::ExecuteModifyBits(std::uint8_t shift,
     const Bytes encoded =
         m_codec_->EncodeModifyBits(shift, and_mask, xor_mask);
     // CRM 仅 RES（xcp.h CRM_MODIFY_BITS_LEN=1），无数据字段可解析。
-    // MTA 隐含依赖与恢复重放由 RunCommand 的 ModifyBits 分支处理。
+    // MTA 不变；响应超时后的执行结果由 RunCommand 标记为未知且不重放。
     (void)RunCommand(CommandCode::ModifyBits, encoded);
 }
 

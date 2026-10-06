@@ -39,12 +39,19 @@ struct XcpliteSymbolInfo {
 /**
  * @brief XCPlite Slave 子进程控制器（不依赖 gtest，可独立使用）
  *
- * 生命周期：构造 → Start()（进程存活且探测到 XCP 会话可建立）→ Stop()。
+ * 生命周期：构造 → Start()（子进程标记与 XCP 会话探测均就绪）→ Stop()。
  * 析构自动 Stop（幂等）。禁止拷贝。
  */
 class XcpliteSlaveProcess {
 public:
-    XcpliteSlaveProcess();
+    /**
+     * @brief 构造子进程控制器
+     * @param first_candidate_port 可选首选端口，仅用于确定性端口冲突测试
+     * @param first_attempt_startup_delay_ms 首次启动延迟，仅用于就绪竞态测试
+     */
+    explicit XcpliteSlaveProcess(
+        std::optional<std::uint16_t> first_candidate_port = std::nullopt,
+        std::uint32_t first_attempt_startup_delay_ms = 0);
     ~XcpliteSlaveProcess();
 
     XcpliteSlaveProcess(const XcpliteSlaveProcess&) = delete;
@@ -53,8 +60,8 @@ public:
     /**
      * @brief 启动 Slave 并等待就绪
      * @details 自动选择端口（避开并发 ctest 任务冲突）；Slave 因端口占用
-     *          早退时顺延换端口重试；就绪 = 一次完整的 CONNECT+DISCONNECT
-     *          成功。超时抛出 std::runtime_error。
+     *          早退时顺延换端口重试；就绪要求子进程写入本次启动标记且
+     *          一次完整的 CONNECT+DISCONNECT 成功。超时抛出 std::runtime_error。
      * @throws std::runtime_error 无法启动 Slave 可执行文件或探测超时
      */
     void Start();

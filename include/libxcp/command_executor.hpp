@@ -506,7 +506,7 @@ public:
     void ExecuteCopyCalPage(const CopyCalPageRequest& request);
 private:
     /// @brief 单条命令的执行流程：状态检查 -> 发送 -> 等待 -> 错误分派 ->
-    /// 恢复重试
+    /// 恢复重试；MODIFY_BITS 超时不重放并报告 OperationOutcomeUnknown
     [[nodiscard]] ParsedPacket RunCommand(CommandCode cmd,
                                           const Bytes& encoded_packet);
     /// @brief 一次发送-等待尝试：占用 Outstanding Command 槽位后发送并等待

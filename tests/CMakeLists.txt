@@ -85,6 +85,8 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
 
   add_executable(XcpliteIntegration
           xcplite_slave_fixture.cpp
+          xcplite_slave_fixture_test.cpp
+          udp_test_slave.cpp
           xcplite_protocol_test.cpp
           xcplite_write_test.cpp
           xcplite_daq_test.cpp)

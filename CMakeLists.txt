@@ -179,7 +179,8 @@ if(LIBXCP_BUILD_A2L)
   # 副产物不并入 libxcp；adapter/*.cpp 是核心<->桥接层唯一接触点
   # （A2lIsolation S2 仅扫描 include/ 与 src/，本目录不在扫描范围）。
   add_library(libxcp_measurement_adapter STATIC
-          adapter/a2l/a2l_measurement_database.cpp)
+          adapter/a2l/a2l_measurement_database.cpp
+          adapter/a2l/measurement_runtime_profile.cpp)
   target_include_directories(libxcp_measurement_adapter PUBLIC
           $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
           $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/adapter>)

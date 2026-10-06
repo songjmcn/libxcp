@@ -279,12 +279,12 @@ Bytes CommandCodec::EncodeGetDaqListInfo(std::uint16_t daq_list) const {
 }
 
 Bytes CommandCodec::EncodeGetDaqEventInfo(std::uint16_t event_channel) const {
-    // GET_DAQ_EVENT_INFO: [D7][event_channel(WORD)]（XCPlite 实然
-    // xcp.h:817-818：CRO_GET_DAQ_EVENT_INFO_LEN=4、索引 CRO_WORD(1)，
-    // 即字节2..3=事件通道号 WORD，**无** reserved 字节）。
+    // GET_DAQ_EVENT_INFO: [D7][reserved][event_channel(WORD)]；
+    // xcp.h:817-818 declares CRO_LEN=4 and CRO_WORD(1), i.e. bytes 2..3.
     Bytes cto;
-    cto.reserve(3);
+    cto.reserve(4);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqEventInfo));
+    cto.push_back(0x00U);
     WriteU16(cto, event_channel);
     return cto;
 }

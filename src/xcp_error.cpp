@@ -27,6 +27,8 @@ std::string_view ErrorCategoryName(ErrorCategory cat) noexcept {
             return "UnsupportedFeature";
         case ErrorCategory::RecoveryFailed:
             return "RecoveryFailed";
+        case ErrorCategory::OperationOutcomeUnknown:
+            return "OperationOutcomeUnknown";
     }
     return "Unknown";
 }

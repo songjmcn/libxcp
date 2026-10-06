@@ -269,6 +269,26 @@ TEST(DtoEnvelopeDecoder, ShortFrameThrows) {
     EXPECT_THROW((void)decoder.Decode(dto, layout), XcpException);
 }
 
+TEST(DtoEnvelopeDecoder, UnknownIdentificationModeThrows) {
+    const DtoEnvelopeDecoder decoder(ByteOrder::Intel);
+    DtoFrameLayout layout;
+    layout.identification_field_type =
+        static_cast<IdentificationFieldType>(0xFFU);
+    layout.header_bytes = 4;
+
+    const auto dto = BytesOf({0x02, 0xAA, 0x0B, 0x00});
+    EXPECT_THROW(
+        {
+            try {
+                (void)decoder.Decode(dto, layout);
+            } catch (const XcpException& e) {
+                EXPECT_EQ(e.Category(), ErrorCategory::MalformedPacket);
+                throw;
+            }
+        },
+        XcpException);
+}
+
 TEST(DtoEnvelopeDecoder, CounterOverflowThrows) {
     const DtoEnvelopeDecoder decoder(ByteOrder::Intel);
     DtoFrameLayout layout;

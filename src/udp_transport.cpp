@@ -200,6 +200,10 @@ void UdpTransport::Open(IPacketListener& listener) {
             "max_datagram_size 必须在 " + std::to_string(kUdpHeaderSize + 1) +
             ".." + std::to_string(kUdpMaxDatagramSize) + " 之间");
     }
+    if (m_config_.receive_poll_interval_ms == 0U) {
+        throw detail::MakeInvalidArgument(
+            "receive_poll_interval_ms 必须大于 0");
+    }
 
     auto impl = std::make_unique<SocketImpl>();
 #if defined(_WIN32)
@@ -257,16 +261,25 @@ void UdpTransport::Open(IPacketListener& listener) {
     }
 
     // ---- 接收超时：使阻塞接收可周期性检查关闭标记，保证 Close() 及时生效 ----
+    int timeout_result = 0;
 #if defined(_WIN32)
     DWORD tv_ms = m_config_.receive_poll_interval_ms;
-    ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO,
-                 reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+    timeout_result = ::setsockopt(
+        impl->handle, SOL_SOCKET, SO_RCVTIMEO,
+        reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
 #else
     timeval tv{};
     tv.tv_sec = m_config_.receive_poll_interval_ms / 1000U;
     tv.tv_usec = (m_config_.receive_poll_interval_ms % 1000U) * 1000U;
-    ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    timeout_result = ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO, &tv,
+                                  sizeof(tv));
 #endif
+    if (timeout_result != 0) {
+        // 先取平台错误文本；closeSocket 可能覆盖 errno / WSAGetLastError。
+        const std::string error = lastSocketError();
+        closeSocket(impl->handle);
+        throw detail::MakeTransportError("设置 UDP 接收超时失败", error);
+    }
 
     // 解析后的远端 sockaddr 缓存到 SocketImpl，避免每次发送重复解析字符串。
     impl->remote = remote;

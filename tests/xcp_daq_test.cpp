@@ -559,20 +559,26 @@ TEST(XcpDaqRecovery, WriteDaqTimeoutReissuesSetDaqPtr) {
     EXPECT_EQ(written[1].entry, 1);
 }
 
-TEST(XcpDaqRecovery, DownloadTimeoutReissuesSetMta) {
+TEST(XcpDaqRecovery, DownloadTimeoutReportsUnknownWithoutRetry) {
     Rig rig;
     rig.slave.FailWith(CommandCode::ShortDownload, ErrorCode::CmdUnknown);
     rig.slave.DropTimes(CommandCode::Download, 1);
     const Bytes data = {0xAA, 0xBB, 0xCC, 0xDD};
-    rig.master->WriteMemoryBytes(0x4000, 0x00, BytesView{data});
+    try {
+        rig.master->WriteMemoryBytes(0x4000, 0x00, BytesView{data});
+        FAIL() << "响应超时后 DOWNLOAD 应报告结果未知";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::OperationOutcomeUnknown);
+        EXPECT_EQ(e.GetCommandCode(),
+                  std::optional<CommandCode>(CommandCode::Download));
+        EXPECT_EQ(e.RetryCount(), 1);
+    }
     EXPECT_EQ(rig.slave.Count(CommandCode::Synch), 1);
-    EXPECT_GE(rig.slave.Count(CommandCode::SetMta), 2)
-        << "每块前都有 SET_MTA，恢复后再来一次（块首地址）";
-    EXPECT_EQ(rig.slave.Count(CommandCode::Download), 2);
-    const auto& mem = rig.slave.Memory();
-    ASSERT_EQ(mem.size(), 4u);
-    EXPECT_EQ(mem.at(0x4000), 0xAAU);
-    EXPECT_EQ(mem.at(0x4003), 0xDDU);
+    EXPECT_EQ(rig.slave.Count(CommandCode::SetMta), 1)
+        << "不确定结果时不得为重放而重建 MTA";
+    EXPECT_EQ(rig.slave.Count(CommandCode::Download), 1);
+    EXPECT_TRUE(rig.slave.Memory().empty())
+        << "该模拟故障发生在命令执行前；结果仍按协议边界报告未知";
 }
 
 // ---------------------------------------------------------------------------

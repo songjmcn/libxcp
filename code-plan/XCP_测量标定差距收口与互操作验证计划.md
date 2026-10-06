@@ -1,6 +1,6 @@
 # XCP 测量与标定差距收口及互操作验证计划
 
-> 性质：现状复核后的**待确认修改计划**，不是已完成记录；本次仅编写文档，不改代码。目标平台 Windows / Linux / macOS，C++20。任何实施均须先按仓库 `AGENTS.md` 逐节确认方案、测试与范围；不擅自修改 `thirdparty/`，不重构已完成模块。
+> 性质：现状复核后的分阶段计划；P0、P1 已按确认范围实施并记录，P2-P4 仍是待执行/待设备门禁的目标。目标平台 Windows / Linux / macOS，C++20。后续实施仍须按仓库 `AGENTS.md` 逐节确认方案、测试与范围；不擅自修改 `thirdparty/`，不重构已完成模块。
 
 ## 1. 目标与边界
 
@@ -36,6 +36,10 @@
 
 **交付**：计划修订、能力/测试矩阵、该批实施记录；**DoD**：旧计划和新口径无相互矛盾；现有已通过测试无回归；未经重建或真实设备验证的项不标 PASS。
 
+**本轮 A2L OFF 复核（Windows Release）**：`build-p0-off` 配置为 `LIBXCP_BUILD_A2L=OFF`、`LIBXCP_BUILD_TESTS=ON`、`LIBXCP_BUILD_XCPLITE_SLAVE=OFF`；先 clean 后全目标 Release 构建成功；全量 CTest 455 项中 454 通过、1 项既有 Skip、0 失败（`AgIntegration/XcpMasterAgTest.ByteApiRequiresMultipleOfAg/Ag1_Cto8`）。该结果确认当前通用核心与测试可在不含 A2L/XCPlite 的配置下构建运行，不代表 P0 全部跨平台 DoD 完成。
+
+**A2L+XCPlite ON 复核（Windows Release，历史全量干净构建基线）**：`build-v09` 配置为 `LIBXCP_BUILD_A2L=ON`、`LIBXCP_BUILD_TESTS=ON`、`LIBXCP_BUILD_XCPLITE_SLAVE=ON`；全目标 clean build 成功；当时 CTest 503 项中 502 通过、1 项既有 Skip、0 失败。构建输出含 MSVC C4244/C4267（测试中的 A2L 地址/长度窄化转换）和 C4100（未使用参数）警告；未在本轮改动这些警告。该历史结果由下方 P1 最新 513 项全量结果 supersede；均仅为 Windows 本地/模拟及 XCPlite 自有对手端证据，非外部 ECU 或跨平台互操作 PASS。
+
 ### P1：测量元数据取证与方言配置（以最小增量为原则）
 
 1. 先审 `adapter/a2l/a2l_measurement_database.cpp`、现有 A2L SDK/IF_DATA 解析器和 `XcpMaster::QueryDaqProcessorInfo`/`QueryDaqResolutionInfo`/`QueryDaqEventInfo` 的真实返回字段。为事件通道建立**显式绑定来源**：可证的 A2L EVENT/IF_DATA 与 Slave 运行时查询交叉校验；变量到事件的对应关系如 A2L 无法证明，则由调用方提供绑定表，未知或歧义必须报错而非默认 0。不要把测试里的按文本匹配 `testev` 直接搬进核心。
@@ -43,6 +47,8 @@
 3. 若当前 API 足够，优先写上层 profile/配置使用样例和测试，不新增公共 API；确需新增接口先提交字段来源、兼容性/ABI 评估并获得批准。对非法事件号、未知识别模式、时间戳单位缺失、过大 ODT、陈旧代际和队列丢帧做负例。
 
 **涉及**：`adapter/a2l/`、必要时 `include/libxcp/measurement/` 与 `src/measurement/`；`tests/xcplite_measurement_test.cpp`、测量单测、A2L 隔离测试。**DoD**：XCPlite 无测试专用硬编码依赖仍能形成正确帧；至少一个非 XCPlite 的不同 DTO/事件配置跑通（真实端尚不可用时仅标模拟 PASS，G2 不完成）；现有显式配置用法保持兼容。
+
+**实施状态（Windows Release 验证）**：P1 首轮硬化与经确认的适配器复用 T-02 均已完成，详情见 `code-plan/XCP_测量标定差距收口_P1实施记录.md`。A2L+XCPLITE ON 最新全量 CTest 为 513 项（512 通过、1 个既有 SKIP、0 失败）；A2L/XCPLITE OFF 为 460 项（459 通过、同一既有 SKIP、0 失败）。首轮历史结果 496/451 已由以上更新结果取代。代码包括显式 symbol-event binding、XCPlite EVENT/DAQ/timestamp runtime profile、测量生命周期/DTO 负例、GET_DAQ_EVENT_INFO reserved-byte 修正；`measurement_demo` 复用 adapter utility。此状态仅代表 Windows、本地 Mock/UDP Loopback 与 vendored XCPlite；真实非 XCPlite 对手端和 Linux/macOS 仍未验证。
 
 ### P2：受保护标定验证（外部对手端先行）
 
@@ -52,6 +58,8 @@
 
 **涉及**：新对手端夹具/配置与 `tests/` 下新增测试、部署说明；Master 代码仅在可复现缺陷证实后最小修复。**DoD**：独立实现的可保护 Slave 正负闭环均 PASS，日志不泄密；设备不可得则明确“P2 未完成”，不能将替代覆盖算为本阶段通过。
 
+**模拟补充（Windows Release）**：新增 `SeedKeyEndToEnd.ProtectedCalibrationWriteRequiresUnlockAndRelocks`，覆盖锁定 DOWNLOAD 拒绝、测试算法解锁、原值核对、写后读回及新 Master CONNECT 后重新锁定。此项仅为 UDP Loopback 模拟证据，不满足本阶段独立对手端 DoD，P2 真实验证仍未完成。另：同一 `XcpMaster` 实例在 DISCONNECT 后立即再次 CONNECT 的实验触发 `当前状态不允许进入恢复: Connecting`；本测试以新 Master 实例验证 Slave 新会话锁状态，不把该行为擅自扩展为修复范围。
+
 ### P3：分页/位标定真实闭环与非幂等超时安全
 
 1. 以当前未提交的 `XCP_1.3.0_变量标定实现计划.md` 和 `XCP_1.3.0_变量标定修改说明.md` 为**已开展工作**复核，不重写 9 命令。先确认对手端真实支持的 Page Switching/MODIFY_BITS/COPY_CAL_PAGE 子集和 CalSeg 地址映射，再选至少一种支持者做 GET_PAG_PROCESSOR_INFO、段/页信息、ECU/XCP page 切换与读回、MODIFY_BITS 掩码读回、COPY_CAL_PAGE 成功/写保护负例；不支持的命令保留 `ERR_CMD_UNKNOWN` 测试，不能以 Mock 通过伪称 XCPlite E2E。
@@ -60,11 +68,17 @@
 
 **涉及**：现有标定文件、`tests/xcp_master_integration_test.cpp`、新独立对手端测试；仅修复已证实问题。**DoD**：规范核对有记录、支持命令真实 E2E PASS、不支持命令显式跳过/负例；超时状态不发生静默双写；无独立可分页 Slave 时不宣称“Page Switching 已完成互操作”。
 
+**模拟实施（Windows Release）**：经用户确认，MODIFY_BITS、DOWNLOAD、SHORT_DOWNLOAD、SET_CAL_PAGE、SET_SEGMENT_MODE、COPY_CAL_PAGE 在响应超时后均不盲目重发；允许先发 SYNCH，但以 `ErrorCategory::OperationOutcomeUnknown` 报告结果不确定。Mock 覆盖六种命令已执行但响应丢失，且验证不重发；Download 执行前丢响应回归也更新为结果未知。`libxcp_tests` Release 构建通过；最终全量 CTest 508 项中 507 通过、1 项既有 Skip、0 失败。首次全量测试中的两个 A2L 性能阈值超限在修正旧 Download 预期后重跑均通过，详细波动数据见实施记录。详情见 `code-plan/XCP_测量标定差距收口_P3模拟实施记录.md`。此结果只关闭本地超时重试安全策略的模拟风险项；真实 Page Switching/MODIFY_BITS/COPY_CAL_PAGE 对手端闭环与 POSIX 验证仍未完成，P3/P4 整体不得标记完成。
+
 ### P4：跨平台与互操作发布门禁
 
 - Windows/MSVC、Linux/GCC 或 Clang、macOS/Clang 各对 Release 构建、核心/DAQ/测量/A2L、XCPlite 真实进程用例实跑，记录架构、网络环境、端口、失败与重试；不可用平台标“未验证”，不得推断通过。测试隔离端口、就绪探测、进程退出与清理。
 - 在至少一种非自有对手端完成抓包核对：CONNECT 参数、UDP LEN/CTR、DAQ DTO 信封/时间戳、CAL 资源与写回负响应；差异入兼容配置清单，不为单个 Slave 改坏标准路径。可选 CANape 对照只作为旁证，不冒充认证。
 - 发布 `docs/` 使用/能力限制说明及 `code-plan/` 每批修改记录：测试数量和跳过项、已确认/未确认能力清单、设备与软件版本、抓包脱敏、回滚方法。
+
+**Windows 本地硬化子项（不代表 P4 整体完成）**：经批准修正 UDP 接收轮询间隔为 0 时可能禁用 socket 接收超时、导致 `Close()` 等待接收线程的问题；配置校验拒绝 0，并检查 `SO_RCVTIMEO` 设置结果、保留平台错误信息。新增零间隔负例。干净 Release 构建成功；当时全量 CTest 502 项中 501 通过、1 项既有 Skip、0 失败。详见 `code-plan/XCP_测量标定差距收口_P4本地硬化实施记录.md`。
+
+**XCPlite 子进程就绪身份绑定子项（不代表 P4 整体完成）**：就绪需同时满足进程存活、本次启动 token 标记存在且 CONNECT/DISCONNECT 成功；新增独占端口占用竞争回归。全 Release 目标增量构建成功；全量 CTest 503 项中 502 通过、1 项既有 Skip、0 失败。详见 `code-plan/XCP_测量标定差距收口_P4子进程就绪探测实施记录.md`。当前 Windows 本地测试通过，但 Linux/macOS 仍未验证（此前 WSL 返回 `Wsl/E_ACCESSDENIED`），非自有设备互操作也未完成；`setsockopt` 故障分支未做注入测试，故 P4 仍未完成。
 
 ## 4. 最终验收矩阵与停工条件
 

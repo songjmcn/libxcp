@@ -12,24 +12,26 @@
  *     非盘文件捷径），落盘后交桥接层解析；
  *  2) A2lMeasurementDatabase 把桥接层 IA2lDatabase 包装为核心
  *     IMeasurementDatabase（adapter/，唯一的桥接接触点）；
- *  3) 适配器 Find 的 event_channel 恒 0（A2L 静态面无事件绑定，见
- *     a2l_measurement_database.cpp :101-103）——运行时事件通道由
- *     测试本地装饰器注入（XCPlite 的 testev，从 Slave 运行时 A2L 的
- *     EVENT 段解析，D18 不硬编码），对应计划"上层 QueryDaqEventInfo
- *     取证后另行补充"的上层职责；
- *  4) MeasurementSession 按 XCPlite 实然取证：RelativeByte 识别字段
- *     （[ODTrel][0xAA][DAQ16]，头长 4，D13）+ 仅首 ODT 帧带 4 字节
- *     时间戳（SetTimestampFirstOdtOnly）+ 时间戳单位 1ns/tick
- *     （Slave OPTION 实然；SetTimestampUnit 显式注入，R13 不猜）。
+ *  3) A2L EVENT 的 event id/cycle/unit 与 QueryDaqEventInfo 交叉核验；
+ *     A2L 不声明 symbol→event 关联，因此绑定表由调用点显式提供，缺失/多值
+ *     均报 InvalidLayout，不把 adapter 的中性 event_channel=0 当成证据；
+ *  4) DTO identification field 与时间戳宽度/单位/TICKS 从运行时查询读取；
+ *     XCPlite 专有 4-byte RelativeByte header 与首 ODT timestamp 仅作为
+ *     单独 profile 配置，不推广成通用 XCP 默认值。
  */
 
 #include <chrono>
 #include <cstdint>
 #include <fstream>
+#include <iomanip>
+#include <iterator>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
-#include <sstream>
 #include <optional>
+#include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,49 +65,154 @@ std::string Qualified(const std::string& symbol) {
     return std::string(test::kXcpliteSlaveProject) + "::" + symbol;
 }
 
-/**
- * @brief 从 Slave 运行时 A2L 的 EVENT 段解析事件通道号（D18 不硬编码）
- * @details 与 xcplite_daq_test.cpp 同法：匹配 `"testev" 0x%...` 形态取
- *          十六进制 id。此处独立副本（测试 TU 不共享匿名命名空间符号）。
- */
-std::optional<std::uint16_t> ResolveEventChannel(
-    const std::filesystem::path& a2l_path, const std::string& short_name) {
+/// @brief A2L EVENT 声明中可用于运行时交叉核验的元数据。
+struct RuntimeEventInfo {
+    std::string name;
+    std::uint16_t channel{0};
+    std::uint8_t time_cycle{0};
+    std::uint8_t time_unit{0};
+};
+
+/// @brief 按 A2L 标准 EVENT 声明读取唯一事件；拒绝缺失、重复和越界字段。
+std::optional<RuntimeEventInfo> ResolveRuntimeEvent(
+    const std::filesystem::path& a2l_path, const std::string& event_name) {
     std::ifstream file(a2l_path);
     if (!file) {
         return std::nullopt;
     }
-    const std::string needle = "\"" + short_name + "\" 0x";
+
+    std::optional<RuntimeEventInfo> found;
     std::string line;
     while (std::getline(file, line)) {
-        const std::size_t pos = line.find(needle);
-        if (pos == std::string::npos) {
+        std::istringstream row(line);
+        std::string begin;
+        std::string kind;
+        std::string name;
+        std::string short_name;
+        std::string channel;
+        std::string type;
+        std::string max_daq;
+        std::string time_cycle;
+        std::string time_unit;
+        std::string priority;
+        if (!(row >> begin >> kind) || begin != "/begin" || kind != "EVENT") {
             continue;
         }
-        const std::size_t hex_begin = pos + needle.size();
-        const std::size_t hex_end = line.find(' ', hex_begin);
-        const std::string hex = line.substr(
-            hex_begin, hex_end == std::string::npos ? std::string::npos
-                                                    : hex_end - hex_begin);
+        if (!(row >> std::quoted(name) >> std::quoted(short_name) >> channel >>
+              type >> max_daq >> time_cycle >> time_unit >> priority)) {
+            return std::nullopt;
+        }
+        if (name != event_name && short_name != event_name) {
+            continue;
+        }
         try {
-            return static_cast<std::uint16_t>(std::stoul(hex, nullptr, 16));
+            std::size_t used = 0;
+            const unsigned long channel_value = std::stoul(channel, &used, 0);
+            if (used != channel.size() ||
+                channel_value > std::numeric_limits<std::uint16_t>::max()) {
+                return std::nullopt;
+            }
+            const unsigned long cycle_value = std::stoul(time_cycle, &used, 10);
+            if (used != time_cycle.size() || cycle_value > 255UL) {
+                return std::nullopt;
+            }
+            const unsigned long unit_value = std::stoul(time_unit, &used, 10);
+            if (used != time_unit.size() || unit_value > 255UL || found) {
+                return std::nullopt;
+            }
+            found = RuntimeEventInfo{name,
+                                     static_cast<std::uint16_t>(channel_value),
+                                     static_cast<std::uint8_t>(cycle_value),
+                                     static_cast<std::uint8_t>(unit_value)};
         } catch (const std::exception&) {
             return std::nullopt;
         }
     }
-    return std::nullopt;
+    return found;
 }
 
-/**
- * @brief 事件通道装饰器：Find 结果注入运行时取证到的事件通道号
- * @details A2L 静态面不含"该变量由哪个事件触发"的绑定（适配器恒回 0）；
- *          上层从 Slave 运行时 A2L EVENT 段取证 testev 通道后在此补充，
- *          使 MeasurementPlanner 把两个变量归入同一事件组（一条 DAQ
- *          List）。核心/适配器均零改动。
- */
+/// @brief 明确记录来源的 DTO envelope/timestamp 配置（本测试 TU 的 profile）。
+struct MeasurementRuntimeProfile {
+    IdentificationFieldType identification{IdentificationFieldType::Absolute};
+    std::size_t identification_bytes{0};
+    std::uint64_t timestamp_unit_ns{0};
+    bool timestamp_first_odt_only{false};
+};
+
+/// @brief 从 XCP 查询取证 XCPlite profile；无来源或 A2L/Slave 不一致即拒绝。
+std::optional<MeasurementRuntimeProfile> QueryXcpliteProfile(
+    XcpMaster& master, const RuntimeEventInfo& event, std::string& error) {
+    const auto processor = master.QueryDaqProcessorInfo();
+    const auto resolution = master.QueryDaqResolutionInfo();
+    const auto runtime_event = master.QueryDaqEventInfo(event.channel);
+    if (!processor || !resolution || !runtime_event) {
+        error = "缺少 DAQ processor/resolution/event 运行时取证";
+        return std::nullopt;
+    }
+    // XCPlite advertises DAQ_HDR_ODT_FIL_DAQW (key-byte code 3): its
+    // four-byte vendor envelope is mapped to the decoder's RelativeByte mode.
+    // Source: thirdparty/XCPlite/src/xcp.h:384-388 and observed DTO dialect.
+    if (processor->key_byte.identification_field_type != 3U) {
+        error = "Slave DAQ_KEY_BYTE 未声明 XCPlite ODT_FIL_DAQW (code 3)";
+        return std::nullopt;
+    }
+    if (runtime_event->time_cycle != event.time_cycle ||
+        runtime_event->time_unit != event.time_unit) {
+        error = "A2L EVENT 周期与 GET_DAQ_EVENT_INFO 不一致";
+        return std::nullopt;
+    }
+
+    // TIMESTAMP_MODE size_code 4 = 4 bytes (docs §7.5.4.10; same mapping
+    // enforced by XcpMaster::DaqTimestampBytesCached during Prepare).
+    if (resolution->timestamp_mode.size_code != 4U ||
+        !resolution->timestamp_mode.fixed ||
+        resolution->timestamp_ticks == 0U) {
+        error = "XCPlite profile 要求固定 32-bit timestamp 且 TICKS 非零";
+        return std::nullopt;
+    }
+
+    // 来源：thirdparty/XCPlite/src/xcplite.c:2520-2530 与
+    // thirdparty/XCPlite/src/xcp_cfg.h:426-433；标准单位码 0..6 分别为
+    // 1ns、10ns、100ns、1us、10us、100us、1ms。乘运行时 TICKS 得每计数 ns。
+    constexpr std::uint64_t kUnitNs[] = {1U, 10U, 100U, 1000U,
+                                         10000U, 100000U, 1000000U};
+    const std::uint8_t unit_code = resolution->timestamp_mode.unit_code;
+    if (unit_code >= std::size(kUnitNs) ||
+        resolution->timestamp_ticks >
+            std::numeric_limits<std::uint64_t>::max() / kUnitNs[unit_code]) {
+        error = "timestamp unit code 未知或单位换算溢出";
+        return std::nullopt;
+    }
+
+    // XCPlite profile dialect: RelativeByte wire header is
+    // [ODTrel][0xAA][DAQ16 LE] (4 bytes), and only ODT0 carries timestamp.
+    // These two quirks are profile-specific, not inferred from generic XCP.
+    return MeasurementRuntimeProfile{
+        IdentificationFieldType::RelativeByte, 4U,
+        kUnitNs[unit_code] * resolution->timestamp_ticks, true};
+}
+
+/// @brief 将已取证的 profile 写入会话；配置必须早于 Prepare。
+void ApplyProfile(MeasurementSession& session,
+                  const MeasurementRuntimeProfile& profile) {
+    session.SetEnvelopeMode(profile.identification,
+                            profile.identification_bytes);
+    session.SetTimestampFirstOdtOnly(profile.timestamp_first_odt_only);
+    session.SetTimestampUnit(profile.timestamp_unit_ns);
+}
+
+/// @brief 明确变量→事件绑定的数据库装饰器；缺失/多值绑定均失败，不默认 0。
 class EventBoundDatabase final : public IMeasurementDatabase {
  public:
-  EventBoundDatabase(IMeasurementDatabase& inner, std::uint16_t event_channel)
-      : m_inner_(inner), m_channel_(event_channel) {}
+  using Binding = std::pair<std::string, std::uint16_t>;
+
+  EventBoundDatabase(IMeasurementDatabase& inner,
+                     std::vector<Binding> bindings)
+      : m_inner_(inner) {
+    for (const Binding& binding : bindings) {
+        m_bindings_[binding.first].insert(binding.second);
+    }
+  }
 
   EventBoundDatabase(const EventBoundDatabase&) = delete;
   EventBoundDatabase& operator=(const EventBoundDatabase&) = delete;
@@ -116,10 +223,19 @@ class EventBoundDatabase final : public IMeasurementDatabase {
     if (!res.HasValue()) {
         return res;
     }
-    MeasurementSymbolInfo info = res.Value();
-    if (info.event_channel == 0U) {
-        info.event_channel = m_channel_;
+    const auto binding = m_bindings_.find(std::string(name));
+    if (binding == m_bindings_.end() || binding->second.empty()) {
+        return detail::MakeMeasurementError<MeasurementSymbolInfo>(
+            MeasurementErrorCode::InvalidLayout,
+            "测量符号缺少显式事件通道绑定", std::string(name));
     }
+    if (binding->second.size() != 1U) {
+        return detail::MakeMeasurementError<MeasurementSymbolInfo>(
+            MeasurementErrorCode::InvalidLayout,
+            "测量符号存在歧义事件通道绑定", std::string(name));
+    }
+    MeasurementSymbolInfo info = res.Value();
+    info.event_channel = *binding->second.begin();
     return detail::MakeMeasurementOk(info);
   }
 
@@ -129,8 +245,8 @@ class EventBoundDatabase final : public IMeasurementDatabase {
   }
 
  private:
-  IMeasurementDatabase& m_inner_;      ///< 被包装的 A2L 适配器
-  std::uint16_t m_channel_{0};         ///< 取证到的事件通道（testev）
+  IMeasurementDatabase& m_inner_;  ///< 被包装的 A2L 适配器
+  std::map<std::string, std::set<std::uint16_t>> m_bindings_;
 };
 
 /// @brief 线程安全帧收集器（worker 线程回调写入）
@@ -230,6 +346,11 @@ bool PhysicalIs(const MeasurementSample& sample, std::uint64_t want) {
 // 主用例：协议拉取 A2L → 桥接 → 适配器 → 会话 → 物理值帧（全链路）
 // ---------------------------------------------------------------------------
 
+TEST_F(XcpliteMeasurementTest, RuntimeEventQueryRejectsInvalidChannel) {
+    auto master = MakeConnectedMaster();
+    EXPECT_THROW((void)master->QueryDaqEventInfo(0xFFFFU), XcpException);
+}
+
 TEST_F(XcpliteMeasurementTest, FullChainSessionProducesPhysicalFrames) {
     // —— 1) UPLOAD 通路拉回运行时 A2L（协议面，不读盘捷径）——
     const auto fetch_master = MakeConnectedMaster();
@@ -251,31 +372,43 @@ TEST_F(XcpliteMeasurementTest, FullChainSessionProducesPhysicalFrames) {
     const a2l::IA2lDatabase* db = loaded.Value()->Database();
     ASSERT_NE(db, nullptr);
 
-    // —— 3) 适配器 + 事件通道装饰（testev 从运行时 A2L EVENT 段取证）——
-    const auto event = ResolveEventChannel(slave_.A2lPath(), "testev");
-    ASSERT_TRUE(event.has_value()) << "A2L EVENT 段未找到 testev（D18）";
+    // —— 3) EVENT 来自实际 UPLOAD 的 A2L；变量→事件关联由调用点显式提供 ——
+    const auto event = ResolveRuntimeEvent(uploaded_a2l, "testev");
+    ASSERT_TRUE(event.has_value()) << "上传 A2L 中缺少唯一、有效的 testev EVENT";
+    const std::string u32_name = Qualified("g_basic_u32");
+    const std::string u8_name = Qualified("g_basic_u8");
     A2lMeasurementDatabase adapter(*db);
-    EventBoundDatabase measurement_db(adapter, *event);
+
+    EventBoundDatabase unbound(adapter, {});
+    const auto missing_binding = unbound.Find(u32_name);
+    ASSERT_FALSE(missing_binding.HasValue());
+    EXPECT_EQ(missing_binding.ErrorInfo().code,
+              MeasurementErrorCode::InvalidLayout);
+    EventBoundDatabase ambiguous(
+        adapter, {{u32_name, event->channel},
+                  {u32_name, static_cast<std::uint16_t>(event->channel ^ 1U)}});
+    const auto ambiguous_binding = ambiguous.Find(u32_name);
+    ASSERT_FALSE(ambiguous_binding.HasValue());
+    EXPECT_EQ(ambiguous_binding.ErrorInfo().code,
+              MeasurementErrorCode::InvalidLayout);
+
+    EventBoundDatabase measurement_db(
+        adapter, {{u32_name, event->channel}, {u8_name, event->channel}});
 
     // FrameSink 先于 session/master 声明：析构顺序为逆序（sink 最后销毁），
     // 断言提前 return 时 session 析构先 join worker，回调绝不触碰悬 sink。
     FrameSink sink;
 
-    // —— 4) 会话：先构造（作监听器）→ Bind → Connect → 取证注入 ——
+    // —— 4) 会话：Bind → Connect → 查询运行时配置并应用 XCPlite profile ——
     MeasurementSession session(measurement_db);
     auto master = MakeMaster(&session);
     session.Bind(*master);
     master->Connect();
-    // 守卫：任何提前展开先 Stop（join worker + StopDaq），此时 master 尚存
     AutoStopSession guard(session);
-
-    // XCPlite 实然取证：RelativeByte [ODTrel][0xAA][DAQ16]，头长 4（D13）；
-    // 时间戳只随事件首 ODT 帧；单位 1ns/tick（SetTimestampUnit 显式注入）。
-    session.SetEnvelopeMode(IdentificationFieldType::RelativeByte, 4U);
-    session.SetTimestampFirstOdtOnly(true);
-    session.SetTimestampUnit(1);
-    const std::string u32_name = Qualified("g_basic_u32");
-    const std::string u8_name = Qualified("g_basic_u8");
+    std::string profile_error;
+    const auto profile = QueryXcpliteProfile(*master, *event, profile_error);
+    ASSERT_TRUE(profile.has_value()) << profile_error;
+    ApplyProfile(session, *profile);
     session.Add(u32_name);
     session.Add(u8_name);
     ASSERT_NO_THROW(session.Prepare());
@@ -324,7 +457,7 @@ TEST_F(XcpliteMeasurementTest, FullChainSessionProducesPhysicalFrames) {
         << "5s 内未见 A2L 定标后的 g_basic_u32==0xDEADBEEF 与 g_basic_u8==0x42"
         << dump();
 
-    // 首 ODT 帧必须带出有效时间戳（unit=1ns → 换算值即计数延展，v0.6 链路）
+    // 首 ODT 帧必须带有效时间戳；物理单位来自 profile 取证而非本测试猜值。
     EXPECT_TRUE(sink.WaitUntil(
         [](const std::vector<MeasurementFrame>& frames) {
             for (const auto& f : frames) {
@@ -357,10 +490,12 @@ TEST_F(XcpliteMeasurementTest, SessionSeesLiveUpdates) {
     const a2l::IA2lDatabase* db = loaded.Value()->Database();
     ASSERT_NE(db, nullptr);
 
-    const auto event = ResolveEventChannel(slave_.A2lPath(), "testev");
+    const auto event = ResolveRuntimeEvent(slave_.A2lPath(), "testev");
     ASSERT_TRUE(event.has_value());
+    const std::string u32_name = Qualified("g_basic_u32");
     A2lMeasurementDatabase adapter(*db);
-    EventBoundDatabase measurement_db(adapter, *event);
+    EventBoundDatabase measurement_db(
+        adapter, {{u32_name, event->channel}});
 
     FrameSink sink;  // 先于 session 声明：析构最后，worker 必先 join 后才可能触及其残骸
     MeasurementSession session(measurement_db);
@@ -368,10 +503,10 @@ TEST_F(XcpliteMeasurementTest, SessionSeesLiveUpdates) {
     session.Bind(*master);
     master->Connect();
     AutoStopSession guard(session);  // 同主用例：失败展开不留悬垂回调
-    session.SetEnvelopeMode(IdentificationFieldType::RelativeByte, 4U);
-    session.SetTimestampFirstOdtOnly(true);
-    session.SetTimestampUnit(1);
-    const std::string u32_name = Qualified("g_basic_u32");
+    std::string profile_error;
+    const auto profile = QueryXcpliteProfile(*master, *event, profile_error);
+    ASSERT_TRUE(profile.has_value()) << profile_error;
+    ApplyProfile(session, *profile);
     session.Add(u32_name);
     ASSERT_NO_THROW(session.Prepare());
 
