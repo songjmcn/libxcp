@@ -16,3 +16,6 @@ add_subdirectory(xcp_master_udp)
 # 另需 xcp_test_slave 目标（LIBXCP_BUILD_TESTS=ON，其目录在根构建中先于本
 # 目录加入），缺位在子目录 CONFIGURE 期 FATAL_ERROR 明示。
 add_subdirectory(measurement_demo)
+
+# 通用 XCP 测量与标定集成示例：目标 profile 明确提供 event/envelope 元数据。
+add_subdirectory(xcp_integration_demo)
