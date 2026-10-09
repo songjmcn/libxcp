@@ -13,7 +13,7 @@ DAQ 数据接收到 A2L 描述文件集成的完整 Master 侧能力。
 | XCP on UDP/IP Transport | 标准 4 字节 Transport Header（LEN/CTR），跨平台 IPv4 Socket，传输层抽象接口 `IXcpTransport` | ✅ |
 | 内存读写 | `MemoryAccess`：SHORT_UPLOAD 优先、必要时降级 SET_MTA+UPLOAD 分块；写路径 | ✅ |
 | Dynamic DAQ 测量 | 变量名 → `MeasurementPlanner` 规划 → 动态 DAQ 落表 → DTO 信封/净荷解码 → 时间戳回卷外推 → `MeasurementFrame` 物理值帧回调 | ✅ v1.0 封板 |
-| A2L 集成 | 经 A2L 桥接层（`libxcp::a2lbridge`，基于上游 a2llib）加载 A2L，变量名解析为地址 / CompuMethod / 事件通道 | ✅ 可选组件 |
+| A2L 集成 | 经 A2L 桥接层（`libxcp::a2lbridge`，基于上游 a2llib）加载 A2L，变量名解析为地址 / CompuMethod / 事件通道 | ✅ 必编组件 |
 | Calibration / Programming | 标定写入、刷写 | ⛔ 不在 v1.0 承诺范围 |
 | CAN / CAN FD Transport | Vector / SocketCAN / Peak 等 | ⛔ v1.0 之后的下一步（见 `code-plan/libxcp_measurement_architecture.md` §25/§26） |
 
@@ -30,7 +30,7 @@ A2L 变量名 → MeasurementPlanner → Dynamic DAQ 配置 → ECU DTO
 
 ```text
 libxcp/
-├── CMakeLists.txt              # 根构建脚本：核心库 + 4 个可选开关
+├── CMakeLists.txt              # 根构建脚本：核心库 + A2L 栈（必编）+ 3 个可选开关
 ├── include/libxcp/             # 公开头文件（v1.0 冻结面）
 │   ├── xcp_master.hpp          #   Master 顶层门面，用户唯一入口
 │   ├── session.hpp             #   会话状态机与协商参数管理
@@ -63,9 +63,9 @@ libxcp/
 │   └── a2l_measurement_database.*   # 包装桥接层 IA2lDatabase → 核心窄接口
 ├── thirdparty/                 # 第三方依赖（未经明确指示不得修改）
 │   ├── a2llib/                 #   git 子模块：上游 A2L 解析库（MIT）
-│   ├── a2l-sdk/                #   A2L 栈构建工程：build-sdk.ps1 一键产出准备根
+│   ├── a2l-sdk/                #   A2L 栈构建工程：主树经 add_subdirectory 直接编译（必编）
 │   │   ├── a2lbridge/          #     语义适配层 libxcp_a2lbridge（C++20）
-│   │   └── build-sdk.ps1       #     产出 liba2l.dll + 桥接库 + 头树
+│   │   └── build-sdk.ps1       #     独立 SDK 开发入口：产出 liba2l.dll + 桥接库 + 头树
 │   └── XCPlite/                #   git 子模块：Vector 的开源 XCP Slave（测试对手端）
 ├── tests/                      # 测试用例（GoogleTest）与测试设施
 │   ├── a2l_gen/gen_a2l.py      #   Python 黄金 A2L 生成器（ctest fixture）
@@ -91,12 +91,13 @@ libxcp/
 | DAQ 解码层 | `daq/` 四个头文件 | DTO 信封切分、ODT 净荷解码、时间戳换算（A2L-free） |
 | 测量层 | `measurement/` | 规划 → DAQ 配置 → 物理值帧回调（A2L-free） |
 | 传输层 | `IXcpTransport` → `UdpTransport` | 抽象接口 + 标准 UDP/IP 实现（预留 CAN 系实现位） |
-| A2L 组件（可选） | `adapter/a2l` + `thirdparty/a2l-sdk` | A2L 解析、语义适配、`IMeasurementDatabase` 实现 |
+| A2L 组件（必编） | `adapter/a2l` + `thirdparty/a2l-sdk` | A2L 解析、语义适配、`IMeasurementDatabase` 实现 |
 
 **依赖隔离**：核心库与测量路径不依赖 A2L——`IMeasurementDatabase` 是核心窄接口，
-A2L 接入是独立可选组件（`adapter/a2l/A2lMeasurementDatabase`），隔离由 ctest
-`A2lIsolation` 门禁持续校验（扫描主树禁引用 A2L 栈 / 桥接层禁含上游头）。
-主工程不编译任何 thirdparty 源码，只以 IMPORTED target 消费准备根产物。
+A2L 接入是独立 target（`adapter/a2l/A2lMeasurementDatabase` →
+`libxcp_measurement_adapter`），虽随主工程必编，但隔离由 ctest `A2lIsolation`
+门禁持续校验（扫描主树禁引用 A2L 栈 / 桥接层禁含上游头）。A2L 栈源码经
+`add_subdirectory(thirdparty/a2l-sdk)` 随主工程直接编译，不再消费预构建准备根。
 
 ### 2.2 模块文档索引
 
@@ -112,7 +113,7 @@ A2L 接入是独立可选组件（`adapter/a2l/A2lMeasurementDatabase`），隔�
 | [A2L 集成](docs/modules/A2L集成.md) | 适配器、桥接层 `a2lbridge`、隔离门禁、构建与测试 |
 | [测试](docs/modules/测试.md) | L1-L4 分层、测试文件清单、测试设施、ctest fixture |
 | [示例程序](docs/modules/示例程序.md) | `xcp_master_udp`、`measurement_demo` 两轮流程与断言口径 |
-| [构建系统](docs/modules/构建系统.md) | CMake 目标、安装规则、4 个构建开关、已知构建注意事项 |
+| [构建系统](docs/modules/构建系统.md) | CMake 目标、安装规则、3 个构建开关与 Boost 硬依赖、已知构建注意事项 |
 | [第三方依赖](docs/modules/第三方依赖.md) | a2llib / a2l-sdk / XCPlite 子模块消费方式与边界纪律 |
 | [文档与工程规范](docs/modules/文档与工程规范.md) | `docs/`、`code-plan/`、`scripts/` 与 AGENTS.md 约定 |
 
@@ -123,9 +124,18 @@ A2L 接入是独立可选组件（`adapter/a2l/A2lMeasurementDatabase`），隔�
 - CMake ≥ 3.24，C++20 编译器（Windows 默认 VS 2022 生成器，根脚本自动指定）
 - 跑测试需 GoogleTest：在线 FetchContent 拉取；离线环境预置
   `.deps-cache/googletest/`（自动改用本地源）
-- A2L 相关目标另需 Python3；构建准备根需 Boost（经 `-BoostRoot` 传入）
+- **Boost 为硬依赖**（A2L 栈必编所致）：CONFIG 包，组件 locale / filesystem /
+  process；configure 期自动发现（显式 `-DBoost_DIR` > `C:\boost\lib\cmake\Boost-*`
+  > `BOOST_ROOT` 环境变量），找不到直接报错并给出指引。本机装有 vcpkg 全局集成时
+  其 Boost 缺 locale/process 组件不会被误选（查找已屏蔽环境注入路径），必要时设
+  `VCPkgLocalAppDataDisabled=true`
+- A2L 专项测试（`A2lSmoke` / `A2lGolden` / `A2lE2E` / `MeasurementAdapterTest` 等）
+  另需 Python3
 
 ### 3.2 Release 编译（推荐）
+
+A2L 栈（`liba2l` / `libxcp::a2lbridge` / `libxcp_measurement_adapter`）随主工程
+必编，常规配置无需任何额外开关：
 
 ```bash
 cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release
@@ -135,6 +145,10 @@ cmake --build cmake-build-release -j 4
 > 注意：本机（CMake 4.0 + VS 生成器）下 `--build -j N` 偶发在 MSBuild 并行
 > 解析项目引用阶段失败于 gtest → ZERO_CHECK（报"0 个错误"但退出码非 0）。
 > 遇到时去掉 `-j` 串行构建即可，产物不受影响。
+>
+> 全新 build 目录的首次构建需编译上游 a2llib 全部翻译单元，耗时数分钟；
+> 增量构建不受影响。子模块未初始化（`thirdparty/a2llib/CMakeLists.txt` 缺失）
+> 时 configure 会给出明确报错，先执行 `git submodule update --init`。
 
 ### 3.3 Debug 编译（仅代码调试用）
 
@@ -164,17 +178,10 @@ cmake --build cmake-build-debug --target clean
 | `LIBXCP_BUILD_EXAMPLES` | OFF | 构建 `examples/`；开启时自动跟随打开 `LIBXCP_BUILD_XCPLITE_SLAVE`（无需手工同开两门） |
 
 A2L 桥接层（`thirdparty/a2l-sdk` → `liba2l` / `libxcp::a2lbridge`）与测量适配器
-`libxcp_measurement_adapter` 为**必编组件**，随主工程无条件构建，无需任何开关。
-唯一新增依赖是 **Boost**（CONFIG 包，组件 locale/filesystem/process）：configure
-期自动发现（显式 `-DBoost_DIR` > `C:\boost\lib\cmake\Boost-*` > `BOOST_ROOT`
-环境变量），找不到直接报错并给出指引。常规配置即最简形式：
-
-```bash
-cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release
-cmake --build cmake-build-release
-```
-
-如需手工指定 Boost 位置：
+`libxcp_measurement_adapter` 为**必编组件**，随主工程无条件构建，不再提供任何开关。
+Boost 自动发现规则：显式 `-DBoost_DIR=<目录>` > Windows 下 `C:\boost\lib\cmake\Boost-*`
+取版本最新 > `BOOST_ROOT` 环境变量探测；找不到直接报错并给出指引。如需手工指定
+Boost 位置：
 
 ```bash
 cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release `
