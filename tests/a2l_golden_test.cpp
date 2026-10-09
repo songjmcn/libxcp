@@ -1651,7 +1651,7 @@ TEST_F(A2lGoldenTest, AsyncNotReadyExactlyOnceAndDestructionSafe) {
         std::future<void> done_f = done.get_future();
         std::atomic<bool> finished{false};
         auto br = A2lBridge::LoadAsync(Golden("golden_basic.a2l"), {},
-                                       [&](Result<void> res) {
+                                       [&](Result<void>) {
                                            finished.store(true);
                                            done.set_value();
                                        });

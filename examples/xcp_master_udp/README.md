@@ -10,13 +10,14 @@
 
 ## 1. 构建
 
-依赖两个既有开关（根 `CMakeLists.txt` 的 `LIBXCP_BUILD_EXAMPLES` 门会校验并
-给出 FATAL_ERROR 指引）：
+依赖既有开关（根 `CMakeLists.txt` 的 `LIBXCP_BUILD_EXAMPLES` 门会自动跟随
+打开 `LIBXCP_BUILD_XCPLITE_SLAVE`，无需手工同开两门；A2L 桥接层现为必编
+组件，无需开关）：
 
 ```bash
 cmake -B cmake-build-xcplite -S . -DCMAKE_BUILD_TYPE=Release \
-      -DLIBXCP_BUILD_XCPLITE_SLAVE=ON -DLIBXCP_BUILD_A2L=ON -DLIBXCP_BUILD_EXAMPLES=ON
-cmake --build cmake-build-xcplite --config Release   # 产出 cpp_demo.exe + xcp_master_udp.exe
+      -DLIBXCP_BUILD_EXAMPLES=ON
+cmake --build cmake-build-xcplite                     # 产出 cpp_demo.exe + xcp_master_udp.exe
 ```
 
 ## 2. 运行

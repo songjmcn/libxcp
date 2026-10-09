@@ -121,72 +121,93 @@ install(DIRECTORY include/libxcp
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 # ----------------------------------------------------------------------------
-# A2L 桥接层（最小开发验证集；见 code-plan/A2L_集成_a2llib选型与适配层详细设计_R4.md）
+# A2L 桥接层（必编组件；见 code-plan/A2L_集成_a2llib选型与适配层详细设计_R4.md）
 #
-# 批次9 起 a2lbridge 并入 thirdparty/a2l-sdk 工程：build-sdk.ps1 一次产出
-# liba2l.dll/lib + libxcp_a2lbridge.lib + include/liba2l 与 include/libxcp 头树。
-# 本工程不编译任何 thirdparty 源码，只创建 IMPORTED target 消费准备根产物。
-# 默认 OFF：不改变原构建。开启时必须显式提供准备根路径
-# （LIBXCP_LIBA2L_ROOT），不做环境变量/注册表/.deps-cache 回退猜测。
+# A2L 栈随主工程无条件构建：thirdparty/a2l-sdk 作为子目录直接编入主工程树
+# （add_subdirectory），无需开关、无需先跑 build-sdk.ps1 生成"准备根"、无需
+# 指定任何路径变量。a2l-sdk 工程自身产出 uchardet 桩 → 上游 a2l(static)
+# → liba2l(SHARED) → libxcp_a2lbridge(static)，其 ALIAS 目标
+# liba2l::liba2l / libxcp::a2lbridge 在主树直接可见，tests/examples 直接消费。
+#
+# Boost 因此成为硬依赖（configure 期解析）：优先用用户显式传入的
+# -DBoost_DIR=<...>/cmake/Boost-<ver>；未传入时按 C:\boost、BOOST_ROOT 环境变量
+# 等常见位置搜索 Config 包，找不到直接 FATAL_ERROR 给出明确指引。多平台约定：
+# Linux/macOS 走系统 Boost 或用户 -DBoost_DIR，Windows 本机约定
+# C:\boost\lib\cmake\Boost-*。
+#
+# build-sdk.ps1 保留为独立 SDK 开发入口（预构建产物场景），不再是主树前置步骤。
 # ----------------------------------------------------------------------------
-option(LIBXCP_BUILD_A2L "Consume the A2L bridge artifacts" OFF)
-set(LIBXCP_LIBA2L_ROOT "" CACHE PATH "Prepared liba2l root")
 
-if(LIBXCP_BUILD_A2L)
-  if(NOT LIBXCP_LIBA2L_ROOT)
-    message(FATAL_ERROR
-            "LIBXCP_BUILD_A2L=ON requires LIBXCP_LIBA2L_ROOT "
-            "(prepared by thirdparty/a2l-sdk/build-sdk.ps1)")
+# --- Boost 自动发现 ---------------------------------------------------------
+# 上游 a2llib/script/boost.cmake 在 Boost_FOUND 已置位时会跳过自身查找，
+# 因此这里先行 find_package 即可统一决定 Boost 来源（幂等，缓存到主树）。
+if(NOT Boost_DIR AND NOT Boost_FOUND)
+  set(_libxcp_boost_search_hints "")
+  # Windows 本机约定：C:/boost/lib/cmake/Boost-<ver>（存在多个版本取最新）
+  if(WIN32 AND EXISTS "C:/boost/lib/cmake")
+    file(GLOB _libxcp_boost_cfg_dirs "C:/boost/lib/cmake/Boost-*")
+    if(_libxcp_boost_cfg_dirs)
+      list(SORT _libxcp_boost_cfg_dirs COMPARE STRING ORDER DESCENDING)
+      list(GET _libxcp_boost_cfg_dirs 0 _libxcp_boost_hint)
+      string(APPEND _libxcp_boost_search_hints "${_libxcp_boost_hint};")
+      message(STATUS "libxcp: 发现候选 Boost_DIR=${_libxcp_boost_hint}")
+    endif()
   endif()
-
-  find_path(LIBXCP_LIBA2L_INCLUDE_DIR
-            NAMES liba2l/liba2l_api.hpp
-            PATHS "${LIBXCP_LIBA2L_ROOT}/include"
-            NO_DEFAULT_PATH REQUIRED)
-  find_library(LIBXCP_LIBA2L_LIBRARY
-               NAMES liba2l
-               PATHS "${LIBXCP_LIBA2L_ROOT}/lib"
-               NO_DEFAULT_PATH REQUIRED)
-  find_file(LIBXCP_LIBA2L_RUNTIME_DLL
-            NAMES liba2l.dll
-            PATHS "${LIBXCP_LIBA2L_ROOT}/bin"
-            NO_DEFAULT_PATH REQUIRED)
-
-  add_library(liba2l::liba2l SHARED IMPORTED GLOBAL)
-  set_target_properties(liba2l::liba2l PROPERTIES
-      IMPORTED_IMPLIB "${LIBXCP_LIBA2L_LIBRARY}"
-      IMPORTED_LOCATION "${LIBXCP_LIBA2L_RUNTIME_DLL}"
-      INTERFACE_INCLUDE_DIRECTORIES "${LIBXCP_LIBA2L_INCLUDE_DIR}")
-
-  # 桥接层：SDK 工程编好的静态库 + 公开头树（IMPORTED 消费，见上注释）。
-  find_path(LIBXCP_A2LBRIDGE_INCLUDE_DIR
-            NAMES libxcp/a2l/a2l_bridge.hpp
-            PATHS "${LIBXCP_LIBA2L_ROOT}/include"
-            NO_DEFAULT_PATH REQUIRED)
-  find_library(LIBXCP_A2LBRIDGE_LIBRARY
-               NAMES libxcp_a2lbridge
-               PATHS "${LIBXCP_LIBA2L_ROOT}/lib"
-               NO_DEFAULT_PATH REQUIRED)
-
-  add_library(libxcp::a2lbridge STATIC IMPORTED GLOBAL)
-  set_target_properties(libxcp::a2lbridge PROPERTIES
-      IMPORTED_LOCATION "${LIBXCP_A2LBRIDGE_LIBRARY}"
-      INTERFACE_INCLUDE_DIRECTORIES "${LIBXCP_A2LBRIDGE_INCLUDE_DIR}"
-      INTERFACE_LINK_LIBRARIES liba2l::liba2l)
-
-  # 测量适配器（v0.5，测量子系统代码增长计划 §5.5 / D1）：
-  # 独立顶层目录 adapter/a2l + 独立 target libxcp_measurement_adapter。
-  # 副产物不并入 libxcp；adapter/*.cpp 是核心<->桥接层唯一接触点
-  # （A2lIsolation S2 仅扫描 include/ 与 src/，本目录不在扫描范围）。
-  add_library(libxcp_measurement_adapter STATIC
-          adapter/a2l/a2l_measurement_database.cpp
-          adapter/a2l/measurement_runtime_profile.cpp)
-  target_include_directories(libxcp_measurement_adapter PUBLIC
-          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-          $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/adapter>)
-  target_link_libraries(libxcp_measurement_adapter PUBLIC
-          libxcp::libxcp libxcp::a2lbridge)
+  # 其次尊重 BOOST_ROOT / Boost_ROOT 环境变量（多平台通用约定）
+  if(DEFINED ENV{BOOST_ROOT})
+    foreach(_sub IN ITEMS lib/cmake "" )
+      file(GLOB _libxcp_boost_env_dirs "$ENV{BOOST_ROOT}/${_sub}/Boost-*")
+      foreach(_d IN LISTS _libxcp_boost_env_dirs)
+        string(APPEND _libxcp_boost_search_hints "${_d};")
+      endforeach()
+    endforeach()
+    unset(_libxcp_boost_env_dirs)
+  endif()
+  unset(_libxcp_boost_hint)
+  unset(_libxcp_boost_cfg_dirs)
 endif()
+
+# CONFIG 模式 + NO_CMAKE_ENVIRONMENT_PATH：只认显式 -DBoost_DIR 与上述搜索
+# 提示，忽略 vcpkg 等环境注入的 Boost_ROOT，避免误选缺 locale/process 组件
+# 的发行版（本机实测 vcpkg 全局集成会劫持裸 find_package）。
+find_package(Boost CONFIG COMPONENTS locale filesystem process
+             HINTS ${_libxcp_boost_search_hints} NO_CMAKE_ENVIRONMENT_PATH)
+if(NOT Boost_FOUND)
+  message(FATAL_ERROR
+          "libxcp requires Boost (CONFIG package with components "
+          "locale, filesystem, process) for the mandatory A2L stack.\n"
+          "Install Boost or pass -DBoost_DIR=<prefix>/lib/cmake/Boost-<version> "
+          "(e.g. C:/boost/lib/cmake/Boost-1.86.0 on this machine).")
+endif()
+unset(_libxcp_boost_search_hints)
+
+# --- a2l-sdk 子工程（真实 target，非 IMPORTED） ------------------------------
+# a2l-sdk 内部按 target 设置 C++23（上游 a2llib 要求），主工程保持 C++20；
+# liba2l 为 SHARED 边界，标准差异不影响 ABI。a2lbridge 本身即 C++20。
+add_subdirectory(thirdparty/a2l-sdk)
+
+# --- 测量适配器（v0.5，测量子系统代码增长计划 §5.5 / D1）--------------------
+# 独立顶层目录 adapter/a2l + 独立 target libxcp_measurement_adapter。
+# 副产物不并入 libxcp；adapter/*.cpp 是核心<->桥接层唯一接触点
+# （A2lIsolation S2 仅扫描 include/ 与 src/，本目录不在扫描范围）。
+add_library(libxcp_measurement_adapter STATIC
+        adapter/a2l/a2l_measurement_database.cpp
+        adapter/a2l/measurement_runtime_profile.cpp)
+target_include_directories(libxcp_measurement_adapter PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/adapter>)
+target_link_libraries(libxcp_measurement_adapter PUBLIC
+        libxcp::libxcp libxcp::a2lbridge)
+
+# ----------------------------------------------------------------------------
+# 构建开关（先于子目录声明；判定与 add_subdirectory 分离，见下方各段）
+#
+# EXAMPLES 门依赖 XCPlite 子项目——其 option 必须出现在 XCPlite 段的跟随
+# 判定之前，故在此集中声明（L30 的 LIBXCP_BUILD_TESTS 保持原位）。
+# ----------------------------------------------------------------------------
+option(LIBXCP_BUILD_EXAMPLES
+       "Build the standalone example programs under examples/"
+       OFF)
 
 # ----------------------------------------------------------------------------
 # XCPlite 协议调试集成（code-plan/XCPlite_Slave_协议调试集成计划.md）
@@ -195,10 +216,21 @@ endif()
 # 目标（不建示例/测试/工具/安装），并在此后由 tests 子目录挂接测试 Slave
 # 可执行文件与 XCPlite 集成测试。不修改 XCPlite 任何源文件，全部配置通过
 # 其公开的 CMake 变量（CMP0077 正常变量）控制。
+#
+# LIBXCP_BUILD_EXAMPLES=ON 时本门自动跟随打开（见下方判定块）。
 # ----------------------------------------------------------------------------
 option(LIBXCP_BUILD_XCPLITE_SLAVE
        "Build the XCPlite-based test slave and protocol-debug integration tests"
        OFF)
+
+if(LIBXCP_BUILD_EXAMPLES AND NOT LIBXCP_BUILD_XCPLITE_SLAVE)
+  # 示例依赖 xcplite 库与 cpp_demo 对手端——EXAMPLES 开则本门自动跟随打开。
+  # CACHE INTERNAL 立即生效（当前作用域可见，XCPlite 子项目段紧随其后），
+  # 且不会在 GUI 中与 option 条目重复；语义仍是 BOOL 缓存项。
+  message(STATUS "libxcp: LIBXCP_BUILD_EXAMPLES=ON，自动开启 LIBXCP_BUILD_XCPLITE_SLAVE")
+  set(LIBXCP_BUILD_XCPLITE_SLAVE ON CACHE INTERNAL
+      "Build the XCPlite-based test slave (auto-enabled by LIBXCP_BUILD_EXAMPLES)")
+endif()
 
 if(LIBXCP_BUILD_XCPLITE_SLAVE)
   # default 配置含 A2L 运行时生成 + UDP/TCP 传输，满足协议调试需要
@@ -223,26 +255,12 @@ endif()
 # ----------------------------------------------------------------------------
 # 示例程序目录（批次22：examples/xcp_master_udp）
 #
-# 默认 OFF——不改变既有构建。前置门 = LIBXCP_BUILD_XCPLITE_SLAVE=ON（xcplite
-# 库与上游示例源的来源，见上方子项目段）且 LIBXCP_BUILD_A2L=ON（示例经桥接层
-# 加载 A2L，libxcp::a2lbridge 的来源）；任一未满足在 CONFIGURE 期 FATAL_ERROR
-# 明确提示，不静默降级、不二次 add_subdirectory(thirdparty/XCPlite)。
+# 默认 OFF——不改变既有构建。LIBXCP_BUILD_EXAMPLES=ON 时前置依赖
+# LIBXCP_BUILD_XCPLITE_SLAVE 自动置 ON（见上方子项目段的跟随判定），无需
+# 手工同开两门；xcplite 库与上游示例源均来自该子项目段。
+# A2L 桥接层（libxcp::a2lbridge）现为必编组件，不再作为本门的检查项。
 # 计划：code-plan/XCPlite_cpp_demo_示例对手端计划.md（v2.1）。
 # ----------------------------------------------------------------------------
-option(LIBXCP_BUILD_EXAMPLES
-       "Build the standalone example programs under examples/"
-       OFF)
-
 if(LIBXCP_BUILD_EXAMPLES)
-  if(NOT LIBXCP_BUILD_XCPLITE_SLAVE)
-    message(FATAL_ERROR
-            "LIBXCP_BUILD_EXAMPLES=ON requires LIBXCP_BUILD_XCPLITE_SLAVE=ON "
-            "(the xcplite library and the cpp_demo opponent come from that subproject gate)")
-  endif()
-  if(NOT LIBXCP_BUILD_A2L)
-    message(FATAL_ERROR
-            "LIBXCP_BUILD_EXAMPLES=ON requires LIBXCP_BUILD_A2L=ON "
-            "(the example loads A2L through the bridge; libxcp::a2lbridge is required)")
-  endif()
   add_subdirectory(examples)
 endif()

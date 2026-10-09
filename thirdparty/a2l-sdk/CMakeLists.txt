@@ -8,7 +8,10 @@
 #   uchardet 桩                           —— 上游硬依赖的最小可链接面（子工程）
 #
 # 依赖解析策略（禁止写死绝对路径）：
-#   Boost    : 由 build-sdk.ps1 传入 -DBoost_DIR=<...>/cmake/Boost-<ver>
+#   Boost    : 两种消费形态——主树 add_subdirectory（默认形态，A2L 栈为必编
+#              组件）时由根 CMakeLists.txt 先行 find_package(Boost CONFIG)
+#              （自动发现 + FATAL_ERROR 指引）；独立构建（build-sdk.ps1，可选
+#              SDK 开发入口）时由脚本传入 -DBoost_DIR=<...>/cmake/Boost-<ver>
 #   uchardet : 本工程自有子工程（预置 uchardet_FOUND + ALIAS 目标使上游跳过
 #              find_package；旧"假包文件对 + CMAKE_PREFIX_PATH"机制批次9退役）
 #
@@ -56,8 +59,11 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../a2llib
 # 由上游把 Boost 头文件中的 autolink 指令一并编入静态库）。VS 生成器不会自动提供
 # Boost 的库目录作为 AdditionalLibraryDirectories，导致 LNK1104。这里从已解析的
 # Boost 库目录补进 liba2l 的链接搜索路径。
-# 注意：Boost::locale 目标由上游 script/boost.cmake 在其自身作用域 find_package
-# 创建；为稳妥起见在本工程独立再 find_package 一次（同 CONFIG 包，幂等）。
+# Boost 来源（两种消费形态）：
+#   - 主树 add_subdirectory：根 CMakeLists.txt 在挂载前 find_package(Boost CONFIG)
+#     （自动发现 + FATAL_ERROR 指引），本工程直接复用其缓存结果；
+#   - build-sdk.ps1 独立构建：脚本传入 -DBoost_DIR=<...>/cmake/Boost-<ver>。
+# 两条路径最终都落到同一次 find_package（CONFIG 包幂等）。
 find_package(Boost CONFIG REQUIRED COMPONENTS locale filesystem process)
 if (TARGET Boost::locale)
     get_target_property(_liba2l_boost_loc Boost::locale IMPORTED_LOCATION_RELEASE)
@@ -90,6 +96,19 @@ target_link_libraries(liba2l PRIVATE a2l)
 set_target_properties(liba2l PROPERTIES
         OUTPUT_NAME liba2l
         POSITION_INDEPENDENT_CODE ON)
+
+# 标准隔离：本工程目录作用域设 C++23，但禁止其作为 INTERFACE 使用要求传播给
+# 主树消费者。被 libxcp 主工程 add_subdirectory 时，若不剥离 cxx_std_23，
+# gtest / libxcp_tests 等 C++20 目标会被强制抬到 C++23（独立构建时因无主树
+# 消费者而无此表现）。消费方仍按各自 target 的标准编译；跨 liba2l.dll 边界的
+# ABI 不受影响（导出宏整类导出，见 include/liba2l/liba2l_export.h）。
+target_compile_features(liba2l PRIVATE cxx_std_23)
+get_target_property(_liba2l_sdk_cxx_feature liba2l INTERFACE_COMPILE_FEATURES)
+if(_liba2l_sdk_cxx_feature MATCHES "cxx_std_")
+    list(FILTER _liba2l_sdk_cxx_feature EXCLUDE REGEX "^cxx_std_")
+    set_target_properties(liba2l PROPERTIES INTERFACE_COMPILE_FEATURES "${_liba2l_sdk_cxx_feature}")
+endif()
+unset(_liba2l_sdk_cxx_feature)
 
 # 把 Boost 库目录加入链接搜索路径（仅作用于本目标的 link.exe 命令行 /LIBPATH）
 target_link_directories(liba2l PRIVATE "${_liba2l_boost_libdir}")

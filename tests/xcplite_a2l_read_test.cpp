@@ -4,7 +4,7 @@
  *        符号名 → 地址/扩展 → 真实 UDP 读值 → 物理值换算。
  *
  * 依据 code-plan/XCPlite_Slave_协议调试集成计划.md Phase1-05。
- * 仅在 LIBXCP_BUILD_A2L=ON 时编译（LIBXCP_HAS_A2LBRIDGE 由 CMake 注入）。
+ * A2L 栈为必编组件，本用例随 XcpliteIntegration 无条件编译。
  *
  * 关键点（对 XCPlite 源码核证的落地）：
  *  - Slave 默认 CASDD 寻址：绝对变量的 ECU_ADDRESS_EXTENSION = 0x01，

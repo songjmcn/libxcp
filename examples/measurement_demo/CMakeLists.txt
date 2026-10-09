@@ -7,7 +7,7 @@
 #
 # 依赖：
 #   - libxcp::libxcp（核心：XcpMaster + MeasurementSession）
-#   - libxcp_measurement_adapter（A2L→核心窄接口适配器，LIBXCP_BUILD_A2L 门）
+#   - libxcp_measurement_adapter（A2L→核心窄接口适配器；A2L 栈为必编组件）
 #   - libxcp::a2lbridge（经适配器 PUBLIC 传播）
 #   - xcp_test_slave 可执行（tests/xcp_test_slave/，需 LIBXCP_BUILD_TESTS=ON
 #     ——该目标在 tests 子目录定义；缺位时 CONFIGURE 期 FATAL_ERROR 明示，

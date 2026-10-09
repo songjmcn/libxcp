@@ -11,8 +11,8 @@
 #        bin/liba2l.dll
 #        lib/liba2l.lib  lib/libxcp_a2lbridge.lib
 #        include/liba2l/*.hpp|*.h  include/libxcp/a2l/*.hpp
-#      该目录即主树 LIBXCP_LIBA2L_ROOT 应指向的位置；主树只建 IMPORTED
-#      target 消费，不编译任何 thirdparty 源码。
+#      该目录为独立 SDK 分发场景的准备根；主树现默认经 add_subdirectory 直接
+#      编译 A2L 栈（必编组件），本脚本不再是主树构建的前置步骤。
 #
 # 用法示例（相对路径即可，脚本自行换算绝对路径；仓库内禁止写死绝对路径）：
 #   pwsh -File thirdparty/a2l-sdk/build-sdk.ps1 -BoostRoot C:\boost\lib `
@@ -156,6 +156,6 @@ Copy-Item (Join-Path $SdkSrc 'a2lbridge\include\libxcp') (Join-Path $Prepared 'i
 
 Write-Host ""
 Write-Host "== 完成 =="
-Write-Host "  准备根（LIBXCP_LIBA2L_ROOT）: $Prepared"
+Write-Host "  准备根（独立 SDK 分发场景）: $Prepared"
 Write-Host "  产物：bin/liba2l.dll  lib/liba2l.lib  lib/libxcp_a2lbridge.lib"
 Write-Host "        include/liba2l/*   include/libxcp/a2l/*"

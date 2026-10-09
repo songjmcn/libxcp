@@ -13,7 +13,7 @@
  *   - ToPhysical：五分支 variant 等形复制（int64/uint64/double/string/bool）；
  *   - 错误 message/symbol 透传。
  *
- * 仅在 LIBXCP_BUILD_A2L=ON 时构建（独立 MeasurementAdapterTest 目标）。
+ * A2L 栈为必编组件，本目标随测试构建无条件生成（独立 MeasurementAdapterTest）。
  */
 
 #include "adapter/a2l/a2l_measurement_database.hpp"

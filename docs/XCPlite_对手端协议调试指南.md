@@ -21,8 +21,8 @@
 
 | 开关 | 作用 | 位置 |
 | --- | --- | --- |
-| `LIBXCP_BUILD_XCPLITE_SLAVE=ON` | 编译对手端与 Xcplite 集成套件 | 根 `CMakeLists.txt:185-194` |
-| `LIBXCP_BUILD_A2L=ON` | A2L 解析/生成链（集成测试依赖） | 根 `CMakeLists.txt` |
+| `LIBXCP_BUILD_XCPLITE_SLAVE=ON` | 编译对手端与 Xcplite 集成套件（`LIBXCP_BUILD_EXAMPLES=ON` 时自动跟随置 ON） | 根 `CMakeLists.txt` XCPlite 段 |
+| （无开关）A2L 解析/生成链 | 必编组件，随主工程无条件构建（需本机 Boost） | 根 `CMakeLists.txt` |
 | `XCPLITE_CONFIGURATION=default` | 对手端配置选型 | 根 `CMakeLists.txt` |
 | （自带）`OPTION_ENABLE_A2L_UPLOAD` | IDT 4 A2L 上传门 | `thirdparty/XCPlite/src/xcplib_cfg.h:168`（default 配置无需额外定义） |
 | （死）`XCP_ENABLE_SEED_KEY` | 上游注释停用 | `thirdparty/XCPlite/src/xcp_cfg.h:342-343`，且分发在 `#if 0`（`xcplite.c:2196`），任何宏无法激活 |
@@ -32,7 +32,7 @@
 
 ```powershell
 cmake -S . -B cmake-build-xcplite -DCMAKE_BUILD_TYPE=Release `
-  -DLIBXCP_BUILD_XCPLITE_SLAVE=ON -DLIBXCP_BUILD_A2L=ON `
+  -DLIBXCP_BUILD_XCPLITE_SLAVE=ON `
   -DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=D:/project/libxcp/cmake-build-release/_deps/googletest-src
 cmake --build cmake-build-xcplite --config Release --target libxcp_tests
 cmake --build cmake-build-xcplite --config Release --target XcpliteIntegration
