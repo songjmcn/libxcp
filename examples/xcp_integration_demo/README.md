@@ -15,12 +15,13 @@
 
 ## 构建
 
-在根目录打开 CMake 示例门和依赖项：
+在根目录打开 CMake 示例门（`LIBXCP_BUILD_EXAMPLES=ON` 会自动跟随打开
+`LIBXCP_BUILD_XCPLITE_SLAVE`）：
 
 ```powershell
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release `
-  -DLIBXCP_BUILD_TESTS=ON -DLIBXCP_BUILD_A2L=ON `
-  -DLIBXCP_BUILD_XCPLITE_SLAVE=ON -DLIBXCP_BUILD_EXAMPLES=ON
+  -DLIBXCP_BUILD_TESTS=ON `
+  -DLIBXCP_BUILD_EXAMPLES=ON
 cmake --build build --config Release --target xcp_integration_demo
 ctest --test-dir build -C Release -R ExampleXcpIntegrationDemo --output-on-failure
 ```

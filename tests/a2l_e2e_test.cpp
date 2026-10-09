@@ -22,6 +22,7 @@
 #include <cctype>
 #include <condition_variable>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,6 +42,7 @@
 
 namespace {
 
+using calmcar::xcp::Address;
 using calmcar::xcp::a2l::A2lBridge;
 using calmcar::xcp::a2l::AddressGranularity;
 using calmcar::xcp::a2l::ByteOrder;
@@ -301,8 +303,10 @@ TEST_F(A2lE2ETest, ReadScalarsThroughA2lAddress) {
     auto ub = db->Find("MASK_ECU::M_UBYTE");
     ASSERT_TRUE(ub.HasValue());
     EXPECT_EQ(ub.Value().xcp_address, 0x3020u);
+    ASSERT_LE(ub.Value().xcp_address,
+              static_cast<std::uint64_t>(std::numeric_limits<Address>::max()));
     const Bytes ub_raw = master_->ReadMemoryBytes(
-        ub.Value().xcp_address, ub.Value().address_extension,
+        static_cast<Address>(ub.Value().xcp_address), ub.Value().address_extension,
         ub.Value().element_size_bytes);
     ASSERT_EQ(ub_raw.size(), 1u);
     EXPECT_EQ(ub_raw[0], 0x2A);
@@ -315,8 +319,11 @@ TEST_F(A2lE2ETest, ReadScalarsThroughA2lAddress) {
     auto masked = db->Find("MASK_ECU::M_MASK");
     ASSERT_TRUE(masked.HasValue());
     EXPECT_EQ(masked.Value().bit_mask, 0x0F00u);
+    ASSERT_LE(masked.Value().xcp_address,
+              static_cast<std::uint64_t>(std::numeric_limits<Address>::max()));
     const Bytes mask_raw = master_->ReadMemoryBytes(
-        masked.Value().xcp_address, masked.Value().address_extension, 2);
+        static_cast<Address>(masked.Value().xcp_address),
+        masked.Value().address_extension, 2);
     auto mask_phys = db->ToPhysical("MASK_ECU::M_MASK", mask_raw);
     ASSERT_TRUE(mask_phys.HasValue());
     ASSERT_TRUE(std::holds_alternative<std::int64_t>(mask_phys.Value()));
@@ -328,16 +335,21 @@ TEST_F(A2lE2ETest, ReadScalarsThroughA2lAddress) {
     auto byte_size = db->ByteSizeOf("MASK_ECU::M_ARR8");
     ASSERT_TRUE(byte_size.HasValue());
     EXPECT_EQ(byte_size.Value(), 8u);
+    ASSERT_LE(arr.Value().xcp_address,
+              static_cast<std::uint64_t>(std::numeric_limits<Address>::max()));
     const Bytes arr_raw = master_->ReadMemoryBytes(
-        arr.Value().xcp_address, arr.Value().address_extension, 8);
+        static_cast<Address>(arr.Value().xcp_address),
+        arr.Value().address_extension, 8);
     const Bytes arr_expect{0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07};
     EXPECT_EQ(arr_raw, arr_expect);
     auto elem3 = calmcar::xcp::a2l::ComputeElementAddress(
         arr.Value(), 3, AddressGranularity::Byte);
     ASSERT_TRUE(elem3.HasValue());
     EXPECT_EQ(elem3.Value(), 0x3048u + 3);  // 0-based：第 4 个元素在 +3
+    ASSERT_LE(elem3.Value(),
+              static_cast<std::uint64_t>(std::numeric_limits<Address>::max()));
     const Bytes elem3_raw = master_->ReadMemoryBytes(
-        elem3.Value(), arr.Value().address_extension, 1);
+        static_cast<Address>(elem3.Value()), arr.Value().address_extension, 1);
     ASSERT_EQ(elem3_raw.size(), 1u);
     EXPECT_EQ(elem3_raw[0], 0x03);
 
@@ -348,9 +360,11 @@ TEST_F(A2lE2ETest, ReadScalarsThroughA2lAddress) {
     EXPECT_EQ(ch.Value().element_size_bytes, 2);
     EXPECT_TRUE(ch.Value().read_write);
     EXPECT_EQ(ch.Value().address_extension, 0x12);
+    ASSERT_LE(ch.Value().xcp_address,
+              static_cast<std::uint64_t>(std::numeric_limits<Address>::max()));
     const Bytes ch_raw = master_->ReadMemoryBytes(
-        ch.Value().xcp_address, ch.Value().address_extension,
-        ch.Value().element_size_bytes);
+        static_cast<Address>(ch.Value().xcp_address),
+        ch.Value().address_extension, ch.Value().element_size_bytes);
     ASSERT_EQ(ch_raw.size(), 2u);
     auto ch_phys = db->ToPhysical("MASK_ECU::C_VALUE", ch_raw);
     ASSERT_TRUE(ch_phys.HasValue());
@@ -374,8 +388,11 @@ TEST_F(A2lE2ETest, WriteBackCalibrationVariable) {
     auto ch = db->Find("MASK_ECU::C_VALUE");
     ASSERT_TRUE(ch.HasValue());
     // 写前先读：确认目标地址已被 fixture 预置为 0x1234
+    ASSERT_LE(ch.Value().xcp_address,
+              static_cast<std::uint64_t>(std::numeric_limits<Address>::max()));
     const Bytes before = master_->ReadMemoryBytes(
-        ch.Value().xcp_address, ch.Value().address_extension, 2);
+        static_cast<Address>(ch.Value().xcp_address),
+        ch.Value().address_extension, 2);
     ASSERT_EQ(before, (Bytes{0x34, 0x12}));
 
     // 反算物理值 → 写回 → 读回 → 正算，四步都必须成立
@@ -383,11 +400,12 @@ TEST_F(A2lE2ETest, WriteBackCalibrationVariable) {
         "MASK_ECU::C_VALUE", PhysicalValue{static_cast<std::int64_t>(0x2211)});
     ASSERT_TRUE(raw_new.HasValue()) << raw_new.ErrorInfo().message;
     ASSERT_EQ(raw_new.Value().size(), 2u);
-    master_->WriteMemoryBytes(ch.Value().xcp_address,
+    master_->WriteMemoryBytes(static_cast<Address>(ch.Value().xcp_address),
                               ch.Value().address_extension, raw_new.Value());
 
     const Bytes after = master_->ReadMemoryBytes(
-        ch.Value().xcp_address, ch.Value().address_extension, 2);
+        static_cast<Address>(ch.Value().xcp_address),
+        ch.Value().address_extension, 2);
     EXPECT_EQ(after, raw_new.Value());
     auto phys = db->ToPhysical("MASK_ECU::C_VALUE", after);
     ASSERT_TRUE(phys.HasValue());

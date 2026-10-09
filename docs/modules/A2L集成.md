@@ -1,11 +1,12 @@
 # A2L 集成（adapter + a2lbridge）
 
-> 归属：`adapter/a2l/`、`thirdparty/a2l-sdk/`、`LIBXCP_BUILD_A2L` 开关
-> 本文档描述 A2L 描述文件的加载、桥接与核心适配，全部为**可选组件**。
+> 归属：`adapter/a2l/`、`thirdparty/a2l-sdk/`（A2L 栈为必编组件，无开关）
+> 本文档描述 A2L 描述文件的加载、桥接与核心适配。
 
 ## 1. 模块定位
 
-核心库与测量路径不依赖 A2L；A2L 接入由三个层次组成，依赖方向单向：
+核心库与测量路径不依赖 A2L（隔离门禁保证主库不知道 A2L 栈存在）；但 A2L 栈
+本身随主工程**无条件构建**。A2L 接入由三个层次组成，依赖方向单向：
 
 ```text
 libxcp 核心 (IMeasurementDatabase 窄接口)
@@ -27,7 +28,7 @@ libxcp 核心 (IMeasurementDatabase 窄接口)
 |---|---|---|
 | 适配器 `A2lMeasurementDatabase` | `adapter/a2l/a2l_measurement_database.*`，target `libxcp_measurement_adapter` | 把桥接层 `IA2lDatabase` 包装为核心 `IMeasurementDatabase`；只做 `Find`（符号→`MeasurementSymbolInfo`）与 `ToPhysical`（换算委托桥接库）两件事，**不实现任何换算/AG 逻辑** |
 | 桥接层 `libxcp_a2lbridge` | `thirdparty/a2l-sdk/a2lbridge/`，target `libxcp::a2lbridge` | 语义适配：`A2lBridge` 门面（Load/LoadAsync、不可变快照）、`IA2lDatabase` 查询（Find/Search/Count/ByteSizeOf）、CompuMethod 求值、DAQ Layout、IF_DATA XCP、RecordLayout、结构体布局 |
-| A2L 栈构建工程 | `thirdparty/a2l-sdk/`（`build-sdk.ps1`） | 一键产出准备根：`liba2l.dll` + `libxcp_a2lbridge.lib` + 头树；主树只建 IMPORTED target 消费，不编译任何 thirdparty 源码 |
+| A2L 栈构建工程 | `thirdparty/a2l-sdk/` | 默认形态：主树 `add_subdirectory` 直接编译（uchardet 桩 → 上游 a2l → `liba2l.dll` → `libxcp_a2lbridge.lib`，Boost 由根 CMakeLists.txt 自动发现）；`build-sdk.ps1` 保留为独立 SDK 开发入口（预构建准备根场景），不再是主树前置步骤 |
 
 ## 3. 关键接口
 
@@ -59,14 +60,13 @@ MeasurementSession session(adapter);
 ## 4. 构建与测试
 
 ```bash
-# 1) 先产出准备根（需 Boost）
-pwsh -File thirdparty/a2l-sdk/build-sdk.ps1 -BoostRoot <boost前缀> \
-     -Config Release -OutRoot build/liba2l-prepared
-# 2) 主树开启
-cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release \
-      -DLIBXCP_BUILD_A2L=ON \
-      -DLIBXCP_LIBA2L_ROOT=build/liba2l-prepared/msvc-x64-Release
+# A2L 栈必编，常规配置即可（需本机 Boost 可用，自动发现；或显式 -DBoost_DIR）
+cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-release
 ```
+
+独立 SDK 开发入口（可选，产出预构建准备根）：
+`pwsh -File thirdparty/a2l-sdk/build-sdk.ps1 -BoostRoot <boost前缀> -Config Release -OutRoot build/liba2l-prepared`。
 
 测试（见 `tests/CMakeLists.txt`）：`a2l_gen`（Python 黄金样本 fixture）→
 `A2lSmoke`、`A2lGolden`（黄金回归 T1~T8）、`A2lE2E`（端到端）、

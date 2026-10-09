@@ -5,7 +5,7 @@
  *        MeasurementSession → 物理值帧）。
  *
  * 依据 code-plan/libxcp_测量子系统代码增长计划.md v0.9（:732-759）。
- * 仅在 LIBXCP_BUILD_XCPLITE_SLAVE + LIBXCP_BUILD_A2L 同时开启时编译。
+ * 仅在 LIBXCP_BUILD_XCPLITE_SLAVE=ON 时编译（A2L 栈为必编组件）。
  *
  * 链路取证（全程无测试专用手工拆包，v0.9 验收项）：
  *  1) 经 GET_ID(IDT_ASAM_UPLOAD)+UPLOAD 从 Slave 拉回运行时 A2L（协议面，

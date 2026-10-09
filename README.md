@@ -160,24 +160,29 @@ cmake --build cmake-build-debug --target clean
 | 开关 | 默认 | 作用 |
 |------|------|------|
 | `LIBXCP_BUILD_TESTS` | **ON** | GoogleTest 单测/集成测试（ctest 套件） |
-| `LIBXCP_BUILD_A2L` | OFF | 消费 A2L 桥接构件并构建 `libxcp_measurement_adapter`；必须同时指定 `LIBXCP_LIBA2L_ROOT` 指向准备根（无环境变量回退猜测） |
 | `LIBXCP_BUILD_XCPLITE_SLAVE` | OFF | 构建 XCPlite 回环 Slave（L3 集成测试载体） |
-| `LIBXCP_BUILD_EXAMPLES` | OFF | 构建 `examples/`（要求上面两门同开，缺位在 CONFIGURE 期直接 FATAL_ERROR） |
+| `LIBXCP_BUILD_EXAMPLES` | OFF | 构建 `examples/`；开启时自动跟随打开 `LIBXCP_BUILD_XCPLITE_SLAVE`（无需手工同开两门） |
 
-A2L 准备根一键构建（相对路径即可，脚本自行换算）：
-
-```powershell
-pwsh -File thirdparty/a2l-sdk/build-sdk.ps1 -BoostRoot <boost前缀> `
-     -Config Release -OutRoot build/liba2l-prepared
-```
-
-随后配置主树：
+A2L 桥接层（`thirdparty/a2l-sdk` → `liba2l` / `libxcp::a2lbridge`）与测量适配器
+`libxcp_measurement_adapter` 为**必编组件**，随主工程无条件构建，无需任何开关。
+唯一新增依赖是 **Boost**（CONFIG 包，组件 locale/filesystem/process）：configure
+期自动发现（显式 `-DBoost_DIR` > `C:\boost\lib\cmake\Boost-*` > `BOOST_ROOT`
+环境变量），找不到直接报错并给出指引。常规配置即最简形式：
 
 ```bash
-cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release \
-      -DLIBXCP_BUILD_A2L=ON \
-      -DLIBXCP_LIBA2L_ROOT=build/liba2l-prepared/msvc-x64-Release
+cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build cmake-build-release
 ```
+
+如需手工指定 Boost 位置：
+
+```bash
+cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release `
+      -DBoost_DIR=C:/boost/lib/cmake/Boost-1.86.0
+```
+
+`thirdparty/a2l-sdk/build-sdk.ps1` 保留为独立 SDK 开发入口（单独产出预构建
+SDK 根的场景），不再是主树构建的前置步骤。
 
 ## 4. 测试
 
@@ -197,10 +202,10 @@ ctest --test-dir cmake-build-release -C Release --output-on-failure
   （`session_test`、`recovery_test`、`xcp_master_integration_test`）；
 - **L3 集成**（需 `LIBXCP_BUILD_XCPLITE_SLAVE=ON`）：真实 UDP + XCPlite Slave
   子进程回环（`XcpliteIntegration`）；A2L 用例（`xcplite_a2l_read_test`、
-  `xcplite_measurement_test`）另需 `LIBXCP_BUILD_A2L=ON`；
-- **A2L 专项**（需 `LIBXCP_BUILD_A2L=ON`）：`A2lSmoke`、`A2lGolden`（黄金回归）、
-  `A2lE2E`（端到端）、`ParseLargeFileUnderBudget`（性能基线）、
-  `A2lIsolation`（依赖隔离静态门禁）；
+  `xcplite_measurement_test`）随本层默认可用（A2L 栈必编）；
+- **A2L 专项**（随 `LIBXCP_BUILD_TESTS=ON` 默认可用）：`A2lSmoke`、`A2lGolden`
+  （黄金回归）、`A2lE2E`（端到端）、`MeasurementAdapterTest`（适配器单测）、
+  `ParseLargeFileUnderBudget`（性能基线）、`A2lIsolation`（依赖隔离静态门禁）；
 - **L4 真 ECU 冒烟清单**见 `code-plan/libxcp_测量子系统_v0.9_记录.md` §6。
 
 ## 5. 测量快速上手（变量名 → 帧回调）

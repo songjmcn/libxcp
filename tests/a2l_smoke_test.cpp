@@ -8,7 +8,7 @@
 //   G4 B-1 地址/extension 原值保留 + AG 元素计数/地址推进；
 //   G5 LINEAR 换算正确（正算 + 逆算 + 负例）；
 //   G6 STATIC DAQ_LIST 冻结布局按 DTO 解出 raw 并换算；
-//   （G7 LIBXCP_BUILD_A2L=OFF 原构建不变由配置期验证，不在本文件内。）
+//   （A2L 栈现为必编组件，无 OFF 模式；历史 G7 门禁见 code-plan 记录。）
 //
 // 期望值与 tests/a2l_gen/gen_a2l.py 的 SPEC/expected.json 逐项对应，
 // 独立于 a2llib 推导（B-1/B-3/B-8/B-14/B-15 语义基线）。
