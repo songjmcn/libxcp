@@ -250,3 +250,20 @@ add_test(NAME A2lIsolation
                  "-DA2L_BRIDGE_DIR=${CMAKE_SOURCE_DIR}/thirdparty/a2l-sdk/a2lbridge"
                  "-DLIBXCP_ROOT_DIR=${CMAKE_SOURCE_DIR}"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/a2l_isolation_check.cmake")
+
+# XCP Master CLI tool smoke tests (requires LIBXCP_BUILD_TOOLS=ON).
+if(LIBXCP_BUILD_TOOLS)
+  add_test(NAME XcpMasterToolHelp COMMAND xcp_master --help)
+  add_test(NAME XcpMasterToolRejectsMissingArgs COMMAND xcp_master)
+  set_tests_properties(XcpMasterToolRejectsMissingArgs PROPERTIES WILL_FAIL TRUE)
+
+  add_executable(XcpMasterSymbolPolicyTest xcp_master_symbol_policy_test.cpp)
+  target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
+  target_include_directories(XcpMasterSymbolPolicyTest PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(XcpMasterSymbolPolicyTest PRIVATE
+          libxcp::a2lbridge GTest::gtest GTest::gtest_main)
+  if(MSVC)
+    target_compile_options(XcpMasterSymbolPolicyTest PRIVATE /utf-8)
+  endif()
+  gtest_discover_tests(XcpMasterSymbolPolicyTest DISCOVERY_TIMEOUT 60)
+endif()

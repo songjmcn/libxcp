@@ -277,6 +277,50 @@ TEST(RecoveryTimeout, SynchPrecedesRetryInCommandOrder) {
     EXPECT_EQ(order[2], CommandCode::Upload);
 }
 
+// --------------------------------------------------------------------------
+// XCPlite 上传响应的精确 4 字节对齐填充兼容
+// --------------------------------------------------------------------------
+
+TEST(UploadResponsePadding, TrimsExactAlignedUploadResponse) {
+    Fixture f;
+    f.Connect();
+    f.slave.SetResponse(
+        CommandCode::Upload,
+        BytesOf({static_cast<std::uint8_t>(PacketType::Res), 0x01, 0x02, 0x03,
+                 0x04, 0x05, 0x06, 0x07, 0x08, 0xA1, 0xA2, 0xA3}));
+
+    const Bytes got = f.executor.ExecuteUpload(8);
+    EXPECT_EQ(got, BytesOf({0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}));
+}
+
+TEST(UploadResponsePadding, TrimsExactAlignedShortUploadResponse) {
+    Fixture f;
+    f.Connect();
+    f.slave.SetResponse(
+        CommandCode::ShortUpload,
+        BytesOf({static_cast<std::uint8_t>(PacketType::Res), 0x01, 0x02, 0x03,
+                 0x04, 0x05, 0x06, 0x07, 0x08, 0xA1, 0xA2, 0xA3}));
+
+    const Bytes got = f.executor.ExecuteShortUpload(8, 0x02, 0x10068);
+    EXPECT_EQ(got, BytesOf({0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08}));
+}
+
+TEST(UploadResponsePadding, RejectsUnexpectedLength) {
+    Fixture f;
+    f.Connect();
+    f.slave.SetResponse(
+        CommandCode::ShortUpload,
+        BytesOf({static_cast<std::uint8_t>(PacketType::Res), 0x01, 0x02, 0x03,
+                 0x04, 0x05, 0x06, 0x07, 0x08, 0xA1, 0xA2}));
+
+    try {
+        (void)f.executor.ExecuteShortUpload(8, 0x02, 0x10068);
+        FAIL() << "非对齐长度必须继续作为畸形响应拒绝";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::MalformedPacket);
+    }
+}
+
 TEST(RecoveryTimeout, ErrCmdSynchOnlyCountsAsRecoveryConfirmation) {
     Fixture f;
     f.Connect();

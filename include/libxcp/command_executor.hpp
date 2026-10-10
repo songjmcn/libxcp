@@ -558,12 +558,12 @@ private:
      */
     void RestoreDaqPtr();
 
-    /// @brief 校验响应数据长度是否等于 elements * AG，不符判为畸形包
+    /// @brief 校验上传响应长度，并裁剪精确匹配的 XCPlite 对齐填充
     /// @param cmd 命令码（用于错误定位）
-    /// @param res 正响应
+    /// @param res 正响应；仅当长度精确匹配已知对齐公式时裁剪尾部填充
     /// @param elements 请求的元素数
-    /// @throws XcpException(MalformedPacket) 长度与期望不符
-    void CheckResLength(CommandCode cmd, const PositiveResponse& res,
+    /// @throws XcpException(MalformedPacket) 长度既非精确长度也非已知填充长度
+    void CheckResLength(CommandCode cmd, PositiveResponse& res,
                         ElementCount elements);
 
     // ---- 依赖 ----

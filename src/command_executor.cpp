@@ -325,19 +325,30 @@ ParsedPacket CommandExecutor::DispatchResponse(CommandCode cmd,
     throw detail::MakeMalformedPacket("等待最终响应时收到非预期 Packet 类型");
 }
 
-void CommandExecutor::CheckResLength(CommandCode cmd,
-                                     const PositiveResponse& res,
+void CommandExecutor::CheckResLength(CommandCode cmd, PositiveResponse& res,
                                      ElementCount elements) {
     const auto ag = m_session_.GetAddressGranularity();
     const auto expected = static_cast<std::size_t>(elements) * AgToBytes(ag);
-    if (res.data.size() != expected) {
-        throw XcpException(
-            ErrorCategory::MalformedPacket,
-            "命令 " + std::to_string(static_cast<int>(cmd)) + " 响应数据长度 " +
-                std::to_string(res.data.size()) +
-                " 不等于期望的 elements*AG = " + std::to_string(expected),
-            cmd);
+    if (res.data.size() == expected) {
+        return;
     }
+
+    // XCPlite 动态地址的异步响应可能按 4 字节对齐，且把尾部填充算入线上长度。
+    // 只接受精确匹配“PID + 数据补齐到 4 字节”的长度，其他超长/短包仍视为畸形。
+    const auto aligned_packet_size = ((expected + 4U) / 4U) * 4U;
+    const auto padded_data_size = aligned_packet_size - 1U;
+    if ((cmd == CommandCode::Upload || cmd == CommandCode::ShortUpload) &&
+        res.data.size() == padded_data_size) {
+        res.data.resize(expected);
+        return;
+    }
+
+    throw XcpException(
+        ErrorCategory::MalformedPacket,
+        "命令 " + std::to_string(static_cast<int>(cmd)) + " 响应数据长度 " +
+            std::to_string(res.data.size()) +
+            " 不等于期望的 elements*AG = " + std::to_string(expected),
+        cmd);
 }
 
 // ---------------------------------------------------------------------------

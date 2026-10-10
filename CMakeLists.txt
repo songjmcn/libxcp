@@ -208,6 +208,9 @@ target_link_libraries(libxcp_measurement_adapter PUBLIC
 option(LIBXCP_BUILD_EXAMPLES
        "Build the standalone example programs under examples/"
        OFF)
+option(LIBXCP_BUILD_TOOLS
+       "Build standalone libxcp tools under tools/"
+       OFF)
 
 # ----------------------------------------------------------------------------
 # XCPlite 协议调试集成（code-plan/XCPlite_Slave_协议调试集成计划.md）
@@ -242,6 +245,14 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
   set(XCPLITE_BUILD_BPF_DEMO OFF)
   set(XCPLITE_INSTALL OFF)
   add_subdirectory(thirdparty/XCPlite)
+endif()
+
+# ----------------------------------------------------------------------------
+# 独立工具（LIBXCP_BUILD_TOOLS 不联动 EXAMPLES / XCPlite）
+# 工具目标先定义，测试可在两门同时开启时对其做 CLI 冒烟验证。
+# ----------------------------------------------------------------------------
+if(LIBXCP_BUILD_TOOLS)
+  add_subdirectory(tools)
 endif()
 
 # ----------------------------------------------------------------------------
