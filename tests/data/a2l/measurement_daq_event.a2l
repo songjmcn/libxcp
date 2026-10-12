@@ -1,0 +1,44 @@
+ASAP2_VERSION 1 61
+/begin PROJECT DaqEventProject "measurement DAQ_EVENT test"
+  /begin MODULE DAQ_EVENT_ECU ""
+    /begin COMPU_METHOD CM "identity" IDENTICAL "%6.2" ""
+    /end COMPU_METHOD
+    /begin MEASUREMENT EVENT0 "event zero" UBYTE CM 0 0 0 255
+      ECU_ADDRESS 0x1000
+      /begin IF_DATA XCP
+        /begin DAQ_EVENT VARIABLE
+          /begin DEFAULT_EVENT_LIST EVENT 0x0 /end DEFAULT_EVENT_LIST
+        /end DAQ_EVENT
+      /end IF_DATA
+    /end MEASUREMENT
+    /begin MEASUREMENT FIXED_MULTI "fixed list" UBYTE CM 0 0 0 255
+      ECU_ADDRESS 0x1001
+      /begin IF_DATA XCP
+        /begin DAQ_EVENT FIXED_EVENT_LIST EVENT 0x1 EVENT 0x2 /end DAQ_EVENT
+      /end IF_DATA
+    /end MEASUREMENT
+    /begin MEASUREMENT DEFAULT_ONLY "default list" UBYTE CM 0 0 0 255
+      ECU_ADDRESS 0x1002
+      /begin IF_DATA XCP
+        /begin DAQ_EVENT VARIABLE
+          /begin DEFAULT_EVENT_LIST EVENT 0x3 /end DEFAULT_EVENT_LIST
+        /end DAQ_EVENT
+      /end IF_DATA
+    /end MEASUREMENT
+    /begin MEASUREMENT PLUS_PREF "plus takes precedence" UBYTE CM 0 0 0 255
+      ECU_ADDRESS 0x1003
+      /begin IF_DATA XCP
+        /begin DAQ_EVENT FIXED_EVENT_LIST EVENT 0x4 /end DAQ_EVENT
+      /end IF_DATA
+      /begin IF_DATA XCPplus 0x0100
+        /begin DAQ_EVENT FIXED_EVENT_LIST EVENT 0x5 EVENT 0x6 /end DAQ_EVENT
+      /end IF_DATA
+    /end MEASUREMENT
+    /begin MEASUREMENT PLAIN_FALLBACK "plain fallback" UBYTE CM 0 0 0 255
+      ECU_ADDRESS 0x1004
+      /begin IF_DATA XCP
+        /begin DAQ_EVENT FIXED_EVENT_LIST EVENT 0x7 /end DAQ_EVENT
+      /end IF_DATA
+    /end MEASUREMENT
+  /end MODULE
+/end PROJECT

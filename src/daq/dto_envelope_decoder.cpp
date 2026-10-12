@@ -79,8 +79,13 @@ DtoEnvelope DtoEnvelopeDecoder::Decode(BytesView dto,
     DtoIdentity identity;
     switch (frame_layout.identification_field_type) {
         case IdentificationFieldType::Absolute: {
-            // byte0 = 绝对 ODT 号；daq_list 由调用方（运行态哪条在跑）路由补充。
-            identity.odt = dto[0];
+            // byte0 = Absolute PID；first_odt 为 START 返回的 FIRST_PID，
+            // 映射成当前单 List 内的相对 ODT 编号。first_odt=0 保持旧纯解码语义。
+            if (dto[0] < frame_layout.first_odt) {
+                ThrowMalformed("Absolute PID 小于 FIRST_PID");
+            }
+            identity.odt = static_cast<std::uint8_t>(
+                dto[0] - frame_layout.first_odt);
             identity.daq_list = 0;
             break;
         }

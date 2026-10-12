@@ -12,6 +12,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -878,6 +879,45 @@ TEST(XcpDaqDynamic, MisnumberedOrEmptySpecsRejectedBeforeWire) {
     EXPECT_THROW(rig.master->ConfigureDaqListsDynamic(specs), XcpException);
     EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
     EXPECT_EQ(rig.slave.Count(CommandCode::AllocDaq), 0);
+}
+
+TEST(XcpDaqDynamic, ExplicitProfileRejectsUnknownIdentificationHeaderBeforeFree) {
+    Rig rig;
+    EnableDynamic(rig.slave);
+    auto specs = MakeDynamicSpecs();
+    EXPECT_THROW(rig.master->ConfigureDaqListsDynamic(specs, 0U), XcpException);
+    EXPECT_THROW(rig.master->ConfigureDaqListsDynamic(specs, 5U), XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
+}
+
+TEST(XcpDaqDynamic, ExplicitProfileKeepsTimestampOffWhileLegacyOverloadPreservesIt) {
+    {
+        Rig rig;
+        EnableDynamic(rig.slave);
+        auto specs = MakeDynamicSpecs();
+        rig.master->ConfigureDaqListsDynamic(specs);
+        const auto sent = rig.transport->SentPackets();
+        const auto mode = std::find_if(sent.begin(), sent.end(), [](const Bytes& packet) {
+            return !packet.empty() && packet[0] ==
+                static_cast<std::uint8_t>(CommandCode::SetDaqListMode);
+        });
+        ASSERT_NE(mode, sent.end());
+        EXPECT_NE((*mode)[1] & static_cast<std::uint8_t>(DaqListModeBit::kTimestamp), 0U);
+    }
+    {
+        Rig rig;
+        EnableDynamic(rig.slave);
+        auto specs = MakeDynamicSpecs();
+        for (auto& spec : specs) spec.timestamp = false;
+        rig.master->ConfigureDaqListsDynamic(specs, 1U);
+        const auto sent = rig.transport->SentPackets();
+        const auto mode = std::find_if(sent.begin(), sent.end(), [](const Bytes& packet) {
+            return !packet.empty() && packet[0] ==
+                static_cast<std::uint8_t>(CommandCode::SetDaqListMode);
+        });
+        ASSERT_NE(mode, sent.end());
+        EXPECT_EQ((*mode)[1] & static_cast<std::uint8_t>(DaqListModeBit::kTimestamp), 0U);
+    }
 }
 
 TEST(XcpDaqDynamic, MidTransactionFailureFreesWholeTableAndDropsLedger) {

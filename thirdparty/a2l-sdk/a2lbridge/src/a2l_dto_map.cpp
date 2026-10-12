@@ -279,6 +279,9 @@ SymbolInfo ConvertSymbol(const liba2l::SymbolDto& dto) {
         info.lower_limit = dto.lower_limit;
         info.upper_limit = dto.upper_limit;
     }
+    info.daq_event_fixed = dto.daq_event_fixed;
+    info.daq_event_default = dto.daq_event_default;
+    info.daq_event_available = dto.daq_event_available;
     return info;
 }
 

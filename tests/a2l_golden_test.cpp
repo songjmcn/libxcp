@@ -267,6 +267,40 @@ TEST_F(A2lGoldenTest, RequireIfDataXcpControlsMissingIfData) {
     EXPECT_EQ(b->Database()->Count().Value(), 15u);
 }
 
+TEST_F(A2lGoldenTest, MeasurementDaqEventListsArePreservedPerSymbol) {
+    LoadOptions options;
+    options.require_if_data_xcp = false;
+    auto b = LoadOk(Data("measurement_daq_event.a2l"), options);
+    ASSERT_NE(b, nullptr);
+    ASSERT_NE(b->Database(), nullptr);
+
+    const auto event0 = b->Database()->Find("EVENT0");
+    ASSERT_TRUE(event0.HasValue()) << event0.ErrorInfo().message;
+    EXPECT_EQ(event0.Value().daq_event_default,
+              (std::vector<std::uint16_t>{0}));
+
+    const auto fixed = b->Database()->Find("FIXED_MULTI");
+    ASSERT_TRUE(fixed.HasValue()) << fixed.ErrorInfo().message;
+    EXPECT_EQ(fixed.Value().daq_event_fixed,
+              (std::vector<std::uint16_t>{1, 2}));
+
+    const auto defaults = b->Database()->Find("DEFAULT_ONLY");
+    ASSERT_TRUE(defaults.HasValue()) << defaults.ErrorInfo().message;
+    EXPECT_EQ(defaults.Value().daq_event_default,
+              (std::vector<std::uint16_t>{3}));
+    EXPECT_TRUE(defaults.Value().daq_event_fixed.empty());
+
+    const auto plus = b->Database()->Find("PLUS_PREF");
+    ASSERT_TRUE(plus.HasValue()) << plus.ErrorInfo().message;
+    EXPECT_EQ(plus.Value().daq_event_fixed,
+              (std::vector<std::uint16_t>{5, 6}));
+
+    const auto plain = b->Database()->Find("PLAIN_FALLBACK");
+    ASSERT_TRUE(plain.HasValue()) << plain.ErrorInfo().message;
+    EXPECT_EQ(plain.Value().daq_event_fixed,
+              (std::vector<std::uint16_t>{7}));
+}
+
 TEST_F(A2lGoldenTest, MalformedButLegalVariantsParse) {
     // A-6 缓解①：行尾（CRLF/LF）、字符串外空白、UTF-8 BOM 三类变体
     for (const char* name : {"golden_basic_lf.a2l", "golden_basic_ws.a2l",

@@ -1,6 +1,7 @@
 add_executable(xcp_master main.cpp)
 target_compile_features(xcp_master PRIVATE cxx_std_20)
-target_link_libraries(xcp_master PRIVATE libxcp::libxcp libxcp::a2lbridge)
+target_link_libraries(xcp_master PRIVATE
+  libxcp::libxcp libxcp::a2lbridge libxcp_measurement_adapter)
 
 if(MSVC)
   target_compile_options(xcp_master PRIVATE /utf-8)

@@ -67,7 +67,8 @@ public:
     explicit MeasurementPlanner(const IMeasurementDatabase& database,
                                 std::uint16_t max_dto,
                                 AddressGranularity address_granularity,
-                                std::size_t timestamp_bytes = 0);
+                                std::size_t timestamp_bytes = 0,
+                                std::size_t identification_bytes = 1);
     ~MeasurementPlanner();
 
     MeasurementPlanner(const MeasurementPlanner&) = delete;
@@ -82,6 +83,7 @@ private:
     std::uint16_t m_max_dto_{0};              ///< 会话 MAX_DTO
     std::size_t m_ag_bytes_{1};               ///< AG 字节数（AgToBytes）
     std::size_t m_timestamp_bytes_{0};        ///< 信封时间戳头字节（0=无）
+    std::size_t m_identification_bytes_{1};  ///< 识别字段头宽
 };
 
 }  // namespace calmcar::xcp

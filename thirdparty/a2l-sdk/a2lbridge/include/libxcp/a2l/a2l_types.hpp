@@ -190,6 +190,12 @@ struct SymbolInfo {
     bool have_limit = false;         ///< 是否声明了符号级限值
     double lower_limit = 0.0;        ///< 符号级下限（have_limit 时有效）
     double upper_limit = 0.0;        ///< 符号级上限（have_limit 时有效）
+    /// @brief 逐 MEASUREMENT DAQ_EVENT fixed event 号列表
+    std::vector<std::uint16_t> daq_event_fixed;
+    /// @brief 逐 MEASUREMENT DAQ_EVENT default event 号列表
+    std::vector<std::uint16_t> daq_event_default;
+    /// @brief 逐 MEASUREMENT DAQ_EVENT available event 号列表
+    std::vector<std::uint16_t> daq_event_available;
 };
 
 // ---------------------------------------------------------------------------

@@ -256,6 +256,14 @@ if(LIBXCP_BUILD_TOOLS)
   add_test(NAME XcpMasterToolHelp COMMAND xcp_master --help)
   add_test(NAME XcpMasterToolRejectsMissingArgs COMMAND xcp_master)
   set_tests_properties(XcpMasterToolRejectsMissingArgs PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME XcpMasterToolRejectsPollingIntervalInDaq
+           COMMAND xcp_master --a2l ignored.a2l --host 127.0.0.1 --port 5555
+                   --mode daq --interval-ms 500)
+  add_test(NAME XcpMasterToolRejectsDaqProfileInPoll
+           COMMAND xcp_master --a2l ignored.a2l --host 127.0.0.1 --port 5555
+                   --daq-profile xcplite)
+  set_tests_properties(XcpMasterToolRejectsPollingIntervalInDaq
+                       XcpMasterToolRejectsDaqProfileInPoll PROPERTIES WILL_FAIL TRUE)
 
   add_executable(XcpMasterSymbolPolicyTest xcp_master_symbol_policy_test.cpp)
   target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)

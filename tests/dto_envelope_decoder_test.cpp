@@ -51,6 +51,20 @@ TEST(DtoEnvelopeDecoder, AbsoluteParsesAbsoluteOdtAndPayload) {
     EXPECT_EQ(env.payload[2], 0xBE);
 }
 
+TEST(DtoEnvelopeDecoder, AbsolutePidUsesFirstPidAndRejectsEarlierPid) {
+    const DtoEnvelopeDecoder decoder(ByteOrder::Intel);
+    DtoFrameLayout layout;
+    layout.identification_field_type = IdentificationFieldType::Absolute;
+    layout.first_odt = 0x20;
+    layout.header_bytes = 1;
+
+    const auto dto = BytesOf({0x22, 0xDE, 0xAD});
+    const DtoEnvelope env = decoder.Decode(dto, layout);
+    EXPECT_EQ(env.identity.odt, 2U);
+    ASSERT_EQ(env.payload.size(), 2U);
+    EXPECT_THROW((void)decoder.Decode(BytesOf({0x1F, 0xDE}), layout), XcpException);
+}
+
 // --------------------------------------------------------------------------
 // RelativeByte（XCPlite 实然）
 // --------------------------------------------------------------------------

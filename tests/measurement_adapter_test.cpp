@@ -132,11 +132,17 @@ SymbolInfo MakeScalar(std::uint64_t xcp_address, std::uint8_t extension,
 class RuntimeProfileSlave {
 public:
     std::uint8_t key_byte{0xC0};
+    std::uint8_t connect_mode_basic{0xC0};
+    std::uint8_t event_max_daq_lists{0xFF};
+    std::uint16_t max_daq{4};
+    std::uint16_t max_event_channel{0xFF};
+    std::uint8_t min_daq{0};
     std::uint8_t daq_properties{0x11};
     std::uint8_t timestamp_mode{0x0C};
     std::uint16_t timestamp_ticks{3};
     std::uint8_t event_cycle{5};
     std::uint8_t event_unit{2};
+    std::uint8_t resource_protection{0};
     bool event_supported{true};
     std::vector<std::uint16_t> queried_events;
 
@@ -145,9 +151,9 @@ public:
         const auto command = static_cast<CommandCode>(packet[0]);
         switch (command) {
             case CommandCode::Connect:
-                return Res({0x15, 0xC0, 0x08, 0x00, 0x08, 0x10, 0x10});
+                return Res({0x15, connect_mode_basic, 0x08, 0x00, 0x08, 0x10, 0x10});
             case CommandCode::GetStatus:
-                return Res({0x00, 0x00, 0x01, 0x07, 0x00});
+                return Res({0x00, resource_protection, 0x01, 0x07, 0x00});
             case CommandCode::GetCommModeInfo:
                 return Res({0x00, 0x0E, 0x00, 0x04, 0x02, 0x08, 0x13});
             case CommandCode::GetPagProcessorInfo:
@@ -156,8 +162,13 @@ public:
             case CommandCode::Disconnect:
                 return Res({});
             case CommandCode::GetDaqProcessorInfo:
-                return Res(
-                    {daq_properties, 0x04, 0x00, 0x02, 0x00, 0x00, key_byte});
+                return Res({
+                    daq_properties,
+                    static_cast<std::uint8_t>(max_daq & 0xFFU),
+                    static_cast<std::uint8_t>(max_daq >> 8U),
+                    static_cast<std::uint8_t>(max_event_channel & 0xFFU),
+                    static_cast<std::uint8_t>(max_event_channel >> 8U),
+                    min_daq, key_byte});
             case CommandCode::GetDaqResolutionInfo:
                 return Res({0x01, 0x08, 0x01, 0x08, timestamp_mode,
                             static_cast<std::uint8_t>(timestamp_ticks & 0xFFU),
@@ -170,7 +181,8 @@ public:
                         static_cast<std::uint16_t>(packet[2]) |
                         (static_cast<std::uint16_t>(packet[3]) << 8U));
                 }
-                return Res({0x01, 0xFF, 0x05, event_cycle, event_unit, 0xFF});
+                return Res({0x01, event_max_daq_lists, 0x05, event_cycle,
+                            event_unit, 0xFF});
             default:
                 return Err(calmcar::xcp::ErrorCode::CmdUnknown);
         }
@@ -408,13 +420,61 @@ TEST(A2lMeasurementDatabase, ToPhysicalErrorCodesMapToCoreCodes) {
     }
 }
 
+TEST(GenericMeasurementRuntimeProfile, AcceptsOnlyAbsoluteTimestampFreeProfile) {
+    RuntimeProfileSlave slave;
+    slave.key_byte = 0x00U;
+    slave.timestamp_mode = 0x00U;
+    auto master = MakeProfileMaster(slave);
+    const std::array<A2lEventMetadata, 1> events{{
+        {"event0", "event0", 0U, 5U, 2U, 1U, 0xFFU},
+    }};
+
+    const auto profile = BuildGenericMeasurementRuntimeProfile(*master, events);
+    ASSERT_TRUE(profile.HasValue()) << profile.ErrorInfo().message;
+    EXPECT_EQ(profile.Value().identification_field_type,
+              IdentificationFieldType::Absolute);
+    EXPECT_EQ(profile.Value().identification_header_bytes, 1U);
+    EXPECT_EQ(profile.Value().daq_entry_granularity_bytes, 1U);
+    EXPECT_EQ(profile.Value().max_daq_entry_size_bytes, 8U);
+    EXPECT_EQ(slave.queried_events, (std::vector<std::uint16_t>{0U}));
+}
+
+TEST(GenericMeasurementRuntimeProfile, RejectsUnverifiedModesAndEvents) {
+    const std::array<A2lEventMetadata, 1> event{{
+        {"event0", "event0", 0U, 5U, 2U, 1U, 0xFFU},
+    }};
+    {
+        RuntimeProfileSlave slave;
+        slave.key_byte = 0x10U;  // ODT address-extension mode is not verified.
+        slave.timestamp_mode = 0x00U;
+        auto master = MakeProfileMaster(slave);
+        EXPECT_FALSE(BuildGenericMeasurementRuntimeProfile(*master, event).HasValue());
+    }
+    {
+        RuntimeProfileSlave slave;
+        slave.key_byte = 0x00U;
+        slave.timestamp_mode = 0x0CU;  // fixed timestamps cannot be disabled.
+        auto master = MakeProfileMaster(slave);
+        EXPECT_FALSE(BuildGenericMeasurementRuntimeProfile(*master, event).HasValue());
+    }
+    {
+        RuntimeProfileSlave slave;
+        slave.key_byte = 0x00U;
+        slave.timestamp_mode = 0x00U;
+        auto master = MakeProfileMaster(slave);
+        auto no_daq_event = event;
+        no_daq_event[0].max_daq_list = 0U;
+        EXPECT_FALSE(BuildGenericMeasurementRuntimeProfile(*master, no_daq_event).HasValue());
+    }
+}
+
 TEST(XcpliteMeasurementRuntimeProfile,
      CrossChecksLiveProfileAndAllBoundEvents) {
     RuntimeProfileSlave slave;
     auto master = MakeProfileMaster(slave);
     const std::array<A2lEventMetadata, 2> events{{
-        {"event0", "event0", 0U, 5U, 2U},
-        {"event4", "event4", 4U, 5U, 2U},
+        {"event0", "event0", 0U, 5U, 2U, 1U, 0xFFU},
+        {"event4", "event4", 4U, 5U, 2U, 1U, 0xFFU},
     }};
 
     const auto profile = BuildXcpliteMeasurementRuntimeProfile(*master, events);
@@ -433,9 +493,31 @@ TEST(XcpliteMeasurementRuntimeProfile,
     EXPECT_NO_THROW(ApplyMeasurementRuntimeProfile(session, profile.Value()));
 }
 
+TEST(DaqRuntimeProfiles, RejectsProtectedDaqBeforeConfiguration) {
+    const std::array<A2lEventMetadata, 1> event{{
+        {"event", "event", 0U, 5U, 2U, 1U, 0xFFU},
+    }};
+    {
+        RuntimeProfileSlave slave;
+        slave.resource_protection = static_cast<std::uint8_t>(Resource::Daq);
+        auto master = MakeProfileMaster(slave);
+        const auto result = BuildGenericMeasurementRuntimeProfile(*master, event);
+        ASSERT_FALSE(result.HasValue());
+        EXPECT_NE(result.ErrorInfo().message.find("不发送 FREE_DAQ"), std::string::npos);
+    }
+    {
+        RuntimeProfileSlave slave;
+        slave.resource_protection = static_cast<std::uint8_t>(Resource::Daq);
+        auto master = MakeProfileMaster(slave);
+        const auto result = BuildXcpliteMeasurementRuntimeProfile(*master, event);
+        ASSERT_FALSE(result.HasValue());
+        EXPECT_NE(result.ErrorInfo().message.find("不发送 FREE_DAQ"), std::string::npos);
+    }
+}
+
 TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
     const std::array<A2lEventMetadata, 1> event{{
-        {"event", "event", 0U, 5U, 2U},
+        {"event", "event", 0U, 5U, 2U, 1U, 0xFFU},
     }};
     {
         RuntimeProfileSlave slave;
@@ -486,6 +568,62 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
         ASSERT_FALSE(result.HasValue());
         EXPECT_EQ(result.ErrorInfo().symbol, "event");
     }
+    {
+        RuntimeProfileSlave slave;
+        slave.connect_mode_basic = 0xC1U;  // Motorola byte order.
+        auto master = MakeProfileMaster(slave);
+        const auto result =
+            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+        ASSERT_FALSE(result.HasValue());
+        EXPECT_NE(result.ErrorInfo().message.find("Intel 字节序"),
+                  std::string::npos);
+    }
+    {
+        RuntimeProfileSlave slave;
+        slave.event_max_daq_lists = 0U;
+        auto master = MakeProfileMaster(slave);
+        const auto result =
+            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+        ASSERT_FALSE(result.HasValue());
+        EXPECT_EQ(result.ErrorInfo().symbol, "event");
+    }
+    {
+        RuntimeProfileSlave slave;
+        slave.max_event_channel = 2U;
+        auto master = MakeProfileMaster(slave);
+        const std::array<A2lEventMetadata, 1> out_of_range{{
+            {"event", "event", 4U, 5U, 2U, 1U, 0xFFU},
+        }};
+        const auto result =
+            BuildXcpliteMeasurementRuntimeProfile(*master, out_of_range);
+        ASSERT_FALSE(result.HasValue());
+        EXPECT_EQ(result.ErrorInfo().symbol, "event");
+    }
+    {
+        // XCPlite MAX_DAQ 是当前已分配列表数；未配置时为 0，仍应允许
+        // 通过 profile 检查并在用户确认后执行动态分配。
+        RuntimeProfileSlave slave;
+        slave.max_daq = 0U;
+        auto master = MakeProfileMaster(slave);
+        const std::array<A2lEventMetadata, 2> events{{
+            {"first", "first", 0U, 5U, 2U, 1U, 0xFFU},
+            {"second", "second", 1U, 5U, 2U, 1U, 0xFFU},
+        }};
+        const auto result =
+            BuildXcpliteMeasurementRuntimeProfile(*master, events);
+        ASSERT_TRUE(result.HasValue()) << result.ErrorInfo().message;
+        EXPECT_EQ(slave.queried_events, (std::vector<std::uint16_t>{0U, 1U}));
+    }
+    {
+        RuntimeProfileSlave slave;
+        slave.min_daq = 1U;
+        auto master = MakeProfileMaster(slave);
+        const auto result =
+            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+        ASSERT_FALSE(result.HasValue());
+        EXPECT_NE(result.ErrorInfo().message.find("从 0 开始"),
+                  std::string::npos);
+    }
 }
 
 TEST(XcpliteMeasurementRuntimeProfile,
@@ -500,7 +638,7 @@ TEST(XcpliteMeasurementRuntimeProfile,
               MeasurementErrorCode::DaqConfigurationError);
 
     const std::array<A2lEventMetadata, 1> event{{
-        {"event", "event", 0U, 5U, 2U},
+        {"event", "event", 0U, 5U, 2U, 1U, 0xFFU},
     }};
     {
         RuntimeProfileSlave zero_ticks;

@@ -20,11 +20,13 @@ namespace calmcar::xcp {
 
 MeasurementPlanner::MeasurementPlanner(
     const IMeasurementDatabase& database, std::uint16_t max_dto,
-    AddressGranularity address_granularity, std::size_t timestamp_bytes)
+    AddressGranularity address_granularity, std::size_t timestamp_bytes,
+    std::size_t identification_bytes)
     : m_database_(database),
       m_max_dto_(max_dto),
       m_ag_bytes_(AgToBytes(address_granularity)),
-      m_timestamp_bytes_(timestamp_bytes) {}
+      m_timestamp_bytes_(timestamp_bytes),
+      m_identification_bytes_(identification_bytes) {}
 
 MeasurementPlanner::~MeasurementPlanner() = default;
 
@@ -94,7 +96,18 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
             "信封头字节数 " + std::to_string(m_timestamp_bytes_) +
                 " 已超 MAX_DTO " + std::to_string(m_max_dto_));
     }
-    const std::size_t odt_id_bytes = 1;  // 识别字段（相对 ODT 模式至少 1 字节 vs 头）
+    const std::size_t odt_id_bytes = m_identification_bytes_;
+    if (odt_id_bytes == 0U || odt_id_bytes > max_dto_bytes) {
+        return detail::MakeMeasurementError<MeasurementPlan>(
+            MeasurementErrorCode::DaqConfigurationError,
+            "识别字段头宽非法或超过 MAX_DTO: " +
+                std::to_string(odt_id_bytes));
+    }
+    if (m_timestamp_bytes_ > max_dto_bytes - odt_id_bytes) {
+        return detail::MakeMeasurementError<MeasurementPlan>(
+            MeasurementErrorCode::DaqConfigurationError,
+            "识别字段与时间戳头超出 MAX_DTO");
+    }
     const std::size_t usable =
         max_dto_bytes - m_timestamp_bytes_ - odt_id_bytes;
 
@@ -180,7 +193,13 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
         }
 
         // 当前 ODT 装不下 → 开新 ODT（同组内新 ODT 仍属当前 List）
-        if (cur.odt_used + row.byte_width > usable) {
+        if (row.byte_width > usable - cur.odt_used) {
+            if (cur.spec.odts.size() >= 256U) {
+                return detail::MakeMeasurementError<MeasurementPlan>(
+                    MeasurementErrorCode::DaqConfigurationError,
+                    "DAQ List ODT 数量超过 8 位 ODT 编号范围(0..255)",
+                    row.name);
+            }
             cur.spec.odts.emplace_back();
             cur.odt_used = 0;
         }

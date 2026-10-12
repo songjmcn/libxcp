@@ -52,8 +52,9 @@ namespace liba2l {
 //               元素类型/换算引用/边界；SDK 不做任何递归或地址推导）；
 //               StructInfoDto +matrix_dim（16-B：INSTANCE 的 MATRIX_DIM 原值，
 //               结构体数组实例逐元素展开的前提）。
+// v7：SymbolDto 增逐 MEASUREMENT 的 fixed/default/available 事件号列表。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 6u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 7u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -278,6 +279,12 @@ struct SymbolDto {
     std::string record_layout_name;
     /// @brief RECORD_LAYOUT 归一化类别（批次13，B-4/B-12；判定见枚举注释）
     RecordLayoutKindDto record_layout_kind = RecordLayoutKindDto::kNotProvided;
+    /// @brief DAQ_EVENT fixed event 号列表（逐 MEASUREMENT 原始顺序透传）
+    std::vector<std::uint16_t> daq_event_fixed;
+    /// @brief DAQ_EVENT default event 号列表（逐 MEASUREMENT 原始顺序透传）
+    std::vector<std::uint16_t> daq_event_default;
+    /// @brief DAQ_EVENT available event 号列表（逐 MEASUREMENT 原始顺序透传）
+    std::vector<std::uint16_t> daq_event_available;
 };
 
 /**

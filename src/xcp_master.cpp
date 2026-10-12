@@ -452,8 +452,30 @@ void XcpMaster::ClearDynamicTableBestEffort() {
 
 void XcpMaster::ConfigureDaqListsDynamic(
     const std::vector<DaqListSpec>& specs) {
+    // 保留原有 XCPlite 调用语义：旧的一参数接口强制请求时间戳。
+    auto legacy_specs = specs;
+    for (auto& spec : legacy_specs) {
+        spec.timestamp = true;
+    }
+    ConfigureDaqListsDynamicImpl(legacy_specs, 1U, true);
+}
+
+void XcpMaster::ConfigureDaqListsDynamic(
+    const std::vector<DaqListSpec>& specs,
+    std::size_t dto_identification_bytes) {
+    ConfigureDaqListsDynamicImpl(specs, dto_identification_bytes, false);
+}
+
+void XcpMaster::ConfigureDaqListsDynamicImpl(
+    const std::vector<DaqListSpec>& specs,
+    std::size_t dto_identification_bytes, bool legacy_timestamp) {
     // ---- 1) 入参预检（非法不发命令；整表 FREE 之前一切本地可拦的错误
     //         都不该让 Slave 的既有表白白陪葬）----
+    if (dto_identification_bytes == 0U || dto_identification_bytes > 4U) {
+        throw detail::MakeInvalidArgument(
+            "DTO 识别字段头宽须为 1..4 字节，实际为 " +
+            std::to_string(dto_identification_bytes));
+    }
     if (specs.empty()) {
         throw detail::MakeInvalidArgument(
             "动态 DAQ 编排至少需要一个 List（ALLOC_DAQ 的 n 不得为 0，"
@@ -494,14 +516,19 @@ void XcpMaster::ConfigureDaqListsDynamic(
             "GET_DAQ_PROCESSOR_INFO），动态整表通路不适用；STATIC 表请改用 "
             "ConfigureDaqList");
     }
-    // ---- 2b) G3 修正：动态信封识别字段后跟随 Slave 声明的时间戳。XCPlite
-    //          强制 TIMESTAMP 模式位（D11）⇒ Slave 必回带时间戳，据此预检
-    //          ODT 预算；未声明（Optional 面缺失）按 0 字节计，不猜（B-3）。
-    const std::size_t timestamp_bytes = DaqTimestampBytesCached();
+    // 信封预算严格使用调用方已验证的识别头宽及每个 List 的 timestamp 位；
+    // 无时间戳时不消费 timestamp resolution。请求时间戳但无法取证宽度时拒绝。
+    const std::size_t cached_timestamp_bytes = DaqTimestampBytesCached();
     const std::size_t ag_bytes = AgToBytes(m_session_.GetAddressGranularity());
     for (const auto& spec : specs) {
-        const std::size_t header_bytes =
-            1U + (spec.dto_counter ? 1U : 0U) + timestamp_bytes;
+        if (spec.timestamp && cached_timestamp_bytes == 0U &&
+            !legacy_timestamp) {
+            throw detail::MakeUnsupportedFeature(
+                "DAQ List 请求时间戳，但 GET_DAQ_RESOLUTION_INFO 未提供可用宽度");
+        }
+        const std::size_t header_bytes = dto_identification_bytes +
+            (spec.dto_counter ? 1U : 0U) +
+            (spec.timestamp || legacy_timestamp ? cached_timestamp_bytes : 0U);
         ValidateDaqListAgainstMaxDto(spec, header_bytes, ag_bytes,
                                      m_session_.MaxDto());
     }
@@ -558,10 +585,9 @@ void XcpMaster::ConfigureDaqListsDynamic(
             }
         }
         for (const auto& spec : specs) {
-            // mode 位按 spec 构造并强制 kTimestamp（XCPlite 缺位回
-            // CRC_CMD_SYNTAX，D11）；stim/dto_counter/pid_off 本地预拒
-            const DaqListModeBit mode =
-                DaqModeBitsFromSpec(spec) | DaqListModeBit::kTimestamp;
+            // List mode 精确按 spec 下发；XCPlite 兼容 profile 显式设置 timestamp，
+            // generic profile 可安全选择无时间戳布局。
+            const DaqListModeBit mode = DaqModeBitsFromSpec(spec);
             m_executor_->ExecuteSetDaqListMode(mode, spec.daq_list,
                                                spec.event_channel,
                                                spec.prescaler, spec.priority);

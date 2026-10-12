@@ -265,6 +265,8 @@ public:
      * @throws XcpException 协议错误、超时或恢复失败
      */
     void ConfigureDaqListsDynamic(const std::vector<DaqListSpec>& specs);
+    void ConfigureDaqListsDynamic(const std::vector<DaqListSpec>& specs,
+                                  std::size_t dto_identification_bytes);
 
     /**
      * @brief 动态列表的同步启动：逐 List Select → START_STOP_SYNCH(Start
@@ -513,6 +515,10 @@ public:
     friend class MeasurementSession;
 
 private:
+    void ConfigureDaqListsDynamicImpl(const std::vector<DaqListSpec>& specs,
+                                      std::size_t dto_identification_bytes,
+                                      bool legacy_timestamp);
+
     std::unique_ptr<IXcpTransport> m_transport_;  ///< 拥有的 Transport
     Session m_session_;                           ///< 会话状态与协商参数
     std::unique_ptr<CommandExecutor>

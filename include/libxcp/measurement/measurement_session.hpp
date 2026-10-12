@@ -119,7 +119,7 @@ public:
     /**
      * @brief 设定 DTO 识别字段模式（运行时取证用；须在 Prepare 前调用）
      * @param type 识别字段模式（默认 RelativeWord）
-     * @param id_field_bytes 识别字段头长（默认 2；RelativeByte 为 4）
+     * @param id_field_bytes 识别字段头长（默认 2；Absolute=1，RelativeByte=4）
      * @details 信封布局只能来自会话取证，绝不猜测（B-16）。worker 解码时
      *          按此模式 + 取证到的时间戳宽度切分识别字段（时间戳段不计入
      *          id_field_bytes，由解码器按 timestamp_size_bits 单独消费）。
@@ -137,6 +137,12 @@ public:
      *          运行中调用抛 InvalidState。
      */
     void SetTimestampUnit(std::uint64_t unit_ns);
+
+    /**
+     * @brief 配置 DTO 是否携带时间戳（须在 Prepare 前调用）
+     * @param enabled false 时不请求时间戳并按无时间戳布局规划/解码
+     */
+    void SetTimestampEnabled(bool enabled);
 
     /**
      * @brief 时间戳是否只随**本事件首个 ODT 帧**出现（v0.9，XCPlite 实然 D13）
@@ -182,6 +188,8 @@ private:
         0};  ///< tick→纳秒（0=未知不猜，R13；SetTimestampUnit 取证注入）
     bool m_timestamp_first_odt_only_{
         false};  ///< 时间戳只随首 ODT 帧（v0.9 D13；SetTimestampFirstOdtOnly）
+    bool m_timestamp_enabled_{true};  ///< Prepare 前配置；默认保持原有取证行为
+    std::uint8_t m_first_pid_{0};     ///< Absolute 模式 START 返回的 FIRST_PID
 
     // 运行态 + 队列 + worker（Start/Stop/OnDto/回调共享锁）
     mutable std::mutex m_run_mutex_;

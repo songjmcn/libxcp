@@ -230,6 +230,20 @@ TEST(MeasurementPlannerTest, ByteWidthNotDivisibleByAgErrors) {
 // ---------------------------------------------------------------------------
 // timestamp 头扣除：usable 变小 + timestamp 置位
 // ---------------------------------------------------------------------------
+TEST(MeasurementPlannerTest, IdentificationHeaderDeduction) {
+  FakeDb db;
+  db.symbols.emplace("fits", MakeInfo(0x1000, 0, 1, 11));
+  db.symbols.emplace("too_big", MakeInfo(0x1100, 0, 1, 13));
+
+  MeasurementPlanner planner(db, /*max_dto=*/16, AddressGranularity::Byte,
+                             /*timestamp_bytes=*/0, /*identification_bytes=*/4);
+  const auto fits = planner.Build({"fits"});
+  ASSERT_TRUE(fits.HasValue()) << fits.ErrorInfo().message;
+  const auto too_big = planner.Build({"too_big"});
+  ASSERT_FALSE(too_big.HasValue());
+  EXPECT_EQ(too_big.ErrorInfo().code, MeasurementErrorCode::DaqConfigurationError);
+}
+
 TEST(MeasurementPlannerTest, TimestampHeaderDeduction) {
   FakeDb db;
   // max_dto=16, timestamp_bytes=4 → usable = 16 - 4 - 1 = 11

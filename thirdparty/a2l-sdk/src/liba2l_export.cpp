@@ -688,6 +688,25 @@ SymbolDto BuildMeasurementSymbol(const a2l::Measurement& m,
     s.compu_method_name = m.Conversion();
     s.conversion =
         BuildConversion(module.GetCompuMethod(m.Conversion()), module);
+    // MEASUREMENT 自身的有效 XCPplus IF_DATA 优先；无效/缺失时回退 plain XCP。
+    const a2l::xcp::XcpDataBlock* plus = m.GetXcpPlusDataBlock();
+    const a2l::xcp::XcpDataBlock* plain = m.GetXcpDataBlock();
+    const a2l::xcp::XcpDataBlock* block =
+        plus != nullptr && plus->IsOk() ? plus
+        : plain != nullptr && plain->IsOk() ? plain
+                                           : nullptr;
+    if (block != nullptr) {
+        const a2l::xcp::DaqEvent* event =
+            block->GetCommonParameters().GetDaqEvent();
+        if (event != nullptr) {
+            const auto& fixed = event->GetFixedEventList();
+            const auto& defaults = event->GetDefaultEventList();
+            const auto& available = event->GetAvailableEventList();
+            s.daq_event_fixed.assign(fixed.begin(), fixed.end());
+            s.daq_event_default.assign(defaults.begin(), defaults.end());
+            s.daq_event_available.assign(available.begin(), available.end());
+        }
+    }
     return s;
 }
 
