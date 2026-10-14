@@ -65,8 +65,7 @@ public:
     /// @brief 让 GET_ID(IDT=4)/UPLOAD 服务一份预置"A2L 文件"（批次21 21-2；
     ///        FILE MTA 顺序读，越界回 ERR_ACCESS_DENIED；mode=0x01 时数据
     ///        内嵌在 GET_ID 响应里而非 UPLOAD 通路）
-    void ServeIdentificationFile(const Bytes& file,
-                                 std::uint8_t mode = 0x00U) {
+    void ServeIdentificationFile(const Bytes& file, std::uint8_t mode = 0x00U) {
         m_upload_file_ = file;
         m_ident_mode_ = mode;
         m_upload_pos_ = 0;
@@ -107,11 +106,13 @@ public:
                 return Res({0x15, 0xC0, m_max_cto_, 0x08, 0x00, 0x10, 0x10});
             case CommandCode::Disconnect:
                 return Res({});
-            case CommandCode::GetStatus:
+            case CommandCode::GetStatus: {
                 // byte1 = Current Session Status（bit6 DAQ_RUNNING，docs
                 // L2220）
-                return Res(
-                    {m_daq_running_ ? 0x40U : 0x00U, 0x00, 0x01, 0x07, 0x00});
+                const auto status_byte =
+                    static_cast<std::uint8_t>(m_daq_running_ ? 0x40U : 0x00U);
+                return Res({status_byte, 0x00, 0x01, 0x07, 0x00});
+            }
             case CommandCode::GetCommModeInfo:
                 return Res({0x00, 0x0E, 0x00, 0x04, 0x02, 0x08, 0x13});
             case CommandCode::GetDaqProcessorInfo:
@@ -881,7 +882,8 @@ TEST(XcpDaqDynamic, MisnumberedOrEmptySpecsRejectedBeforeWire) {
     EXPECT_EQ(rig.slave.Count(CommandCode::AllocDaq), 0);
 }
 
-TEST(XcpDaqDynamic, ExplicitProfileRejectsUnknownIdentificationHeaderBeforeFree) {
+TEST(XcpDaqDynamic,
+     ExplicitProfileRejectsUnknownIdentificationHeaderBeforeFree) {
     Rig rig;
     EnableDynamic(rig.slave);
     auto specs = MakeDynamicSpecs();
@@ -890,19 +892,24 @@ TEST(XcpDaqDynamic, ExplicitProfileRejectsUnknownIdentificationHeaderBeforeFree)
     EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
 }
 
-TEST(XcpDaqDynamic, ExplicitProfileKeepsTimestampOffWhileLegacyOverloadPreservesIt) {
+TEST(XcpDaqDynamic,
+     ExplicitProfileKeepsTimestampOffWhileLegacyOverloadPreservesIt) {
     {
         Rig rig;
         EnableDynamic(rig.slave);
         auto specs = MakeDynamicSpecs();
         rig.master->ConfigureDaqListsDynamic(specs);
         const auto sent = rig.transport->SentPackets();
-        const auto mode = std::find_if(sent.begin(), sent.end(), [](const Bytes& packet) {
-            return !packet.empty() && packet[0] ==
-                static_cast<std::uint8_t>(CommandCode::SetDaqListMode);
-        });
+        const auto mode =
+            std::find_if(sent.begin(), sent.end(), [](const Bytes& packet) {
+                return !packet.empty() &&
+                       packet[0] == static_cast<std::uint8_t>(
+                                        CommandCode::SetDaqListMode);
+            });
         ASSERT_NE(mode, sent.end());
-        EXPECT_NE((*mode)[1] & static_cast<std::uint8_t>(DaqListModeBit::kTimestamp), 0U);
+        EXPECT_NE(
+            (*mode)[1] & static_cast<std::uint8_t>(DaqListModeBit::kTimestamp),
+            0U);
     }
     {
         Rig rig;
@@ -911,12 +918,16 @@ TEST(XcpDaqDynamic, ExplicitProfileKeepsTimestampOffWhileLegacyOverloadPreserves
         for (auto& spec : specs) spec.timestamp = false;
         rig.master->ConfigureDaqListsDynamic(specs, 1U);
         const auto sent = rig.transport->SentPackets();
-        const auto mode = std::find_if(sent.begin(), sent.end(), [](const Bytes& packet) {
-            return !packet.empty() && packet[0] ==
-                static_cast<std::uint8_t>(CommandCode::SetDaqListMode);
-        });
+        const auto mode =
+            std::find_if(sent.begin(), sent.end(), [](const Bytes& packet) {
+                return !packet.empty() &&
+                       packet[0] == static_cast<std::uint8_t>(
+                                        CommandCode::SetDaqListMode);
+            });
         ASSERT_NE(mode, sent.end());
-        EXPECT_EQ((*mode)[1] & static_cast<std::uint8_t>(DaqListModeBit::kTimestamp), 0U);
+        EXPECT_EQ(
+            (*mode)[1] & static_cast<std::uint8_t>(DaqListModeBit::kTimestamp),
+            0U);
     }
 }
 
@@ -1026,7 +1037,8 @@ TEST(XcpDaqDynamic, StaticTimestampPrecheckUsesDeclaredWidthOnly) {
 
 // ---------------------------------------------------------------------------
 // 批次21 21-2：GET_ID(IDT_ASAM_UPLOAD=4) + UPLOAD 顺序分块的 A2L 上传编排
-// （XCPlite 实然方言：2 字节 CRO [FA][IDT]、4 字节 LE LENGTH、FILE MTA 纯顺序读）
+// （XCPlite 实然方言：2 字节 CRO [FA][IDT]、4 字节 LE LENGTH、FILE MTA
+// 纯顺序读）
 // ---------------------------------------------------------------------------
 
 Bytes MakeIdentFile() {

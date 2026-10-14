@@ -265,13 +265,26 @@ if(LIBXCP_BUILD_TOOLS)
   set_tests_properties(XcpMasterToolRejectsPollingIntervalInDaq
                        XcpMasterToolRejectsDaqProfileInPoll PROPERTIES WILL_FAIL TRUE)
 
-  add_executable(XcpMasterSymbolPolicyTest xcp_master_symbol_policy_test.cpp)
+  add_executable(XcpMasterSymbolPolicyTest
+          xcp_master_symbol_policy_test.cpp
+          xcp_master_calibration_policy_test.cpp
+          xcp_master_tui_model_test.cpp)
   target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
-  target_include_directories(XcpMasterSymbolPolicyTest PRIVATE ${PROJECT_SOURCE_DIR})
+  target_include_directories(XcpMasterSymbolPolicyTest PRIVATE
+          ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
   target_link_libraries(XcpMasterSymbolPolicyTest PRIVATE
-          libxcp::a2lbridge GTest::gtest GTest::gtest_main)
+          libxcp::a2lbridge GTest::gtest GTest::gtest_main Threads::Threads)
   if(MSVC)
     target_compile_options(XcpMasterSymbolPolicyTest PRIVATE /utf-8)
   endif()
   gtest_discover_tests(XcpMasterSymbolPolicyTest DISCOVERY_TIMEOUT 60)
 endif()
+
+# Boost.Locale-backed A2L log timestamp compatibility test.
+add_executable(A2lLogTimestampTest a2l_log_timestamp_test.cpp)
+target_compile_features(A2lLogTimestampTest PRIVATE cxx_std_20)
+target_include_directories(A2lLogTimestampTest PRIVATE
+        ${PROJECT_SOURCE_DIR}/thirdparty/a2l-sdk/src)
+target_link_libraries(A2lLogTimestampTest PRIVATE
+        a2l Boost::locale GTest::gtest GTest::gtest_main)
+gtest_discover_tests(A2lLogTimestampTest DISCOVERY_TIMEOUT 60)

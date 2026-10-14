@@ -1,6 +1,6 @@
-# XCP Master CLI Tool
+# XCP Master TUI Tool
 
-`xcp_master` is a standalone C++20 command-line tool for browsing an A2L database and connecting to an explicitly supplied XCP-on-UDP slave. It does not launch or depend on XCPlite `cpp_demo` and does not reuse source code from `examples/`.
+`xcp_master` is a standalone C++20 terminal UI tool targeting Windows, Linux, and macOS. It browses an A2L database and connects to an explicitly supplied XCP-on-UDP slave. Its display panel and command input are separated; asynchronous polling/DAQ output is routed to the UI rather than printed over active input. It does not launch or depend on XCPlite `cpp_demo` and does not reuse source code from `examples/`. Full platform builds still depend on a Boost/A2L toolchain whose C++ ABI matches the compiler.
 
 ## Build
 
@@ -10,7 +10,7 @@ cmake --build build --config Release --target xcp_master
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-Disable the tool with `-DLIBXCP_BUILD_TOOLS=OFF` (the default). This option is independent of `LIBXCP_BUILD_EXAMPLES` and does not enable XCPlite. The A2L bridge runtime library is copied beside the executable by the tool target.
+Disable the tool with `-DLIBXCP_BUILD_TOOLS=OFF` (the default). This option is independent of `LIBXCP_BUILD_EXAMPLES` and does not enable XCPlite. When tools are enabled, CMake fetches FTXUI v7.0.3 at a pinned commit using FetchContent; it is not a submodule and is not stored in `thirdparty/`. For offline builds, set CMake's standard `FETCHCONTENT_SOURCE_DIR_FTXUI` override to a matching local checkout. The A2L bridge runtime library is copied beside the executable by the tool target. The project-owned `thirdparty/a2l-sdk` integration explicitly links Boost.Locale and uses it for A2L log timestamps; provide a Boost package built for the same compiler ABI.
 
 ## Run
 
@@ -28,15 +28,16 @@ Required arguments are the local A2L file, slave IPv4 address and UDP port. `--m
 - `info <module::name>`: show symbol metadata, fixed/default/available event lists, and conservative read/write support status.
 - `add <module::name>` / `remove <module::name>`: manage the selected observation set.
 - `read <module::name>`: read once and convert to a physical value.
-- In poll mode, `watch` reads selected symbols immediately and then polls at the requested target interval. Results append as timestamped lines; actual cycle time depends on ECU response time and number of selected symbols. This is not a hard real-time frequency guarantee.
+- In poll mode, `watch` reads selected symbols immediately and then polls at the requested target interval. The observation view keeps one latest timestamped value/status row per selected symbol; stopping preserves those rows and marks them stopped. Actual cycle time depends on ECU response time and number of selected symbols. This is not a hard real-time frequency guarantee.
 - In DAQ mode, `watch` uses Slave event-driven DTOs; no polling interval is applied. Only scalar `MEASUREMENT` symbols with exactly one distinct A2L `FIXED_EVENT_LIST` event are eligible. Event ID 0 is valid; DEFAULT/AVAILABLE lists are never substituted. The `generic` profile supports only the validated, timestamp-free standard Absolute-PID layout, FREE address-extension mode, and one DAQ list. The explicitly selected `xcplite` profile is a separate vendor compatibility path; it validates runtime processor/resolution/event facts and does not imply generic support.
 - Before each DAQ configuration, the tool performs local layout and capability checks. It then warns that `FREE_DAQ` clears the Slave's entire dynamic DAQ table and requires a fresh `y` confirmation. Refusal sends no destructive configuration command. Existing Slave DAQ configuration is not restored after Stop.
 - During DAQ, `read`, `write`, `add`, and `remove` are refused; stop first. After DAQ stops, manual reads and the normal confirmed write/read-back flow are available again.
 - `stop` then Enter: stop the active polling or DAQ session. Polling waits for any in-flight XCP command to return or time out.
 - `write <module::name> <physical-value>`: request a scalar CHARACTERISTIC/VALUE write. The tool displays current and target values and asks for explicit confirmation; it then writes and reads back.
+- `find [pattern]`: search scalar `CHARACTERISTIC/VALUE` calibration items in the separate calibration view. The view also shows read-only/unsupported candidates and their policy reason; selecting an item does not access the ECU.
 - `help`, `quit`.
 
-The interface is a normal text command loop, not a split-pane TUI. Asynchronous watch results may appear among terminal input; Enter submits commands. Master commands are serialized on the single XCP connection, and DAQ callbacks enqueue output without printing on the DTO worker.
+The upper display panel switches among observation values, calibration, command results, and logs (press F2 to cycle, or use the view menu); the command input remains fixed below. Use ↑/↓ while the command input is focused to browse up to 200 submitted commands; moving down past the newest entry restores the draft that was present before browsing. F5 requests stop; Esc returns focus to the command input. In the calibration view, use the search field, select a scalar item, enter a physical target, then explicitly request read or write. Every write follows the same conservative validation, pre-read, default-cancel confirmation, write, and read-back path as the `write` command. During confirmation, only `Y/y` confirms; `N/n` or `Esc` cancels, F5 cancels and requests stop, and other input is swallowed so it cannot reach the command field. Ordinary commands are not queued while another is running; `stop` and `quit` are prioritized as control requests. Asynchronous watch results update the display without overwriting command input. Observation, command-result, and log views retain at most the latest 512 lines each. The UI requires an interactive terminal.
 
 ## Safety and capability limits
 
