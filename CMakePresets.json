@@ -1,0 +1,48 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "Cmake config(Release)",
+      "displayName": "libxcp Configure Ninja(Release)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LIBXCP_BUILD_TESTS": "OFF",
+        "LIBXCP_BUILD_TOOLS":"ON",
+        "Boost_USE_STATIC_LIBS":"ON",
+        "LIBXCP_BUILD_EXAMPLES":"ON"
+      }
+    },
+    {
+      "name": "Cmake config(Debug)",
+      "displayName": "libxcp Configure Ninja(Debug)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LIBXCP_BUILD_TESTS": "OFF",
+        "LIBXCP_BUILD_TOOLS":"ON",
+        "Boost_USE_STATIC_LIBS": "ON",
+        "LIBXCP_BUILD_EXAMPLES":"ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "clangd",
+      "displayName": "Build libxcp core",
+      "configurePreset": "Cmake config(Release)",
+      "targets": [
+        "libxcp"
+      ]
+    }
+  ]
+}

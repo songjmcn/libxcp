@@ -292,13 +292,11 @@ TEST_F(A2lGoldenTest, MeasurementDaqEventListsArePreservedPerSymbol) {
 
     const auto plus = b->Database()->Find("PLUS_PREF");
     ASSERT_TRUE(plus.HasValue()) << plus.ErrorInfo().message;
-    EXPECT_EQ(plus.Value().daq_event_fixed,
-              (std::vector<std::uint16_t>{5, 6}));
+    EXPECT_EQ(plus.Value().daq_event_fixed, (std::vector<std::uint16_t>{5, 6}));
 
     const auto plain = b->Database()->Find("PLAIN_FALLBACK");
     ASSERT_TRUE(plain.HasValue()) << plain.ErrorInfo().message;
-    EXPECT_EQ(plain.Value().daq_event_fixed,
-              (std::vector<std::uint16_t>{7}));
+    EXPECT_EQ(plain.Value().daq_event_fixed, (std::vector<std::uint16_t>{7}));
 }
 
 TEST_F(A2lGoldenTest, MalformedButLegalVariantsParse) {
@@ -1179,6 +1177,7 @@ TEST_F(A2lGoldenTest, StructLeafRealCorpusFourForms) {
         std::uint8_t esz;      ///< 期望元素宽（B-3 可证值）
         std::uint8_t rw;       ///< 期望读写位（随 INSTANCE 声明，见下注）
         std::uint64_t extent;  ///< 数组成员元素数（0 = 标量叶子无 dims）
+        bool characteristic = false;  ///< TYPEDEF_CHARACTERISTIC叶子
     };
     static constexpr LeafExpect kLeaves[] = {
         // 形态 1：结构标量成员
@@ -1207,14 +1206,20 @@ TEST_F(A2lGoldenTest, StructLeafRealCorpusFourForms) {
         // 关键词，
         // CalSeg 实例走分段相对寻址故缺省只读——物理可写性由批次17 裸地址
         // 写通路实证，A2L 元数据层不伪造读写位）
-        {"kDefaultCalParams.cal_factor", 0x80010000, 0, 2, 0, 0},
-        {"kDefaultCalParams.cal_offset", 0x80010004, 0, 4, 0, 0},
+        {"kDefaultCalParams.cal_factor", 0x80010000, 0, 2, 0, 0, true},
+        {"kDefaultCalParams.cal_offset", 0x80010004, 0, 4, 0, 0, true},
     };
     for (const auto& e : kLeaves) {
         const std::string key = std::string("xcp_test_slave::") + e.path;
         auto r = db->Find(key);
         ASSERT_TRUE(r.HasValue()) << key << ": " << r.ErrorInfo().message;
-        EXPECT_EQ(r.Value().kind, SymbolKind::Measurement) << key;
+        EXPECT_EQ(r.Value().kind, e.characteristic ? SymbolKind::Characteristic
+                                                   : SymbolKind::Measurement)
+            << key;
+        if (e.characteristic) {
+            EXPECT_EQ(r.Value().characteristic_type, CharacteristicType::Value)
+                << key;
+        }
         EXPECT_EQ(r.Value().xcp_address, e.addr) << key;
         EXPECT_EQ(static_cast<unsigned>(r.Value().address_extension),
                   static_cast<unsigned>(e.ext))
@@ -1270,6 +1275,95 @@ TEST_F(A2lGoldenTest, StructLeafRealCorpusFourForms) {
     EXPECT_EQ(bad.ErrorInfo().phase, Phase::Conversion);
     EXPECT_NE(bad.ErrorInfo().message.find("只读"), std::string::npos)
         << bad.ErrorInfo().message;
+}
+
+TEST_F(A2lGoldenTest, CppDemoV201TypedInstancesAndMemoryPages) {
+    auto bridge = LoadOk(Data("cpp_demo_V201_corrected.a2l"));
+    ASSERT_NE(bridge, nullptr);
+    const IA2lDatabase* db = bridge->Database();
+    ASSERT_NE(db, nullptr);
+    EXPECT_TRUE(bridge->ListLoadWarnings().empty());
+
+    const std::string counter_key = "cpp_demo::kParameters.counter_max";
+    auto counter = db->Find(counter_key);
+    ASSERT_TRUE(counter.HasValue()) << counter.ErrorInfo().message;
+    EXPECT_EQ(counter.Value().kind, SymbolKind::Characteristic);
+    EXPECT_EQ(counter.Value().characteristic_type, CharacteristicType::Value);
+    EXPECT_TRUE(counter.Value().read_write);
+    ASSERT_TRUE(counter.Value().memory_segment.has_value());
+    EXPECT_EQ(counter.Value().memory_segment->name, "kParameters");
+    EXPECT_EQ(counter.Value().memory_segment->segment_number, 1u);
+    ASSERT_EQ(counter.Value().memory_segment->pages.size(), 2u);
+    EXPECT_EQ(counter.Value().memory_segment->pages[0].number, 0u);
+    EXPECT_EQ(counter.Value().memory_segment->pages[0].xcp_write_access,
+              XcpPageWriteAccess::DontCare);
+    EXPECT_EQ(counter.Value().memory_segment->pages[1].number, 1u);
+    EXPECT_EQ(counter.Value().memory_segment->pages[1].xcp_write_access,
+              XcpPageWriteAccess::NotAllowed);
+
+    const std::string curve_key = "cpp_demo::SigGen1.lookup.values";
+    auto curve = db->Find(curve_key);
+    ASSERT_TRUE(curve.HasValue()) << curve.ErrorInfo().message;
+    EXPECT_EQ(curve.Value().kind, SymbolKind::Characteristic);
+    EXPECT_EQ(curve.Value().characteristic_type, CharacteristicType::Curve);
+    EXPECT_EQ(curve.Value().xcp_address, 0x80020020u);
+    EXPECT_EQ(curve.Value().element_size_bytes, 4u);
+    ASSERT_EQ(curve.Value().dimensions.size(), 1u);
+    EXPECT_EQ(curve.Value().dimensions[0].extent, 11u);
+    EXPECT_EQ(curve.Value().dimensions[0].byte_stride, 4u);
+    ASSERT_TRUE(curve.Value().fixed_curve_axis.has_value());
+    EXPECT_DOUBLE_EQ(curve.Value().fixed_curve_axis->offset, 0.0);
+    EXPECT_DOUBLE_EQ(curve.Value().fixed_curve_axis->distance, 1.0);
+    EXPECT_EQ(curve.Value().fixed_curve_axis->point_count, 11u);
+    ASSERT_TRUE(curve.Value().memory_segment.has_value());
+    EXPECT_EQ(curve.Value().memory_segment->segment_number, 2u);
+    auto curve_size = db->ByteSizeOf(curve_key);
+    ASSERT_TRUE(curve_size.HasValue()) << curve_size.ErrorInfo().message;
+    EXPECT_EQ(curve_size.Value(), 44u);
+
+    // F32 little-endian raw 1.5 可按固定轴CURVE点索引解码并单点往返。
+    const Bytes raw_float{0x00, 0x00, 0xC0, 0x3F};
+    auto decoded = db->ToPhysicalElement(curve_key, 7, BytesView(raw_float));
+    ASSERT_TRUE(decoded.HasValue()) << decoded.ErrorInfo().message;
+    ASSERT_TRUE(std::holds_alternative<double>(decoded.Value()))
+        << "PhysicalValue variant index=" << decoded.Value().index();
+    EXPECT_DOUBLE_EQ(std::get<double>(decoded.Value()), 1.5);
+    auto encoded = db->FromPhysicalElement(curve_key, 7, PhysicalValue{0.5});
+    ASSERT_TRUE(encoded.HasValue()) << encoded.ErrorInfo().message;
+    EXPECT_EQ(encoded.Value().size(), 4u);
+    auto round_trip =
+        db->ToPhysicalElement(curve_key, 7, BytesView(encoded.Value()));
+    ASSERT_TRUE(round_trip.HasValue()) << round_trip.ErrorInfo().message;
+    EXPECT_DOUBLE_EQ(std::get<double>(round_trip.Value()), 0.5);
+    auto invalid_curve_index =
+        db->ToPhysicalElement(curve_key, 11, BytesView(raw_float));
+    ASSERT_FALSE(invalid_curve_index.HasValue());
+    EXPECT_EQ(invalid_curve_index.ErrorInfo().code, ErrorCode::BadArgument);
+    auto whole_curve_write = db->FromPhysical(curve_key, PhysicalValue{0.5});
+    ASSERT_FALSE(whole_curve_write.HasValue());
+    EXPECT_EQ(whole_curve_write.ErrorInfo().code,
+              ErrorCode::UnsupportedOperation);
+
+    // MEASUREMENT数组只开放元素读取；整体写入及标定写入API均拒绝。
+    const std::string histogram_key = "cpp_demo::loop_histogram";
+    auto histogram = db->Find(histogram_key);
+    ASSERT_TRUE(histogram.HasValue()) << histogram.ErrorInfo().message;
+    EXPECT_EQ(histogram.Value().kind, SymbolKind::Measurement);
+    ASSERT_EQ(histogram.Value().dimensions.size(), 1u);
+    EXPECT_EQ(histogram.Value().dimensions[0].extent, 128u);
+    auto histogram_size = db->ByteSizeOf(histogram_key);
+    ASSERT_TRUE(histogram_size.HasValue())
+        << histogram_size.ErrorInfo().message;
+    EXPECT_EQ(histogram_size.Value(), 512u);
+    const Bytes raw_count{42, 0, 0, 0};
+    auto count =
+        db->ToPhysicalElement(histogram_key, 127, BytesView(raw_count));
+    ASSERT_TRUE(count.HasValue()) << count.ErrorInfo().message;
+    EXPECT_EQ(std::get<std::int64_t>(count.Value()), 42);
+    auto array_write = db->FromPhysicalElement(
+        histogram_key, 0, PhysicalValue{std::uint64_t{42}});
+    ASSERT_FALSE(array_write.HasValue());
+    EXPECT_EQ(array_write.ErrorInfo().code, ErrorCode::UnsupportedOperation);
 }
 
 TEST_F(A2lGoldenTest, StructLeafBrokenCorpusWarnsEveryRejection) {

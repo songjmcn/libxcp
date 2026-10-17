@@ -9,8 +9,8 @@
  *   2. `ToPhysical(name, raw)` → `MeasurementValue`（a2l::PhysicalValue → core 值）。
  * 物理换算、地址/宽度探测全部委托给桥接库，本类**不实现任何换算 / AG 逻辑**。
  *
- * 依赖方向：适配器 `.cpp` 仅包含核心 `<libxcp/measurement/*.hpp>` 与桥接层
- * `<libxcp/a2l/ia2l_database.hpp>`；核心**绝不**包含 `<libxcp/a2l/*>`。
+ * 依赖方向：适配器 `.cpp` 仅包含核心 `<libxcp/measurement/.hpp>` 与桥接层
+ * `<libxcp/a2l/ia2l_database.hpp>`；核心**绝不**包含 `<libxcp/a2l/>`。
  * A2lIsolation 门禁（tests/a2l_isolation_check.cmake）据此保证 S1/S2 0 命中。
  */
 

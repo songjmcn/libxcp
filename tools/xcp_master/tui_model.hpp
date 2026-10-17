@@ -4,6 +4,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -58,6 +59,19 @@ private:
  * @brief 按符号名保留最新观测值，避免周期更新无限追加重复行。
  * @details 多线程共享时，调用方必须在外部同步所有访问。
  */
+struct ObservationSnapshot {
+    std::string value;     /**< 最近成功取得的物理值文本。 */
+    std::string status;    /**< 最新读取来源或错误状态。 */
+    std::string timestamp; /**< 最近一次样本时间。 */
+    bool has_value{false}; /**< 是否曾取得可显示的物理值。 */
+    bool stale{false};     /**< 最近操作失败，当前值是旧值。 */
+    bool stopped{false};   /**< 采样已停止；旧值仍可查看。 */
+};
+
+/**
+ * @brief 按符号名保留最新观测快照，供变量预览和详情弹窗查询。
+ * @details 多线程共享时，调用方必须在外部同步所有访问。
+ */
 class LatestObservationModel {
 public:
     /**
@@ -68,24 +82,96 @@ public:
         : capacity_(capacity) {}
 
     /**
-     * @brief 新增或替换某一符号的显示行。
+     * @brief 新增或替换某一符号的兼容显示行。
      * @param key 符号规范名。
      * @param line 包含最新值和状态的显示文本。
      */
     void Update(std::string key, std::string line) {
-        const auto found = std::find(keys_.begin(), keys_.end(), key);
-        if (found != keys_.end()) {
-            lines_[static_cast<std::size_t>(found - keys_.begin())] =
-                std::move(line);
+        const auto index = FindIndex(key);
+        if (index.has_value()) {
+            lines_[*index] = std::move(line);
+            samples_[*index] = {lines_[*index], "", "", true, false, false};
             return;
         }
-        if (capacity_ == 0U || key.empty()) return;
-        if (keys_.size() == capacity_) {
-            keys_.erase(keys_.begin());
-            lines_.erase(lines_.begin());
-        }
+        if (!CanInsert(key)) return;
         keys_.push_back(std::move(key));
+        samples_.push_back({line, "", "", true, false, false});
         lines_.push_back(std::move(line));
+    }
+
+    /**
+     * @brief 保存一次成功读取的物理值并清除旧值/停止标记。
+     * @param key 符号规范名。
+     * @param value 按 A2L 单位格式化的物理值。
+     * @param status 来源状态，例如 DAQ、POLL 或手动读取。
+     * @param timestamp 本地显示时间；可为空。
+     */
+    void UpdateValue(std::string key, std::string value, std::string status,
+                     std::string timestamp = {}) {
+        const auto index = FindIndex(key);
+        ObservationSnapshot sample{std::move(value),
+                                   std::move(status),
+                                   std::move(timestamp),
+                                   true,
+                                   false,
+                                   false};
+        if (index.has_value()) {
+            samples_[*index] = std::move(sample);
+            lines_[*index] = FormatLine(key, samples_[*index]);
+            return;
+        }
+        if (!CanInsert(key)) return;
+        keys_.push_back(std::move(key));
+        lines_.push_back(FormatLine(keys_.back(), sample));
+        samples_.push_back(std::move(sample));
+    }
+
+    /**
+     * @brief 标记最近读取失败；保留上次值并明确标为旧值。
+     * @param key 符号规范名。
+     * @param status 失败原因或状态。
+     * @param timestamp 失败发生时间；可为空。
+     */
+    void MarkFailure(std::string key, std::string status,
+                     std::string timestamp = {}) {
+        const auto index = FindIndex(key);
+        ObservationSnapshot sample;
+        if (index.has_value()) sample = samples_[*index];
+        sample.status = std::move(status);
+        sample.timestamp = std::move(timestamp);
+        sample.stale = sample.has_value;
+        sample.stopped = false;
+        if (index.has_value()) {
+            samples_[*index] = std::move(sample);
+            lines_[*index] = FormatLine(key, samples_[*index]);
+            return;
+        }
+        if (!CanInsert(key)) return;
+        keys_.push_back(std::move(key));
+        lines_.push_back(FormatLine(keys_.back(), sample));
+        samples_.push_back(std::move(sample));
+    }
+
+    /**
+     * @brief 标记变量已加入采样且等待新样本，保留已有物理值。
+     * @param key 符号规范名。
+     */
+    void MarkPending(std::string key) {
+        const auto index = FindIndex(key);
+        ObservationSnapshot sample;
+        if (index.has_value()) sample = samples_[*index];
+        sample.status = "等待新样本";
+        sample.stale = sample.has_value;
+        sample.stopped = false;
+        if (index.has_value()) {
+            samples_[*index] = std::move(sample);
+            lines_[*index] = FormatLine(key, samples_[*index]);
+            return;
+        }
+        if (!CanInsert(key)) return;
+        keys_.push_back(std::move(key));
+        lines_.push_back(FormatLine(keys_.back(), sample));
+        samples_.push_back(std::move(sample));
     }
 
     /**
@@ -99,15 +185,41 @@ public:
         if (found == keys_.end()) return;
         const auto index = static_cast<std::size_t>(found - keys_.begin());
         keys_.erase(found);
+        samples_.erase(samples_.begin() + static_cast<std::ptrdiff_t>(index));
         lines_.erase(lines_.begin() + static_cast<std::ptrdiff_t>(index));
     }
 
-    /** @brief 将现有行标记为采集已停止，不清除最后观测值。 */
+    /**
+     * @brief 将单个样本标记为停止，不清除最后物理值。
+     * @param key 符号规范名。
+     */
+    void MarkStopped(std::string_view key) {
+        const auto index = FindIndex(key);
+        if (!index.has_value()) return;
+        samples_[*index].stopped = true;
+        lines_[*index] = FormatLine(keys_[*index], samples_[*index]);
+    }
+
+    /** @brief 将全部样本标记为停止，不清除最后物理值。 */
     void MarkAllStopped() {
-        constexpr std::string_view kStoppedSuffix = " | 已停止";
-        for (auto& line : lines_) {
-            if (!line.ends_with(kStoppedSuffix)) line += kStoppedSuffix;
+        for (std::size_t index = 0; index < samples_.size(); ++index) {
+            samples_[index].stopped = true;
+            lines_[index] = FormatLine(keys_[index], samples_[index]);
         }
+    }
+
+    /**
+     * @brief 查找某个符号的最新快照。
+     * @param key 符号规范名。
+     * @return 样本副本；从未见过时为空。
+     */
+    [[nodiscard]] std::optional<ObservationSnapshot> Find(
+        std::string_view key) const {
+        const auto found = std::find_if(
+            keys_.begin(), keys_.end(),
+            [key](const std::string& current) { return current == key; });
+        if (found == keys_.end()) return std::nullopt;
+        return samples_[static_cast<std::size_t>(found - keys_.begin())];
     }
 
     /**
@@ -118,16 +230,73 @@ public:
         return lines_;
     }
 
-    /**
-     * @brief 返回当前唯一观测变量数量。
-     * @return 当前行数。
-     */
+    /** @brief 返回当前唯一观测变量数量。 */
     [[nodiscard]] std::size_t Size() const noexcept { return lines_.size(); }
 
 private:
-    std::size_t capacity_;           /**< 唯一符号数量上限。 */
-    std::vector<std::string> keys_;  /**< 与显示行一一对应的规范名。 */
-    std::vector<std::string> lines_; /**< 每个符号最新的状态和值。 */
+    /** @brief 查找键对应索引；未找到时返回空。 */
+    [[nodiscard]] std::optional<std::size_t> FindIndex(
+        std::string_view key) const {
+        const auto found = std::find_if(
+            keys_.begin(), keys_.end(),
+            [key](const std::string& current) { return current == key; });
+        if (found == keys_.end()) return std::nullopt;
+        return static_cast<std::size_t>(found - keys_.begin());
+    }
+
+    /** @brief 判断能否插入新键；超限时同步淘汰最旧样本。 */
+    bool CanInsert(const std::string& key) {
+        if (capacity_ == 0U || key.empty()) return false;
+        if (keys_.size() == capacity_) {
+            keys_.erase(keys_.begin());
+            samples_.erase(samples_.begin());
+            lines_.erase(lines_.begin());
+        }
+        return true;
+    }
+
+    /** @brief 统一生成包含时间、状态、旧值和停止标记的显示行。 */
+    [[nodiscard]] static std::string FormatLine(
+        const std::string& key, const ObservationSnapshot& sample) {
+        std::string line;
+        if (!sample.timestamp.empty()) line = sample.timestamp + " ";
+        line += key;
+        if (sample.has_value)
+            line += " = " + sample.value;
+        else
+            line += " | " + (sample.status.empty() ? "未读取" : sample.status);
+        if (sample.has_value && !sample.status.empty())
+            line += " | " + sample.status;
+        if (sample.stale && sample.has_value) line += "（旧值）";
+        if (sample.stopped) line += " | 已停止";
+        return line;
+    }
+
+    std::size_t capacity_;                     /**< 唯一符号数量上限。 */
+    std::vector<std::string> keys_;            /**< 样本对应的规范名。 */
+    std::vector<ObservationSnapshot> samples_; /**< 保留的物理值和状态。 */
+    std::vector<std::string> lines_;           /**< 与样本同步的显示行。 */
+};
+
+/**
+ * @brief 为异步搜索输入提供轻量代际，阻止旧结果覆盖较新的编辑草稿。
+ * @details 该模型只由 UI 线程读写；后台搜索将捕获值带回 UI 线程比较。
+ */
+class SearchInputRevision {
+public:
+    /** @brief 用户编辑搜索输入时递增代际。 */
+    void MarkEdited() { ++revision_; }
+
+    /** @brief 获取提交搜索时应随请求保存的代际。 */
+    [[nodiscard]] std::uint64_t Capture() const { return revision_; }
+
+    /** @brief 判断完成的搜索是否仍对应当前输入草稿。 */
+    [[nodiscard]] bool Matches(std::uint64_t revision) const {
+        return revision_ == revision;
+    }
+
+private:
+    std::uint64_t revision_{0}; /**< 搜索输入编辑代际。 */
 };
 
 /**
@@ -169,6 +338,19 @@ public:
     }
 
     /**
+     * @brief 仅在命令成功入队后记录历史并清空输入草稿。
+     * @param draft 输入框当前文本。
+     * @param accepted 命令队列是否接受本次提交。
+     * @return 已提交并清空草稿时返回 true；拒绝时原样保留。
+     */
+    [[nodiscard]] bool Commit(std::string& draft, bool accepted) {
+        if (!accepted) return false;
+        Add(draft);
+        draft.clear();
+        return true;
+    }
+
+    /**
      * @brief 返回上一条命令；首次向上时保存当前编辑草稿。
      * @param current 当前输入框文本。
      * @return 历史命令；历史为空时返回空。
@@ -199,48 +381,409 @@ private:
     std::string draft_;                 /**< 开始历史浏览时保存的输入草稿。 */
 };
 
+/** @brief 按视图维护独立的显示窗口，历史浏览不因追加行自动跳回底部。 */
+class PanelViewport {
+public:
+    /** @brief 默认面板页高；运行时会按终端尺寸更新。 */
+    static constexpr std::size_t kPageSize = 18;
+
+    /**
+     * @brief 创建指定数量的视图窗口。
+     * @param views 独立滚动视图数量。
+     * @param page_size 初始每页行数。
+     */
+    explicit PanelViewport(std::size_t views, std::size_t page_size = kPageSize)
+        : positions_(views), page_size_(std::max<std::size_t>(1U, page_size)) {}
+
+    /** @brief 更新每页行数并夹紧所有滚动位置。 */
+    void SetPageSize(std::size_t page_size) {
+        page_size_ = std::max<std::size_t>(1U, page_size);
+        for (auto& position : positions_)
+            if (!position.follow)
+                position.first = std::min(position.first, page_size_);
+    }
+
+    /** @brief 返回当前每页行数。 */
+    [[nodiscard]] std::size_t PageSize() const noexcept { return page_size_; }
+
+    /** @brief 获取窗口起点，截断被缩短的结果集合。 */
+    [[nodiscard]] std::size_t Start(std::size_t view, std::size_t total) const {
+        if (view >= positions_.size()) return 0;
+        const auto maximum = total > page_size_ ? total - page_size_ : 0U;
+        return positions_[view].follow
+                   ? maximum
+                   : std::min(positions_[view].first, maximum);
+    }
+
+    /** @brief 向更旧的行移动一屏。 */
+    void PageUp(std::size_t view, std::size_t total) {
+        if (view >= positions_.size()) return;
+        const auto start = Start(view, total);
+        positions_[view] = {start > page_size_ ? start - page_size_ : 0U,
+                            false};
+    }
+
+    /** @brief 向更新的行移动一屏，到达尾部后重新跟随新增行。 */
+    void PageDown(std::size_t view, std::size_t total) {
+        if (view >= positions_.size()) return;
+        const auto maximum = total > page_size_ ? total - page_size_ : 0U;
+        const auto start = Start(view, total);
+        const auto next = std::min(maximum, start + page_size_);
+        positions_[view] = {next, next == maximum};
+    }
+
+    /** @brief 新结果快照从第一行开始浏览。 */
+    void ResetToTop(std::size_t view) {
+        if (view < positions_.size()) positions_[view] = {0U, false};
+    }
+
+    /** @brief 返回普通结果面板时恢复跟随其最新行。 */
+    void FollowBottom(std::size_t view) {
+        if (view < positions_.size()) positions_[view] = {};
+    }
+
+    /** @brief 有界行缓冲淘汰最旧一行时保持历史窗口可见位置。 */
+    void EvictFront(std::size_t view) {
+        if (view < positions_.size() && !positions_[view].follow &&
+            positions_[view].first > 0U)
+            --positions_[view].first;
+    }
+
+private:
+    /** @brief 每个视图独立的浏览位置和是否跟随末尾。 */
+    struct Position {
+        std::size_t first{0}; /**< 历史窗口首行索引。 */
+        bool follow{true};    /**< 当前窗口跟随最新行。 */
+    };
+    std::vector<Position> positions_; /**< 各视图的滚动位置。 */
+    std::size_t page_size_;           /**< 当前终端尺寸对应的页高。 */
+};
+
+/** @brief 当前终端尺寸对应的固定层/弹窗尺寸规划。 */
+struct TuiLayoutMetrics {
+    static constexpr int kMinimumWidth = 80;  /**< 可用终端最小列数。 */
+    static constexpr int kMinimumHeight = 24; /**< 可用终端最小行数。 */
+
+    int width{};                  /**< 终端列数。 */
+    int height{};                 /**< 终端行数。 */
+    std::size_t panel_rows{1U};   /**< 结果/日志主面板页高。 */
+    std::size_t preview_rows{1U}; /**< 变量预览表格页高。 */
+    int modal_width{1};           /**< 弹窗最大宽度。 */
+    int modal_height{1};          /**< 弹窗最大高度。 */
+    bool compact{true};           /**< 是否采用窄屏单行样式。 */
+    bool too_small{true};         /**< 是否低于最低可用尺寸。 */
+};
+
+/**
+ * @brief 按窗口尺寸计算页高、响应式模式和弹窗边界。
+ * @param width 当前终端列数。
+ * @param height 当前终端行数。
+ * @return 所有行列值均为正数的布局快照。
+ */
+[[nodiscard]] inline TuiLayoutMetrics CalculateTuiLayout(int width,
+                                                         int height) noexcept {
+    TuiLayoutMetrics layout;
+    layout.width = std::max(0, width);
+    layout.height = std::max(0, height);
+    layout.compact = layout.width < 100;
+    layout.too_small = layout.width < TuiLayoutMetrics::kMinimumWidth ||
+                       layout.height < TuiLayoutMetrics::kMinimumHeight;
+
+    // 双行状态、页签、分隔线、命令栏和提示栏占 7 行，外框占 2 行；
+    // 结果/日志再留一行显示分页位置，预览区则留搜索与状态两行。
+    layout.panel_rows =
+        static_cast<std::size_t>(std::max(1, layout.height - 10));
+    layout.preview_rows =
+        static_cast<std::size_t>(std::max(1, layout.height - 11));
+    layout.modal_width = std::max(1, std::min(88, layout.width - 8));
+    layout.modal_height = std::max(1, std::min(20, layout.height - 6));
+    return layout;
+}
+
+/** @brief 变量详情弹窗的当前交互页面。 */
+enum class VariableModalPage { Closed, Details, Confirmation };
+
+/** @brief 管理变量详情弹窗、写入确认和关闭时的稳定选择。 */
+class VariableModalState {
+public:
+    /**
+     * @brief 打开一个变量的详情页面。
+     * @param qualified_name A2L 规范名称。
+     * @param layout 当前尺寸规划。
+     * @return 尺寸可用且名称非空时成功。
+     */
+    bool Open(std::string qualified_name, const TuiLayoutMetrics& layout) {
+        if (layout.too_small || qualified_name.empty()) return false;
+        selected_name_ = std::move(qualified_name);
+        page_ = VariableModalPage::Details;
+        return true;
+    }
+
+    /**
+     * @brief 打开危险操作确认页面；只可从详情页对可写项调用。
+     * @param write_supported 当前符号是否满足写入资格。
+     * @param layout 当前尺寸规划。
+     * @return 允许时进入确认页面。
+     */
+    bool BeginConfirmation(bool write_supported,
+                           const TuiLayoutMetrics& layout) {
+        if (page_ != VariableModalPage::Details || !write_supported ||
+            layout.too_small)
+            return false;
+        page_ = VariableModalPage::Confirmation;
+        return true;
+    }
+
+    /**
+     * @brief 从普通命令打开通用危险操作确认页面。
+     * @param layout 当前尺寸规划。
+     * @return 尺寸可用时进入确认页面。
+     */
+    bool OpenCommandConfirmation(const TuiLayoutMetrics& layout) {
+        if (page_ != VariableModalPage::Closed || layout.too_small)
+            return false;
+        selected_name_.clear();
+        page_ = VariableModalPage::Confirmation;
+        return true;
+    }
+
+    /** @brief 取消确认后回到同一个变量详情。 */
+    void CancelConfirmation() {
+        if (page_ == VariableModalPage::Confirmation)
+            page_ = VariableModalPage::Details;
+    }
+
+    /** @brief 确认请求结束后恢复详情页，以显示结果。 */
+    void CompleteConfirmation() { CancelConfirmation(); }
+
+    /** @brief 关闭弹窗；列表过滤、行选择和滚动由调用方保留。 */
+    void Close() {
+        page_ = VariableModalPage::Closed;
+        selected_name_.clear();
+    }
+
+    /** @brief 弹窗是否显示。 */
+    [[nodiscard]] bool IsOpen() const noexcept {
+        return page_ != VariableModalPage::Closed;
+    }
+
+    /** @brief 弹窗打开时锁定背景变量列表，延迟异步搜索结果应用。 */
+    [[nodiscard]] bool BlocksBackgroundListUpdates() const noexcept {
+        return IsOpen();
+    }
+
+    /** @brief 弹窗当前页面。 */
+    [[nodiscard]] VariableModalPage Page() const noexcept { return page_; }
+
+    /** @brief 弹窗绑定的符号规范名。 */
+    [[nodiscard]] const std::string& SelectedName() const noexcept {
+        return selected_name_;
+    }
+
+private:
+    VariableModalPage page_{VariableModalPage::Closed}; /**< 当前弹窗页。 */
+    std::string selected_name_; /**< 打开时快照，关闭时清空。 */
+};
+
+/** @brief 将异步标定结果绑定到具体选择，防止旧结果污染新表单。 */
+class CalibrationSelection {
+public:
+    /** @brief 选择快照，供后台读写命令和结果回填使用。 */
+    struct Snapshot {
+        std::string name;         /**< 规范符号名。 */
+        std::uint64_t revision{}; /**< 选择变化代际。 */
+    };
+
+    /** @brief 选中另一变量或清空选择；只有变化才递增代际。 */
+    [[nodiscard]] bool Select(std::string name) {
+        if (name == name_) return false;
+        name_ = std::move(name);
+        ++revision_;
+        return true;
+    }
+
+    /** @brief 当前变量及代际的不可变快照。 */
+    [[nodiscard]] Snapshot Current() const { return {name_, revision_}; }
+
+    /** @brief 判断异步命令的快照仍与当前选择一致。 */
+    [[nodiscard]] bool Matches(const Snapshot& snapshot) const {
+        return !snapshot.name.empty() && snapshot.name == name_ &&
+               snapshot.revision == revision_;
+    }
+
+private:
+    std::string name_;         /**< 当前规范符号名。 */
+    std::uint64_t revision_{}; /**< 防止 A→B→A 的旧回填的代际。 */
+};
+
+/** @brief 标定表单的选择、草稿和值都绑定同一代际。 */
+class CalibrationFormModel {
+public:
+    std::string target;                           /**< 当前目标物理值草稿。 */
+    std::string current{"尚未读取"};              /**< 当前选择的最近回读值。 */
+    std::string status{"请选择变量并读取当前值"}; /**< 当前选择的提示。 */
+
+    /** @brief 切换选择时清除旧目标、回读和值状态；搜索更新可强制重置。 */
+    [[nodiscard]] bool Select(std::string name, bool force = false) {
+        if (force) static_cast<void>(selection_.Select({}));
+        if (!selection_.Select(name) && !force) return false;
+        target.clear();
+        current = "尚未读取";
+        status = name.empty() ? "没有匹配项" : "请选择变量并读取当前值";
+        return true;
+    }
+
+    /** @brief 获取当前选择的不可变快照。 */
+    [[nodiscard]] CalibrationSelection::Snapshot Snapshot() const {
+        return selection_.Current();
+    }
+
+    /** @brief 判断异步命令的快照仍属于当前表单。 */
+    [[nodiscard]] bool Matches(
+        const CalibrationSelection::Snapshot& snapshot) const {
+        return selection_.Matches(snapshot);
+    }
+
+    /** @brief 只应用属于当前选择代际的异步结果。 */
+    [[nodiscard]] bool Apply(
+        const CalibrationSelection::Snapshot& snapshot,
+        const std::string& new_status,
+        std::optional<std::string> new_current = std::nullopt) {
+        if (!Matches(snapshot)) return false;
+        if (new_current) current = std::move(*new_current);
+        status = new_status;
+        return true;
+    }
+
+private:
+    CalibrationSelection selection_; /**< 当前选择代际。 */
+};
+
 /**
  * @brief 在线程间传递单次危险操作的确认结果。
  * @details 每次 Begin 创建新的待确认周期；无明确接受结果或退出时默认取消。
  */
 class ConfirmationGate {
 public:
-    /** @brief 开始新的待确认周期并清除先前结果。 */
-    void Begin() {
-        std::lock_guard lock(mutex_);
-        answer_.reset();
-        pending_ = true;
-    }
+    /** @brief 单次确认的标识，旧标识不能批准新操作。 */
+    using Ticket = std::uint64_t;
 
     /**
-     * @brief 等待用户结果，退出请求可打断等待并按取消处理。
-     * @param stopping 工具退出标志。
-     * @return 仅明确接受且未被退出打断时返回 true。
+     * @brief 开始新的确认周期，使旧周期的许可失效。
+     * @return 本次操作的唯一标识。
      */
-    [[nodiscard]] bool Wait(const std::atomic<bool>& stopping) {
-        std::unique_lock lock(mutex_);
-        condition_.wait(lock, [this, &stopping] {
-            return answer_.has_value() || stopping.load();
-        });
-        pending_ = false;
-        return answer_.value_or(false);
-    }
-
-    /**
-     * @brief 提交当前周期的明确选择。
-     * @param accepted true 表示接受，false 表示取消。
-     */
-    void Resolve(bool accepted) {
+    [[nodiscard]] Ticket Begin() {
+        Ticket ticket;
         {
             std::lock_guard lock(mutex_);
-            if (!pending_) return;
-            answer_ = accepted;
+            ticket = ++ticket_;
+            answer_.reset();
+            consumed_ = false;
+            pending_ = true;
+        }
+        condition_.notify_all();  // 旧票据等待者立即结束，而不是等新周期回答。
+        return ticket;
+    }
+
+    /**
+     * @brief 等待本次选择；退出或取消优先于已收到的确认。
+     * @param ticket 本次操作标识。
+     * @param stopping 工具退出标志。
+     * @return 仅本次操作被明确接受且没有停止请求时返回 true。
+     */
+    [[nodiscard]] bool Wait(Ticket ticket, const std::atomic<bool>& stopping) {
+        std::unique_lock lock(mutex_);
+        condition_.wait(lock, [this, ticket, &stopping] {
+            return ticket != ticket_ || answer_.has_value() || stopping.load();
+        });
+        if (ticket != ticket_) return false;
+        pending_ = false;
+        return !stopping.load() && answer_.value_or(false);
+    }
+
+    /**
+     * @brief 提交本次明确选择；首次回答有效，取消允许撤销尚未执行的许可。
+     * @param ticket 本次操作标识。
+     * @param accepted true 表示接受，false 表示取消。
+     */
+    void Resolve(Ticket ticket, bool accepted) {
+        {
+            std::lock_guard lock(mutex_);
+            if (ticket != ticket_ || consumed_) return;
+            if (accepted) {
+                if (!pending_ || answer_.has_value()) return;
+                answer_ = true;
+            } else {
+                // 取消可撤销 Wait 已返回但尚未 Dispatch
+                // 的许可；接受后不再能二次确认。
+                answer_ = false;
+                pending_ = false;
+            }
         }
         condition_.notify_all();
     }
 
-    /** @brief 取消当前待确认周期。 */
-    void Cancel() { Resolve(false); }
+    /** @brief 无条件撤销尚未Dispatch的当前许可。 */
+    void Cancel() {
+        {
+            std::lock_guard lock(mutex_);
+            if (consumed_) return;
+            answer_ = false;
+            pending_ = false;
+        }
+        condition_.notify_all();
+    }
+
+    /**
+     * @brief 原子取消尚未进入Dispatch的操作。
+     * @return 若取消赢得Dispatch边界且确实撤销了许可则返回true。
+     */
+    [[nodiscard]] bool CancelBeforeDispatch() {
+        {
+            std::lock_guard lock(mutex_);
+            if (consumed_ || (!pending_ && answer_ != true)) return false;
+            answer_ = false;
+            pending_ = false;
+        }
+        condition_.notify_all();
+        return true;
+    }
+
+    /**
+     * @brief 在发送危险命令前再次检查本次许可和停止状态。
+     * @param ticket 本次操作标识。
+     * @param stopping 工具退出标志。
+     * @return 尚未撤销的明确许可。
+     */
+    [[nodiscard]] bool Authorized(Ticket ticket,
+                                  const std::atomic<bool>& stopping) const {
+        std::lock_guard lock(mutex_);
+        return ticket == ticket_ && !consumed_ && !stopping.load() &&
+               answer_ == true;
+    }
+
+    /**
+     * @brief 原子消费确认许可，再在锁外调用同步发送函数。
+     * @param ticket 本次操作标识。
+     * @param stopping 停止或退出标志。
+     * @param send 实际危险操作；许可被消费后，后续取消无法撤回。
+     * @return 是否成功消费许可并进入发送函数。
+     */
+    template <typename Send>
+    [[nodiscard]] bool Dispatch(Ticket ticket,
+                                const std::atomic<bool>& stopping,
+                                Send&& send) {
+        {
+            std::lock_guard lock(mutex_);
+            if (ticket != ticket_ || consumed_ || stopping.load() ||
+                answer_ != true)
+                return false;
+            // 消费许可是线性化点；之后的取消不会阻塞并视为已进入下发。
+            consumed_ = true;
+        }
+        std::forward<Send>(send)();
+        return true;
+    }
 
     /**
      * @brief 查询确认周期是否仍处于待决状态。
@@ -251,12 +794,36 @@ public:
         return pending_;
     }
 
+    /** @brief 返回当前周期标识，供 UI 事件绑定本次回答。 */
+    [[nodiscard]] Ticket CurrentTicket() const {
+        std::lock_guard lock(mutex_);
+        return ticket_;
+    }
+
 private:
     mutable std::mutex mutex_;          /**< 确认周期状态互斥量。 */
     std::condition_variable condition_; /**< 确认结果等待通知。 */
-    std::optional<bool> answer_;        /**< 当前周期的明确用户选择。 */
-    bool pending_{false}; /**< 当前是否存在未收取结果的确认周期。 */
+    std::optional<bool> answer_; /**< 当前周期的用户选择；取消不可变回确认。 */
+    Ticket ticket_{0};           /**< 单调递增的周期标识。 */
+    bool pending_{false};        /**< 尚待命令线程收取的确认周期。 */
+    bool consumed_{false};       /**< 危险操作许可已被领取。 */
 };
+
+/**
+ * @brief 仅在本次确认仍有效时调用危险操作发送者。
+ * @param gate 确认状态。
+ * @param ticket 本次操作标识。
+ * @param stopping 停止或退出标志。
+ * @param send 实际危险命令发送函数。
+ * @return 是否进入了危险操作发送函数；请求已在途时不能撤销。
+ */
+template <typename Send>
+[[nodiscard]] bool SendIfConfirmed(ConfirmationGate& gate,
+                                   ConfirmationGate::Ticket ticket,
+                                   const std::atomic<bool>& stopping,
+                                   Send&& send) {
+    return gate.Dispatch(ticket, stopping, std::forward<Send>(send));
+}
 
 /**
  * @brief 将确认键转换为确认/取消结果。

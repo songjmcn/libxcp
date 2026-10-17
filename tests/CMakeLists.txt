@@ -32,6 +32,11 @@ FetchContent_Declare(
         GIT_SHALLOW TRUE)
 
 FetchContent_MakeAvailable(googletest)
+# GTest上游将FetchContent头文件标记为SYSTEM；AppleClang因此可能优先
+# 命中/usr/local/include中的旧安装版，造成头文件与本次构建archive ABI不一致。
+# 取消其SYSTEM分类，让本地Fetched头先于编译器默认系统目录搜索。
+set_property(TARGET gtest PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "")
+set_property(TARGET gtest_main PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "")
 
 add_executable(libxcp_tests
         protocol_types_test.cpp

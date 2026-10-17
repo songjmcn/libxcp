@@ -10,6 +10,7 @@
 #include "structure_layout.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <string>
@@ -98,13 +99,16 @@ constexpr char kKeySep = '\x1F';
     return true;
 }
 
-/// @brief 解析上下文：三张注册表 + 输出累加器
+/// @brief 解析上下文：类型注册表 + 输出累加器。
 struct LayoutContext {
     /// @brief TYPEDEF_STRUCTURE 注册表（module\x1Fname → DTO）
     std::unordered_map<std::string, const liba2l::StructInfoDto*> structs;
     /// @brief TYPEDEF_MEASUREMENT 注册表（module\x1Fname → DTO）
     std::unordered_map<std::string, const liba2l::TypedefMeasurementDto*>
-        scalars;
+        measurements;
+    /// @brief TYPEDEF_CHARACTERISTIC 注册表（module\x1Fname → DTO）
+    std::unordered_map<std::string, const liba2l::TypedefCharacteristicDto*>
+        characteristics;
     std::vector<SymbolInfo> leaves;     ///< 输出叶子
     std::vector<LoadWarning> warnings;  ///< 输出告警
 };
@@ -138,8 +142,9 @@ void Reject(LayoutContext& ctx, const std::string& module,
 [[nodiscard]] SymbolInfo MakeScalarLeaf(
     const liba2l::TypedefMeasurementDto& tm, const std::string& inst_name,
     std::uint64_t base_address, std::uint8_t address_extension,
-    bool instance_read_write, const std::string& member_path,
-    std::uint64_t byte_offset, std::uint64_t count) {
+    bool instance_read_write, const std::string& ref_memory_segment,
+    const std::string& member_path, std::uint64_t byte_offset,
+    std::uint64_t count) {
     SymbolInfo info;
     info.module_name = tm.module_name;
     info.name = member_path;  // 全限定路径（MODULE::instance.member.…）
@@ -155,8 +160,9 @@ void Reject(LayoutContext& ctx, const std::string& module,
     // AG 绝不乘入基址（批次16 §2 地址公式）。AG≠BYTE 的 ECU 上
     // "成员偏移按字节直加"是未经语料核证的外推，批次16 §5 风险表已记录。
     info.xcp_address = base_address + byte_offset;
-    // 扩展从 INSTANCE 原值透传；成员级不存在独立扩展（ASAP2 语义核证）
+    // 扩展与段引用均从INSTANCE原值透传；成员级无独立声明。
     info.address_extension = address_extension;
+    info.ref_memory_segment = ref_memory_segment;
     info.element_size_bytes = tm.element_size_bytes;
     if (count > 1) {
         // 多维成员数组 flatten 为单维（extent=乘积、stride=元素宽）：
@@ -185,6 +191,119 @@ void Reject(LayoutContext& ctx, const std::string& module,
 }
 
 /**
+ * @brief 验证并创建TYPEDEF_CHARACTERISTIC VALUE/CURVE叶子。
+ * @param tc TYPEDEF_CHARACTERISTIC事实
+ * @param inst_name INSTANCE名（描述/诊断）
+ * @param base_address INSTANCE基址
+ * @param address_extension INSTANCE地址扩展
+ * @param instance_read_write INSTANCE写权限声明
+ * @param ref_memory_segment INSTANCE引用的MEMORY_SEGMENT（可能为空）
+ * @param member_path 完整实例成员路径
+ * @param byte_offset 成员相对实例的字节偏移
+ * @param member_count 成员MATRIX_DIM元素数
+ * @param output 成功时写入的领域符号
+ * @param reason 失败时写入拒绝原因
+ * @param total_bytes_out 成功时的完整成员存储字节数
+ * @return 仅可证明的VALUE标量或单FIX_AXIS_PAR_DIST CURVE时返回true
+ */
+[[nodiscard]] bool MakeCharacteristicLeaf(
+    const liba2l::TypedefCharacteristicDto& tc, const std::string& inst_name,
+    std::uint64_t base_address, std::uint8_t address_extension,
+    bool instance_read_write, const std::string& ref_memory_segment,
+    const std::string& member_path, std::uint64_t byte_offset,
+    std::uint64_t member_count, SymbolInfo* output, std::string* reason,
+    std::uint64_t* total_bytes_out) {
+    if (output == nullptr || reason == nullptr || total_bytes_out == nullptr) {
+        return false;
+    }
+    if (tc.record_layout_kind != liba2l::RecordLayoutKindDto::kPlainScalar ||
+        tc.record_layout_name.empty() || tc.element_size_bytes == 0 ||
+        tc.data_type == liba2l::AsamDataTypeDto::kUnknown) {
+        *reason =
+            "TYPEDEF_CHARACTERISTIC RECORD_LAYOUT/FNC_VALUES类型或宽度不可证";
+        return false;
+    }
+    const SymbolInfo type_info = ConvertTypedefCharacteristic(tc);
+    if (type_info.element_size_bytes != tc.element_size_bytes) {
+        *reason = "FNC_VALUES数据类型与导出元素宽度不一致";
+        return false;
+    }
+
+    std::uint64_t element_count = 1;
+    if (tc.characteristic_type == liba2l::CharacteristicTypeDto::kValue) {
+        if (!tc.axis_descriptions.empty() || !tc.matrix_dim.empty() ||
+            member_count != 1) {
+            *reason = "VALUE仅支持无维度标量成员";
+            return false;
+        }
+    } else if (tc.characteristic_type ==
+               liba2l::CharacteristicTypeDto::kCurve) {
+        if (!tc.matrix_dim.empty() || member_count != 1 ||
+            tc.axis_descriptions.size() != 1) {
+            *reason = "CURVE仅支持单轴、非数组实例成员";
+            return false;
+        }
+        const liba2l::TypedefAxisDescrDto& axis = tc.axis_descriptions.front();
+        constexpr std::uint64_t kMaxFixedCurvePoints = 4096;
+        if (axis.axis_type != liba2l::AxisTypeDto::kFixAxis ||
+            !axis.has_fix_axis_par_dist || axis.fix_axis_points == 0 ||
+            axis.fix_axis_points > kMaxFixedCurvePoints ||
+            axis.max_axis_points != axis.fix_axis_points ||
+            !axis.axis_pts_ref.empty() || !axis.curve_axis_ref.empty() ||
+            !axis.fixed_axis_values.empty() ||
+            !std::isfinite(axis.fix_axis_offset) ||
+            !std::isfinite(axis.fix_axis_distance) ||
+            axis.fix_axis_distance == 0.0) {
+            *reason = "CURVE轴不是可证明的FIX_AXIS_PAR_DIST固定轴";
+            return false;
+        }
+        element_count = axis.fix_axis_points;
+    } else {
+        *reason = "仅支持TYPEDEF_CHARACTERISTIC/VALUE标量与固定轴CURVE";
+        return false;
+    }
+
+    std::uint64_t total_bytes = 0;
+    if (!MulU64(element_count, tc.element_size_bytes, &total_bytes)) {
+        *reason = "标定成员总字节数溢出";
+        return false;
+    }
+    if (byte_offset >
+        std::numeric_limits<std::uint64_t>::max() - base_address) {
+        *reason = "INSTANCE基址加成员偏移溢出";
+        return false;
+    }
+
+    SymbolInfo info = type_info;
+    info.name = member_path;
+    info.description = tc.description.empty()
+                           ? ("STRUCTLEAF of " + inst_name)
+                           : (tc.description + " [leaf of " + inst_name + "]");
+    info.xcp_address = base_address + byte_offset;
+    info.address_extension = address_extension;
+    info.read_write = instance_read_write;
+    info.ref_memory_segment = ref_memory_segment;
+    if (element_count > 1) {
+        Dimension dimension;
+        dimension.extent = element_count;
+        dimension.byte_stride = tc.element_size_bytes;
+        info.dimensions.push_back(dimension);
+    }
+    if (tc.characteristic_type == liba2l::CharacteristicTypeDto::kCurve) {
+        const liba2l::TypedefAxisDescrDto& axis = tc.axis_descriptions.front();
+        FixedCurveAxisInfo fixed_axis;
+        fixed_axis.offset = axis.fix_axis_offset;
+        fixed_axis.distance = axis.fix_axis_distance;
+        fixed_axis.point_count = axis.fix_axis_points;
+        fixed_axis.explicit_values = axis.fixed_axis_values;
+        info.fixed_curve_axis = std::move(fixed_axis);
+    }
+    *output = std::move(info);
+    *total_bytes_out = total_bytes;
+    return true;
+}
+
+/**
  * @brief 递归展开一个 TYPEDEF_STRUCTURE 的成员
  * @param ctx 解析上下文
  * @param st 待展开的结构类型
@@ -192,6 +311,7 @@ void Reject(LayoutContext& ctx, const std::string& module,
  * @param base_address 实例基址
  * @param address_extension 实例地址扩展
  * @param instance_read_write 实例 READ_WRITE
+ * @param ref_memory_segment 实例 REF_MEMORY_SEGMENT（可空）
  * @param prefix 当前路径前缀（进入时 = 已定位到 st 实例对象的路径）
  * @param struct_base 该结构对象相对实例基址的字节偏移
  * @param depth 当前递归深度
@@ -201,6 +321,7 @@ void Reject(LayoutContext& ctx, const std::string& module,
 void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                   const std::string& inst_name, std::uint64_t base_address,
                   std::uint8_t address_extension, bool instance_read_write,
+                  const std::string& ref_memory_segment,
                   const std::string& prefix, std::uint64_t struct_base,
                   int depth, std::vector<std::string>& chain,
                   std::size_t& leaf_budget_left) {
@@ -247,9 +368,18 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
         }
         const std::string ref_key = TypeKey(st.module_name, m->typedef_name);
 
+        // 类型命名空间冲突时不按注册表顺序猜测。
+        const auto scalar_it = ctx.measurements.find(ref_key);
+        const auto characteristic_it = ctx.characteristics.find(ref_key);
+        if (scalar_it != ctx.measurements.end() &&
+            characteristic_it != ctx.characteristics.end()) {
+            Reject(ctx, st.module_name, path,
+                   "类型名同时匹配TYPEDEF_MEASUREMENT与TYPEDEF_CHARACTERISTIC");
+            continue;
+        }
+
         // ① 标量成员：引用 TYPEDEF_MEASUREMENT
-        auto scalar_it = ctx.scalars.find(ref_key);
-        if (scalar_it != ctx.scalars.end()) {
+        if (scalar_it != ctx.measurements.end()) {
             const liba2l::TypedefMeasurementDto& tm = *scalar_it->second;
             if (tm.element_size_bytes == 0) {
                 Reject(ctx, st.module_name, path,
@@ -279,12 +409,48 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
             --leaf_budget_left;
             ctx.leaves.push_back(
                 MakeScalarLeaf(tm, inst_name, base_address, address_extension,
-                               instance_read_write, path,
+                               instance_read_write, ref_memory_segment, path,
                                struct_base + m->address_offset, count));
             continue;
         }
 
-        // ② 结构成员：引用 TYPEDEF_STRUCTURE（递归）
+        // ② TYPEDEF_CHARACTERISTIC：只开放已证明布局的VALUE标量和固定轴CURVE。
+        if (characteristic_it != ctx.characteristics.end()) {
+            std::uint64_t member_offset = 0;
+            if (m->address_offset >
+                std::numeric_limits<std::uint64_t>::max() - struct_base) {
+                Reject(ctx, st.module_name, path, "结构成员偏移累加溢出");
+                continue;
+            }
+            member_offset = struct_base + m->address_offset;
+            SymbolInfo leaf;
+            std::string reason;
+            std::uint64_t total_bytes = 0;
+            if (!MakeCharacteristicLeaf(
+                    *characteristic_it->second, inst_name, base_address,
+                    address_extension, instance_read_write, ref_memory_segment,
+                    path, member_offset, count, &leaf, &reason, &total_bytes)) {
+                Reject(ctx, st.module_name, path, std::move(reason));
+                continue;
+            }
+            if (m->address_offset > st.size_bytes ||
+                total_bytes > st.size_bytes - m->address_offset) {
+                Reject(ctx, st.module_name, path,
+                       "标定成员越界：offset + size > SIZE");
+                continue;
+            }
+            if (leaf_budget_left == 0) {
+                Reject(ctx, st.module_name, path,
+                       "实例叶子预算耗尽（上限 " +
+                           std::to_string(kInstanceLeafBudget) + "），截断");
+                return;
+            }
+            --leaf_budget_left;
+            ctx.leaves.push_back(std::move(leaf));
+            continue;
+        }
+
+        // ③ 结构成员：引用 TYPEDEF_STRUCTURE（递归）
         auto struct_it = ctx.structs.find(ref_key);
         if (struct_it != ctx.structs.end()) {
             const liba2l::StructInfoDto& child = *struct_it->second;
@@ -323,7 +489,7 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                     count == 1 ? path : (path + "[" + std::to_string(i) + "]");
                 ExpandStruct(ctx, child, inst_name, base_address,
                              address_extension, instance_read_write,
-                             elem_prefix,
+                             ref_memory_segment, elem_prefix,
                              struct_base + m->address_offset + i * child_size,
                              depth + 1, chain, leaf_budget_left);
             }
@@ -331,10 +497,11 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
             continue;
         }
 
-        // ③ 双注册表都查不到：类型引用缺失，不可证
+        // ④ 三类注册表都查不到：类型引用缺失，不可证。
         Reject(ctx, st.module_name, path,
                "成员引用的类型 " + m->typedef_name +
-                   " 在 TYPEDEF_MEASUREMENT / TYPEDEF_STRUCTURE 中均不存在");
+                   " 在TYPEDEF_MEASUREMENT/TYPEDEF_CHARACTERISTIC/"
+                   "TYPEDEF_STRUCTURE中均不存在");
     }
 }
 
@@ -343,7 +510,9 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
 StructureLayoutResult BuildStructureLeaves(
     const std::vector<liba2l::StructInfoDto>& typedef_structs,
     const std::vector<liba2l::StructInfoDto>& instances,
-    const std::vector<liba2l::TypedefMeasurementDto>& typedefs) {
+    const std::vector<liba2l::TypedefMeasurementDto>& typedefs,
+    const std::vector<liba2l::TypedefCharacteristicDto>&
+        typedef_characteristics) {
     StructureLayoutResult result;
     LayoutContext ctx;
     ctx.structs.reserve(typedef_structs.size());
@@ -351,9 +520,13 @@ StructureLayoutResult BuildStructureLeaves(
         // 同名 TYPEDEF 以先到为准（SDK 快照已按 MODULE,名排序，稳定）
         ctx.structs.emplace(TypeKey(st.module_name, st.name), &st);
     }
-    ctx.scalars.reserve(typedefs.size());
+    ctx.measurements.reserve(typedefs.size());
     for (const liba2l::TypedefMeasurementDto& tm : typedefs) {
-        ctx.scalars.emplace(TypeKey(tm.module_name, tm.name), &tm);
+        ctx.measurements.emplace(TypeKey(tm.module_name, tm.name), &tm);
+    }
+    ctx.characteristics.reserve(typedef_characteristics.size());
+    for (const liba2l::TypedefCharacteristicDto& tc : typedef_characteristics) {
+        ctx.characteristics.emplace(TypeKey(tc.module_name, tc.name), &tc);
     }
 
     for (const liba2l::StructInfoDto& inst : instances) {
@@ -395,8 +568,9 @@ StructureLayoutResult BuildStructureLeaves(
                                 : (inst.name + "[" + std::to_string(i) + "]");
             std::vector<std::string> chain = {ref_key};
             ExpandStruct(ctx, st, inst.name, inst.address,
-                         inst.address_extension, inst.read_write, prefix,
-                         i * st.size_bytes, 1, chain, budget);
+                         inst.address_extension, inst.read_write,
+                         inst.ref_memory_segment, prefix, i * st.size_bytes, 1,
+                         chain, budget);
         }
     }
     result.leaves = std::move(ctx.leaves);

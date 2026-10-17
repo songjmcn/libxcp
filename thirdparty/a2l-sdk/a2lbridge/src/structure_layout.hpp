@@ -47,8 +47,9 @@ struct StructureLayoutResult {
  * @brief 展开所有 INSTANCE 的可证成员叶子
  * @param typedef_structs SDK 的 TYPEDEF_STRUCTURE 快照（含 members）
  * @param instances SDK 的 INSTANCE 快照（含基址/扩展/READ_WRITE）
- * @param typedefs SDK 的 TYPEDEF_MEASUREMENT 快照（标量成员类型；
- *        换算快照与 SymbolDto 同为 SDK 内嵌口径，无需外部解析）
+ * @param typedefs SDK 的 TYPEDEF_MEASUREMENT 快照（MEASUREMENT成员类型）
+ * @param typedef_characteristics SDK 的 TYPEDEF_CHARACTERISTIC
+ * 快照（VALUE/CURVE类型和固定轴事实）
  * @return 叶子列表 + 告警
  * @details 防护上界（批次16 §5 风险控制）：
  *  - 递归深度 ≤ 32（超限 → 该分支拒绝）；
@@ -64,7 +65,9 @@ struct StructureLayoutResult {
 [[nodiscard]] StructureLayoutResult BuildStructureLeaves(
     const std::vector<liba2l::StructInfoDto>& typedef_structs,
     const std::vector<liba2l::StructInfoDto>& instances,
-    const std::vector<liba2l::TypedefMeasurementDto>& typedefs);
+    const std::vector<liba2l::TypedefMeasurementDto>& typedefs,
+    const std::vector<liba2l::TypedefCharacteristicDto>&
+        typedef_characteristics);
 
 }  // namespace calmcar::xcp::a2l::detail
 

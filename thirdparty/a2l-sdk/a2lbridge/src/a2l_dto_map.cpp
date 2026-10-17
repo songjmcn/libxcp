@@ -319,6 +319,70 @@ SymbolInfo ConvertStructure(const liba2l::StructInfoDto& dto) {
     return info;
 }
 
+SymbolInfo ConvertTypedefCharacteristic(
+    const liba2l::TypedefCharacteristicDto& dto) {
+    SymbolInfo info;
+    info.module_name = dto.module_name;
+    info.name = dto.name;
+    info.description = dto.description;
+    info.kind = SymbolKind::Characteristic;
+    info.characteristic_type = ConvertCharType(dto.characteristic_type);
+    info.data_type = ConvertDataType(dto.data_type);
+    info.element_size_bytes = ElementSizeOf(info.data_type);
+    info.byte_order = ConvertByteOrder(dto.byte_order);
+    info.conversion = ConvertConversion(dto.conversion);
+    if (!dto.phys_unit.empty()) {
+        info.conversion.unit = dto.phys_unit;
+    }
+    if (dto.have_limit) {
+        info.have_limit = true;
+        info.lower_limit = dto.lower_limit;
+        info.upper_limit = dto.upper_limit;
+    }
+    // TYPEDEF自身没有实例地址和实例READ_WRITE；调用方必须从INSTANCE继承。
+    info.read_write = false;
+    return info;
+}
+
+MemorySegmentInfo ConvertMemorySegment(const liba2l::MemorySegmentDto& dto) {
+    MemorySegmentInfo info;
+    info.module_name = dto.module_name;
+    info.name = dto.name;
+    info.address = dto.address;
+    info.size = dto.size;
+    info.address_extension = dto.address_extension;
+    info.segment_number = dto.segment_number;
+    info.page_count = dto.number_of_pages;
+    info.has_xcp_segment = dto.has_xcp_segment;
+    info.pages.reserve(dto.pages.size());
+    for (const liba2l::MemoryPageDto& page : dto.pages) {
+        MemoryPageInfo converted;
+        converted.number = page.number;
+        converted.ecu_access = page.ecu_access_type;
+        converted.xcp_read_access = page.xcp_read_access_type;
+        switch (page.xcp_write_access_type) {
+            case liba2l::XcpPageWriteAccessDto::kNotAllowed:
+                converted.xcp_write_access = XcpPageWriteAccess::NotAllowed;
+                break;
+            case liba2l::XcpPageWriteAccessDto::kWithoutEcuOnly:
+                converted.xcp_write_access = XcpPageWriteAccess::WithoutEcuOnly;
+                break;
+            case liba2l::XcpPageWriteAccessDto::kWithEcuOnly:
+                converted.xcp_write_access = XcpPageWriteAccess::WithEcuOnly;
+                break;
+            case liba2l::XcpPageWriteAccessDto::kDontCare:
+                converted.xcp_write_access = XcpPageWriteAccess::DontCare;
+                break;
+            case liba2l::XcpPageWriteAccessDto::kUnknown:
+            default:
+                converted.xcp_write_access = XcpPageWriteAccess::Unknown;
+                break;
+        }
+        info.pages.push_back(converted);
+    }
+    return info;
+}
+
 bool ConvertRecordLayoutInfo(const liba2l::SymbolDto& dto,
                              RecordLayoutInfo* out) {
     if (out == nullptr) {

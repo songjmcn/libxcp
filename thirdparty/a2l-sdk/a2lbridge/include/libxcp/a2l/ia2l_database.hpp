@@ -9,6 +9,7 @@
 #define LIBXCP_A2L_IA2L_DATABASE_HPP_
 
 #include <cstddef>
+#include <cstdint>
 #include <string_view>
 #include <vector>
 
@@ -70,12 +71,32 @@ public:
         std::string_view qualified_name, BytesView raw) const = 0;
 
     /**
+     * @brief 指定0基元素的raw字节→物理值（MEASUREMENT数组及CURVE点读取）。
+     * @param qualified_name 规范键或全库唯一裸名
+     * @param element_index 0基线性索引，必须小于CountElements
+     * @param raw 单个元素的raw字节，长度必须等于element_size_bytes
+     */
+    [[nodiscard]] virtual Result<PhysicalValue> ToPhysicalElement(
+        std::string_view qualified_name, std::uint64_t element_index,
+        BytesView raw) const = 0;
+
+    /**
      * @brief 物理值 → raw 字节（默认严格拒绝越界、NaN/Inf 和不可逆映射，B-15）
      * @param qualified_name 规范键或全库唯一裸名
      * @param physical_value tagged 物理值
      */
     [[nodiscard]] virtual Result<Bytes> FromPhysical(
         std::string_view qualified_name,
+        const PhysicalValue& physical_value) const = 0;
+
+    /**
+     * @brief 将单个物理元素编码为raw（仅CHARACTERISTIC/VALUE标量或CURVE点）。
+     * @param qualified_name 规范键或全库唯一裸名
+     * @param element_index 0基索引；VALUE标量仅接受0，CURVE检查已证明的维度
+     * @param physical_value tagged物理值
+     */
+    [[nodiscard]] virtual Result<Bytes> FromPhysicalElement(
+        std::string_view qualified_name, std::uint64_t element_index,
         const PhysicalValue& physical_value) const = 0;
 };
 

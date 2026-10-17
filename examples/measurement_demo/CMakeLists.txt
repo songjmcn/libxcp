@@ -2,25 +2,17 @@
 # measurement_demo —— 测量子系统端到端示例（v0.9）
 #
 # 计划依据：code-plan/libxcp_测量子系统代码增长计划.md v0.9 交付物 3。
-# 一条命令端到端：示例自行拉起/终止 xcp_test_slave，内部完成
+# 一条命令端到端：示例自行拉起/终止 examples/xcp_master_udp 提供的 cpp_demo，内部完成
 # 「UPLOAD 拉回 A2L → 桥接加载 → 适配器 → MeasurementSession → 物理值帧」。
 #
 # 依赖：
 #   - libxcp::libxcp（核心：XcpMaster + MeasurementSession）
 #   - libxcp_measurement_adapter（A2L→核心窄接口适配器；A2L 栈为必编组件）
 #   - libxcp::a2lbridge（经适配器 PUBLIC 传播）
-#   - xcp_test_slave 可执行（tests/xcp_test_slave/，需 LIBXCP_BUILD_TESTS=ON
-#     ——该目标在 tests 子目录定义；缺位时 CONFIGURE 期 FATAL_ERROR 明示，
-#     不静默降级、不在本目录二次定义）
+#   - cpp_demo 可执行（由同级 examples/xcp_master_udp/ 定义）；示例可用
+#     --slave 覆盖默认对手端，不依赖 tests/ 目标或源码
 #   - demo_process.cpp 复用 examples/xcp_master_udp/ 的自包含子进程封装
-#     （示例目录内部共享，不引用 tests/ 源码）
 # =============================================================================
-
-if(NOT TARGET xcp_test_slave)
-  message(FATAL_ERROR
-          "measurement_demo requires target xcp_test_slave "
-          "(LIBXCP_BUILD_TESTS=ON in addition to the examples prerequisites)")
-endif()
 
 add_executable(measurement_demo
         measurement_demo.cpp
@@ -29,19 +21,19 @@ target_compile_features(measurement_demo PRIVATE cxx_std_20)
 target_link_libraries(measurement_demo PRIVATE
         libxcp::libxcp
         libxcp_measurement_adapter)
-# Slave 可执行文件路径经 CMake 注入，禁止硬编码
+# cpp_demo 可执行文件路径经 CMake 注入，禁止硬编码
 # （沿用 examples/xcp_master_udp/CMakeLists.txt:37-41 先例）
 # XCP_104.aml 路径经 CMake 注入（照抄 examples/xcp_master_udp/CMakeLists.txt:18,41
 # 先例）：cpp_demo 生成的 A2L 含 `/include "XCP_104.aml"`，示例在 run-dir 预置副本
-# 保证桥接 include 链可解析（xcp_test_slave 自写 AML，预置块以 skip_existing 让位）。
+# 保证 cpp_demo 上传 A2L 的 include 链可解析，已存在文件不覆盖。
 set(XCPLITE_A2L_INCLUDE_DIR "${PROJECT_SOURCE_DIR}/thirdparty/XCPlite")
 target_compile_definitions(measurement_demo PRIVATE
-        XCP_TEST_SLAVE_EXECUTABLE="$<TARGET_FILE:xcp_test_slave>"
+        CPP_DEMO_EXECUTABLE="$<TARGET_FILE:cpp_demo>"
         XCP_104_AML_FILE="${XCPLITE_A2L_INCLUDE_DIR}/XCP_104.aml")
 # demo_process.hpp 的搜索路径（与 xcp_master_udp 共享实现）
 target_include_directories(measurement_demo PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../xcp_master_udp")
-add_dependencies(measurement_demo xcp_test_slave cpp_demo)
+add_dependencies(measurement_demo cpp_demo)
 if(MSVC)
   target_compile_options(measurement_demo PRIVATE /utf-8)
 endif()
@@ -52,17 +44,16 @@ add_custom_command(TARGET measurement_demo POST_BUILD
                 "$<TARGET_FILE:liba2l::liba2l>"
                 "$<TARGET_FILE_DIR:measurement_demo>")
 
-# ctest 冒烟：非 gtest 裸可执行 + 退出码；RUN_SERIAL 与 ExampleXcpMasterUdp
-# 同口径（端口不同：5556 vs 5555，仍串行降概率）；5556 被占 → 预检 exit 2 →
-# 计 FAIL 暴露环境问题。
+# ctest 默认冒烟：非 gtest 裸可执行 + 退出码；与 ExampleXcpMasterUdp 共用 5555，
+# 均设 RUN_SERIAL 避免端口并发；端口被占时预检 exit 2，作为环境错误暴露。
 add_test(NAME ExampleMeasurementDemo
         COMMAND measurement_demo --run-dir "${CMAKE_CURRENT_BINARY_DIR}/ctest_run")
 set_tests_properties(ExampleMeasurementDemo PROPERTIES
         RUN_SERIAL TRUE
         TIMEOUT 180)
 
-# 原版 XCPlite cpp_demo 专项回归：检验同一 DAQ 样本的 raw 与物理值换算，
-# 避免仅依赖上方默认使用 xcp_test_slave 的冒烟测试。
+# cpp_demo 多符号专项回归：检验多事件路由及同一 DAQ 样本的 raw/物理值换算；
+# 与默认零参数冒烟保持独立 run-dir。
 add_test(NAME ExampleCppDemoMeasurement
         COMMAND measurement_demo
                 --slave "$<TARGET_FILE:cpp_demo>"

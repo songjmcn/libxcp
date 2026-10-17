@@ -29,6 +29,7 @@ ZERO_CHECK/
 *[[]1[]]_include.cmake
 compile_commands.json
 CMakeLists.txt.*.swp
+cmake-build*
 
 # ---- 编译器 / 链接器中间产物 ----
 *.obj
@@ -82,6 +83,10 @@ __pycache__/
 # ---- IDE / 编辑器 ----
 .vs/
 .vscode/
+!.vscode/
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
 .idea/
 .cache/
 .clangd/

@@ -237,7 +237,7 @@ session.Stop();
 `DaqTimestampConverter` 外推并计入 `Statistics().timestamp_wraps`。
 
 端到端可运行样例：`examples/measurement_demo/measurement_demo.cpp`
-（启动 XCPlite Slave → UPLOAD 取 A2L → 适配器 → 会话全链路，含 RAII 守卫范式）。
+（默认启动 examples 内的 cpp_demo → UPLOAD 取 A2L → 适配器 → 会话全链路，含 RAII 守卫范式；无需开启 tests）。
 
 ## 6. 公开头文件（v1.0 冻结面）
 
