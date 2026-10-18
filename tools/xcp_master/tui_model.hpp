@@ -60,12 +60,14 @@ private:
  * @details 多线程共享时，调用方必须在外部同步所有访问。
  */
 struct ObservationSnapshot {
-    std::string value;     /**< 最近成功取得的物理值文本。 */
+    std::string value;     /**< 最近成功取得的标量物理值文本。 */
     std::string status;    /**< 最新读取来源或错误状态。 */
     std::string timestamp; /**< 最近一次样本时间。 */
     bool has_value{false}; /**< 是否曾取得可显示的物理值。 */
     bool stale{false};     /**< 最近操作失败，当前值是旧值。 */
     bool stopped{false};   /**< 采样已停止；旧值仍可查看。 */
+    bool is_array{false};  /**< 最近样本是否为完整数组批次。 */
+    std::vector<std::string> array_values; /**< 原子发布的数组元素值。 */
 };
 
 /**
@@ -90,12 +92,13 @@ public:
         const auto index = FindIndex(key);
         if (index.has_value()) {
             lines_[*index] = std::move(line);
-            samples_[*index] = {lines_[*index], "", "", true, false, false};
+            samples_[*index] = {lines_[*index], "",    "",    true,
+                                false,          false, false, {}};
             return;
         }
         if (!CanInsert(key)) return;
         keys_.push_back(std::move(key));
-        samples_.push_back({line, "", "", true, false, false});
+        samples_.push_back({line, "", "", true, false, false, false, {}});
         lines_.push_back(std::move(line));
     }
 
@@ -114,7 +117,36 @@ public:
                                    std::move(timestamp),
                                    true,
                                    false,
-                                   false};
+                                   false,
+                                   false,
+                                   {}};
+        if (index.has_value()) {
+            samples_[*index] = std::move(sample);
+            lines_[*index] = FormatLine(key, samples_[*index]);
+            return;
+        }
+        if (!CanInsert(key)) return;
+        keys_.push_back(std::move(key));
+        lines_.push_back(FormatLine(keys_.back(), sample));
+        samples_.push_back(std::move(sample));
+    }
+
+    /**
+     * @brief 原子替换某一符号的完整数组样本。
+     * @param key 符号规范名。
+     * @param values 按 A2L 数组索引顺序格式化的全部元素值。
+     * @param status 来源状态，例如 POLL。
+     * @param timestamp 整批数组样本时间；可为空。
+     */
+    void UpdateArrayValue(std::string key, std::vector<std::string> values,
+                          std::string status, std::string timestamp = {}) {
+        const auto index = FindIndex(key);
+        ObservationSnapshot sample;
+        sample.status = std::move(status);
+        sample.timestamp = std::move(timestamp);
+        sample.has_value = true;
+        sample.is_array = true;
+        sample.array_values = std::move(values);
         if (index.has_value()) {
             samples_[*index] = std::move(sample);
             lines_[*index] = FormatLine(key, samples_[*index]);
@@ -261,10 +293,14 @@ private:
         std::string line;
         if (!sample.timestamp.empty()) line = sample.timestamp + " ";
         line += key;
-        if (sample.has_value)
+        if (sample.has_value && sample.is_array) {
+            line += " = [" + std::to_string(sample.array_values.size()) +
+                    " elements]";
+        } else if (sample.has_value) {
             line += " = " + sample.value;
-        else
+        } else {
             line += " | " + (sample.status.empty() ? "未读取" : sample.status);
+        }
         if (sample.has_value && !sample.status.empty())
             line += " | " + sample.status;
         if (sample.stale && sample.has_value) line += "（旧值）";
@@ -277,6 +313,70 @@ private:
     std::vector<ObservationSnapshot> samples_; /**< 保留的物理值和状态。 */
     std::vector<std::string> lines_;           /**< 与样本同步的显示行。 */
 };
+
+/** @brief 预览菜单中的父符号或子值行。 */
+struct PreviewRow {
+    std::string symbol_name;                    /**< 所属 A2L 符号规范名。 */
+    std::optional<std::uint64_t> element_index; /**< 子元素0基索引。 */
+    bool is_child{false};                       /**< 是否为展开的子行。 */
+    bool is_read_action{false}; /**< 是否为只读的一次性读取动作。 */
+    bool is_placeholder{false}; /**< 是否为尚无样本的提示行。 */
+};
+
+/** @brief 创建一个符号的行布局所需信息。 */
+struct PreviewRowSource {
+    std::string symbol_name;           /**< A2L 符号规范名。 */
+    bool expanded{false};              /**< 是否展开。 */
+    bool has_sample{false};            /**< 是否已有完整成功样本。 */
+    bool is_array{false};              /**< 样本是否为数组。 */
+    std::size_t value_count{0U};       /**< 当前数组样本的元素数。 */
+    bool has_dimensions{false};        /**< 符号元数据是否声明维度。 */
+    bool manual_read_available{false}; /**< 是否可在停止采样时读取一次。 */
+};
+
+/**
+ * @brief 为展开符号生成稳定父/子行映射，便于菜单滚动和测试。
+ * @param sources 按 A2L 排序的符号显示状态。
+ * @return 与菜单标签一一对应的父行和子值行。
+ */
+inline std::vector<PreviewRow> BuildPreviewRows(
+    const std::vector<PreviewRowSource>& sources) {
+    std::vector<PreviewRow> rows;
+    for (const auto& source : sources) {
+        rows.push_back({source.symbol_name, std::nullopt, false, false, false});
+        if (!source.expanded) continue;
+        if (source.manual_read_available)
+            rows.push_back(
+                {source.symbol_name, std::nullopt, true, true, false});
+        if (source.has_sample && source.is_array && source.value_count > 0U) {
+            for (std::size_t index = 0; index < source.value_count; ++index)
+                rows.push_back({source.symbol_name,
+                                static_cast<std::uint64_t>(index), true, false,
+                                false});
+        } else if (source.has_sample && !source.is_array) {
+            rows.push_back(
+                {source.symbol_name, std::nullopt, true, false, false});
+        } else {
+            rows.push_back(
+                {source.symbol_name, std::nullopt, true, false, true});
+        }
+    }
+    return rows;
+}
+
+/** @brief 预览行激活后的界面动作。 */
+enum class PreviewRowAction { ToggleExpansion, ReadOnce, Ignore };
+
+/**
+ * @brief 根据预览行类型选择安全的 Enter 动作。
+ * @param row 当前菜单行映射。
+ * @return 父行展开、读取动作，或对子行/占位行无操作。
+ */
+inline PreviewRowAction ActionForPreviewRow(const PreviewRow& row) {
+    if (row.is_read_action) return PreviewRowAction::ReadOnce;
+    if (row.is_child || row.is_placeholder) return PreviewRowAction::Ignore;
+    return PreviewRowAction::ToggleExpansion;
+}
 
 /**
  * @brief 为异步搜索输入提供轻量代际，阻止旧结果覆盖较新的编辑草稿。
@@ -501,7 +601,7 @@ struct TuiLayoutMetrics {
 }
 
 /** @brief 变量详情弹窗的当前交互页面。 */
-enum class VariableModalPage { Closed, Details, Confirmation };
+enum class VariableModalPage { Closed, Details, Calibration, Confirmation };
 
 /** @brief 管理变量详情弹窗、写入确认和关闭时的稳定选择。 */
 class VariableModalState {
@@ -520,16 +620,31 @@ public:
     }
 
     /**
-     * @brief 打开危险操作确认页面；只可从详情页对可写项调用。
+     * @brief 打开与只读详情分离的标定表单。
+     * @param qualified_name A2L 规范名称。
+     * @param layout 当前尺寸规划。
+     * @return 尺寸可用且名称非空时成功。
+     */
+    bool OpenCalibration(std::string qualified_name,
+                         const TuiLayoutMetrics& layout) {
+        if (layout.too_small || qualified_name.empty()) return false;
+        selected_name_ = std::move(qualified_name);
+        page_ = VariableModalPage::Calibration;
+        return true;
+    }
+
+    /**
+     * @brief 打开危险操作确认页面；只可从标定页对可写项调用。
      * @param write_supported 当前符号是否满足写入资格。
      * @param layout 当前尺寸规划。
      * @return 允许时进入确认页面。
      */
     bool BeginConfirmation(bool write_supported,
                            const TuiLayoutMetrics& layout) {
-        if (page_ != VariableModalPage::Details || !write_supported ||
+        if (page_ != VariableModalPage::Calibration || !write_supported ||
             layout.too_small)
             return false;
+        confirmation_return_page_ = VariableModalPage::Calibration;
         page_ = VariableModalPage::Confirmation;
         return true;
     }
@@ -543,22 +658,25 @@ public:
         if (page_ != VariableModalPage::Closed || layout.too_small)
             return false;
         selected_name_.clear();
+        confirmation_return_page_ = VariableModalPage::Closed;
         page_ = VariableModalPage::Confirmation;
         return true;
     }
 
-    /** @brief 取消确认后回到同一个变量详情。 */
+    /** @brief 取消确认后返回发起确认的标定页或关闭通用确认弹窗。 */
     void CancelConfirmation() {
-        if (page_ == VariableModalPage::Confirmation)
-            page_ = VariableModalPage::Details;
+        if (page_ != VariableModalPage::Confirmation) return;
+        page_ = confirmation_return_page_;
+        if (page_ == VariableModalPage::Closed) selected_name_.clear();
     }
 
-    /** @brief 确认请求结束后恢复详情页，以显示结果。 */
+    /** @brief 确认请求结束后返回标定页或关闭通用确认弹窗。 */
     void CompleteConfirmation() { CancelConfirmation(); }
 
     /** @brief 关闭弹窗；列表过滤、行选择和滚动由调用方保留。 */
     void Close() {
         page_ = VariableModalPage::Closed;
+        confirmation_return_page_ = VariableModalPage::Closed;
         selected_name_.clear();
     }
 
@@ -582,7 +700,9 @@ public:
 
 private:
     VariableModalPage page_{VariableModalPage::Closed}; /**< 当前弹窗页。 */
-    std::string selected_name_; /**< 打开时快照，关闭时清空。 */
+    VariableModalPage confirmation_return_page_{
+        VariableModalPage::Closed}; /**< 确认完成后恢复的来源页。 */
+    std::string selected_name_;     /**< 打开时快照，关闭时清空。 */
 };
 
 /** @brief 将异步标定结果绑定到具体选择，防止旧结果污染新表单。 */

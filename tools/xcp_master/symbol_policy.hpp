@@ -105,6 +105,33 @@ namespace calmcar::xcp::tools {
     return {};
 }
 
+/// @brief 只根据A2L静态信息检查标定写入候选，不读取ECU状态。
+[[nodiscard]] inline std::string SymbolStaticWriteUnsupportedReason(
+    const a2l::SymbolInfo& symbol) {
+    std::string reason;
+    if (symbol.kind == a2l::SymbolKind::Characteristic &&
+        symbol.characteristic_type == a2l::CharacteristicType::Curve) {
+        reason = SymbolDetailReadUnsupportedReason(symbol);
+        if (!reason.empty()) return reason;
+        if (!symbol.read_write) return "A2L INSTANCE 未标记为可写";
+        if (symbol.fixed_curve_axis->point_count == 0U)
+            return "固定轴曲线没有可写点";
+    } else {
+        reason = SymbolWriteUnsupportedReason(symbol);
+        if (!reason.empty()) return reason;
+    }
+
+    if (!symbol.memory_segment.has_value() ||
+        !symbol.memory_segment->has_xcp_segment)
+        return "无法唯一关联有效的XCP MEMORY_SEGMENT/PAG";
+    const auto& pages = symbol.memory_segment->pages;
+    if (std::none_of(pages.begin(), pages.end(), [](const auto& page) {
+            return page.xcp_write_access == a2l::XcpPageWriteAccess::DontCare;
+        }))
+        return "A2L未声明允许无条件XCP写入的PAGE";
+    return {};
+}
+
 /// @brief 检查A2L静态页声明与XCP实时页属性是否都允许写入。
 [[nodiscard]] inline std::string CalibrationPageWriteUnsupportedReason(
     const a2l::SymbolInfo& symbol, std::uint8_t active_page,

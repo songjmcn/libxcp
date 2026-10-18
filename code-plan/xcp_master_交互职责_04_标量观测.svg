@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="920" viewBox="0 0 1440 920">
+<title>D / 非数组变量观测：标量原位展开</title>
+<g font-family="SFMono-Regular, Menlo, Consolas, monospace">
+<rect width="1440" height="920" fill="#0b1220"/>
+<text x="36" y="44" fill="#f3f7fc" font-size="26">D / 非数组变量观测：标量原位展开</text>
+<text x="36" y="76" fill="#93a5ba" font-size="15">设计效果图 · 非运行截图 · 变量数值、时间与单位均为示意</text>
+<rect x="24" y="100" width="1392" height="776" rx="5" fill="#111c2d" stroke="#33475f"/>
+<text x="44" y="132" fill="#6ee7df" font-size="19">XCP MASTER   UDP 127.0.0.1:5555   |   cpp_demo_V201.a2l</text>
+<text x="44" y="164" fill="#b9cadb" font-size="18">已连接  |  POLL 运行中 · 100 ms  |  观测集合 3 项  |  展开 2 项</text>
+<rect x="36" y="182" width="1368" height="36" rx="5" fill="#1e3048"/>
+<text x="48" y="207" fill="#6ee7df" font-size="18">[ 变量预览 ]       命令结果       日志</text>
+<text x="48" y="246" fill="#b9cadb" font-size="18">搜索:                             范围: 全部变量 / [ 观测集合 ]</text>
+<rect x="42" y="269" width="1350" height="40" rx="5" fill="#234b60" stroke="#6ee7df"/>
+<text x="50" y="296" fill="#dce5ef" font-size="19">▾  [✓]  cpp_demo::speed           MEAS · FLOAT64_IEEE · 标量       采样中</text>
+<rect x="74" y="321" width="1290" height="139" rx="5" fill="#17283b"/>
+<text x="98" y="350" fill="#93a5ba" font-size="16">当前物理值                         数据状态                  最近更新时间</text>
+<text x="98" y="398" fill="#6ee7df" font-size="32">42.50</text>
+<text x="280" y="396" fill="#b9cadb" font-size="18">km/h</text>
+<text x="555" y="392" fill="#a6d4c8" font-size="19">采样中 · 有效</text>
+<text x="935" y="392" fill="#dce5ef" font-size="19">18:30:01.200</text>
+<text x="98" y="439" fill="#b9cadb" font-size="16">来源：POLL  |  读取能力：支持  |  标定能力：只读 MEASUREMENT</text>
+<text x="50" y="499" fill="#dce5ef" font-size="19">▾  [✓]  cpp_demo::counter         MEAS · UWORD · 标量              采样中</text>
+<rect x="74" y="519" width="1290" height="126" rx="5" fill="#17283b"/>
+<text x="98" y="549" fill="#93a5ba" font-size="16">当前物理值                         数据状态                  最近更新时间</text>
+<text x="98" y="592" fill="#6ee7df" font-size="32">128</text>
+<text x="280" y="590" fill="#b9cadb" font-size="18">无单位</text>
+<text x="555" y="586" fill="#a6d4c8" font-size="19">采样中 · 有效</text>
+<text x="935" y="586" fill="#dce5ef" font-size="19">18:30:01.200</text>
+<text x="98" y="626" fill="#b9cadb" font-size="16">来源：POLL  |  标量直接显示单值，不显示数组索引或分页控件</text>
+<text x="50" y="687" fill="#dce5ef" font-size="19">▸  [✓]  cpp_demo::temperature     MEAS · UBYTE · 标量              采样中（已折叠）</text>
+<text x="78" y="735" fill="#f2cb75" font-size="17">已折叠变量继续采样，但不显示数值；选中该行后按 Enter 展开。</text>
+<text x="78" y="766" fill="#93a5ba" font-size="16">stop 后保留最近值及时间，明确标记“已停止 / 旧值”，不伪装为实时数据。</text>
+<rect x="36" y="786" width="1368" height="36" rx="5" fill="#1e3048"/>
+<text x="48" y="811" fill="#dce5ef" font-size="18">命令 &gt; </text>
+<text x="48" y="852" fill="#6ee7df" font-size="16">Enter 展开/折叠   F6 成员切换   F4 标定   F3 只读详情   F5 停止   F2 切换视图</text>
+<text x="36" y="904" fill="#93a5ba" font-size="16">列表快捷键：Ctrl+A / ⌘A 管理观测，Ctrl+S / ⌘S 进入标定；只读变量拒绝申请写入。</text>
+</g>
+</svg>

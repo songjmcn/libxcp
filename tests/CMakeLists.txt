@@ -273,7 +273,8 @@ if(LIBXCP_BUILD_TOOLS)
   add_executable(XcpMasterSymbolPolicyTest
           xcp_master_symbol_policy_test.cpp
           xcp_master_calibration_policy_test.cpp
-          xcp_master_tui_model_test.cpp)
+          xcp_master_tui_model_test.cpp
+          xcp_master_symbol_display_test.cpp)
   target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
   target_include_directories(XcpMasterSymbolPolicyTest PRIVATE
           ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)

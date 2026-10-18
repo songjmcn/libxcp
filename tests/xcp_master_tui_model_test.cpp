@@ -9,7 +9,9 @@
 
 namespace {
 
+using calmcar::xcp::tools::ActionForPreviewRow;
 using calmcar::xcp::tools::BoundedLineBuffer;
+using calmcar::xcp::tools::BuildPreviewRows;
 using calmcar::xcp::tools::CalculateTuiLayout;
 using calmcar::xcp::tools::CalibrationFormModel;
 using calmcar::xcp::tools::CalibrationSelection;
@@ -19,6 +21,8 @@ using calmcar::xcp::tools::ConfirmationGate;
 using calmcar::xcp::tools::LatestObservationModel;
 using calmcar::xcp::tools::NextViewIndex;
 using calmcar::xcp::tools::PanelViewport;
+using calmcar::xcp::tools::PreviewRowAction;
+using calmcar::xcp::tools::PreviewRowSource;
 using calmcar::xcp::tools::SearchInputRevision;
 using calmcar::xcp::tools::TuiLayoutMetrics;
 using calmcar::xcp::tools::VariableModalPage;
@@ -533,8 +537,8 @@ TEST(TuiLayoutTest, RejectsInteractiveOperationsBelowMinimumSize) {
     }
 }
 
-/** @brief Enter 打开详情弹窗，Esc/确认取消返回同一详情并保留表单变量。 */
-TEST(VariableModalStateTest, OpensDetailsAndReturnsAfterConfirmation) {
+/** @brief 只读详情不进入确认；标定确认取消/完成后返回标定表单。 */
+TEST(VariableModalStateTest, SeparatesReadOnlyDetailsFromCalibrationForm) {
     const auto layout = CalculateTuiLayout(100, 30);
     VariableModalState modal;
     ASSERT_TRUE(modal.Open("ECU::gain", layout));
@@ -542,14 +546,17 @@ TEST(VariableModalStateTest, OpensDetailsAndReturnsAfterConfirmation) {
     EXPECT_TRUE(modal.BlocksBackgroundListUpdates());
     EXPECT_EQ(modal.Page(), VariableModalPage::Details);
     EXPECT_EQ(modal.SelectedName(), "ECU::gain");
-    EXPECT_FALSE(modal.BeginConfirmation(false, layout));
+    EXPECT_FALSE(modal.BeginConfirmation(true, layout));
+
+    ASSERT_TRUE(modal.OpenCalibration("ECU::gain", layout));
+    EXPECT_EQ(modal.Page(), VariableModalPage::Calibration);
     ASSERT_TRUE(modal.BeginConfirmation(true, layout));
     EXPECT_EQ(modal.Page(), VariableModalPage::Confirmation);
     modal.CancelConfirmation();
-    EXPECT_EQ(modal.Page(), VariableModalPage::Details);
+    EXPECT_EQ(modal.Page(), VariableModalPage::Calibration);
     ASSERT_TRUE(modal.BeginConfirmation(true, layout));
     modal.CompleteConfirmation();
-    EXPECT_EQ(modal.Page(), VariableModalPage::Details);
+    EXPECT_EQ(modal.Page(), VariableModalPage::Calibration);
     EXPECT_EQ(modal.SelectedName(), "ECU::gain");
     modal.Close();
     EXPECT_FALSE(modal.IsOpen());
@@ -568,8 +575,12 @@ TEST(VariableModalStateTest, RejectsDetailsAndConfirmationOnSmallTerminal) {
     EXPECT_FALSE(modal.OpenCommandConfirmation(small_layout));
     ASSERT_TRUE(modal.Open("ECU::gain", normal_layout));
     EXPECT_TRUE(modal.BlocksBackgroundListUpdates());
-    EXPECT_FALSE(modal.BeginConfirmation(true, small_layout));
+    EXPECT_FALSE(modal.BeginConfirmation(true, normal_layout));
     EXPECT_EQ(modal.Page(), VariableModalPage::Details);
+    EXPECT_FALSE(modal.OpenCalibration("ECU::gain", small_layout));
+    ASSERT_TRUE(modal.OpenCalibration("ECU::gain", normal_layout));
+    EXPECT_FALSE(modal.BeginConfirmation(true, small_layout));
+    EXPECT_EQ(modal.Page(), VariableModalPage::Calibration);
 }
 
 /** @brief 通用命令确认也仅在合适尺寸下打开，并可独立关闭。 */
@@ -581,6 +592,9 @@ TEST(VariableModalStateTest, OpensCommandConfirmationWithoutVariableDetails) {
     EXPECT_TRUE(modal.BlocksBackgroundListUpdates());
     EXPECT_EQ(modal.Page(), VariableModalPage::Confirmation);
     EXPECT_TRUE(modal.SelectedName().empty());
+    modal.CancelConfirmation();
+    EXPECT_EQ(modal.Page(), VariableModalPage::Closed);
+    ASSERT_TRUE(modal.OpenCommandConfirmation(layout));
     modal.Close();
     EXPECT_FALSE(modal.IsOpen());
     EXPECT_FALSE(modal.BlocksBackgroundListUpdates());
@@ -600,6 +614,133 @@ TEST(LatestObservationModelTest, FailureKeepsPreviousValueAsStale) {
     EXPECT_TRUE(sample->has_value);
     EXPECT_NE(model.Lines()[0].find("1.25 V"), std::string::npos);
     EXPECT_NE(model.Lines()[0].find("旧值"), std::string::npos);
+}
+
+/** @brief 数组样本按整批保存，行摘要不会展开或丢失元素。 */
+TEST(LatestObservationModelTest, StoresArraySnapshotAtomically) {
+    LatestObservationModel model(2);
+    model.UpdateArrayValue("ECU::histogram", {"10", "20", "30"}, "POLL",
+                           "12:00:00");
+
+    const auto sample = model.Find("ECU::histogram");
+    ASSERT_TRUE(sample.has_value());
+    EXPECT_TRUE(sample->is_array);
+    EXPECT_TRUE(sample->has_value);
+    EXPECT_FALSE(sample->stale);
+    EXPECT_EQ(sample->array_values,
+              (std::vector<std::string>{"10", "20", "30"}));
+    ASSERT_EQ(model.Lines().size(), 1U);
+    EXPECT_NE(model.Lines()[0].find("[3 elements]"), std::string::npos);
+}
+
+/** @brief 整数组读取失败保留上一完整批次并标记为旧值。 */
+TEST(LatestObservationModelTest, ArrayFailurePreservesWholePreviousBatch) {
+    LatestObservationModel model(2);
+    const std::vector<std::string> previous{"1", "2", "3", "4"};
+    model.UpdateArrayValue("ECU::histogram", previous, "POLL", "12:00:00");
+    model.MarkFailure("ECU::histogram", "UPLOAD 超时", "12:00:01");
+
+    const auto sample = model.Find("ECU::histogram");
+    ASSERT_TRUE(sample.has_value());
+    EXPECT_TRUE(sample->is_array);
+    EXPECT_TRUE(sample->stale);
+    EXPECT_EQ(sample->status, "UPLOAD 超时");
+    EXPECT_EQ(sample->array_values, previous);
+    EXPECT_NE(model.Lines()[0].find("旧值"), std::string::npos);
+}
+
+/** @brief 新标量样本替换数组样本时清除旧数组元素。 */
+TEST(LatestObservationModelTest, ScalarUpdateReplacesArrayShape) {
+    LatestObservationModel model(2);
+    model.UpdateArrayValue("ECU::histogram", {"1", "2"}, "POLL");
+    model.UpdateValue("ECU::histogram", "7", "POLL");
+
+    const auto sample = model.Find("ECU::histogram");
+    ASSERT_TRUE(sample.has_value());
+    EXPECT_FALSE(sample->is_array);
+    EXPECT_TRUE(sample->array_values.empty());
+    EXPECT_EQ(sample->value, "7");
+}
+
+/** @brief 展开数组时为所有元素生成连续且可滚动的菜单子行。 */
+TEST(PreviewRowsTest, ExpandedArrayCreatesEveryElementRow) {
+    const auto rows = BuildPreviewRows(
+        {PreviewRowSource{"ECU::histogram", true, true, true, 3U, true}});
+
+    ASSERT_EQ(rows.size(), 4U);
+    EXPECT_FALSE(rows[0].is_child);
+    EXPECT_EQ(rows[0].symbol_name, "ECU::histogram");
+    for (std::size_t index = 0; index < 3U; ++index) {
+        EXPECT_TRUE(rows[index + 1U].is_child);
+        EXPECT_EQ(rows[index + 1U].symbol_name, "ECU::histogram");
+        ASSERT_TRUE(rows[index + 1U].element_index.has_value());
+        EXPECT_EQ(rows[index + 1U].element_index, index);
+    }
+}
+
+/** @brief 大数组展开行覆盖首尾索引且折叠不会生成子行。 */
+TEST(PreviewRowsTest, LargeArrayRowsRemainBoundedBySampleAndExpansion) {
+    const auto expanded = BuildPreviewRows(
+        {PreviewRowSource{"ECU::histogram", true, true, true, 4096U, true}});
+    ASSERT_EQ(expanded.size(), 4097U);
+    ASSERT_TRUE(expanded[1].element_index.has_value());
+    EXPECT_EQ(expanded[1].element_index, 0U);
+    ASSERT_TRUE(expanded.back().element_index.has_value());
+    EXPECT_EQ(expanded.back().element_index, 4095U);
+
+    const auto collapsed = BuildPreviewRows(
+        {PreviewRowSource{"ECU::histogram", false, true, true, 4096U, true}});
+    ASSERT_EQ(collapsed.size(), 1U);
+    EXPECT_FALSE(collapsed.front().is_child);
+}
+
+/** @brief 无样本时显示独立占位子行，不伪造数组索引。 */
+TEST(PreviewRowsTest, ExpandedUnobservedArrayCreatesPlaceholder) {
+    const auto rows = BuildPreviewRows(
+        {PreviewRowSource{"ECU::histogram", true, false, false, 0U, true}});
+
+    ASSERT_EQ(rows.size(), 2U);
+    EXPECT_FALSE(rows[0].is_child);
+    EXPECT_TRUE(rows[1].is_child);
+    EXPECT_TRUE(rows[1].is_placeholder);
+    EXPECT_FALSE(rows[1].element_index.has_value());
+}
+
+/** @brief 停止观测时，展开行提供不改变观测成员资格的一次读取动作。 */
+TEST(PreviewRowsTest, ExpandedStoppedArrayOffersIndependentReadOnceAction) {
+    const auto rows = BuildPreviewRows({PreviewRowSource{
+        "ECU::histogram", true, false, true, 0U, true, true}});
+
+    ASSERT_EQ(rows.size(), 3U);
+    EXPECT_FALSE(rows[0].is_child);
+    EXPECT_TRUE(rows[1].is_child);
+    EXPECT_TRUE(rows[1].is_read_action);
+    EXPECT_FALSE(rows[1].element_index.has_value());
+    EXPECT_TRUE(rows[2].is_child);
+    EXPECT_TRUE(rows[2].is_placeholder);
+}
+
+/** @brief Enter对父行、读取动作、数据子行分别执行安全动作。 */
+TEST(PreviewRowsTest, EnterActionDispatchesByPreviewRowKind) {
+    const auto rows = BuildPreviewRows(
+        {PreviewRowSource{"ECU::histogram", true, true, true, 2U, true, true}});
+
+    ASSERT_EQ(rows.size(), 4U);
+    EXPECT_EQ(ActionForPreviewRow(rows[0]), PreviewRowAction::ToggleExpansion);
+    EXPECT_EQ(ActionForPreviewRow(rows[1]), PreviewRowAction::ReadOnce);
+    EXPECT_EQ(ActionForPreviewRow(rows[2]), PreviewRowAction::Ignore);
+    EXPECT_EQ(ActionForPreviewRow(rows[3]), PreviewRowAction::Ignore);
+}
+
+/** @brief 运行观测期间展开行不显示单次读取动作。 */
+TEST(PreviewRowsTest, ExpandedWatchedArrayDoesNotOfferManualReadAction) {
+    const auto rows = BuildPreviewRows({PreviewRowSource{
+        "ECU::histogram", true, true, true, 2U, true, false}});
+
+    ASSERT_EQ(rows.size(), 3U);
+    EXPECT_FALSE(rows[1].is_read_action);
+    EXPECT_EQ(rows[1].element_index, 0U);
+    EXPECT_EQ(rows[2].element_index, 1U);
 }
 
 }  // namespace

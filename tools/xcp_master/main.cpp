@@ -45,6 +45,7 @@
 #include <ftxui/dom/elements.hpp>
 
 #include "calibration_policy.hpp"
+#include "symbol_display.hpp"
 #include "tui_model.hpp"
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/a2l/ia2l_database.hpp"
@@ -104,6 +105,9 @@ using calmcar::xcp::a2l::CharacteristicType;
 using calmcar::xcp::a2l::PhysicalValue;
 using calmcar::xcp::a2l::SymbolInfo;
 using calmcar::xcp::a2l::SymbolKind;
+using calmcar::xcp::tools::BuildPreviewRows;
+using calmcar::xcp::tools::PreviewRow;
+using calmcar::xcp::tools::PreviewRowSource;
 using calmcar::xcp::tools::TuiLayoutMetrics;
 
 struct Options {
@@ -362,7 +366,7 @@ public:
         auto scope_menu = Menu(&preview_scope_labels_, &preview_scope_selected_,
                                scope_options);
         MenuOption preview_options;
-        preview_options.on_enter = [this] { OpenPreviewDetails(); };
+        preview_options.on_enter = [this] { ActivatePreviewRow(); };
         auto preview_menu =
             Menu(&preview_labels_, &preview_selected_, preview_options);
         auto preview_view =
@@ -375,261 +379,169 @@ public:
         MenuOption view_options = MenuOption::Horizontal();
         auto view_menu = Menu(&view_labels_, &view_selected_, view_options);
 
-        InputOption element_index_options;
-        element_index_options.placeholder = "0基数组元素/曲线点索引";
-        element_index_options.on_change = [this] { OnElementIndexChanged(); };
-        auto element_index_input =
-            Input(&modal_element_index_text_, element_index_options);
+        InputOption calibration_index_options;
+        calibration_index_options.placeholder = "0基数组元素/曲线点索引";
+        auto calibration_element_index_input =
+            Input(&modal_element_index_text_, calibration_index_options);
         InputOption target_options;
         target_options.placeholder = "目标物理值（仅VALUE或单曲线点）";
         auto target_input = Input(&calibration_form_.target, target_options);
-        auto read_button =
-            Button("读取当前值", [this] { SubmitCalibrationRead(); });
-        auto previous_array_page_button =
-            Button("数组上一页", [this] { NavigateArrayPage(-1); });
-        auto read_array_page_button =
-            Button("读取本页", [this] { SubmitCalibrationArrayPage(); });
-        auto next_array_page_button =
-            Button("数组下一页", [this] { NavigateArrayPage(1); });
-        auto watch_button =
-            Button("切换采样", [this] { TogglePreviewWatch(); });
+        auto calibration_read_button =
+            Button("读回当前值", [this] { SubmitCalibrationRead(); });
         auto write_button =
             Button("申请写入…", [this] { SubmitCalibrationWrite(); });
         auto close_button =
-            Button("关闭详情", [this] { CloseVariableModal(); });
-        auto element_index_label =
+            Button("返回预览", [this] { CloseVariableModal(); });
+        auto close_calibration_button =
+            Button("取消标定", [this] { CloseVariableModal(); });
+        auto calibration_element_index_label =
             Renderer([] { return text("元素索引(0基)："); });
-        auto element_index_control = Maybe(
-            Container::Horizontal({element_index_label, element_index_input}),
-            [this] {
-                return !terminal_too_small_.load() &&
-                       modal_symbol_info_.has_value() &&
-                       RequiresElementIndex(*modal_symbol_info_);
-            });
+        auto calibration_element_index_control =
+            Maybe(Container::Horizontal({calibration_element_index_label,
+                                         calibration_element_index_input}),
+                  [this] {
+                      return !terminal_too_small_.load() &&
+                             variable_modal_.Page() ==
+                                 calmcar::xcp::tools::VariableModalPage::
+                                     Calibration &&
+                             modal_symbol_info_.has_value() &&
+                             RequiresElementIndex(*modal_symbol_info_);
+                  });
         auto target_label = Renderer([] { return text("目标值："); });
         auto target_control =
             Maybe(Container::Horizontal({target_label, target_input}), [this] {
                 return !terminal_too_small_.load() && !DaqRunning() &&
+                       variable_modal_.Page() ==
+                           calmcar::xcp::tools::VariableModalPage::
+                               Calibration &&
                        modal_symbol_info_.has_value() &&
                        ModalWriteUnsupportedReason().empty();
             });
-        auto read_control = Maybe(read_button, [this] {
+        auto calibration_read_control = Maybe(calibration_read_button, [this] {
             return !terminal_too_small_.load() && !DaqRunning() &&
+                   variable_modal_.Page() ==
+                       calmcar::xcp::tools::VariableModalPage::Calibration &&
                    modal_symbol_info_.has_value() &&
                    ModalReadUnsupportedReason().empty();
         });
-        auto array_page_control =
-            Maybe(Container::Horizontal({previous_array_page_button,
-                                         read_array_page_button,
-                                         next_array_page_button}),
-                  [this] {
-                      return !terminal_too_small_.load() && !DaqRunning() &&
-                             ModalArrayPageUnsupportedReason().empty();
-                  });
-        auto array_page_display = Maybe(
-            Renderer([this] {
-                if (!modal_symbol_info_.has_value()) return text("");
-                const auto extent =
-                    modal_symbol_info_->dimensions.front().extent;
-                const auto count =
-                    modal_array_page_start_ < extent
-                        ? std::min<std::uint64_t>(
-                              kArrayPageSize, extent - modal_array_page_start_)
-                        : 0U;
-                const auto end = modal_array_page_start_ + count;
-                return vbox({text("数组页：[" +
-                                  std::to_string(modal_array_page_start_) +
-                                  ", " + std::to_string(end) + ") / " +
-                                  std::to_string(extent)),
-                             paragraph(modal_array_page_lines_)});
-            }),
-            [this] { return ModalArrayPageUnsupportedReason().empty(); });
-        auto watch_control = Maybe(watch_button, [this] {
-            return !terminal_too_small_.load() && !DaqRunning() &&
-                   modal_symbol_info_.has_value() &&
-                   modal_symbol_info_->kind == SymbolKind::Measurement &&
-                   calmcar::xcp::tools::SymbolReadUnsupportedReason(
-                       *modal_symbol_info_)
-                       .empty();
-        });
         auto write_control = Maybe(write_button, [this] {
             return !terminal_too_small_.load() && !DaqRunning() &&
+                   variable_modal_.Page() ==
+                       calmcar::xcp::tools::VariableModalPage::Calibration &&
                    modal_symbol_info_.has_value() &&
                    ModalWriteUnsupportedReason().empty();
         });
-        auto details_container = Container::Vertical(
-            {element_index_control, array_page_control, array_page_display,
-             target_control, read_control, watch_control, write_control,
-             close_button});
-        auto details_renderer = Renderer(details_container, [&] {
+        auto details_container = Container::Vertical({close_button});
+        auto calibration_container =
+            Container::Vertical({calibration_element_index_control,
+                                 target_control, calibration_read_control,
+                                 write_control, close_calibration_button});
+        auto details_renderer = Renderer(details_container, [this,
+                                                             close_button] {
             const auto layout = current_layout_;
-            std::string name;
-            std::string current;
-            std::string form_status;
-            std::optional<calmcar::xcp::tools::ObservationSnapshot> sample;
-            bool watched = false;
-            {
-                std::lock_guard lock(output_mutex_);
-                name = modal_symbol_info_.has_value()
-                           ? QualifiedName(*modal_symbol_info_)
-                           : variable_modal_.SelectedName();
-                current = calibration_form_.current;
-                form_status = calibration_form_.status;
-                if (!name.empty()) sample = observation_model_.Find(name);
-                std::lock_guard watched_lock(watched_mutex_);
-                watched = std::find(watched_.begin(), watched_.end(), name) !=
-                          watched_.end();
-            }
-            auto read_reason = ModalReadUnsupportedReason();
-            auto write_reason = ModalWriteUnsupportedReason();
-            const bool daq_active = DaqRunning();
-            const bool array_page_supported =
-                ModalArrayPageUnsupportedReason().empty();
-            if (daq_active) {
-                if (read_reason.empty()) read_reason = "DAQ运行中";
-                if (write_reason.empty()) write_reason = "DAQ运行中";
-            }
-            const std::string kind =
-                modal_symbol_info_.has_value()
-                    ? (modal_symbol_info_->kind == SymbolKind::Measurement
-                           ? "MEASUREMENT"
-                       : modal_symbol_info_->kind ==
-                                   SymbolKind::Characteristic &&
-                               modal_symbol_info_->characteristic_type ==
-                                   CharacteristicType::Value
-                           ? "CHARACTERISTIC/VALUE"
-                       : modal_symbol_info_->kind ==
-                                   SymbolKind::Characteristic &&
-                               modal_symbol_info_->characteristic_type ==
-                                   CharacteristicType::Curve
-                           ? "CHARACTERISTIC/CURVE"
-                           : "其他CHARACTERISTIC/结构体")
-                    : "";
-            std::string element_info;
-            if (modal_symbol_info_.has_value() &&
-                !modal_symbol_info_->dimensions.empty()) {
-                const auto& symbol = *modal_symbol_info_;
-                element_info = "元素总数：" +
-                               std::to_string(symbol.dimensions.front().extent);
-                if (symbol.fixed_curve_axis.has_value()) {
-                    const auto index = calmcar::xcp::tools::ParseElementIndex(
-                        modal_element_index_text_);
-                    if (index &&
-                        *index <
-                            symbol.fixed_curve_axis->explicit_values.size()) {
-                        element_info +=
-                            " | X[" + std::to_string(*index) + "]=" +
-                            std::to_string(symbol.fixed_curve_axis
-                                               ->explicit_values[*index]);
-                    } else if (index &&
-                               *index < symbol.fixed_curve_axis->point_count) {
-                        element_info +=
-                            " | X[" + std::to_string(*index) + "]=" +
-                            std::to_string(symbol.fixed_curve_axis->offset +
-                                           symbol.fixed_curve_axis->distance *
-                                               static_cast<double>(*index));
-                    } else {
-                        element_info +=
-                            " | X[0]=" +
-                            std::to_string(symbol.fixed_curve_axis->offset) +
-                            "，步长=" +
-                            std::to_string(symbol.fixed_curve_axis->distance);
-                    }
+            if (!modal_symbol_info_.has_value())
+                return text("没有可显示的 A2L 元数据") | border;
+
+            const auto& symbol = *modal_symbol_info_;
+            const auto description =
+                calmcar::xcp::tools::DescribeSymbolType(symbol);
+            const auto read_reason =
+                calmcar::xcp::tools::SymbolDetailReadUnsupportedReason(symbol);
+            const auto write_reason =
+                calmcar::xcp::tools::SymbolStaticWriteUnsupportedReason(symbol);
+
+            std::string dimensions = "标量";
+            if (!symbol.dimensions.empty()) {
+                dimensions.clear();
+                for (const auto& dimension : symbol.dimensions) {
+                    if (!dimensions.empty()) dimensions += " × ";
+                    dimensions += std::to_string(dimension.extent);
                 }
             }
-            const std::string unit = modal_symbol_info_.has_value()
-                                         ? modal_symbol_info_->conversion.unit
-                                         : "";
-            const bool curve_point_write =
-                modal_symbol_info_.has_value() &&
-                modal_symbol_info_->kind == SymbolKind::Characteristic &&
-                modal_symbol_info_->characteristic_type ==
-                    CharacteristicType::Curve;
-            const std::string write_label =
-                curve_point_write ? "曲线点写入：" : "写入能力：";
-            const std::string latest =
-                sample.has_value() && sample->has_value
-                    ? sample->value + (unit.empty() ? "" : " " + unit) +
-                          (sample->stale ? "（旧值）" : "") +
-                          (sample->stopped ? "（已停止）" : "")
-                    : "尚无成功样本";
-            const std::string sample_time =
-                sample.has_value() && !sample->timestamp.empty()
-                    ? " | 时间：" + sample->timestamp
-                    : "";
+            std::string axis = "固定轴：无";
+            if (symbol.fixed_curve_axis.has_value()) {
+                const auto& fixed_axis = *symbol.fixed_curve_axis;
+                axis =
+                    "固定轴：点数=" + std::to_string(fixed_axis.point_count) +
+                    "，偏移=" + std::to_string(fixed_axis.offset) +
+                    "，步长=" + std::to_string(fixed_axis.distance);
+            }
+            const std::string read_status = read_reason.empty()
+                                                ? "通过静态布局策略"
+                                                : "拒绝：" + read_reason;
+            const std::string write_status =
+                write_reason.empty()
+                    ? "静态候选；实际写入仍须在独立标定流程检查活动页并确认"
+                    : "拒绝：" + write_reason;
             const auto warning =
                 layout.too_small
-                    ? text("终端尺寸不足；读取/编辑/危险确认已禁用。") |
-                          color(Color::Red)
+                    ? text("终端尺寸不足；确认操作已禁用。") | color(Color::Red)
                     : text(
-                          "详情弹窗锁定背景列表；Esc "
-                          "关闭并保留筛选与滚动位置。");
-            const auto title = text("变量详情 · " + name + "    [Esc 关闭]") |
-                               bold | color(Color::Cyan);
-            if (array_page_supported) {
-                return vbox({title, separator(),
-                             text("一维MEASUREMENT数组" +
-                                  (unit.empty() ? "" : " | 单位：" + unit) +
-                                  " | 支持0基单项读取和8项分页；只读"),
-                             text("状态：" + form_status),
-                             array_page_control->Render(),
-                             array_page_display->Render(),
-                             element_index_control->Render(),
-                             hbox({read_control->Render(), text("  "),
-                                   close_button->Render()}),
-                             warning}) |
-                       border |
-                       size(WIDTH, LESS_THAN, std::max(1, layout.modal_width)) |
-                       size(HEIGHT, LESS_THAN,
-                            std::max(1, layout.modal_height));
-            }
-            return vbox({title, separator(),
-                         text("类型：" + kind +
-                              (unit.empty() ? "" : " | 单位：" + unit)),
-                         text("采样状态：" +
-                              std::string(DaqRunning()
-                                              ? "DAQ运行中，采样集合锁定"
-                                          : watched ? "已加入采样"
-                                                    : "未加入采样")),
-                         text("最近值：" + latest + sample_time +
-                              (sample.has_value() && !sample->status.empty()
-                                   ? " | " + sample->status
-                                   : "")),
-                         text(array_page_supported
-                                  ? "读取：支持索引/分页 | 写入：数组只读"
-                                  : "手动读取：" +
-                                        (read_reason.empty()
-                                             ? "允许"
-                                             : "拒绝 — " + read_reason)),
-                         text(write_label + (write_reason.empty()
-                                                 ? "可申请（仍需确认）"
-                                                 : "拒绝 — " + write_reason)),
-                         text("当前值：" + current +
-                              (current == "尚未读取" || unit.empty()
-                                   ? ""
-                                   : " " + unit) +
-                              " | " + form_status),
-                         element_info.empty()
-                             ? text("")
-                             : text("元素布局：" + element_info),
-                         array_page_control->Render(),
-                         array_page_display->Render(),
+                          "本页只显示 A2L 元数据与静态策略，不访问 ECU。"
+                          "观测请返回预览列表；标定请按 F4/Ctrl+S/Cmd+S。");
 
-                         element_index_control->Render(),
-                         target_control->Render(),
-                         hbox({read_control->Render(), text("  "),
-                               watch_control->Render(), text("  "),
-                               write_control->Render(), text("  "),
-                               close_button->Render()}),
-                         text("索引为0基；写入仅限安全策略允许的 "
-                              "CHARACTERISTIC/VALUE 或固定轴 CURVE 单点；"
-                              "表单编辑不会自动写入。") |
-                             color(Color::Yellow),
-                         warning}) |
+            return vbox(
+                       {text("A2L 元数据 · " + QualifiedName(symbol) +
+                             "    [Esc 返回]") |
+                            bold | color(Color::Cyan),
+                        separator(),
+                        text("对象类别：" + KindName(symbol) + " | 基础类型：" +
+                             description.base_type),
+                        text("数据形态：" + description.data_shape +
+                             " | 维度：" + dimensions + " | 单元素宽度：" +
+                             description.element_width),
+                        text("单位：" + symbol.conversion.unit),
+                        text("XCP 地址：" + std::to_string(symbol.xcp_address) +
+                             " | 地址扩展：" +
+                             std::to_string(symbol.address_extension)),
+                        text(axis), text("读取静态策略：" + read_status),
+                        text("标定静态策略：" + write_status), warning,
+                        close_button->Render()}) |
                    border |
                    size(WIDTH, LESS_THAN, std::max(1, layout.modal_width)) |
                    size(HEIGHT, LESS_THAN, std::max(1, layout.modal_height));
         });
+
+        auto calibration_renderer = Renderer(
+            calibration_container, [this, calibration_element_index_control,
+                                    target_control, calibration_read_control,
+                                    write_control, close_calibration_button] {
+                const auto layout = current_layout_;
+                if (!modal_symbol_info_.has_value())
+                    return text("没有可标定的变量") | border;
+                const auto& symbol = *modal_symbol_info_;
+                const auto name = QualifiedName(symbol);
+                const auto description =
+                    calmcar::xcp::tools::DescribeSymbolType(symbol);
+                const auto write_reason = ModalWriteUnsupportedReason();
+                const auto read_reason = ModalReadUnsupportedReason();
+                const auto write_status = write_reason.empty()
+                                              ? "满足候选条件；仍需明确确认"
+                                              : "拒绝：" + write_reason;
+                return vbox(
+                           {text("独立标定流程 · " + name + "    [Esc 返回]") |
+                                bold | color(Color::Yellow),
+                            separator(),
+                            text("类别：" + KindName(symbol) + " | 基础类型：" +
+                                 description.base_type),
+                            text("形态：" + description.data_shape +
+                                 " | 单元素宽度：" + description.element_width),
+                            text("当前值：" + calibration_form_.current),
+                            text("读取状态：" + read_reason),
+                            text("写入资格：" + write_status),
+                            calibration_element_index_control->Render(),
+                            target_control->Render(),
+                            hbox({calibration_read_control->Render(),
+                                  text("  "), write_control->Render(),
+                                  text("  "),
+                                  close_calibration_button->Render()}),
+                            text("标定值只在确认页按 Y 后发送；N/Esc 取消。") |
+                                color(Color::Yellow)}) |
+                       border |
+                       size(WIDTH, LESS_THAN, std::max(1, layout.modal_width)) |
+                       size(HEIGHT, LESS_THAN,
+                            std::max(1, layout.modal_height));
+            });
 
         auto confirmation_renderer = Renderer([this] {
             const auto layout = current_layout_;
@@ -637,7 +549,8 @@ public:
                              color(Color::Yellow),
                          separator(), paragraph(confirmation_prompt_),
                          text("Y/y：明确确认；N/"
-                              "n、Esc：取消；变量写入返回详情，命令确认返回界面"
+                              "n、Esc：取消；变量写入返回标定表单，命令确认返回"
+                              "界面"
                               "。"),
                          text("Enter、其它按键及窗口过小都不会发送操作；F5取消"
                               "并停止。")}) |
@@ -646,7 +559,8 @@ public:
                    size(HEIGHT, LESS_THAN, std::max(1, layout.modal_height));
         });
         auto modal_pages = Container::Tab(
-            {details_renderer, confirmation_renderer}, &modal_page_selected_);
+            {details_renderer, calibration_renderer, confirmation_renderer},
+            &modal_page_selected_);
 
         auto root =
             Container::Vertical({view_menu, view_content, command_input});
@@ -691,8 +605,9 @@ public:
             if (modal_visible_ &&
                 variable_modal_.Page() ==
                     calmcar::xcp::tools::VariableModalPage::Confirmation) {
-                help = compact ? "Y确认 | N/Esc取消回详情 | F5取消并停止"
-                               : "Y 确认 | N/Esc 取消并回详情 | F5 取消并停止";
+                help = compact
+                           ? "Y确认 | N/Esc取消返回 | F5取消并停止"
+                           : "Y 确认 | N/Esc 取消后返回发起页 | F5 取消并停止";
             } else if (modal_visible_) {
                 help = compact ? "Tab切换 | Esc关闭 | F5停止"
                                : "Tab 弹窗内切换 | Enter 激活 | Esc 关闭详情 | "
@@ -703,11 +618,12 @@ public:
                            : "Enter 执行 | ↑↓ 命令历史 | F2 切换视图 | F5 停止 "
                              "| quit 退出";
             } else if (preview_menu->Focused()) {
-                help =
-                    compact
-                        ? "↑↓选择 | PgUp/Dn翻页 | Enter详情 | F2视图 | Esc命令"
-                        : "↑↓ 选择变量 | PgUp/PgDn 翻页 | Enter 打开详情 | F2 "
-                          "视图 | Esc 命令";
+                help = compact
+                           ? "↑↓滚动 | Enter展开 | F3详情 | Ctrl/Cmd+A/F6采样 "
+                             "| Ctrl/Cmd+S/F4标定"
+                           : "↑↓ 选择/滚动 | Enter 展开/折叠 | F3 只读详情 | "
+                             "Ctrl+A/Cmd+A/F6 观测 | Ctrl+S/Cmd+S/F4 标定 | F2 "
+                             "视图 | Esc 命令";
             } else if (search_input->Focused()) {
                 help = compact ? "Enter搜索元数据 | 不触发ECU操作 | Esc命令"
                                : "输入名称模式 | Enter 搜索A2L元数据 | "
@@ -766,7 +682,7 @@ public:
                    border;
         });
         auto ui = Modal(renderer, modal_pages, &modal_visible_);
-        ui = CatchEvent(ui, [this, command_input](Event event) {
+        ui = CatchEvent(ui, [this, command_input, preview_menu](Event event) {
             if (modal_visible_) {
                 if (event == Event::F2) return true;
                 if (event == Event::F5) {
@@ -800,6 +716,26 @@ public:
                     return true;
                 }
                 return false;
+            }
+            if (view_selected_ == 0 && preview_menu->Focused()) {
+                if (event == Event::CtrlA || event == Event::AltA ||
+                    event == Event::Special("\x1b[97;9u") ||
+                    event == Event::Special("\x1b[65;10u") ||
+                    event == Event::F6) {
+                    TogglePreviewWatch();
+                    return true;
+                }
+                if (event == Event::CtrlS || event == Event::AltS ||
+                    event == Event::Special("\x1b[115;9u") ||
+                    event == Event::Special("\x1b[83;10u") ||
+                    event == Event::F4) {
+                    OpenCalibration();
+                    return true;
+                }
+                if (event == Event::F3) {
+                    OpenPreviewDetails();
+                    return true;
+                }
             }
             if (event == Event::F5) {
                 SubmitCommand("stop");
@@ -887,9 +823,19 @@ private:
         const std::optional<calmcar::xcp::tools::ObservationSnapshot>& sample,
         bool watched) const {
         const auto name = QualifiedName(symbol);
-        std::string label = name + " | ";
+        const std::string type_label =
+            calmcar::xcp::tools::FormatSymbolTypeLabel(symbol, KindName(symbol),
+                                                       current_layout_.compact);
+        std::string label = current_layout_.compact
+                                ? type_label + " | " + name + " | "
+                                : name + " | " + type_label + " | ";
         if (sample.has_value() && sample->has_value) {
-            label += sample->value;
+            if (sample->is_array) {
+                label += "[" + std::to_string(sample->array_values.size()) +
+                         " elements]";
+            } else {
+                label += sample->value;
+            }
             if (!symbol.conversion.unit.empty())
                 label += " " + symbol.conversion.unit;
             if (sample->stale) label += "（旧值）";
@@ -902,12 +848,9 @@ private:
                          : "—";
         }
         label += watched ? " | 已加入采样" : " | 未采样";
-        const auto read_reason =
-            calmcar::xcp::tools::SymbolReadUnsupportedReason(symbol);
+        const auto read_reason = ObservationUnsupportedReason(symbol);
         if (!read_reason.empty()) label += " | 读取拒绝: " + read_reason;
-        if (symbol.kind == SymbolKind::Measurement) {
-            label += " | MEASUREMENT";
-        } else {
+        if (symbol.kind != SymbolKind::Measurement) {
             const auto write_reason =
                 calmcar::xcp::tools::SymbolWriteUnsupportedReason(symbol);
             label += write_reason.empty() ? " | 可写标量候选"
@@ -916,18 +859,50 @@ private:
         return label;
     }
 
-    /** @brief 在界面线程重建过滤后的变量表和索引。 */
+    /** @brief 格式化展开的标量观测子行。 */
+    std::string FormatExpandedScalarValue(
+        const SymbolInfo& symbol,
+        const calmcar::xcp::tools::ObservationSnapshot& sample) const {
+        std::string label = "  └ 值：" + sample.value;
+        if (!symbol.conversion.unit.empty())
+            label += " " + symbol.conversion.unit;
+        if (!sample.timestamp.empty()) label += " | " + sample.timestamp;
+        if (sample.stale || sample.stopped) label += " | 旧样本";
+        return label;
+    }
+
+    /** @brief 格式化展开的数组元素子行。 */
+    std::string FormatExpandedArrayValue(const SymbolInfo& symbol,
+                                         std::size_t index,
+                                         const std::string& value,
+                                         bool stale) const {
+        std::string label = "  └ [" + std::to_string(index) + "] = " + value;
+        if (!symbol.conversion.unit.empty())
+            label += " " + symbol.conversion.unit;
+        if (stale) label += " | 旧样本";
+        return label;
+    }
+
+    /** @brief 在界面线程重建父行/动作行/数据行并保留行身份。 */
     void RebuildPreviewLabels() {
-        const auto old_selected_name =
+        const auto old_selected_row =
             preview_selected_ >= 0 &&
                     static_cast<std::size_t>(preview_selected_) <
-                        preview_visible_names_.size()
-                ? preview_visible_names_[preview_selected_]
-                : std::string{};
+                        preview_rows_.size()
+                ? preview_rows_[preview_selected_]
+                : PreviewRow{};
         const auto old_selected_index = preview_selected_;
         preview_labels_.clear();
         preview_visible_names_.clear();
         preview_visible_index_.clear();
+        preview_rows_.clear();
+        std::vector<PreviewRowSource> row_sources;
+        std::unordered_map<
+            std::string,
+            std::optional<calmcar::xcp::tools::ObservationSnapshot>>
+            samples_by_name;
+        std::unordered_map<std::string, bool> watched_by_name;
+        std::unordered_map<std::string, std::string> read_reasons_by_name;
         std::lock_guard lock(output_mutex_);
         std::lock_guard watched_lock(watched_mutex_);
         for (const auto& symbol : preview_symbols_) {
@@ -936,14 +911,101 @@ private:
                                            name) != watched_.end();
             if (preview_scope_selected_ == 1 && !watched) continue;
             const auto sample = observation_model_.Find(name);
-            preview_visible_index_[name] = preview_labels_.size();
-            preview_visible_names_.push_back(name);
-            preview_labels_.push_back(
-                FormatPreviewLabel(symbol, sample, watched));
+            const bool expanded = expanded_preview_names_.contains(name);
+            const bool has_sample = sample.has_value() && sample->has_value;
+            const auto read_reason = PreviewReadUnsupportedReason(symbol);
+            const bool manual_read_available =
+                (!watching_.load() || !watched) && !DaqRunning() &&
+                read_reason.empty();
+            row_sources.push_back(
+                {name, expanded, has_sample, has_sample && sample->is_array,
+                 has_sample && sample->is_array ? sample->array_values.size()
+                                                : 0U,
+                 !symbol.dimensions.empty(), manual_read_available});
+            samples_by_name.emplace(name, sample);
+            watched_by_name.emplace(name, watched);
+            read_reasons_by_name.emplace(name, read_reason);
         }
-        const auto retained = preview_visible_index_.find(old_selected_name);
-        if (retained != preview_visible_index_.end()) {
-            preview_selected_ = static_cast<int>(retained->second);
+
+        preview_rows_ = BuildPreviewRows(row_sources);
+        for (const auto& row : preview_rows_) {
+            preview_visible_names_.push_back(row.symbol_name);
+            const auto symbol_index =
+                preview_symbol_index_.find(row.symbol_name);
+            if (symbol_index == preview_symbol_index_.end()) {
+                preview_labels_.push_back(row.symbol_name + " | A2L候选已失效");
+                continue;
+            }
+            const auto& symbol = preview_symbols_[symbol_index->second];
+            const auto sample_it = samples_by_name.find(row.symbol_name);
+            const auto watched_it = watched_by_name.find(row.symbol_name);
+            const auto reason_it = read_reasons_by_name.find(row.symbol_name);
+            const std::optional<calmcar::xcp::tools::ObservationSnapshot>
+                sample = sample_it == samples_by_name.end() ? std::nullopt
+                                                            : sample_it->second;
+            const bool watched =
+                watched_it != watched_by_name.end() && watched_it->second;
+            if (!row.is_child) {
+                preview_visible_index_.try_emplace(row.symbol_name,
+                                                   preview_labels_.size());
+                preview_labels_.push_back(
+                    FormatPreviewLabel(symbol, sample, watched));
+            } else if (row.is_read_action) {
+                preview_labels_.push_back(
+                    "  └ [单次读取] 按 Enter 读取完整变量（不加入观测）");
+            } else if (row.is_placeholder) {
+                std::string status;
+                if (sample.has_value() && !sample->status.empty()) {
+                    status = sample->status;
+                } else if (watched && watching_.load()) {
+                    status = "等待首次完整样本";
+                } else if (reason_it != read_reasons_by_name.end() &&
+                           !reason_it->second.empty()) {
+                    status = "读取不可用: " + reason_it->second;
+                } else if (watched) {
+                    status = "观测已停止；尚无样本";
+                } else {
+                    status = "尚无样本";
+                }
+                preview_labels_.push_back("  └ " + status);
+            } else if (row.element_index.has_value() && sample.has_value() &&
+                       sample->has_value && sample->is_array &&
+                       *row.element_index < sample->array_values.size()) {
+                preview_labels_.push_back(FormatExpandedArrayValue(
+                    symbol, static_cast<std::size_t>(*row.element_index),
+                    sample->array_values[*row.element_index],
+                    sample->stale || sample->stopped));
+            } else if (sample.has_value() && sample->has_value &&
+                       !sample->is_array) {
+                preview_labels_.push_back(
+                    FormatExpandedScalarValue(symbol, *sample));
+            } else {
+                preview_labels_.push_back("  └ 尚无可显示的完整样本");
+            }
+        }
+
+        const auto same_row = [&](const PreviewRow& candidate) {
+            return candidate.symbol_name == old_selected_row.symbol_name &&
+                   candidate.is_child == old_selected_row.is_child &&
+                   candidate.is_read_action ==
+                       old_selected_row.is_read_action &&
+                   candidate.is_placeholder ==
+                       old_selected_row.is_placeholder &&
+                   candidate.element_index == old_selected_row.element_index;
+        };
+        auto retained =
+            std::find_if(preview_rows_.begin(), preview_rows_.end(), same_row);
+        if (retained == preview_rows_.end()) {
+            retained = std::find_if(preview_rows_.begin(), preview_rows_.end(),
+                                    [&](const PreviewRow& candidate) {
+                                        return !candidate.is_child &&
+                                               candidate.symbol_name ==
+                                                   old_selected_row.symbol_name;
+                                    });
+        }
+        if (retained != preview_rows_.end()) {
+            preview_selected_ = static_cast<int>(
+                std::distance(preview_rows_.begin(), retained));
         } else {
             preview_selected_ =
                 preview_labels_.empty()
@@ -953,10 +1015,12 @@ private:
         }
         const std::string active_filter =
             preview_active_filter_.empty() ? "*" : preview_active_filter_;
-        preview_status_ =
-            "结果筛选 " + active_filter + "：匹配 " +
-            std::to_string(preview_symbols_.size()) + " 项；当前显示 " +
-            std::to_string(preview_labels_.size()) + " 项 | ↑↓选择，Enter详情";
+        preview_status_ = "结果筛选 " + active_filter + "：匹配 " +
+                          std::to_string(preview_symbols_.size()) +
+                          " 个变量；当前显示 " +
+                          std::to_string(preview_labels_.size()) +
+                          " 行 | Enter 展开/读取，F3 详情，Ctrl+A/Cmd+A/F6 "
+                          "观测，Ctrl+S/Cmd+S/F4 标定";
         if (preview_filter_ != preview_active_filter_)
             preview_status_ += " | 搜索框是未提交草稿";
     }
@@ -969,10 +1033,6 @@ private:
         {
             std::lock_guard lock(output_mutex_);
             observation_model_.UpdateValue(name, value, status, timestamp);
-            const auto selection = calibration_form_.Snapshot();
-            if (selection.name == name)
-                static_cast<void>(
-                    calibration_form_.Apply(selection, status, value));
         }
         RequestPreviewRefresh(name);
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
@@ -985,9 +1045,6 @@ private:
         {
             std::lock_guard lock(output_mutex_);
             observation_model_.MarkFailure(name, status, timestamp);
-            const auto selection = calibration_form_.Snapshot();
-            if (selection.name == name)
-                static_cast<void>(calibration_form_.Apply(selection, status));
         }
         RequestPreviewRefresh(name);
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
@@ -998,10 +1055,6 @@ private:
         {
             std::lock_guard lock(output_mutex_);
             observation_model_.MarkPending(name);
-            const auto selection = calibration_form_.Snapshot();
-            if (selection.name == name)
-                static_cast<void>(
-                    calibration_form_.Apply(selection, "等待样本"));
         }
         RequestPreviewRefresh(name);
     }
@@ -1018,7 +1071,8 @@ private:
             std::lock_guard watched_lock(watched_mutex_);
             const bool watched = std::find(watched_.begin(), watched_.end(),
                                            name) != watched_.end();
-            if (preview_scope_selected_ == 1 && !watched) {
+            if ((preview_scope_selected_ == 1 && !watched) ||
+                expanded_preview_names_.contains(name)) {
                 rebuild = true;
             } else {
                 preview_labels_[visible->second] =
@@ -1032,33 +1086,112 @@ private:
     /** @brief 处理“全部/仅采样”范围切换。 */
     void OnPreviewScopeChanged() { RebuildPreviewLabels(); }
 
-    /** @brief Enter 打开预览行详情；列表位置与搜索词不变。 */
+    /** @brief 在预览列表中原位展开或折叠当前父变量行。 */
+    void TogglePreviewExpansion() {
+        if (terminal_too_small_.load() || preview_selected_ < 0 ||
+            static_cast<std::size_t>(preview_selected_) >= preview_rows_.size())
+            return;
+        const auto& row = preview_rows_[preview_selected_];
+        if (row.symbol_name.empty() || row.is_child) return;
+        const auto [expanded, inserted] =
+            expanded_preview_names_.insert(row.symbol_name);
+        if (!inserted) expanded_preview_names_.erase(expanded);
+        RebuildPreviewLabels();
+        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
+    }
+
+    /** @brief 根据当前行类型展开变量或发起独立的一次性读取。 */
+    void ActivatePreviewRow() {
+        if (preview_selected_ < 0 ||
+            static_cast<std::size_t>(preview_selected_) >= preview_rows_.size())
+            return;
+        const auto row = preview_rows_[preview_selected_];
+        if (row.symbol_name.empty()) return;
+        switch (calmcar::xcp::tools::ActionForPreviewRow(row)) {
+            case calmcar::xcp::tools::PreviewRowAction::ToggleExpansion:
+                TogglePreviewExpansion();
+                break;
+            case calmcar::xcp::tools::PreviewRowAction::ReadOnce:
+                SubmitPreviewReadOnce(row.symbol_name);
+                break;
+            case calmcar::xcp::tools::PreviewRowAction::Ignore:
+                break;
+        }
+    }
+
+    /** @brief 将展开行的一次性读取提交到后台命令线程。 */
+    void SubmitPreviewReadOnce(const std::string& name) {
+        if (DaqRunning()) {
+            RecordObservationFailure(name, "DAQ运行期间不能执行单次读取。",
+                                     LocalTimestamp());
+            return;
+        }
+        const auto symbol_index = preview_symbol_index_.find(name);
+        if (symbol_index == preview_symbol_index_.end()) {
+            RecordObservationFailure(name, "A2L变量已不在当前预览结果中。",
+                                     LocalTimestamp());
+            return;
+        }
+        const auto reason = PreviewReadUnsupportedReason(
+            preview_symbols_[symbol_index->second]);
+        if (!reason.empty()) {
+            RecordObservationFailure(name, "单次读取拒绝：" + reason,
+                                     LocalTimestamp());
+            return;
+        }
+        if (!SubmitCommand("previewread", std::nullopt, {}, std::nullopt,
+                           std::nullopt, std::optional<std::string>{name}))
+            RecordObservationFailure(name, "单次读取未能进入命令队列。",
+                                     LocalTimestamp());
+    }
+
+    /** @brief 从预览列表进入独立标定表单；不改变观测集合。 */
+    void OpenCalibration() {
+        if (terminal_too_small_.load() || preview_selected_ < 0 ||
+            static_cast<std::size_t>(preview_selected_) >= preview_rows_.size())
+            return;
+        const auto name = preview_rows_[preview_selected_].symbol_name;
+        const auto symbol = preview_symbol_index_.find(name);
+        if (symbol == preview_symbol_index_.end()) return;
+        modal_symbol_info_ = preview_symbols_[symbol->second];
+        modal_element_index_text_ =
+            RequiresElementIndex(*modal_symbol_info_) ? "0" : "";
+        {
+            std::lock_guard lock(output_mutex_);
+            static_cast<void>(calibration_form_.Select(name, true));
+            const auto sample = observation_model_.Find(name);
+            if (sample.has_value() && sample->has_value && !sample->is_array)
+                static_cast<void>(
+                    calibration_form_.Apply(calibration_form_.Snapshot(),
+                                            sample->status, sample->value));
+        }
+        if (!variable_modal_.OpenCalibration(name, current_layout_)) {
+            modal_symbol_info_.reset();
+            Say("无法打开标定表单，请检查终端尺寸和 A2L 符号。");
+            return;
+        }
+        modal_page_selected_ = 1;
+        calibration_modal_active_ = true;
+        modal_visible_ = true;
+        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
+    }
+
+    /** @brief F3 打开只读详情；列表位置与搜索词不变。 */
     void OpenPreviewDetails() {
         if (terminal_too_small_.load()) {
             Say("窗口小于 80×24，变量详情和编辑操作已禁用。");
             return;
         }
         if (preview_selected_ < 0 ||
-            static_cast<std::size_t>(preview_selected_) >=
-                preview_visible_names_.size())
+            static_cast<std::size_t>(preview_selected_) >= preview_rows_.size())
             return;
-        const auto name = preview_visible_names_[preview_selected_];
+        const auto name = preview_rows_[preview_selected_].symbol_name;
+        if (name.empty()) return;
         const auto symbol = preview_symbol_index_.find(name);
         if (symbol == preview_symbol_index_.end()) return;
         modal_symbol_info_ = preview_symbols_[symbol->second];
-        modal_element_index_text_ =
-            RequiresElementIndex(*modal_symbol_info_) ? "0" : "";
-        modal_array_page_start_ = 0;
-        modal_array_page_lines_ = "尚未读取本页。";
-        {
-            std::lock_guard lock(output_mutex_);
-            static_cast<void>(calibration_form_.Select(name, true));
-            const auto sample = observation_model_.Find(name);
-            if (sample.has_value() && sample->has_value)
-                static_cast<void>(
-                    calibration_form_.Apply(calibration_form_.Snapshot(),
-                                            sample->status, sample->value));
-        }
+        modal_element_index_text_.clear();
+        calibration_modal_active_ = false;
         const auto layout = current_layout_;
         if (!variable_modal_.Open(name, layout)) {
             modal_symbol_info_.reset();
@@ -1080,13 +1213,14 @@ private:
             if (revoke_confirmation) ResolveConfirmation(false);
         }
         if (revoke_confirmation) confirmation_gate_.Cancel();
+        const bool closing_calibration = calibration_modal_active_;
         variable_modal_.Close();
         modal_visible_ = false;
         modal_page_selected_ = 0;
         modal_symbol_info_.reset();
-        modal_array_page_start_ = 0;
-        modal_array_page_lines_.clear();
-        {
+        modal_element_index_text_.clear();
+        calibration_modal_active_ = false;
+        if (closing_calibration) {
             std::lock_guard lock(output_mutex_);
             static_cast<void>(calibration_form_.Select({}, true));
         }
@@ -1094,11 +1228,17 @@ private:
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
     }
 
-    /** @brief 在模态详情中切换该变量是否加入当前采样集合。 */
+    /** @brief 在预览列表中切换当前符号的观测集合成员资格。 */
     void TogglePreviewWatch() {
-        if (!modal_symbol_info_.has_value()) return;
-        const auto name = QualifiedName(*modal_symbol_info_);
-        SubmitCommand(IsWatched(name) ? "remove " + name : "add " + name);
+        if (preview_selected_ < 0 ||
+            static_cast<std::size_t>(preview_selected_) >= preview_rows_.size())
+            return;
+        const auto& name = preview_rows_[preview_selected_].symbol_name;
+        if (name.empty()) return;
+        if (IsWatched(name))
+            Remove(name);
+        else
+            Add(name);
     }
 
     /** @brief 由后台更新触发；样本/观测集合变化统一回到界面线程。 */
@@ -1153,9 +1293,9 @@ private:
         std::optional<std::uint64_t>
             preview_revision; /**< 搜索输入提交代际。 */
         std::optional<std::uint64_t>
-            element_index; /**< 详情弹窗提交的0基元素索引。 */
-        std::optional<std::uint64_t>
-            array_page_start; /**< 数组分页读取的0基起始索引。 */
+            element_index; /**< 标定表单提交的0基元素索引。 */
+        std::optional<std::string>
+            preview_read_symbol; /**< 展开预览行发起的一次性读取符号。 */
     };
 
     /** @brief 在详情弹窗打开期间延迟列表重建，保护背景列表上下文。 */
@@ -1174,7 +1314,7 @@ private:
         std::string target = {},
         std::optional<std::uint64_t> preview_revision = std::nullopt,
         std::optional<std::uint64_t> element_index = std::nullopt,
-        std::optional<std::uint64_t> array_page_start = std::nullopt) {
+        std::optional<std::string> preview_read_symbol = std::nullopt) {
         if (command.empty()) return true;
         const bool control =
             command == "stop" || command == "quit" || command == "exit";
@@ -1188,11 +1328,13 @@ private:
                 confirmation_gate_.Cancel();
                 command_queue_.push_front({command, std::move(calibration),
                                            std::move(target), preview_revision,
-                                           element_index, array_page_start});
+                                           element_index,
+                                           std::move(preview_read_symbol)});
             } else {
                 command_queue_.push_back({command, std::move(calibration),
                                           std::move(target), preview_revision,
-                                          element_index, array_page_start});
+                                          element_index,
+                                          std::move(preview_read_symbol)});
             }
         }
         if (rejected) {
@@ -1244,11 +1386,11 @@ private:
     /**
      * @brief 在模态窗口中请求确认并等待用户选择；无明确接受则取消。
      * @param prompt 危险操作完整说明。
-     * @param keep_details 确认完成后是否返回当前变量详情。
+     * @param calibration_context 确认完成后是否返回独立标定页。
      * @return 本次有效确认票据；拒绝/退出/尺寸不足时为空。
      */
     std::optional<calmcar::xcp::tools::ConfirmationGate::Ticket> Confirm(
-        const std::string& prompt, bool keep_details = false) {
+        const std::string& prompt, bool calibration_context = false) {
         if (worker_stop_.load() || control_cancel_.load()) return std::nullopt;
         if (terminal_too_small_.load()) {
             Say("终端尺寸不足（至少 80×24）；危险操作未发送。");
@@ -1262,7 +1404,8 @@ private:
             confirmation_gate_.Cancel();
             return std::nullopt;
         }
-        screen_->Post(ftxui::Closure([this, ticket, prompt, keep_details] {
+        screen_->Post(ftxui::Closure([this, ticket, prompt,
+                                      calibration_context] {
             if (!confirmation_gate_.Pending() ||
                 confirmation_gate_.CurrentTicket() != ticket)
                 return;
@@ -1276,7 +1419,7 @@ private:
                 return;
             }
             const bool opened =
-                keep_details
+                calibration_context
                     ? variable_modal_.BeginConfirmation(true, current_layout_)
                     : variable_modal_.OpenCommandConfirmation(current_layout_);
             if (!opened) {
@@ -1284,16 +1427,21 @@ private:
                 return;
             }
             confirmation_prompt_ = prompt;
-            modal_page_selected_ = 1;
+            modal_page_selected_ = 2;
             modal_visible_ = true;
         }));
         const bool accepted = confirmation_gate_.Wait(ticket, worker_stop_);
         if (screen_) {
-            screen_->Post(ftxui::Closure([this, keep_details] {
-                if (keep_details) {
+            screen_->Post(ftxui::Closure([this, calibration_context] {
+                if (calibration_context) {
                     variable_modal_.CompleteConfirmation();
                     modal_visible_ = variable_modal_.IsOpen();
-                    modal_page_selected_ = 0;
+                    modal_page_selected_ =
+                        variable_modal_.Page() ==
+                                calmcar::xcp::tools::VariableModalPage::
+                                    Calibration
+                            ? 1
+                            : 0;
                 } else {
                     CloseVariableModal(false);
                 }
@@ -1332,58 +1480,6 @@ private:
         return !symbol.dimensions.empty() ||
                (symbol.kind == SymbolKind::Characteristic &&
                 symbol.characteristic_type == CharacteristicType::Curve);
-    }
-
-    /** @brief 判断详情对象是否可显示连续的一维测量数组分页。 */
-    bool IsMeasurementArray(const SymbolInfo& symbol) const {
-        return symbol.kind == SymbolKind::Measurement &&
-               symbol.dimensions.size() == 1U &&
-               symbol.dimensions.front().extent > 0U;
-    }
-
-    /** @brief 当前详情是否支持安全的数组分页读取。 */
-    std::string ModalArrayPageUnsupportedReason() const {
-        if (!modal_symbol_info_.has_value()) return "未选择变量";
-        const auto& symbol = *modal_symbol_info_;
-        if (!IsMeasurementArray(symbol)) return "分页只支持一维MEASUREMENT数组";
-        return calmcar::xcp::tools::SymbolDetailReadUnsupportedReason(symbol);
-    }
-
-    /** @brief 输入索引变化时同步所在数组页并丢弃旧页缓存。 */
-    void OnElementIndexChanged() {
-        if (!modal_symbol_info_.has_value() ||
-            !IsMeasurementArray(*modal_symbol_info_))
-            return;
-        const auto index =
-            calmcar::xcp::tools::ParseElementIndex(modal_element_index_text_);
-        if (!index) return;
-        const auto page_start = (*index / kArrayPageSize) * kArrayPageSize;
-        if (page_start == modal_array_page_start_) return;
-        modal_array_page_start_ = page_start;
-        modal_array_page_lines_ = "尚未读取本页。";
-        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
-    }
-
-    /** @brief 通过上一页/下一页按钮导航数组页并更新起始索引。 */
-    void NavigateArrayPage(int direction) {
-        if (!modal_symbol_info_.has_value() ||
-            !IsMeasurementArray(*modal_symbol_info_))
-            return;
-        const auto extent = modal_symbol_info_->dimensions.front().extent;
-        const auto last_start =
-            ((extent - 1U) / kArrayPageSize) * kArrayPageSize;
-        const auto next_start =
-            direction < 0 ? (modal_array_page_start_ >= kArrayPageSize
-                                 ? modal_array_page_start_ - kArrayPageSize
-                                 : 0U)
-                          : calmcar::xcp::tools::NextElementPageStart(
-                                extent, modal_array_page_start_, kArrayPageSize)
-                                .value_or(last_start);
-        if (next_start == modal_array_page_start_) return;
-        modal_array_page_start_ = next_start;
-        modal_element_index_text_ = std::to_string(next_start);
-        modal_array_page_lines_ = "尚未读取本页。";
-        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
     }
 
     /** @brief 当前详情是否满足安全的手动读取能力。 */
@@ -1432,7 +1528,7 @@ private:
         return "A2L未声明允许无条件XCP写入的PAGE";
     }
 
-    /** @brief 将模态详情绑定的符号快照提交到安全读取路径。 */
+    /** @brief 标定页读取依赖独立的标定选择快照。 */
     void SubmitCalibrationRead() {
         calmcar::xcp::tools::CalibrationSelection::Snapshot selection;
         {
@@ -1451,31 +1547,6 @@ private:
         }
         SubmitCommand("calread", std::move(selection), {}, std::nullopt,
                       element_index);
-    }
-
-    /** @brief 将当前数组页读取请求提交到后台XCP命令队列。 */
-    void SubmitCalibrationArrayPage() {
-        if (!modal_symbol_info_.has_value()) return;
-        const auto reason = ModalArrayPageUnsupportedReason();
-        if (!reason.empty()) {
-            Say("数组分页读取不支持: " + reason);
-            return;
-        }
-        if (DaqRunning()) {
-            Say("DAQ运行中，不能执行数组分页读取。");
-            return;
-        }
-        calmcar::xcp::tools::CalibrationSelection::Snapshot selection;
-        {
-            std::lock_guard lock(output_mutex_);
-            selection = calibration_form_.Snapshot();
-        }
-        if (selection.name != QualifiedName(*modal_symbol_info_)) return;
-        if (SubmitCommand("calpage", selection, {}, std::nullopt, std::nullopt,
-                          modal_array_page_start_)) {
-            modal_array_page_lines_ = "读取中…";
-            if (screen_) screen_->PostEvent(ftxui::Event::Custom);
-        }
     }
 
     /** @brief 将详情弹窗中的目标值交给既有预读/确认/回写路径。 */
@@ -1526,10 +1597,6 @@ private:
         modal_symbol_info_.reset();
         variable_modal_.Close();
         modal_page_selected_ = 0;
-        {
-            std::lock_guard lock(output_mutex_);
-            static_cast<void>(calibration_form_.Select({}, true));
-        }
         preview_symbols_ = std::move(result.symbols);
         preview_symbol_index_.clear();
         for (std::size_t index = 0; index < preview_symbols_.size(); ++index)
@@ -1604,7 +1671,12 @@ private:
             listing_active_ = false;
         }
         if (command == "quit" || command == "exit") return false;
-        if (command == "find") {
+        if (command == "previewread") {
+            if (!request.preview_read_symbol)
+                Say("预览单次读取参数无效。");
+            else
+                ReadPreviewOnce(*request.preview_read_symbol);
+        } else if (command == "find") {
             std::string pattern;
             input >> pattern;
             FindPreviewCandidates(pattern.empty() ? "*" : pattern,
@@ -1620,12 +1692,6 @@ private:
                 Say("标定表单参数无效。");
             else
                 ReadCalibration(*request.calibration, request.element_index);
-        } else if (command == "calpage") {
-            if (!request.calibration || !request.array_page_start)
-                Say("数组分页参数无效。");
-            else
-                ReadCalibrationArrayPage(*request.calibration,
-                                         *request.array_page_start);
         } else if (command == "help") {
             PrintHelp();
         } else if (command == "list") {
@@ -1638,10 +1704,6 @@ private:
             std::string name;
             input >> name;
             Info(name);
-        } else if (command == "add") {
-            std::string name;
-            input >> name;
-            Add(name);
         } else if (command == "remove") {
             std::string name;
             input >> name;
@@ -1665,9 +1727,10 @@ private:
     }
 
     void PrintHelp() const {
-        Say("命令：list [pattern|all] | more | info <name> | add/remove <name> "
+        Say("命令：list [pattern|all] | more | info <name> | remove <name> "
             "| read <name> | watch | stop | write <name> <value> | find "
-            "[pattern] | quit；变量预览 Enter 打开详情，Esc 关闭弹窗。");
+            "[pattern] | quit；变量预览 Enter 展开/折叠，F3 只读详情，"
+            "Ctrl+A/Cmd+A/F6 观测，Ctrl+S/Cmd+S/F4 标定。");
         Say("mode=" + options_.mode +
             (options_.mode == "poll"
                  ? "；watch 按目标周期 " +
@@ -1676,7 +1739,7 @@ private:
                  : "；watch 使用事件驱动 DAQ，profile=" + options_.daq_profile +
                        "。"));
         Say("DAQ 只支持唯一 FIXED_EVENT_LIST 的 MEASUREMENT；运行中禁止 "
-            "read/write/add/remove。stop + Enter 停止。");
+            "read/write 和修改观测集合。stop + Enter 停止。");
     }
 
     void List(const std::string& pattern) {
@@ -1788,13 +1851,34 @@ private:
         Say(out.str());
     }
 
+    /** @brief 检查观测资格；仅一维MEASUREMENT数组复用详情读取策略。 */
+    std::string ObservationUnsupportedReason(const SymbolInfo& symbol) const {
+        if (symbol.dimensions.empty())
+            return calmcar::xcp::tools::SymbolReadUnsupportedReason(symbol);
+        if (options_.mode != "poll")
+            return "DAQ数组的ODT/DTO映射尚未验证；当前仅支持标量观测";
+        if (symbol.kind == SymbolKind::Measurement)
+            return calmcar::xcp::tools::SymbolDetailReadUnsupportedReason(
+                symbol);
+        return calmcar::xcp::tools::SymbolReadUnsupportedReason(symbol);
+    }
+
+    /** @brief 检查停止采样时展开行的一次性读取资格。 */
+    std::string PreviewReadUnsupportedReason(const SymbolInfo& symbol) const {
+        if (symbol.dimensions.empty())
+            return calmcar::xcp::tools::SymbolReadUnsupportedReason(symbol);
+        if (symbol.kind != SymbolKind::Measurement)
+            return "单次数组读取仅支持MEASUREMENT";
+        return calmcar::xcp::tools::SymbolDetailReadUnsupportedReason(symbol);
+    }
+
     void Add(const std::string& name) {
         if (DaqRunning()) {
             Say("DAQ 运行期间不能修改观测集；请先 stop。");
             return;
         }
         if (name.empty()) {
-            Say("用法: add <module::name>");
+            Say("请先在变量列表中选择变量，再按 Ctrl+A/Cmd+A/F6 加入观测。");
             return;
         }
         auto found = database_.Find(name);
@@ -1802,10 +1886,8 @@ private:
             Say("Find 失败: " + found.ErrorInfo().message);
             return;
         }
-        if (!calmcar::xcp::tools::SymbolReadUnsupportedReason(found.Value())
-                 .empty()) {
-            Say("不能观测: " + calmcar::xcp::tools::SymbolReadUnsupportedReason(
-                                   found.Value()));
+        if (!ObservationUnsupportedReason(found.Value()).empty()) {
+            Say("不能观测: " + ObservationUnsupportedReason(found.Value()));
             return;
         }
         auto canonical = QualifiedName(found.Value());
@@ -1918,154 +2000,44 @@ private:
                   : "读取失败或不支持: " + QualifiedName(found.Value()));
     }
 
-    /** @brief 仅把仍匹配详情符号/选择代际的数组页结果回填UI。 */
-    void PostArrayPageResult(
-        const calmcar::xcp::tools::CalibrationSelection::Snapshot& selection,
-        const std::string& name, std::uint64_t page_start,
-        std::string page_text) {
-        const auto apply_page = [this, selection, name, page_start,
-                                 page_text = std::move(page_text)] {
-            if (!modal_visible_ || !modal_symbol_info_.has_value() ||
-                QualifiedName(*modal_symbol_info_) != name ||
-                modal_array_page_start_ != page_start ||
-                !CalibrationSelectionMatches(selection))
-                return;
-            modal_array_page_lines_ = page_text;
-            if (screen_) screen_->PostEvent(ftxui::Event::Custom);
-        };
-        if (screen_)
-            screen_->Post(ftxui::Closure(apply_page));
-        else
-            apply_page();
-    }
-
-    /** @brief 读取并换算一页连续MEASUREMENT数组元素，回填详情弹窗。 */
-    void ReadCalibrationArrayPage(
-        const calmcar::xcp::tools::CalibrationSelection::Snapshot& selection,
-        std::uint64_t page_start) {
-        if (!CalibrationSelectionMatches(selection)) {
-            Say("标定选择已改变，取消旧数组页读取请求。");
-            return;
-        }
+    /** @brief 从展开预览行执行一次性POLL读取，不触碰标定表单。 */
+    void ReadPreviewOnce(const std::string& name) {
+        const auto timestamp = LocalTimestamp();
         if (DaqRunning()) {
-            Say("DAQ运行期间禁止读取数组页，请先 stop。");
-            PostArrayPageResult(selection, selection.name, page_start,
-                                "DAQ运行中；请先停止采样。");
+            RecordObservationFailure(name, "DAQ运行中；不能执行单次读取。",
+                                     timestamp);
             return;
         }
-        auto found = database_.Find(selection.name);
+        const auto found = database_.Find(name);
         if (!found.HasValue()) {
-            const auto error = "A2L查找数组失败: " + found.ErrorInfo().message;
-            Say(error);
-            PostArrayPageResult(selection, selection.name, page_start, error);
+            RecordObservationFailure(
+                name, "A2L查找失败: " + found.ErrorInfo().message, timestamp);
             return;
         }
-        const auto& symbol = found.Value();
-        if (symbol.kind != SymbolKind::Measurement ||
-            symbol.dimensions.size() != 1U) {
-            const std::string error = "数组页参数或MEASUREMENT布局无效。";
-            Say(error);
-            PostArrayPageResult(selection, QualifiedName(symbol), page_start,
-                                error);
-            return;
-        }
-        const auto page = calmcar::xcp::tools::MakeElementPageRange(
-            symbol.dimensions.front().extent, page_start, kArrayPageSize);
-        if (!page.has_value()) {
-            const std::string error = "数组页起点未对齐或超出维度。";
-            Say(error);
-            PostArrayPageResult(selection, QualifiedName(symbol), page_start,
-                                error);
-            return;
-        }
-        const auto session = master_.GetSessionParameters();
-        const auto ag =
-            static_cast<std::size_t>(session.connect.address_granularity);
-        const auto count = page->count;
-        const auto reason =
-            calmcar::xcp::tools::ElementRangeLayoutUnsupportedReason(
-                symbol, page_start, count, ag, session.connect.byte_order);
+        const auto canonical = QualifiedName(found.Value());
+        const auto reason = PreviewReadUnsupportedReason(found.Value());
         if (!reason.empty()) {
-            const auto error = "数组页布局不支持: " + reason;
-            Say(error);
-            PostArrayPageResult(selection, QualifiedName(symbol), page_start,
-                                error);
+            RecordObservationFailure(canonical, "读取拒绝: " + reason,
+                                     timestamp);
             return;
         }
-        const auto byte_count = count * symbol.element_size_bytes;
-        if (byte_count == 0U ||
-            byte_count > std::numeric_limits<ByteCount>::max()) {
-            const std::string error = "数组页字节长度超出XCP读取范围。";
-            Say(error);
-            PostArrayPageResult(selection, QualifiedName(symbol), page_start,
-                                error);
-            return;
-        }
-        const auto stride = symbol.dimensions.front().byte_stride;
-        const auto address = symbol.xcp_address + page_start * stride;
-        Bytes raw;
-        try {
-            std::lock_guard command_lock(command_mutex_);
-            raw = master_.ReadMemoryBytes(
-                static_cast<Address>(address),
-                static_cast<AddressExtension>(symbol.address_extension),
-                static_cast<ByteCount>(byte_count));
-        } catch (const std::exception& error) {
-            const auto message =
-                "数组页XCP读取失败: " + std::string(error.what());
-            Say(message);
-            PostArrayPageResult(selection, QualifiedName(symbol), page_start,
-                                message);
-            return;
-        }
-        if (raw.size() != byte_count) {
-            const std::string error = "数组页XCP返回字节数与A2L布局不一致。";
-            Say(error);
-            PostArrayPageResult(selection, QualifiedName(symbol), page_start,
-                                error);
-            return;
-        }
-        std::vector<std::string> values;
-        values.reserve(static_cast<std::size_t>(count));
-        for (std::uint64_t offset = 0; offset < count; ++offset) {
-            const auto byte_offset =
-                static_cast<std::size_t>(offset * symbol.element_size_bytes);
-            const auto element_begin =
-                raw.begin() + static_cast<std::ptrdiff_t>(byte_offset);
-            const auto element_end =
-                element_begin +
-                static_cast<std::ptrdiff_t>(symbol.element_size_bytes);
-            Bytes element(element_begin, element_end);
-            const auto index = page_start + offset;
-            auto physical = database_.ToPhysicalElement(QualifiedName(symbol),
-                                                        index, element);
-            if (!physical.HasValue()) {
-                const auto error =
-                    "数组元素物理换算失败: " + physical.ErrorInfo().message;
-                Say(error);
-                PostArrayPageResult(selection, QualifiedName(symbol),
-                                    page_start, error);
-                return;
+        if (!found.Value().dimensions.empty()) {
+            std::string error;
+            const auto values = ReadObservedArray(found.Value(), error, false);
+            if (values.has_value()) {
+                RecordArrayObservationValue(canonical, std::move(*values),
+                                            "单次读取", timestamp, false);
+            } else if (!error.empty()) {
+                RecordObservationFailure(canonical, error, timestamp);
             }
-            values.push_back(PhysicalToString(physical.Value()));
+            return;
         }
-
-        std::ostringstream lines;
-        for (std::size_t row = 0; row < values.size(); row += 4U) {
-            if (row != 0U) lines << '\n';
-            for (std::size_t column = row;
-                 column < std::min(values.size(), row + 4U); ++column) {
-                if (column != row) lines << " | ";
-                lines << '[' << (page_start + column)
-                      << "]: " << values[column];
-            }
-        }
-        const auto page_text = lines.str();
-        const auto name = QualifiedName(symbol);
-        const auto page_end = page_start + count;
-        Say(name + " 数组页[" + std::to_string(page_start) + ", " +
-            std::to_string(page_end) + ")读取成功。");
-        PostArrayPageResult(selection, name, page_start, page_text);
+        const auto value = ReadPhysical(found.Value());
+        if (value.has_value())
+            RecordObservationValue(canonical, PhysicalToString(*value),
+                                   "单次读取", timestamp);
+        else
+            RecordObservationFailure(canonical, "单次读取失败", timestamp);
     }
 
     /** @brief 执行命令行读操作并显示结果。 */
@@ -2143,6 +2115,120 @@ private:
             Say("XCP 读取错误: " + std::string(e.what()));
             return std::nullopt;
         }
+    }
+
+    /**
+     * @brief 以小块读取一维 MEASUREMENT 数组，全部元素成功后才返回快照。
+     * @param symbol 已解析的数组符号
+     * @param error 读取/换算失败原因；因停止而取消时保持为空
+     * @return 完整物理值数组；中断或任一块失败时返回空
+     */
+    std::optional<std::vector<std::string>> ReadObservedArray(
+        const SymbolInfo& symbol, std::string& error,
+        bool require_watched = true) {
+        const auto reason =
+            calmcar::xcp::tools::SymbolDetailReadUnsupportedReason(symbol);
+        if (!reason.empty()) {
+            error = "数组布局不支持: " + reason;
+            return std::nullopt;
+        }
+        if (symbol.kind != SymbolKind::Measurement ||
+            symbol.dimensions.size() != 1U) {
+            error = "数组仅读取一维 MEASUREMENT。";
+            return std::nullopt;
+        }
+
+        const auto extent = symbol.dimensions.front().extent;
+        const auto canonical = QualifiedName(symbol);
+        const auto operation = require_watched ? "POLL" : "单次读取";
+        const auto cancelled = [this, &canonical, require_watched] {
+            if (worker_stop_.load()) return true;
+            return require_watched &&
+                   (control_cancel_.load() || !watching_.load() ||
+                    !IsWatched(canonical));
+        };
+        std::vector<std::string> values;
+        values.reserve(static_cast<std::size_t>(extent));
+        for (std::uint64_t start = 0; start < extent; start += kArrayPageSize) {
+            if (cancelled()) return std::nullopt;
+            const auto page = calmcar::xcp::tools::MakeElementPageRange(
+                extent, start, kArrayPageSize);
+            if (!page.has_value()) {
+                error = std::string(operation) + "数组页范围验证失败。";
+                return std::nullopt;
+            }
+            const auto session = master_.GetSessionParameters();
+            const auto ag =
+                static_cast<std::size_t>(session.connect.address_granularity);
+            const auto range_reason =
+                calmcar::xcp::tools::ElementRangeLayoutUnsupportedReason(
+                    symbol, start, page->count, ag, session.connect.byte_order);
+            if (!range_reason.empty()) {
+                error = std::string(operation) +
+                        "数组页布局不支持: " + range_reason;
+                return std::nullopt;
+            }
+            if (symbol.element_size_bytes == 0U ||
+                page->count > std::numeric_limits<std::uint64_t>::max() /
+                                  symbol.element_size_bytes) {
+                error = std::string(operation) + "数组页字节长度溢出。";
+                return std::nullopt;
+            }
+            const auto byte_count = page->count * symbol.element_size_bytes;
+            if (byte_count == 0U ||
+                byte_count > std::numeric_limits<ByteCount>::max()) {
+                error =
+                    std::string(operation) + "数组页字节长度超出 XCP 范围。";
+                return std::nullopt;
+            }
+            const auto address = symbol.xcp_address +
+                                 start * symbol.dimensions.front().byte_stride;
+            Bytes raw;
+            try {
+                std::lock_guard command_lock(command_mutex_);
+                if (cancelled()) return std::nullopt;
+                raw = master_.ReadMemoryBytes(
+                    static_cast<Address>(address),
+                    static_cast<AddressExtension>(symbol.address_extension),
+                    static_cast<ByteCount>(byte_count));
+            } catch (const std::exception& exception) {
+                if (cancelled()) return std::nullopt;
+                error = std::string(operation) +
+                        "数组 XCP 读取失败: " + std::string(exception.what());
+                return std::nullopt;
+            }
+            if (cancelled()) return std::nullopt;
+            if (raw.size() != byte_count) {
+                error = std::string(operation) +
+                        "数组 XCP 返回字节数与 A2L 布局不一致。";
+                return std::nullopt;
+            }
+            for (std::uint64_t offset = 0; offset < page->count; ++offset) {
+                const auto byte_offset = static_cast<std::size_t>(
+                    offset * symbol.element_size_bytes);
+                const auto element_begin =
+                    raw.begin() + static_cast<std::ptrdiff_t>(byte_offset);
+                const auto element_end =
+                    element_begin +
+                    static_cast<std::ptrdiff_t>(symbol.element_size_bytes);
+                const Bytes element(element_begin, element_end);
+                const auto index = start + offset;
+                const auto physical = database_.ToPhysicalElement(
+                    QualifiedName(symbol), index, element);
+                if (!physical.HasValue()) {
+                    error = std::string(operation) + "数组元素物理换算失败: " +
+                            physical.ErrorInfo().message;
+                    return std::nullopt;
+                }
+                values.push_back(PhysicalToString(physical.Value()));
+            }
+        }
+        if (values.size() != extent) {
+            error =
+                std::string(operation) + "数组快照元素数量与 A2L 维度不一致。";
+            return std::nullopt;
+        }
+        return values;
     }
 
     /** @brief 在持有XCP命令互斥锁时复核活动页及实时PAGE_PROPERTIES。 */
@@ -2434,10 +2520,27 @@ private:
                 watched_.end())
                 return;
             observation_model_.UpdateValue(name, value, status, timestamp);
-            const auto selection = calibration_form_.Snapshot();
-            if (selection.name == name)
-                static_cast<void>(
-                    calibration_form_.Apply(selection, status, value));
+        }
+        RequestPreviewRefresh(name);
+        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
+    }
+
+    /** @brief 原子发布完整数组快照，并可为POLL复核观测集合。 */
+    void RecordArrayObservationValue(const std::string& name,
+                                     std::vector<std::string> values,
+                                     const std::string& status,
+                                     const std::string& timestamp,
+                                     bool require_watched) {
+        {
+            std::lock_guard output_lock(output_mutex_);
+            if (require_watched) {
+                std::lock_guard watched_lock(watched_mutex_);
+                if (std::find(watched_.begin(), watched_.end(), name) ==
+                    watched_.end())
+                    return;
+            }
+            observation_model_.UpdateArrayValue(name, std::move(values), status,
+                                                timestamp);
         }
         RequestPreviewRefresh(name);
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
@@ -2454,9 +2557,6 @@ private:
                 watched_.end())
                 return;
             observation_model_.MarkFailure(name, status, timestamp);
-            const auto selection = calibration_form_.Snapshot();
-            if (selection.name == name)
-                static_cast<void>(calibration_form_.Apply(selection, status));
         }
         RequestPreviewRefresh(name);
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
@@ -2484,7 +2584,7 @@ private:
             watch_list_empty = watched_.empty();
         }
         if (watch_list_empty) {
-            Say("观测列表为空；先用 add <name> 添加变量。");
+            Say("观测列表为空；请在变量列表选择变量后按 Ctrl+A/Cmd+A/F6。");
             return;
         }
         watching_.store(true);
@@ -2511,14 +2611,36 @@ private:
                                                         LocalTimestamp());
                         continue;
                     }
-                    auto value = ReadPhysical(found.Value());
                     const auto timestamp = LocalTimestamp();
-                    if (value) {
-                        RecordWatchedObservationValue(
-                            name, PhysicalToString(*value), "POLL", timestamp);
+                    if (!found.Value().dimensions.empty()) {
+                        std::string error;
+                        std::optional<std::vector<std::string>> values;
+                        try {
+                            values = ReadObservedArray(found.Value(), error);
+                        } catch (const std::exception& exception) {
+                            error = "POLL 数组读取异常: " +
+                                    std::string(exception.what());
+                        }
+                        if (values.has_value()) {
+                            RecordArrayObservationValue(
+                                name, std::move(*values), "POLL", timestamp,
+                                true);
+                        } else if (watching_.load() && IsWatched(name)) {
+                            RecordWatchedObservationFailure(
+                                name,
+                                error.empty() ? "POLL数组读取已取消" : error,
+                                timestamp);
+                        }
                     } else {
-                        RecordWatchedObservationFailure(name, "POLL读取失败",
-                                                        timestamp);
+                        auto value = ReadPhysical(found.Value());
+                        if (value) {
+                            RecordWatchedObservationValue(
+                                name, PhysicalToString(*value), "POLL",
+                                timestamp);
+                        } else {
+                            RecordWatchedObservationFailure(
+                                name, "POLL读取失败", timestamp);
+                        }
                     }
                 }
                 std::unique_lock lock(wait_mutex_);
@@ -2542,7 +2664,7 @@ private:
             names = watched_;
         }
         if (names.empty()) {
-            Say("观测列表为空；先用 add <name> 添加变量。");
+            Say("观测列表为空；请从变量预览中选择变量并按 Ctrl+A/Cmd+A/F6。");
             return;
         }
 
@@ -2859,11 +2981,10 @@ private:
     std::optional<SymbolInfo>
         modal_symbol_info_;                /**< 模态打开时固定的A2L符号快照。 */
     std::string modal_element_index_text_; /**< 0基数组元素/曲线点索引草稿。 */
-    std::uint64_t modal_array_page_start_{0}; /**< 数组分页的0基起始索引。 */
-    std::string modal_array_page_lines_{
-        "尚未读取本页。"};              /**< 当前页读取结果。 */
-    bool modal_visible_{false};         /**< FTXUI模态覆盖层是否显示。 */
-    int modal_page_selected_{0};        /**< 详情页0、确认页1。 */
+    bool modal_visible_{false};            /**< FTXUI模态覆盖层是否显示。 */
+    bool calibration_modal_active_{
+        false};                         /**< 标定表单是否拥有当前模态状态。 */
+    int modal_page_selected_{0};        /**< 详情0、标定1、确认2。 */
     TuiLayoutMetrics current_layout_{}; /**< UI线程计算的最近布局。 */
     std::atomic<bool> terminal_too_small_{
         true}; /**< 尺寸不足时禁止危险操作。 */
@@ -2879,7 +3000,10 @@ private:
     std::vector<std::string>
         preview_visible_names_; /**< 当前过滤后的菜单名称。 */
     std::unordered_map<std::string, std::size_t>
-        preview_visible_index_;               /**< 规范名到预览菜单行号。 */
+        preview_visible_index_;            /**< 规范名到父预览菜单行号。 */
+    std::vector<PreviewRow> preview_rows_; /**< 菜单行到符号/元素的映射。 */
+    std::unordered_set<std::string>
+        expanded_preview_names_;              /**< 当前原位展开的符号规范名。 */
     std::vector<std::string> preview_labels_; /**< 变量预览菜单文本。 */
     std::vector<std::string> view_labels_{"变量预览", "命令结果",
                                           "日志"}; /**< 顶部三视图标签。 */

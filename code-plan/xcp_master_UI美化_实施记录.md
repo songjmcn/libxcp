@@ -30,3 +30,16 @@
 - 尚无真实终端键盘/焦点/resize 人工走查、实际截图或 Slave/ECU 联测；没有执行真实标定写入。
 - Windows/Linux 跨平台验收遵循此前暂缓决定，本轮只在当前 AppleClang 环境验证。
 - 当前自动化主要覆盖纯模型、安全门和 CLI smoke；FTXUI 实际事件循环的端到端焦点/鼠标事件尚无专门集成测试。
+
+## 后续修改：A2L 变量类型显示
+
+- 用户批准增加变量类型提示（m12742）。`tools/xcp_master/symbol_display.hpp` 根据现有 A2L 元数据格式化对象类别、基础 `AsamDataType`、数据形态和单元素宽度；不从宽度反推类型，缺失维度/宽度明确显示未知。覆盖标量、测量数组、VALUE、固定轴 CURVE、MAP、多维曲线、VAL_BLK 与 ASCII。
+- `tools/xcp_master/main.cpp` 的变量列表增加紧凑类型标签，窄屏时类型前置于变量名以避免被长名称挤出可视区域；详情弹窗增加完整类别、基础类型、形态和元素宽度。不扩大搜索对象范围、不改 SDK/公共 API/CLI，也不改变读写资格策略。
+- 新增 `tests/xcp_master_symbol_display_test.cpp` 并接入 `tests/CMakeLists.txt`，覆盖 ASAM 类型名称、标量/数组/MAP/CURVE、未知维度/类型、变宽字符串、VAL_BLK/ASCII 形态。
+- 更新 `tools/xcp_master/README.md` 描述列表和详情中的类型信息。
+
+## 本次构建与测试
+
+- AppleClang Release：`cmake -S . -B cmake-build-release-a2l` 配置成功；`cmake --build cmake-build-release-a2l --target xcp_master XcpMasterSymbolPolicyTest -j4` 成功。
+- 聚焦测试：`ctest --test-dir cmake-build-release-a2l --output-on-failure -R 'XcpMaster'`，**24/24 通过，0 失败**，包含新增的 8 个类型显示用例。
+- 已对本次修改的 C++ 源文件运行 `clang-format`。未运行全仓库构建/CTest、交互终端实测、Windows/Linux 验证。

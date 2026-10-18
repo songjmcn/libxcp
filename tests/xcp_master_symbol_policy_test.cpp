@@ -1,4 +1,5 @@
 #include <limits>
+#include <string>
 
 #include "gtest/gtest.h"
 #include "libxcp/a2l/a2l_types.hpp"
@@ -22,6 +23,7 @@ using calmcar::xcp::tools::NextElementPageStart;
 using calmcar::xcp::tools::ParseElementIndex;
 using calmcar::xcp::tools::SymbolDetailReadUnsupportedReason;
 using calmcar::xcp::tools::SymbolReadUnsupportedReason;
+using calmcar::xcp::tools::SymbolStaticWriteUnsupportedReason;
 using calmcar::xcp::tools::SymbolWriteUnsupportedReason;
 
 TEST(XcpMasterSymbolPolicyTest, AllowsScalarMeasurementReadOnly) {
@@ -167,6 +169,43 @@ TEST(XcpMasterSymbolPolicyTest, RequiresStaticAndRuntimePageWritePermission) {
                                                     PageAccessType::DontCare)
                   .find("唯一映射"),
               std::string::npos);
+}
+
+/** @brief 验证详情静态策略只依赖A2L声明，不探测ECU活动页。 */
+TEST(XcpMasterSymbolPolicyTest, StaticWritePolicyUsesOnlyA2lMetadata) {
+    SymbolInfo value;
+    value.kind = SymbolKind::Characteristic;
+    value.characteristic_type = CharacteristicType::Value;
+    value.element_size_bytes = 4;
+    value.read_write = true;
+
+    EXPECT_NE(SymbolStaticWriteUnsupportedReason(value).find("MEMORY_SEGMENT"),
+              std::string::npos);
+
+    MemorySegmentInfo segment;
+    segment.name = "kParameters";
+    segment.segment_number = 1;
+    segment.has_xcp_segment = true;
+    segment.pages = {{0, 0, 0, XcpPageWriteAccess::DontCare}};
+    value.memory_segment = segment;
+    EXPECT_TRUE(SymbolStaticWriteUnsupportedReason(value).empty());
+
+    value.memory_segment->pages.front().xcp_write_access =
+        XcpPageWriteAccess::NotAllowed;
+    EXPECT_NE(SymbolStaticWriteUnsupportedReason(value).find("PAGE"),
+              std::string::npos);
+
+    SymbolInfo curve;
+    curve.kind = SymbolKind::Characteristic;
+    curve.characteristic_type = CharacteristicType::Curve;
+    curve.element_size_bytes = 4;
+    curve.read_write = true;
+    curve.dimensions.push_back({0, 4, 4});
+    curve.fixed_curve_axis = FixedCurveAxisInfo{0.0, 1.0, 4, {}};
+    curve.memory_segment = segment;
+    curve.memory_segment->pages.front().xcp_write_access =
+        XcpPageWriteAccess::DontCare;
+    EXPECT_TRUE(SymbolStaticWriteUnsupportedReason(curve).empty());
 }
 
 TEST(XcpMasterSymbolPolicyTest, ParsesStrictZeroBasedElementIndices) {
