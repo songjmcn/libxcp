@@ -121,6 +121,20 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
                   "$<TARGET_FILE:liba2l::liba2l>"
                   "$<TARGET_FILE_DIR:XcpliteIntegration>")
 
+  # examples 子目录在 tests 之后配置；这里登记源文件与延迟求值的目标路径，
+  # 由 examples/xcp_slave_demo/CMakeLists.txt 在目标创建后补充构建依赖。
+  if(LIBXCP_BUILD_EXAMPLES)
+    target_sources(XcpliteIntegration PRIVATE
+            xcp_slave_demo_model_test.cpp
+            xcp_slave_demo_integration_test.cpp
+            "${PROJECT_SOURCE_DIR}/examples/xcp_slave_demo/slave_model.cpp")
+    target_include_directories(XcpliteIntegration PRIVATE
+            "${PROJECT_SOURCE_DIR}/examples/xcp_slave_demo")
+    target_compile_definitions(XcpliteIntegration PRIVATE
+            XCP_SLAVE_DEMO_EXECUTABLE="$<TARGET_FILE:xcp_slave_demo>"
+            XCP_THIRDPARTY_DIR="${PROJECT_SOURCE_DIR}/thirdparty")
+  endif()
+
   gtest_discover_tests(XcpliteIntegration DISCOVERY_TIMEOUT 120)
 endif()
 
