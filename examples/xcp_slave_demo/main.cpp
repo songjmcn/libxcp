@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "libxcp/a2l/a2l_bridge.hpp"
+#include "libxcp/log.hpp"
 #include "slave_registry.hpp"
 
 #if LIBXCP_ENABLE_LOG
@@ -41,6 +42,9 @@ constexpr char kEpkVersion[] = "1.0.0";
 constexpr std::uint16_t kDefaultPort = 5555U;
 /// @brief 默认 XCP 测量消息队列容量，单位为字节。
 constexpr std::uint32_t kMeasurementQueueSize = 32768U;
+/// @brief 心跳日志间隔，单位为快速循环次数（10 ms × 500 = 5 秒）。
+/// @note 采用 tick 计数而非墙钟，避免与实时循环的时钟补偿逻辑相互干扰。
+constexpr std::uint32_t kHeartbeatFastTickInterval = 500U;
 /// @brief 快速循环周期，单位为纳秒。
 constexpr std::chrono::nanoseconds kFastPeriod{kFastEventCycleNs};
 /// @brief 慢速循环周期，单位为纳秒。
@@ -386,6 +390,7 @@ int GenerateA2l(const CommandLineOptions& options) {
         address[3] == 0U) {
         std::cerr
             << "A2L 生成模式要求可连接的具体 IPv4 地址，不能使用 0.0.0.0\n";
+        LIBXCP_LOG_ERROR("A2L 生成失败：要求具体 IPv4 地址，实际传入 0.0.0.0");
         return 2;
     }
 
@@ -393,6 +398,8 @@ int GenerateA2l(const CommandLineOptions& options) {
     std::string error_message;
     if (!PrepareOutput(options, paths, error_message)) {
         std::cerr << error_message << '\n';
+        LIBXCP_LOG_ERROR("A2L 生成失败：输出目录准备失败，原因={}",
+                         error_message);
         return 2;
     }
 
@@ -402,6 +409,8 @@ int GenerateA2l(const CommandLineOptions& options) {
             error_message = "XcpInit 初始化失败";
             RemoveGeneratedOutputs(paths);
             std::cerr << error_message << '\n';
+            LIBXCP_LOG_ERROR("A2L 生成失败：XcpInit 初始化失败，项目名={}",
+                             kProjectName);
             return 1;
         }
 
@@ -410,6 +419,8 @@ int GenerateA2l(const CommandLineOptions& options) {
             error_message = "A2lInit 初始化失败";
             RemoveGeneratedOutputs(paths);
             std::cerr << error_message << '\n';
+            LIBXCP_LOG_ERROR("A2L 生成失败：A2lInit 初始化失败，端点={}:{}",
+                             options.bind_address, options.port);
             return 1;
         }
 
@@ -418,6 +429,8 @@ int GenerateA2l(const CommandLineOptions& options) {
             (void)A2lFinalize();
             RemoveGeneratedOutputs(paths);
             std::cerr << "注册 A2L 元数据失败：" << error_message << '\n';
+            LIBXCP_LOG_ERROR("A2L 生成失败：注册元数据失败，原因={}",
+                             error_message);
             return 1;
         }
 
@@ -435,6 +448,10 @@ int GenerateA2l(const CommandLineOptions& options) {
             RemoveGeneratedOutputs(paths);
             std::cerr
                 << "A2L 输出完整性检查失败（Finalize、文件或无网络约束）\n";
+            LIBXCP_LOG_ERROR(
+                "A2L 生成失败：输出完整性检查未通过，finalize={} A2L非空={} "
+                "AML非空={} 服务已启动={}",
+                finalized, a2l_nonempty, aml_nonempty, XcpEthServerStatus());
             return 1;
         }
 
@@ -447,6 +464,8 @@ int GenerateA2l(const CommandLineOptions& options) {
             RemoveGeneratedOutputs(paths);
             std::cerr << "生成的 A2L 无法通过桥接层解析：" << parse_error
                       << '\n';
+            LIBXCP_LOG_ERROR("A2L 生成失败：桥接层无法解析，原因={}",
+                             parse_error);
             return 1;
         }
         const auto* xcp_info = loaded.Value()->XcpInfo();
@@ -455,16 +474,23 @@ int GenerateA2l(const CommandLineOptions& options) {
             xcp_info->transports.front().remote_host != options.bind_address) {
             RemoveGeneratedOutputs(paths);
             std::cerr << "A2L 中的 XCP/UDP 端点与 CLI 配置不一致\n";
+            LIBXCP_LOG_ERROR(
+                "A2L 生成失败：A2L 端点与 CLI 配置不一致，期望 {}:{}",
+                options.bind_address, options.port);
             return 1;
         }
 
         std::cout << "A2L 已生成并通过桥接解析：" << paths.a2l_file.string()
                   << '\n'
                   << "外链 AML：" << paths.aml_file.string() << '\n';
+        LIBXCP_LOG_INFO("A2L 生成成功：A2L={} AML={} 端点={}:{}",
+                        paths.a2l_file.string(), paths.aml_file.string(),
+                        options.bind_address, options.port);
         return 0;
     } catch (const std::exception& exception) {
         RemoveGeneratedOutputs(paths);
         std::cerr << "A2L 生成异常：" << exception.what() << '\n';
+        LIBXCP_LOG_ERROR("A2L 生成失败：抛出异常，原因={}", exception.what());
         return 1;
     }
 }
@@ -486,6 +512,8 @@ void HandleTerminationSignal(int signal_number) {
 int RunSlave(const CommandLineOptions& options) {
     if (!XcpInit(kProjectName, kEpkVersion, XCP_MODE_LOCAL)) {
         std::cerr << "XcpInit 初始化失败\n";
+        LIBXCP_LOG_ERROR("从站启动失败：XcpInit 初始化失败，项目名={} EPK={}",
+                         kProjectName, kEpkVersion);
         return 1;
     }
 
@@ -494,6 +522,8 @@ int RunSlave(const CommandLineOptions& options) {
     if (!InitializeSlaveRegistry(registry, false, &error_message)) {
         std::cerr << "初始化 XCPlite 事件/标定段失败：" << error_message
                   << '\n';
+        LIBXCP_LOG_ERROR("从站启动失败：事件/标定段初始化失败，原因={}",
+                         error_message);
         return 1;
     }
 
@@ -502,12 +532,21 @@ int RunSlave(const CommandLineOptions& options) {
                           kMeasurementQueueSize)) {
         std::cerr << "XcpEthServerInit 失败，无法监听 " << options.bind_address
                   << ':' << options.port << '\n';
+        LIBXCP_LOG_ERROR(
+            "从站启动失败：XcpEthServerInit 无法监听 {}:{}，队列容量={} 字节",
+            options.bind_address, options.port, kMeasurementQueueSize);
         return 1;
     }
+
+    RegisterSlaveProtocolCallbacks();
 
     std::signal(SIGINT, HandleTerminationSignal);
     std::signal(SIGTERM, HandleTerminationSignal);
     g_keep_running = 1;
+    LIBXCP_LOG_INFO(
+        "从站已启动：UDP {}:{}，快事件 {} ns，慢事件 {} ns，测量队列 {} 字节",
+        options.bind_address, options.port, kFastEventCycleNs, kSlowEventCycleNs,
+        kMeasurementQueueSize);
     std::cout << "XCPlite UDP Slave 正在监听 " << options.bind_address << ':'
               << options.port << "（快事件 10 ms，慢事件 100 ms）\n"
               << "按 Ctrl+C 退出。\n";
@@ -524,6 +563,9 @@ int RunSlave(const CommandLineOptions& options) {
                 MakeDefaultCalibrationParameters();
             if (!CopyCalibrationSnapshot(registry, parameters)) {
                 std::cerr << "无法读取标定段快照，Slave 将停止\n";
+                LIBXCP_LOG_ERROR(
+                    "从站运行期失败：无法读取标定段快照，累计快事件次数={}",
+                    tick);
                 runtime_failure = true;
                 break;
             }
@@ -545,13 +587,27 @@ int RunSlave(const CommandLineOptions& options) {
                 next_slow = now + kSlowPeriod;
             }
         }
+
+        // 按周期观察协议状态边沿，只在跳变时写日志，不进入实时敏感临界区。
+        ObserveSlaveProtocolState();
+
+        // 降频心跳：确认从站在无主站连接时仍持续运行；与边沿日志相互独立。
+        if (kHeartbeatFastTickInterval != 0U &&
+            tick != 0U && tick % kHeartbeatFastTickInterval == 0U) {
+            LIBXCP_LOG_INFO(
+                "从站心跳：累计快事件次数={}，已连接={}，DAQ 运行中={}",
+                tick, XcpIsConnected(), XcpIsDaqRunning());
+        }
         std::this_thread::sleep_until(std::min(next_fast, next_slow));
     }
 
     if (!XcpEthServerShutdown()) {
         std::cerr << "XcpEthServerShutdown 返回失败\n";
+        LIBXCP_LOG_ERROR("从站关闭失败：XcpEthServerShutdown 返回失败");
         return 1;
     }
+    LIBXCP_LOG_INFO("从站已正常退出：累计快事件次数={}，运行期故障={}", tick,
+                    runtime_failure);
     return runtime_failure ? 1 : 0;
 }
 
@@ -584,6 +640,10 @@ int main(int argc, char* argv[]) {
         return 2;
     }
 #endif
+    LIBXCP_LOG_INFO(
+        "从站进程启动：模式={} 绑定={}:{} 输出目录={} A2L版本={}",
+        options.generate_a2l ? "生成A2L" : "常驻服务", options.bind_address,
+        options.port, options.output_dir.string(), xcp_slave_demo::kEpkVersion);
     if (options.generate_a2l) {
         return xcp_slave_demo::GenerateA2l(options);
     }

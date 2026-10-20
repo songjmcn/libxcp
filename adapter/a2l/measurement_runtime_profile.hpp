@@ -32,6 +32,9 @@ public:
         std::string_view name) const override;
     MeasurementResult<MeasurementValue> ToPhysical(
         std::string_view name, BytesView raw) const override;
+    MeasurementResult<MeasurementValue> ToPhysicalElement(
+        std::string_view name, std::uint64_t element_index,
+        BytesView raw) const override;
 
 private:
     IMeasurementDatabase& m_inner_;
@@ -66,6 +69,7 @@ struct XcpliteMeasurementRuntimeProfile {
     std::uint8_t identification_header_bytes{4};
     std::uint64_t timestamp_unit_ns{0};
     bool timestamp_first_odt_only{true};
+    MeasurementDaqCapabilities daq_entry_capabilities{};
 };
 
 /// @brief 查询并校验保守的通用 Absolute-PID 无时间戳配置及 A2L 事件。

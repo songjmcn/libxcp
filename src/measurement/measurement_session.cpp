@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -144,6 +145,19 @@ void MeasurementSession::SetTimestampFirstOdtOnly(bool first_only) {
     m_timestamp_first_odt_only_ = first_only;
 }
 
+void MeasurementSession::SetDaqEntryCapabilities(
+    MeasurementDaqCapabilities capabilities) {
+    if (m_prepared_ || Running()) {
+        ThrowState("MeasurementSession::SetDaqEntryCapabilities 须在 Prepare 前调用");
+    }
+    if (capabilities.supports_contiguous_1d_arrays &&
+        (capabilities.entry_granularity_bytes == 0U ||
+         capabilities.max_entry_size_bytes == 0U)) {
+        ThrowInvalid("数组准入缺少已验证的 DAQ Entry 粒度或最大长度");
+    }
+    m_daq_entry_capabilities_ = capabilities;
+}
+
 void MeasurementSession::Bind(XcpMaster& master) {
     if (m_bound_) {
         ThrowInvalid("MeasurementSession::Bind 重复绑定");
@@ -202,7 +216,8 @@ void MeasurementSession::Prepare() {
     // 规划 + 下发（一个整体：失败不留半份账，ConfigureDaqListsDynamic 自回滚）
     MeasurementPlanner planner(m_database_, m_max_dto_,
                                params.connect.address_granularity,
-                               m_timestamp_bytes_, m_id_field_bytes_);
+                               m_timestamp_bytes_, m_id_field_bytes_,
+                               m_daq_entry_capabilities_);
     const MeasurementResult<MeasurementPlan> plan = planner.Build(names);
     if (!plan.HasValue()) {
         // v0.6 硬化：按错误码映射异常类别上抛（不再统一 InvalidArgument）
@@ -237,10 +252,17 @@ void MeasurementSession::Prepare() {
             odts.push_back(OdtView{r.odt, {}});
             it = std::prev(odts.end());
         }
-        it->slices.push_back(OdtSlice{r.name, r.payload_offset, r.size, false});
+        it->slices.push_back(OdtSlice{r.name,
+                                      r.payload_offset,
+                                      r.size,
+                                      false,
+                                      r.is_array,
+                                      r.element_count,
+                                      r.element_size_bytes});
     }
 
     m_plan_generation_ = master.DaqConfigGeneration();
+    m_prepared_ = true;
 }
 
 void MeasurementSession::Start(MeasurementCallback callback) {
@@ -482,15 +504,72 @@ void MeasurementSession::WorkerLoop() {
             sample.raw = ds.raw;
             sample.valid = ds.valid;
             sample.timestamp = frame_out.timestamp;
-            if (ds.valid) {
-                const MeasurementResult<MeasurementValue> conv =
-                    m_database_.ToPhysical(ds.name, BytesView{ds.raw});
-                if (conv.HasValue()) {
-                    sample.value = conv.Value();
-                } else {
+            const auto route_it = std::find_if(
+                view->slices.begin(), view->slices.end(),
+                [&](const OdtSlice& slice) { return slice.name == ds.name; });
+            if (route_it == view->slices.end()) {
+                sample.valid = false;
+                sample.error = "DTO 切片缺少已规划路由";
+            } else {
+                sample.is_array = route_it->is_array;
+                if (!ds.valid) {
+                    sample.error = "DTO 原始切片解码失败";
+                } else if (!route_it->is_array) {
+                    const MeasurementResult<MeasurementValue> conv =
+                        m_database_.ToPhysical(ds.name, BytesView{ds.raw});
+                    if (conv.HasValue()) {
+                        sample.value = conv.Value();
+                    } else {
+                        sample.valid = false;
+                        sample.error = conv.ErrorInfo().message;
+                    }
+                } else if (route_it->element_count == 0U ||
+                           route_it->element_size_bytes == 0U ||
+                           route_it->element_count >
+                               std::numeric_limits<std::size_t>::max() /
+                                   route_it->element_size_bytes ||
+                           ds.raw.size() !=
+                               static_cast<std::size_t>(route_it->element_count) *
+                                   route_it->element_size_bytes) {
                     sample.valid = false;
-                    m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
+                    sample.error = "DTO 数组字节数与已规划元素布局不匹配";
+                } else {
+                    std::vector<MeasurementValue> elements;
+                    elements.reserve(route_it->element_count);
+                    for (std::uint64_t index = 0;
+                         index < route_it->element_count; ++index) {
+                        const std::size_t byte_offset =
+                            static_cast<std::size_t>(index) *
+                            route_it->element_size_bytes;
+                        const BytesView element_raw{
+                            ds.raw.data() + byte_offset,
+                            route_it->element_size_bytes};
+                        const MeasurementResult<MeasurementValue> converted =
+                            m_database_.ToPhysicalElement(ds.name, index,
+                                                          element_raw);
+                        if (!converted.HasValue()) {
+                            sample.valid = false;
+                            sample.error = converted.ErrorInfo().message;
+                            elements.clear();
+                            break;
+                        }
+                        elements.push_back(converted.Value());
+                    }
+                    if (sample.valid &&
+                        elements.size() == route_it->element_count) {
+                        sample.elements = std::move(elements);
+                    } else {
+                        sample.valid = false;
+                        if (sample.error.empty()) {
+                            sample.error = "数组元素换算未生成完整样本";
+                        }
+                    }
                 }
+            }
+            // 截断 DTO 切片维持原有降级语义：仍回调无效样本，但只对完整切片的
+            // 换算/数组布局失败递增解码错误计数（畸形整帧在上层单独计数）。
+            if (!sample.valid && ds.valid) {
+                m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
             }
             frame_out.samples.push_back(std::move(sample));
         }

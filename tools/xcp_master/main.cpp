@@ -100,6 +100,7 @@ using calmcar::xcp::BuildXcpliteMeasurementRuntimeProfile;
 using calmcar::xcp::ByteCount;
 using calmcar::xcp::Bytes;
 using calmcar::xcp::IdentificationFieldType;
+using calmcar::xcp::MeasurementDaqCapabilities;
 using calmcar::xcp::MeasurementFrame;
 using calmcar::xcp::MeasurementPlanner;
 using calmcar::xcp::MeasurementSession;
@@ -483,7 +484,7 @@ public:
                     ? text("终端尺寸不足；确认操作已禁用。") | color(Color::Red)
                     : text(
                           "本页只显示 A2L 元数据与静态策略，不访问 ECU。"
-                          "观测请返回预览列表；标定请按 F4/Ctrl+S/Cmd+S。");
+                          "观测请返回预览列表；标定请返回预览列表按 F4。");
 
             return vbox(
                        {text("A2L 元数据 · " + QualifiedName(symbol) +
@@ -567,9 +568,11 @@ public:
             {details_renderer, calibration_renderer, confirmation_renderer},
             &modal_page_selected_);
 
-        auto root =
-            Container::Vertical({view_menu, view_content, command_input});
-        root->SetActiveChild(command_input);
+        // 根组件按模式隔离事件，预览区的 Tab 不可抵达命令输入。
+        auto preview_area = Container::Vertical({view_menu, view_content});
+        auto root = Container::Tab({preview_area, command_input},
+                                   input_mode_.Selector());
+        preview_menu->TakeFocus();
         auto renderer = Renderer(root, [&] {
             const auto terminal = Terminal::Size();
             current_layout_ = calmcar::xcp::tools::CalculateTuiLayout(
@@ -617,32 +620,34 @@ public:
                 help = compact ? "Tab切换 | Esc关闭 | F5停止"
                                : "Tab 弹窗内切换 | Enter 激活 | Esc 关闭详情 | "
                                  "F5 停止";
-            } else if (command_input->Focused()) {
-                help = compact
-                           ? "Enter执行 | ↑↓历史 | F2视图 | F5停止 | quit退出"
-                           : "Enter 执行 | ↑↓ 命令历史 | F2 切换视图 | F5 停止 "
-                             "| quit 退出";
-            } else if (preview_menu->Focused()) {
-                help = compact
-                           ? "↑↓滚动 | Enter展开 | F3详情 | Ctrl/Cmd+A/F6采样 "
-                             "| Ctrl/Cmd+S/F4标定"
-                           : "↑↓ 选择/滚动 | Enter 展开/折叠 | F3 只读详情 | "
-                             "Ctrl+A/Cmd+A/F6 观测 | Ctrl+S/Cmd+S/F4 标定 | F2 "
-                             "视图 | Esc 命令";
-            } else if (search_input->Focused()) {
-                help = compact ? "Enter搜索元数据 | 不触发ECU操作 | Esc命令"
-                               : "输入名称模式 | Enter 搜索A2L元数据 | "
-                                 "不触发ECU读写 | Esc 命令";
-            } else if (scope_menu->Focused()) {
-                help = compact ? "←→范围 | Enter应用 | F2视图 | Esc命令"
-                               : "←→ 选择全部/已采样 | Enter 应用 | F2 视图 | "
-                                 "Esc 命令";
-            } else {
+            } else if (input_mode_.InCommandMode()) {
                 help =
                     compact
-                        ? "F2视图 | Tab焦点 | PgUp/Dn翻页 | F5停止 | quit退出"
-                        : "F2 切换三视图 | Tab 焦点 | PgUp/PgDn 浏览 | F5 停止 "
-                          "| quit 退出";
+                        ? "Enter执行 | ↑↓历史 | Esc预览 | F2视图 | F5停止"
+                        : "Enter 执行 | ↑↓ 命令历史 | Esc 返回预览（保留草稿）"
+                          " | F2 切换视图 | F5 停止 | quit 退出";
+            } else if (view_selected_ != 0) {
+                help = compact ? "F2视图 | F7命令 | PgUp/Dn翻页 | F5停止"
+                               : "F2 切换三视图 | F7 输入命令 | PgUp/PgDn "
+                                 "浏览 | F5 停止";
+            } else if (preview_menu->Focused()) {
+                help = compact
+                           ? "Tab焦点 | Enter展开 | F3详情 | F4标定 | F6观测 | "
+                             "F7命令"
+                           : "Tab 预览内焦点 | Enter 展开/读取 | F3 只读详情 "
+                             "| F4 标定 | F6 切换观测成员 | F7 输入命令";
+            } else if (search_input->Focused()) {
+                help = compact ? "Tab焦点 | Enter搜索 | F7命令 | F5停止"
+                               : "Tab 预览内焦点 | Enter 搜索A2L元数据 | "
+                                 "F7 输入命令 | F5 停止";
+            } else if (scope_menu->Focused()) {
+                help = compact ? "Tab焦点 | ←→范围 | F7命令 | F5停止"
+                               : "Tab 预览内焦点 | ←→ 选择全部/已采样 | "
+                                 "F7 输入命令 | F5 停止";
+            } else {
+                help = compact ? "F2视图 | Tab焦点 | F7命令 | F5停止"
+                               : "F2 切换三视图 | Tab 在预览内切换焦点 | "
+                                 "F7 输入命令 | F5 停止";
             }
             const auto dimensions =
                 current_layout_.too_small
@@ -682,14 +687,21 @@ public:
                                            : view_content->Render()) |
                           flex});
             return vbox({status_bar, main_panel | flex, separator(),
-                         hbox({text("命令 > "), command_input->Render()}),
+                         hbox({text(input_mode_.InCommandMode()
+                                        ? "命令 > "
+                                        : "命令（按 F7 输入）> "),
+                               command_input->Render()}),
                          hbox({dimensions, text("  |  "), text(help)})}) |
                    border;
         });
         auto ui = Modal(renderer, modal_pages, &modal_visible_);
-        ui = CatchEvent(ui, [this, command_input, preview_menu](Event event) {
+        ui = CatchEvent(ui, [this, command_input, search_input, scope_menu,
+                             preview_menu, view_menu](Event event) {
             if (modal_visible_) {
-                if (event == Event::F2) return true;
+                if (event == Event::F2 || event == Event::F3 ||
+                    event == Event::F4 || event == Event::F6 ||
+                    event == Event::F7)
+                    return true;
                 if (event == Event::F5) {
                     if (variable_modal_.Page() ==
                         calmcar::xcp::tools::VariableModalPage::Confirmation) {
@@ -722,18 +734,30 @@ public:
                 }
                 return false;
             }
-            if (view_selected_ == 0 && preview_menu->Focused()) {
-                if (event == Event::CtrlA || event == Event::AltA ||
-                    event == Event::Special("\x1b[97;9u") ||
-                    event == Event::Special("\x1b[65;10u") ||
-                    event == Event::F6) {
+            // 安全停止及模式切换优先于输入组件，且不会提交当前草稿。
+            if (event == Event::F5) {
+                SubmitCommand("stop");
+                return true;
+            }
+            if (event == Event::F7) {
+                input_mode_.EnterCommandMode();
+                command_input->TakeFocus();
+                return true;
+            }
+            if (event == Event::Escape) {
+                if (input_mode_.InCommandMode()) {
+                    input_mode_.LeaveCommandMode(view_selected_);
+                    preview_menu->TakeFocus();
+                }
+                return true;
+            }
+            if (input_mode_.AllowsPreviewListAction(view_selected_,
+                                                    preview_menu->Focused())) {
+                if (event == Event::F6) {
                     TogglePreviewWatch();
                     return true;
                 }
-                if (event == Event::CtrlS || event == Event::AltS ||
-                    event == Event::Special("\x1b[115;9u") ||
-                    event == Event::Special("\x1b[83;10u") ||
-                    event == Event::F4) {
+                if (event == Event::F4) {
                     OpenCalibration();
                     return true;
                 }
@@ -742,8 +766,32 @@ public:
                     return true;
                 }
             }
-            if (event == Event::F5) {
-                SubmitCommand("stop");
+            // 菜单自身会消费 Tab，因此由顶层显式实现预览三控件环路。
+            if (!input_mode_.InCommandMode() && view_selected_ == 0 &&
+                (event == Event::Tab || event == Event::TabReverse)) {
+                using calmcar::xcp::tools::PreviewFocusTarget;
+                auto current = PreviewFocusTarget::List;
+                if (search_input->Focused())
+                    current = PreviewFocusTarget::Search;
+                else if (scope_menu->Focused())
+                    current = PreviewFocusTarget::Scope;
+                else if (!preview_menu->Focused()) {
+                    preview_menu->TakeFocus();
+                    return true;
+                }
+                const auto next = calmcar::xcp::tools::NextPreviewFocusTarget(
+                    current, event == Event::TabReverse);
+                switch (next) {
+                    case PreviewFocusTarget::Search:
+                        search_input->TakeFocus();
+                        break;
+                    case PreviewFocusTarget::Scope:
+                        scope_menu->TakeFocus();
+                        break;
+                    case PreviewFocusTarget::List:
+                        preview_menu->TakeFocus();
+                        break;
+                }
                 return true;
             }
             if (event == Event::PageUp || event == Event::PageDown) {
@@ -761,12 +809,14 @@ public:
                     viewport_.PageDown(view, total);
                 return true;
             }
-            if (command_input->Focused() && event == Event::ArrowUp) {
+            if (input_mode_.InCommandMode() && command_input->Focused() &&
+                event == Event::ArrowUp) {
                 if (auto previous = command_history_.Previous(command_text_))
                     command_text_ = std::move(*previous);
                 return true;
             }
-            if (command_input->Focused() && event == Event::ArrowDown) {
+            if (input_mode_.InCommandMode() && command_input->Focused() &&
+                event == Event::ArrowDown) {
                 if (auto next = command_history_.Next())
                     command_text_ = std::move(*next);
                 return true;
@@ -774,11 +824,12 @@ public:
             if (event == Event::F2) {
                 view_selected_ = calmcar::xcp::tools::NextViewIndex(
                     view_selected_, view_labels_.size());
-                command_input->TakeFocus();
-                return true;
-            }
-            if (event == Event::Escape) {
-                command_input->TakeFocus();
+                if (!input_mode_.InCommandMode()) {
+                    if (view_selected_ == 0)
+                        preview_menu->TakeFocus();
+                    else
+                        view_menu->TakeFocus();
+                }
                 return true;
             }
             return false;
@@ -853,8 +904,9 @@ private:
                          : "—";
         }
         label += watched ? " | 已加入采样" : " | 未采样";
-        const auto read_reason = ObservationUnsupportedReason(symbol);
-        if (!read_reason.empty()) label += " | 读取拒绝: " + read_reason;
+        const auto observation_reason = ObservationUnsupportedReason(symbol);
+        if (!observation_reason.empty())
+            label += " | 观测拒绝: " + observation_reason;
         if (symbol.kind != SymbolKind::Measurement) {
             const auto write_reason =
                 calmcar::xcp::tools::SymbolWriteUnsupportedReason(symbol);
@@ -989,6 +1041,10 @@ private:
             }
         }
 
+        // 空搜索结果也留一个不可操作的菜单占位行，保持列表可聚焦。
+        if (preview_labels_.empty())
+            preview_labels_.push_back("（当前范围没有可显示的变量）");
+
         const auto same_row = [&](const PreviewRow& candidate) {
             return candidate.symbol_name == old_selected_row.symbol_name &&
                    candidate.is_child == old_selected_row.is_child &&
@@ -1023,9 +1079,9 @@ private:
         preview_status_ = "结果筛选 " + active_filter + "：匹配 " +
                           std::to_string(preview_symbols_.size()) +
                           " 个变量；当前显示 " +
-                          std::to_string(preview_labels_.size()) +
-                          " 行 | Enter 展开/读取，F3 详情，Ctrl+A/Cmd+A/F6 "
-                          "观测，Ctrl+S/Cmd+S/F4 标定";
+                          std::to_string(preview_rows_.size()) +
+                          " 行 | Enter 展开/读取，F3 详情，F4 标定，F6 "
+                          "观测，F7 命令";
         if (preview_filter_ != preview_active_filter_)
             preview_status_ += " | 搜索框是未提交草稿";
     }
@@ -1735,7 +1791,7 @@ private:
         Say("命令：list [pattern|all] | more | info <name> | remove <name> "
             "| read <name> | watch | stop | write <name> <value> | find "
             "[pattern] | quit；变量预览 Enter 展开/折叠，F3 只读详情，"
-            "Ctrl+A/Cmd+A/F6 观测，Ctrl+S/Cmd+S/F4 标定。");
+            "F4 标定、F6 观测成员，F7 进入命令、Esc 返回预览。");
         Say("mode=" + options_.mode +
             (options_.mode == "poll"
                  ? "；watch 按目标周期 " +
@@ -1856,12 +1912,19 @@ private:
         Say(out.str());
     }
 
-    /** @brief 检查观测资格；仅一维MEASUREMENT数组复用详情读取策略。 */
+    /** @brief 按采样模式检查A2L静态观测资格；DAQ还需固定事件信息。 */
     std::string ObservationUnsupportedReason(const SymbolInfo& symbol) const {
+        if (options_.mode == "daq") {
+            std::vector<std::uint16_t> available_events;
+            available_events.reserve(events_.size());
+            for (const auto& event : events_)
+                available_events.push_back(event.channel);
+            return calmcar::xcp::tools::SymbolDaqObservationUnsupportedReason(
+                symbol, available_events,
+                options_.daq_profile == "xcplite");
+        }
         if (symbol.dimensions.empty())
             return calmcar::xcp::tools::SymbolReadUnsupportedReason(symbol);
-        if (options_.mode != "poll")
-            return "DAQ数组的ODT/DTO映射尚未验证；当前仅支持标量观测";
         if (symbol.kind == SymbolKind::Measurement)
             return calmcar::xcp::tools::SymbolDetailReadUnsupportedReason(
                 symbol);
@@ -1883,7 +1946,7 @@ private:
             return;
         }
         if (name.empty()) {
-            Say("请先在变量列表中选择变量，再按 Ctrl+A/Cmd+A/F6 加入观测。");
+            Say("请先在变量列表中选择变量，再按 F6 加入观测。");
             return;
         }
         auto found = database_.Find(name);
@@ -2589,7 +2652,7 @@ private:
             watch_list_empty = watched_.empty();
         }
         if (watch_list_empty) {
-            Say("观测列表为空；请在变量列表选择变量后按 Ctrl+A/Cmd+A/F6。");
+            Say("观测列表为空；请在变量列表选择变量后按 F6。");
             return;
         }
         watching_.store(true);
@@ -2669,12 +2732,11 @@ private:
             names = watched_;
         }
         if (names.empty()) {
-            Say("观测列表为空；请从变量预览中选择变量并按 Ctrl+A/Cmd+A/F6。");
+            Say("观测列表为空；请从变量预览中选择变量并按 F6。");
             return;
         }
 
         std::vector<A2lEventMetadata> selected_events;
-        std::vector<SymbolInfo> selected_symbols;
         for (const auto& name : names) {
             auto found = database_.Find(name);
             if (!found.HasValue()) {
@@ -2682,28 +2744,15 @@ private:
                 return;
             }
             const auto& symbol = found.Value();
-            if (symbol.kind != SymbolKind::Measurement) {
-                Say(name + " | DAQ 仅支持 MEASUREMENT，不支持标定项。");
-                return;
-            }
-            const auto reason =
-                calmcar::xcp::tools::SymbolReadUnsupportedReason(symbol);
+            // 与F6和预览列表共用静态准入，运行期配置仍在下方复核。
+            const auto reason = ObservationUnsupportedReason(symbol);
             if (!reason.empty()) {
                 Say(name + " | DAQ 不支持: " + reason);
                 return;
             }
-            auto fixed = symbol.daq_event_fixed;
-            std::sort(fixed.begin(), fixed.end());
-            fixed.erase(std::unique(fixed.begin(), fixed.end()), fixed.end());
-            if (fixed.size() != 1U) {
-                Say(name +
-                    " | 需要唯一 FIXED_EVENT_LIST；不回退到 "
-                    "DEFAULT/AVAILABLE。");
-                return;
-            }
             const auto event = std::find_if(
                 events_.begin(), events_.end(), [&](const auto& item) {
-                    return item.channel == fixed.front();
+                    return item.channel == symbol.daq_event_fixed.front();
                 });
             if (event == events_.end()) {
                 Say(name + " | A2L 缺少对应 EVENT_CHANNEL 元数据。");
@@ -2714,25 +2763,35 @@ private:
                                  return item.channel == event->channel;
                              }))
                 selected_events.push_back(*event);
-            selected_symbols.push_back(symbol);
         }
 
         const auto session = master_.GetSessionParameters();
         std::size_t timestamp_bytes = 0;
         std::size_t identification_bytes = 1;
-        std::size_t max_entry = 0;
-        std::size_t entry_granularity = 0;
+        MeasurementDaqCapabilities daq_entry_capabilities{};
         std::optional<XcpliteMeasurementRuntimeProfile> xcplite_profile;
         if (options_.daq_profile == "generic") {
             auto profile =
                 BuildGenericMeasurementRuntimeProfile(master_, selected_events);
             if (!profile.HasValue()) {
-                Say("通用 DAQ 能力校验失败: " + profile.ErrorInfo().message);
+                const std::string& reason = profile.ErrorInfo().message;
+                std::string hint;
+                // 仅在已知的 DTO 标识/时间戳/地址扩展布局不兼容时提示
+                // XCPlite 的显式选择；不自动重试，也不发送 FREE_DAQ。
+                if (reason.find("generic profile 仅支持") !=
+                        std::string::npos ||
+                    reason.find("Slave 强制固定时间戳") != std::string::npos) {
+                    hint =
+                        "；DAQ 未启动。若已确认是 XCPlite，请重启并显式添加 "
+                        "--daq-profile xcplite";
+                }
+                Say("通用 DAQ 能力校验失败: " + reason + hint);
                 return;
             }
             identification_bytes = profile.Value().identification_header_bytes;
-            max_entry = profile.Value().max_daq_entry_size_bytes;
-            entry_granularity = profile.Value().daq_entry_granularity_bytes;
+            daq_entry_capabilities = MeasurementDaqCapabilities{
+                false, profile.Value().daq_entry_granularity_bytes,
+                profile.Value().max_daq_entry_size_bytes};
         } else {
             auto profile =
                 BuildXcpliteMeasurementRuntimeProfile(master_, selected_events);
@@ -2743,27 +2802,13 @@ private:
             xcplite_profile = profile.Value();
             timestamp_bytes = 4;
             identification_bytes = profile.Value().identification_header_bytes;
-        }
-        const auto ag =
-            static_cast<std::size_t>(session.connect.address_granularity);
-        for (const auto& symbol : selected_symbols) {
-            if (symbol.element_size_bytes > max_entry && max_entry != 0U) {
-                Say(QualifiedName(symbol) + " | 数据宽度超过 DAQ entry 上限。");
-                return;
-            }
-            if (entry_granularity != 0U &&
-                (symbol.element_size_bytes % entry_granularity != 0U ||
-                 symbol.element_size_bytes % std::max<std::size_t>(ag, 1U) !=
-                     0U)) {
-                Say(QualifiedName(symbol) +
-                    " | 数据宽度与 DAQ/地址粒度不兼容。");
-                return;
-            }
+            daq_entry_capabilities = profile.Value().daq_entry_capabilities;
         }
         MeasurementPlanner planner(measurement_database_,
                                    session.connect.max_dto,
                                    session.connect.address_granularity,
-                                   timestamp_bytes, identification_bytes);
+                                   timestamp_bytes, identification_bytes,
+                                   daq_entry_capabilities);
         auto planned = planner.Build(names);
         if (!planned.HasValue()) {
             Say("DAQ 本地规划失败: " + planned.ErrorInfo().message);
@@ -2872,18 +2917,27 @@ private:
                         timestamp);
                     continue;
                 }
-                std::ostringstream value_text;
-                std::visit(
-                    [&](const auto& value) {
-                        using T = std::decay_t<decltype(value)>;
-                        if constexpr (std::is_same_v<T, std::string>)
-                            value_text << value;
-                        else
-                            value_text << std::setprecision(15) << value;
-                    },
-                    sample.value);
-                RecordWatchedObservationValue(sample.name, value_text.str(),
-                                              status.str(), timestamp);
+                if (sample.is_array) {
+                    // DTO 中的数组按一个样本一次发布；失败时不覆盖此前整批值。
+                    std::vector<std::string> values;
+                    values.reserve(sample.elements.size());
+                    for (const auto& element : sample.elements)
+                        values.push_back(PhysicalToString(element));
+                    if (values.empty()) {
+                        RecordWatchedObservationFailure(
+                            sample.name, "DAQ数组样本为空 | " + status.str(),
+                            timestamp);
+                    } else {
+                        RecordArrayObservationValue(sample.name,
+                                                    std::move(values),
+                                                    status.str(), timestamp,
+                                                    true);
+                    }
+                } else {
+                    RecordWatchedObservationValue(
+                        sample.name, PhysicalToString(sample.value),
+                        status.str(), timestamp);
+                }
             }
         }
     }
@@ -3008,16 +3062,19 @@ private:
         preview_visible_index_;            /**< 规范名到父预览菜单行号。 */
     std::vector<PreviewRow> preview_rows_; /**< 菜单行到符号/元素的映射。 */
     std::unordered_set<std::string>
-        expanded_preview_names_;              /**< 当前原位展开的符号规范名。 */
-    std::vector<std::string> preview_labels_; /**< 变量预览菜单文本。 */
+        expanded_preview_names_; /**< 当前原位展开的符号规范名。 */
+    /** @brief 变量预览菜单文本；空结果也用占位行保持焦点。 */
+    std::vector<std::string> preview_labels_{"（正在加载A2L变量…）"};
     std::vector<std::string> view_labels_{"变量预览", "命令结果",
                                           "日志"}; /**< 顶部三视图标签。 */
     std::vector<std::string> preview_scope_labels_{
-        "全部变量", "仅采样"};          /**< 变量预览范围筛选。 */
-    int view_selected_{0};              /**< 当前选中视图：预览、结果、日志。 */
-    int preview_selected_{0};           /**< 当前变量预览菜单行。 */
-    int preview_scope_selected_{0};     /**< 0=全部变量，1=仅采样。 */
-    std::string preview_filter_;        /**< 当前变量名搜索输入框草稿。 */
+        "全部变量", "仅采样"}; /**< 变量预览范围筛选。 */
+    calmcar::xcp::tools::TuiInputModeState
+        input_mode_;                /**< 显式预览/命令输入模式及事件隔离。 */
+    int view_selected_{0};          /**< 当前选中视图：预览、结果、日志。 */
+    int preview_selected_{0};       /**< 当前变量预览菜单行。 */
+    int preview_scope_selected_{0}; /**< 0=全部变量，1=仅采样。 */
+    std::string preview_filter_;    /**< 当前变量名搜索输入框草稿。 */
     std::string preview_active_filter_; /**< 当前结果使用的实际筛选。 */
     calmcar::xcp::tools::SearchInputRevision
         preview_input_revision_; /**< 防止旧搜索结果覆盖新草稿。 */

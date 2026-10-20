@@ -187,6 +187,67 @@ elseif(MODE STREQUAL "cli-error")
   if(IS_DIRECTORY "${WORK_DIR}/logs")
     message(FATAL_ERROR "非法 CLI 路径不应初始化日志或创建目录")
   endif()
+elseif(MODE STREQUAL "slave-a2l")
+  # xcp_slave_demo 生成 A2L 路径的日志验证：确定性、无网络竞争。
+  if(NOT DEFINED PROGRAM_EXE)
+    message(FATAL_ERROR "PROGRAM_EXE 必须提供")
+  endif()
+  file(MAKE_DIRECTORY "${WORK_DIR}/gen")
+  execute_process(
+    COMMAND "${PROGRAM_EXE}"
+            --generate-a2l --overwrite
+            --output-dir "${WORK_DIR}/gen"
+            --bind 127.0.0.1 --port 45671
+    WORKING_DIRECTORY "${WORK_DIR}"
+    RESULT_VARIABLE result
+    OUTPUT_VARIABLE stdout
+    ERROR_VARIABLE stderr
+    TIMEOUT 120)
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "从站 A2L 生成失败（${result}）：${stdout} ${stderr}")
+  endif()
+  # glog 不得出现在 stderr；XCPlite 自身的 dbg_print 输出不在本断言范围。
+  string(FIND "${stderr}" "Logging before InitGoogleLogging" premature_glog)
+  if(NOT premature_glog EQUAL -1)
+    message(FATAL_ERROR "glog 在初始化前污染 stderr：'${stderr}'")
+  endif()
+
+  file(GLOB_RECURSE log_files LIST_DIRECTORIES FALSE
+       "${WORK_DIR}/logs/examples/xcp_slave_demo/*")
+  if(NOT log_files)
+    message(FATAL_ERROR "从站 A2L 生成未产生日志文件")
+  endif()
+  set(log_content "")
+  foreach(log_file IN LISTS log_files)
+    get_filename_component(log_name "${log_file}" NAME)
+    if(log_name MATCHES "^\\.")
+      message(FATAL_ERROR "从站日志文件名不能以点开头：'${log_name}'")
+    endif()
+    if(NOT log_name MATCHES "^xcp_slave_demo\\.(INFO|WARNING|ERROR)\\..+\\.glog$")
+      message(FATAL_ERROR "从站日志文件名不符合约定：'${log_name}'")
+    endif()
+    file(READ "${log_file}" part)
+    string(APPEND log_content "${part}")
+  endforeach()
+
+  foreach(expected IN ITEMS
+      "从站进程启动：模式=生成A2L"
+      "从站注册完成："
+      "A2L 生成成功：")
+    string(FIND "${log_content}" "${expected}" found)
+    if(found EQUAL -1)
+      message(FATAL_ERROR "从站日志缺少 '${expected}'")
+    endif()
+  endforeach()
+  # 生成模式不得出现常驻服务的启动或协议回调注册日志。
+  foreach(unexpected IN ITEMS
+      "从站已启动：UDP"
+      "从站协议回调已注册")
+    string(FIND "${log_content}" "${unexpected}" found)
+    if(NOT found EQUAL -1)
+      message(FATAL_ERROR "生成模式不应出现 '${unexpected}'")
+    endif()
+  endforeach()
 else()
   message(FATAL_ERROR "未知 MODE '${MODE}'")
 endif()

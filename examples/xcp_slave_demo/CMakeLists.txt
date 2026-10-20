@@ -37,3 +37,14 @@ add_custom_command(TARGET xcp_slave_demo POST_BUILD
 if(TARGET XcpliteIntegration)
   add_dependencies(XcpliteIntegration xcp_slave_demo)
 endif()
+
+# 本示例自有日志布点的黑盒验证：tests 目录先于 examples 配置，因此
+# 依赖 xcp_slave_demo 目标的测试必须在此处注册。
+if(LIBXCP_ENABLE_LOG AND LIBXCP_BUILD_TESTS)
+  add_test(NAME LibxcpLogSlaveDemoA2l
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=slave-a2l"
+                   "-DPROGRAM_EXE=$<TARGET_FILE:xcp_slave_demo>"
+                   "-DTEST_ROOT=${PROJECT_BINARY_DIR}/tests/log-behavior"
+                   -P "${PROJECT_SOURCE_DIR}/tests/logging_behavior_test.cmake")
+endif()

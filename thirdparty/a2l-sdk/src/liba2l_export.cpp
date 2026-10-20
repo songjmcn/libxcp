@@ -900,6 +900,20 @@ StructInfoDto BuildInstanceInfo(const a2l::Instance& in,
     // 显式接收：src/a2lparser.y:871）。丢失它会让结构体数组实例只剩第 0 个
     // 元素可寻址；逐元素展开与越界门归桥接层 StructureLayoutResolver。
     d.matrix_dim.assign(in.MatrixDim().begin(), in.MatrixDim().end());
+    // 与普通 MEASUREMENT 一致：仅从有效的 XCPplus/plain XCP IF_DATA
+    // 透传固定 DAQ 事件；不能把 DEFAULT/AVAILABLE 当作固定事件。
+    const a2l::xcp::XcpDataBlock* plus = in.GetXcpPlusDataBlock();
+    const a2l::xcp::XcpDataBlock* plain = in.GetXcpDataBlock();
+    const a2l::xcp::XcpDataBlock* block = plus != nullptr && plus->IsOk() ? plus
+                                          : plain != nullptr && plain->IsOk()
+                                              ? plain
+                                              : nullptr;
+    if (block != nullptr) {
+        if (const auto* event = block->GetCommonParameters().GetDaqEvent()) {
+            const auto& fixed = event->GetFixedEventList();
+            d.daq_event_fixed.assign(fixed.begin(), fixed.end());
+        }
+    }
     return d;
 }
 

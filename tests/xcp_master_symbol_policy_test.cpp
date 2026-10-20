@@ -1,5 +1,7 @@
+#include <cstdint>
 #include <limits>
 #include <string>
+#include <vector>
 
 #include "gtest/gtest.h"
 #include "libxcp/a2l/a2l_types.hpp"
@@ -21,6 +23,7 @@ using calmcar::xcp::tools::ElementRangeLayoutUnsupportedReason;
 using calmcar::xcp::tools::MakeElementPageRange;
 using calmcar::xcp::tools::NextElementPageStart;
 using calmcar::xcp::tools::ParseElementIndex;
+using calmcar::xcp::tools::SymbolDaqObservationUnsupportedReason;
 using calmcar::xcp::tools::SymbolDetailReadUnsupportedReason;
 using calmcar::xcp::tools::SymbolReadUnsupportedReason;
 using calmcar::xcp::tools::SymbolStaticWriteUnsupportedReason;
@@ -45,6 +48,73 @@ TEST(XcpMasterSymbolPolicyTest, AllowsWritableScalarValueCharacteristic) {
 
     EXPECT_TRUE(SymbolReadUnsupportedReason(symbol).empty());
     EXPECT_TRUE(SymbolWriteUnsupportedReason(symbol).empty());
+}
+
+/// @brief DAQ拒绝标定量及 Generic 数组；显式 XCPlite 接纳安全的一维数组。
+TEST(XcpMasterSymbolPolicyTest, DaqRejectsCalibrationAndGenericArrays) {
+    const std::vector<std::uint16_t> event_channels{3};
+    SymbolInfo calibration;
+    calibration.kind = SymbolKind::Characteristic;
+    calibration.characteristic_type = CharacteristicType::Value;
+    calibration.element_size_bytes = 4;
+    calibration.daq_event_fixed = {3};
+    EXPECT_TRUE(SymbolReadUnsupportedReason(calibration).empty());
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(calibration, event_channels)
+                  .find("MEASUREMENT"),
+              std::string::npos);
+
+    SymbolInfo array;
+    array.kind = SymbolKind::Measurement;
+    array.element_size_bytes = 4;
+    array.dimensions.push_back({0, 8, 4});
+    array.daq_event_fixed = {3};
+    EXPECT_TRUE(SymbolDetailReadUnsupportedReason(array).empty());
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(array, event_channels)
+                  .find("Generic profile"),
+              std::string::npos);
+    EXPECT_TRUE(SymbolDaqObservationUnsupportedReason(
+                    array, event_channels, /*allow_contiguous_1d_array=*/true)
+                    .empty());
+
+    array.dimensions.front().extent = 256;
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(array, event_channels, true)
+                  .find("单 Entry"),
+              std::string::npos);
+    array.dimensions.front().extent = 64;  // 元素数可表示，但 64 * 4 = 256
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(array, event_channels, true)
+                  .find("单 Entry"),
+              std::string::npos);
+    array.dimensions.front().extent = 8;
+    array.dimensions.front().byte_stride = 8;
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(array, event_channels, true)
+                  .find("数组维度"),
+              std::string::npos);
+}
+
+/// @brief DAQ必须具有唯一固定事件，且A2L中存在对应事件频道。
+TEST(XcpMasterSymbolPolicyTest, DaqRequiresUniqueKnownFixedEvent) {
+    const std::vector<std::uint16_t> event_channels{3};
+    SymbolInfo symbol;
+    symbol.kind = SymbolKind::Measurement;
+    symbol.element_size_bytes = 4;
+    symbol.daq_event_default = {3};
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(symbol, event_channels)
+                  .find("FIXED_EVENT_LIST"),
+              std::string::npos);
+    symbol.daq_event_fixed = {3, 4};
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(symbol, event_channels)
+                  .find("FIXED_EVENT_LIST"),
+              std::string::npos);
+    symbol.daq_event_fixed = {4};
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(symbol, event_channels)
+                  .find("EVENT_CHANNEL"),
+              std::string::npos);
+    symbol.daq_event_fixed = {3, 3};
+    EXPECT_TRUE(
+        SymbolDaqObservationUnsupportedReason(symbol, event_channels).empty());
+    symbol.daq_event_fixed = {3};
+    EXPECT_TRUE(
+        SymbolDaqObservationUnsupportedReason(symbol, event_channels).empty());
 }
 
 TEST(XcpMasterSymbolPolicyTest, RejectsReadOnlyAndNonValueCharacteristics) {

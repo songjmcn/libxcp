@@ -1,12 +1,19 @@
 #include "slave_registry.hpp"
 
+#include <atomic>
 #include <cstddef>
 
 #include "a2l.h"
+#include "libxcp/log.hpp"
 #include "xcplib.h"
 
 namespace xcp_slave_demo {
 namespace {
+
+/// @brief 上一次观察到的 XCP 连接状态，用于主循环边沿检测。
+std::atomic<bool> g_last_connected{false};
+/// @brief 上一次观察到的 DAQ 运行状态，用于主循环边沿检测。
+std::atomic<bool> g_last_daq_running{false};
 
 /// @brief 快速测量事件的稳定名称。
 constexpr char kFastEventName[] = "meas_fast_10ms";
@@ -155,6 +162,7 @@ bool InitializeSlaveRegistry(SlaveRegistry& registry, bool create_a2l,
         if (error_message != nullptr) {
             *error_message = "XCP 尚未激活，无法注册事件和标定段";
         }
+        LIBXCP_LOG_ERROR("从站注册前置条件不满足：XCP 尚未激活");
         return false;
     }
 
@@ -168,6 +176,12 @@ bool InitializeSlaveRegistry(SlaveRegistry& registry, bool create_a2l,
         if (error_message != nullptr) {
             *error_message = "XCPlite 固定 DAQ 事件注册失败";
         }
+        LIBXCP_LOG_ERROR(
+            "从站固定 DAQ 事件注册失败：fast={} slow={} 周期 fast={} ns slow={} "
+            "ns",
+            static_cast<unsigned>(registry.fast_event_id),
+            static_cast<unsigned>(registry.slow_event_id), kFastEventCycleNs,
+            kSlowEventCycleNs);
         return false;
     }
 
@@ -177,12 +191,19 @@ bool InitializeSlaveRegistry(SlaveRegistry& registry, bool create_a2l,
         if (error_message != nullptr) {
             *error_message = "XCPlite 标定段注册失败";
         }
+        LIBXCP_LOG_ERROR("从站标定段注册失败：段名={}", kCalibrationSegmentName);
         return false;
     }
 
     if (create_a2l) {
         RegisterA2lInstances(registry);
     }
+    LIBXCP_LOG_INFO(
+        "从站注册完成：fast_event={} slow_event={} calseg_index={} 生成A2L={}",
+        static_cast<unsigned>(registry.fast_event_id),
+        static_cast<unsigned>(registry.slow_event_id),
+        static_cast<unsigned>(registry.calibration_segment->getIndex()),
+        create_a2l);
     return true;
 }
 
@@ -208,6 +229,62 @@ bool CopyCalibrationSnapshot(const SlaveRegistry& registry,
         parameters = *guard;
     }
     return true;
+}
+
+namespace {
+
+/**
+ * @brief XCPlite CONNECT 回调，记录主站连接请求的准入结果。
+ *
+ * 只记录"收到请求"这一事件本身；连接状态的跳变统一由
+ * ObserveSlaveProtocolState() 轮询判定，避免两套机制互相抵消。
+ * @param mode CONNECT 命令的 mode 字节（0 表示 normal）。
+ * @return 始终返回 true，保持默认的"连接总是被接受"语义。
+ */
+bool OnSlaveConnectCallback(std::uint8_t mode) {
+    LIBXCP_LOG_INFO("从站协议事件：收到 CONNECT 请求，mode={}，已接受连接",
+                    static_cast<unsigned>(mode));
+    return true;
+}
+
+/**
+ * @brief XCPlite DAQ 启动回调，记录 DAQ 已完成启动。
+ * @return 固定返回 0，表示成功。
+ */
+std::uint8_t OnSlaveStartDaqCallback() {
+    LIBXCP_LOG_INFO("从站协议事件：DAQ 已启动");
+    return 0U;
+}
+
+/**
+ * @brief XCPlite DAQ 停止回调，记录 DAQ 已停止。
+ */
+void OnSlaveStopDaqCallback() {
+    LIBXCP_LOG_INFO("从站协议事件：DAQ 已停止");
+}
+
+}  // namespace
+
+void RegisterSlaveProtocolCallbacks() noexcept {
+    ApplXcpRegisterConnectCallback(OnSlaveConnectCallback);
+    ApplXcpRegisterStartDaqCallback(OnSlaveStartDaqCallback);
+    ApplXcpRegisterStopDaqCallback(OnSlaveStopDaqCallback);
+    LIBXCP_LOG_INFO("从站协议回调已注册：CONNECT、START_DAQ、STOP_DAQ");
+}
+
+void ObserveSlaveProtocolState() noexcept {
+    const bool connected = XcpIsConnected();
+    const bool daq_running = XcpIsDaqRunning();
+
+    // 仅在状态跳变时记录，避免 10 ms 级主循环刷日志。
+    if (connected != g_last_connected.exchange(connected)) {
+        LIBXCP_LOG_INFO("从站协议状态变化：连接 {}",
+                        connected ? "已建立" : "已断开");
+    }
+    if (daq_running != g_last_daq_running.exchange(daq_running)) {
+        LIBXCP_LOG_INFO("从站协议状态变化：DAQ {}",
+                        daq_running ? "运行中" : "已停止");
+    }
 }
 
 }  // namespace xcp_slave_demo

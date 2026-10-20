@@ -518,6 +518,9 @@ struct StructInfoDto {
     ///          （INDEX_MAP 暂不解析，与标量成员数组同一口径）。
     ///          TYPEDEF_STRUCTURE 无本属性，对它恒空。
     std::vector<std::uint64_t> matrix_dim;
+    /// @brief INSTANCE IF_DATA XCP DAQ_EVENT 中原始
+    /// FIXED_EVENT_LIST；结构定义恒空
+    std::vector<std::uint16_t> daq_event_fixed;
     std::vector<StructMemberDto> members;  ///< 成员元数据（不展开）
 };
 

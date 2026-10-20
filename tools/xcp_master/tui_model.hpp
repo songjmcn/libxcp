@@ -411,6 +411,61 @@ inline int NextViewIndex(int selected, std::size_t view_count) noexcept {
     return static_cast<int>((current + 1U) % view_count);
 }
 
+/** @brief 预览模式下可通过 Tab 到达的三处焦点。 */
+enum class PreviewFocusTarget { Search, Scope, List };
+
+/**
+ * @brief 计算预览区 Tab/Shift+Tab 的循环目标，不跨入命令框。
+ * @param current 当前预览焦点。
+ * @param reverse 是否为 Shift+Tab。
+ * @return 下一个预览焦点。
+ */
+inline PreviewFocusTarget NextPreviewFocusTarget(PreviewFocusTarget current,
+                                                 bool reverse) noexcept {
+    const int index = static_cast<int>(current);
+    const int offset = reverse ? 2 : 1;
+    return static_cast<PreviewFocusTarget>((index + offset) % 3);
+}
+
+/**
+ * @brief 管理预览/命令输入模式，并约束列表操作的入口。
+ * @details 仅由 UI 线程访问；选择器地址提供给 FTXUI Tab 容器隔离事件。
+ */
+class TuiInputModeState {
+public:
+    /** @brief 返回供 FTXUI Tab 容器使用的模式选择器。 */
+    [[nodiscard]] int* Selector() noexcept { return &selector_; }
+
+    /** @brief 当前是否允许命令输入。 */
+    [[nodiscard]] bool InCommandMode() const noexcept { return selector_ == 1; }
+
+    /** @brief 显式进入命令模式；重复进入不会执行命令。 */
+    void EnterCommandMode() noexcept { selector_ = 1; }
+
+    /**
+     * @brief 退出命令模式并回到变量预览视图，不触碰输入草稿。
+     * @param selected_view 当前顶部视图索引。
+     */
+    void LeaveCommandMode(int& selected_view) noexcept {
+        selector_ = 0;
+        selected_view = 0;
+    }
+
+    /**
+     * @brief 列表快捷键是否有资格分派；实际符号权限由业务层继续检查。
+     * @param selected_view 当前顶部视图索引。
+     * @param list_focused 列表是否为实际焦点。
+     * @return 只在预览模式、预览视图、列表聚焦时为 true。
+     */
+    [[nodiscard]] bool AllowsPreviewListAction(
+        int selected_view, bool list_focused) const noexcept {
+        return !InCommandMode() && selected_view == 0 && list_focused;
+    }
+
+private:
+    int selector_{0}; /**< 0=预览模式，1=命令模式，启动默认预览。 */
+};
+
 /**
  * @brief 管理命令输入历史及历史浏览期间的草稿恢复。
  * @details 仅由 UI 线程访问，不提供内部同步。

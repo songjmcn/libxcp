@@ -331,3 +331,177 @@ Windows/MSVC、Linux、macOS 分别运行 Release；缺少环境则记录“未�
 
 - 未在 Windows/Linux 构建；未验证已安装 glog 0.7.1 包、父工程预建 target、`FETCHCONTENT_SOURCE_DIR_GLOG` 本地替代源码及安装静态库消费工程。
 - 全量构建仍受上述 FakeA2l 第三方接口变化与旧测试桩不兼容影响；该阻塞与日志改动无关，日志相关自有目标和选定回归测试均已单独构建/运行。
+
+## 12. 从站侧日志缺口与 XCPlite 既有日志设施分析
+
+本节是调查记录，不是已批准的实施内容。提出的实施范围需用户确认后另行授权。
+
+### 12.1 现象与根因
+
+用户报告 `xcp_slave_demo` 无日志输出。核查结论：**不是文件输出配置问题，而是该示例没有任何自有日志布点**。
+
+| 检查项 | 实测结果 |
+| --- | --- |
+| CMake 接入 | 已接入，`examples/xcp_slave_demo/CMakeLists.txt:18` 调用 `libxcp_configure_program_logging` |
+| 进程入口初始化 | 已接入，`examples/xcp_slave_demo/main.cpp:579-586` 构造 `ProgramLogSession` 并 `Initialize` |
+| 日志目录 | 已生成且为空：`logs/examples/xcp_slave_demo/` |
+| 该目录内日志文件 | 0 个 |
+| `examples/xcp_slave_demo/` 内 `LIBXCP_LOG_*` 调用 | 0 处（`main.cpp`、`slave_model.cpp`、`slave_registry.cpp` 均无） |
+
+判定依据：日志目录被创建说明 `ProgramLogSession::Initialize` 已成功执行到 `InitGoogleLogging`（若初始化失败会在 `main.cpp:584` 以退出码 2 结束且不建目录）。glog 只在首次真正写入日志时才创建 `.glog` 文件，因此"目录存在但无文件"精确对应"初始化成功但从未调用任何日志宏"。
+
+对照：`tools/xcp_master` 有 33 处调用（`tools/xcp_master/main.cpp` 1 处 + `src/xcp_master.cpp` 32 处），故有日志。`xcp_slave_demo` 是薄壳示例，业务逻辑全部位于第三方 XCPlite（`XcpInit`、`XcpEthServerInit`、`XcpEthServerShutdown`），而项目规则禁止修改第三方文件，因此其错误分支目前仅有 `std::cerr`：`examples/xcp_slave_demo/main.cpp:488`、`:495`、`:503`、`:526`、`:552`。
+
+### 12.2 XCPlite 自身日志设施（实测，非推断）
+
+XCPlite **自带一套完整且默认开启的分级调试打印设施**，与本项目 `LIBXCP_LOG_*` 相互独立。
+
+实现位置：`thirdparty/XCPlite/src/dbg_print.h`（243 行，声明为公共领域）。
+
+| 维度 | 实测值 |
+| --- | --- |
+| 总开关 | `OPTION_ENABLE_DBG_PRINTS`，定义在 `thirdparty/XCPlite/src/xcplib_cfg.h:45`，**默认已定义（开启）** |
+| 输出目标 | `OPTION_ENABLE_DBG_STDERR`，定义在 `xcplib_cfg.h:47`，**默认已定义 → 走 stderr** |
+| 默认级别 | `OPTION_DEFAULT_DBG_LEVEL 3`（`xcplib_cfg.h:49`），即 Info |
+| 编译期上限 | `OPTION_MAX_DBG_LEVEL 4`（`xcplib_cfg.h:51`）；超过上限的宏被 `#undef` 为空实现（`dbg_print.h:196-222`） |
+| 级别语义 | 1=Error、2=Warn、3=Info、4=Trace（注释注明 level 4 用于打印全部 XCP 命令）、5=Debug、6=Very verbose（`dbg_print.h:21-27`、`xcplib_cfg.h:48`） |
+| 级别来源 | `OPTION_FIXED_DBG_LEVEL` 编译期固定，或运行期变量 `gXcpLogLevel`（`dbg_print.h:59-85`） |
+| 运行期变量 | `gXcpLogLevel` 定义于 `thirdparty/XCPlite/src/xcplite.c:351`，初值 `OPTION_DEFAULT_DBG_LEVEL`；可由 XCP 命令改写并在 `xcplite.c:361-363` 打印变更 |
+| 宏集合 | `DBG_PRINTF_ERROR`/`DBG_PRINT_ERROR`、`DBG_PRINTF_WARNING`/`DBG_PRINT_WARNING`、`DBG_PRINTF3`/`DBG_PRINT3`(Info)、`DBG_PRINTF4`/`DBG_PRINT4`(Trace)、`DBG_PRINTF5`/`DBG_PRINT5`、`DBG_PRINTF6`/`DBG_PRINT6` |
+| 输出风格 | ANSI 彩色（红/黄/灰，FreeRTOS 下置空，`dbg_print.h:39-57`）；前缀 `DBG_PRINT_PREFIX` 可置空（`dbg_print.h:36`）；可选 `DBG_PRINT_ERROR_LOCATION` 附加 `__FILE__-__LINE__`（`dbg_print.h:87-94`） |
+| 埋点规模 | `src/*.c` 中 `DBG_PRINT*` 宏调用共 651 处（含 `DBG_PRINTF3` 79、`DBG_PRINTF6` 75、`DBG_PRINTF5` 63、`DBG_PRINT3` 61 等）；`src/`+`inc/` 中 `printf`/`fprintf` 共 343 处，覆盖 `xcplite.c`、`xcpethtl.c`、`sockets.c`、`persistence.c`、`shm.c`、`a2l.c`、`a2l_writer.c`、`xcpappl.c`、`platform.c`、`queue64v.c`、`queue64f.c`、`util.c` |
+| 平台差异 | `xcplib_rtos_cfg.h:60` 对 `OPTION_ENABLE_DBG_STDERR` 执行 `#undef`，RTOS 配置下改为 stdout |
+
+**关键推论**：由于总开关默认开启、默认级别为 Info，XCPlite 从站在运行时**本就在往 stderr 打印协议级信息**。用户观察到的"从站没有日志"应理解为"没有进入 `logs/` 文件的自有日志"，终端上可能已有被忽略或被重定向丢弃的 XCPlite 打印。
+
+**对本项目不可用的原因**（供后续决策）：
+
+1. 输出是 stdout/stderr 文本，无目录、无轮转、无按级别分文件，与本项目 `logs/<模块>/<程序名>/<程序名>.<级别>.<时间>.<PID>.glog` 约定不兼容。
+2. 无时间戳、无线程标识；行前缀可被置空。
+3. 开启/调整需改 `thirdparty/XCPlite/src/xcplib_cfg.h`，违反"未获明确指示不得修改 thirdparty"规则。各 `xcplib_*_cfg.h` 仅在 RTOS 变体中覆盖一处，无面向使用者的外部注入入口。
+4. 若强行开启，其 stderr 输出会与本项目"三级日志只写文件、不上屏"的既有测试断言冲突。
+
+**更正记录**：本节初稿曾据一次 grep 结果误判"配置头中无任何日志开关、零入口"。该次 grep 在 `thirdparty/XCPlite` 目录内仍带 `src/` 前缀拼接，命中不存在的路径，导致假阴性。复核后确认真实情况为默认开启，并据此重写本节。
+
+### 12.3 从站侧日志布点实施结果
+
+用户已接受方案 C（新增从站↔主站联调的协议日志消费者），并明确约束：**不得修改 XCPlite 任何代码**。
+
+XCPlite 未提供报文级 XCP 命令钩子。`thirdparty/XCPlite/inc/xcplib.h:993-1008` 仅提供语义级回调注册：`ApplXcpRegisterConnectCallback`、`ApplXcpRegisterPrepareDaqCallback`、`ApplXcpRegisterStartDaqCallback`、`ApplXcpRegisterStopDaqCallback`、`ApplXcpRegisterFreezeDaqCallback`、`ApplXcpRegisterGetCalPageCallback`、`ApplXcpRegisterSetCalPageCallback`、`ApplXcpRegisterFreezeCalCallback`、`ApplXcpRegisterInitCalCallback`、`ApplXcpRegisterCheckCallback`、`ApplXcpRegisterReadCallback`、`ApplXcpRegisterWriteCallback`、`ApplXcpRegisterFlushCallback`、`ApplXcpRegisterIdleCallback`，以及时钟类回调 `:984-991`。查询接口 `xcplib.h:56-58` 提供 `XcpIsStarted`、`XcpIsConnected`、`XcpIsDaqRunning`。
+
+因此从站记录的协议详情是**语义级**（连接建立/断开、DAQ 启动/停止），而非主站 `src/command_executor.cpp` 那样的逐字节 CRO/RES 摘要。用户已确认接受该边界。
+
+**已实施布点**（全部经公开 API 观察，未改第三方）：
+
+| 位置 | 级别 | 内容 |
+| --- | --- | --- |
+| `examples/xcp_slave_demo/main.cpp:635` | INFO | 进程启动：模式、绑定地址:端口、输出目录、A2L 版本 |
+| `examples/xcp_slave_demo/main.cpp:485` | INFO | A2L 生成成功：A2L/AML 路径、端点 |
+| `examples/xcp_slave_demo/main.cpp:546` | INFO | 从站已启动：UDP 地址、快/慢事件周期、测量队列字节数 |
+| `examples/xcp_slave_demo/main.cpp:599` | INFO | 正常退出：累计快事件次数、运行期故障标志 |
+| `examples/xcp_slave_demo/main.cpp` 失败分支 | ERROR | `XcpInit`、注册初始化、`XcpEthServerInit`、标定快照、关闭、A2L 生成失败 |
+| `examples/xcp_slave_demo/slave_registry.cpp:246` | INFO | CONNECT 回调：收到连接请求、mode、准入结果 |
+| `examples/xcp_slave_demo/slave_registry.cpp:253` | INFO | START_DAQ 回调：DAQ 已启动 |
+| `examples/xcp_slave_demo/slave_registry.cpp:262` | INFO | STOP_DAQ 回调：DAQ 已停止 |
+| `examples/xcp_slave_demo/slave_registry.cpp:206` | INFO | 从站注册完成：fast_event、slow_event、calseg_index、生成 A2L 标志 |
+| `examples/xcp_slave_demo/slave_registry.cpp:272` | INFO | 协议回调已注册：CONNECT、START_DAQ、STOP_DAQ |
+| `examples/xcp_slave_demo/slave_registry.cpp:282` | INFO | 状态边沿：连接/DAQ 状态跳变时记录 |
+| `examples/xcp_slave_demo/main.cpp:595-600` | INFO | 降频心跳：每 500 次快循环（5 秒）报告 tick 与协议状态 |
+
+12.3 原方案的 5 类布点已全部实施：①失败路径 ERROR、②启动成功 INFO、③协议事件 INFO、④状态边沿检测、⑤降频心跳。
+
+心跳实现细节（`examples/xcp_slave_demo/main.cpp:47`）：`constexpr std::uint32_t kHeartbeatFastTickInterval = 500U;`，即 10 ms × 500 = 5 秒。采用 **tick 计数**而非墙钟，避免与主循环 [:573-585](<examples/xcp_slave_demo/main.cpp#L573>) 的时钟补偿逻辑相互干扰；心跳内容为 `累计快事件次数={}，已连接={}，DAQ 运行中={}`，与 [:282](<examples/xcp_slave_demo/slave_registry.cpp#L282>) 的边沿日志相互独立、不重复。
+
+**实施要点与踩坑记录**：
+
+1. **回调预置缓存会吞掉轮询边沿**（已修复）。初版让 `OnSlaveConnectCallback` 同时执行 `g_last_connected.store(true)`，而 `ObserveSlaveProtocolState()` 用 `exchange(connected)` 做边沿检测。回调先置位后，轮询读到的旧值已是 `true`，与当前 `true` 相等 → **永不触发边沿日志**。实测确认（保持连接 4 秒仍无"连接 已建立"记录）。修复方式：删除回调中的 `store`，边沿检测统一由轮询负责。这不只是去重——XCPlite **没有 DISCONNECT 回调**（仅 CONNECT/START_DAQ/STOP_DAQ），依赖回调会完全漏掉断开边沿，轮询才是可靠机制。
+2. **`isConnected()` 对命令的前置门禁**：`thirdparty/XCPlite/src/xcplite.c:2094-2097` 规定未连接状态下除传输层命令外一律忽略。这解释了联调中 DISCONNECT 返回 `fe 21`（`CmdSyntax=0x21`）的现象——连接已断开，该命令被拒——**并非日志代码缺陷**。
+3. **测试注册位置**：`CMakeLists.txt:358` 的 `add_subdirectory(tests)` 先于 `:371` 的 `add_subdirectory(examples)`，因此依赖 `xcp_slave_demo` 目标的 `add_test` **必须放在 `examples/xcp_slave_demo/CMakeLists.txt`**，否则 `TARGET xcp_slave_demo` 判断为假、测试静默不注册。
+4. **`LIBXCP_ENABLE_LOG=OFF` 时从站示例编译失败**（已修复，真实缺陷）。`CMakeLists.txt:203-207` 的原 `libxcp_configure_program_logging` OFF 分支只注入 `LIBXCP_ENABLE_LOG=0`，**不提供 include 搜索路径**；ON 分支因链接 `libxcp_program_logging`（其 include 目录为 PUBLIC）而侥幸通过。`xcp_slave_demo` 只链接 `xcplite::xcplite` 与 `libxcp::a2lbridge`、**不链接 libxcp 核心**，故 OFF 时报 `fatal error: 'libxcp/log.hpp' file not found`。此缺陷此前被掩盖：`cmake-build-control-log-off-release` 的 `LIBXCP_BUILD_EXAMPLES` 为 OFF，从站示例从未在该目录构建过。修复：函数末尾统一追加 `target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/include)`。
+5. **glog 缓冲导致运行期读不到日志**（测试设计教训）。心跳测试初版在进程存活期间轮询日志文件，**只读到"进程启动"一条**，误判为心跳缺失。实测在系统临时目录下从站运行一切正常，日志**延迟到进程退出（`ShutdownGoogleLogging`）才落盘**。正确做法：先 `Stop()`（SIGTERM，触发主循环退出与 glog flush）再读文件。从站的 SIGTERM handler 见 `examples/xcp_slave_demo/main.cpp:544`。
+6. **`XcpliteIntegration` 需要显式日志配置**。该目标原先未调用 `libxcp_configure_program_logging`，因此既无 `LIBXCP_ENABLE_LOG` 定义也不链接日志初始化器；`log.hpp` 的兜底 `#define LIBXCP_ENABLE_LOG 0` 会让新增用例永远走 OFF 分支而失去意义。已在 `tests/CMakeLists.txt` 中为其补上该调用。
+
+**约束遵守**：未改变 XCPlite 调用顺序与返回值语义；未新增业务公共接口；日志写入不进入实时性敏感路径的临界区。
+
+### 12.4 测试用例与验证结果
+
+新增 CTest 用例 `LibxcpLogSlaveDemoA2l`（注册于 `examples/xcp_slave_demo/CMakeLists.txt`，驱动脚本 `tests/logging_behavior_test.cmake` 的 `slave-a2l` 模式）：
+
+- 以 `--generate-a2l --overwrite` 运行从站（确定性、无网络竞争）。
+- 断言退出码为 0；stderr 不含 `Logging before InitGoogleLogging`。
+- 断言 `logs/examples/xcp_slave_demo/` 下产生日志文件；文件名匹配 `^xcp_slave_demo\.(INFO|WARNING|ERROR)\..+\.glog$` 且不以点开头（回归 b8 记录的文件名前缀缺陷）。
+- 断言日志含 `从站进程启动：模式=生成A2L`、`从站注册完成：`、`A2L 生成成功：`。
+- 反断言生成模式**不应**出现 `从站已启动：UDP`、`从站协议回调已注册`。
+
+**实测结果**（`cmake-build-logging-release`，Release / `LIBXCP_ENABLE_LOG=ON` / TESTS+EXAMPLES ON）：
+
+```
+LibxcpLogFileOutput            Passed  0.01
+LibxcpLogControlRecovery       Passed  0.52
+LibxcpLogUnwritableDirectory   Passed  0.01
+LibxcpLogDiscoveryNoDirectory  Passed  0.01
+LibxcpLogSlaveDemoA2l          Passed  0.01
+LoggingMacrosTest.LoggingCallsDoNotEscapeExceptions  Passed
+100% tests passed, 0 tests failed out of 6
+```
+
+手工联调实测（`cmake-build-release` 从站，Python 构造 XCP-on-UDP `CONNECT`，帧格式依据 `src/udp_header_codec.cpp:29-37`：LEN 小端 = XCP Packet 长度、CTR 小端、其后为原始包）：
+
+```
+I... slave_registry.cpp:246] 从站协议事件：收到 CONNECT 请求，mode=0，已接受连接
+I... slave_registry.cpp:282] 从站协议状态变化：连接 已建立
+```
+
+两条分别来自 XCPlite 回调线程与主循环轮询，互不重复且互补。
+
+**心跳用例 `ServiceEmitsPeriodicHeartbeatLog`**（`tests/xcp_slave_demo_integration_test.cpp:1318`，属 `XcpliteIntegration`）：
+
+- 在临时工作目录启动常驻从站（`--bind 127.0.0.1 --port <空闲端口>`），等待 9 秒（覆盖 5 秒心跳周期），`Stop()`（SIGTERM）后读取 `logs/examples/xcp_slave_demo/` 全部 `.glog`（辅助函数 `ReadSlaveLogs`，`:1293`）。
+- ON 断言：日志含 `从站心跳`、`累计快事件次数=`、`已连接=`、`DAQ 运行中=`，且无主站时 `已连接=false`。
+- OFF 断言：日志目录为空（心跳逻辑不得产生任何输出）。
+- **反向验证**：临时将 `kHeartbeatFastTickInterval` 改为 `100000U`（不可达）后用例**按预期失败**于 `:1344`，确认断言能真实检出心跳缺失，而非恒真。
+
+**用 CTest 脚本而非 gtest 的取舍**：心跳需 5 秒且必须"启动—等待—终止"，而 CMake `execute_process` 会阻塞至进程退出、无超时终止能力，故复用 `tests/xcp_slave_demo_integration_test.cpp` 中已有的跨平台 `DemoChildProcess`（`:141`，Windows `CreateProcessW` / POSIX `fork+execv`，`Stop()` 用 SIGTERM→SIGKILL）。
+
+**`XcpliteIntegration` 的日志配置**：该目标原先未调用 `libxcp_configure_program_logging`，故既无 `LIBXCP_ENABLE_LOG` 定义也不链接日志初始化器；`include/libxcp/log.hpp:8-9` 的兜底 `#define LIBXCP_ENABLE_LOG 0` 会使新增用例永远走 OFF 分支而失去意义。已在 `tests/CMakeLists.txt` 补上该调用。
+
+**双构建目录实测结果**：
+
+```
+# cmake-build-logging-release（Release / LIBXCP_ENABLE_LOG=ON / TESTS+TOOLS+EXAMPLES ON）
+LoggingMacrosTest.*                              Passed
+XcpSlaveDemoIntegrationTest.* (7 项，含心跳)      Passed
+LibxcpLogFileOutput / ControlRecovery / UnwritableDirectory / DiscoveryNoDirectory / SlaveDemoA2l  Passed
+ServiceEmitsPeriodicHeartbeatLog                 Passed  9.04
+100% tests passed, 0 tests failed out of 13
+
+# cmake-build-control-log-off-release（Release / LIBXCP_ENABLE_LOG=OFF / EXAMPLES=ON）
+XcpSlaveDemoIntegrationTest.* (7 项) + LoggingMacrosTest   Passed
+ServiceEmitsPeriodicHeartbeatLog                 Passed  9.03
+100% tests passed, 0 tests failed out of 8
+```
+
+两目录全量目标构建均成功（含 `xcp_slave_demo`、`XcpliteIntegration`、`xcp_master`、`xcp_master_udp`、`measurement_demo`、`xcp_integration_demo`）。
+
+### 12.5 待决事项
+
+- XCPlite `dbg_print` 设施的处置方式：用户已选择"仅写入本文件，暂不决定"。未启用、未修改其配置头。
+- 从站侧尚未布点：CRO/RES 逐字节摘要（XCPlite 无相应钩子，需改第三方，明确排除）；`libxcp_configure_program_logging` 在从站示例上的接入已有意义，因其为纯 XCPlite 程序、不链接 libxcp 核心。
+- 从站心跳间隔当前硬编码为 `kHeartbeatFastTickInterval = 500U`（5 秒），未提供命令行或环境变量覆盖；如需按场景调整，需新增配置项（当前未获授权）。
+
+### 12.6 XCPlite hook 机制说明（供后续布点参考）
+
+XCPlite 的 hook 为**单槽位函数指针 + NULL 回退**，非观察者列表，且**无互斥保护**，实现分散在四层：
+
+| 层 | 位置 | 作用 |
+| --- | --- | --- |
+| 存储 | `thirdparty/XCPlite/src/xcpappl.c:40-58` | 文件级静态指针（如 `static bool (*__callback_connect)(uint8_t mode) = NULL;`），`ApplXcpRegister*Callback` 直接赋值，**重复注册即覆盖** |
+| 回退 | `thirdparty/XCPlite/src/xcpappl.c:74-112` | `ApplXcpConnect` 判空后调用，为空走内置默认（多数 permissive，如连接恒成功） |
+| 分发 | `thirdparty/XCPlite/src/xcplite.c:2066` | `if (!ApplXcpConnect(mode)) return CRC_CMD_OK;` —— 返回 `false` 即**静默忽略**，不发 ERR |
+| 调用链 | `thirdparty/XCPlite/src/xcpethserver.c:478` → `xcpethtl.c:379` → `:291` → `xcplite.c:2040` | 回调在 **`XcpServerReceiveThread` 接收线程中同步执行** |
+
+**并发模型**：XCPlite 不加锁，改为线程身份断言 `XcpMut_`（`xcplite.c:214-220`）——非所有者线程访问 `shared_mut` 只打印 `DBG_PRINTF_ERROR`。因此**回调内不得执行重活**，否则阻塞收包线程；这也是从站把状态边沿检测放在主循环轮询、而回调只写轻量 INFO 的原因。
+
+**能力边界**：hook 是协议语义级的，因为它从 `XcpCommand` 的内部分支摘出，而非包裹收发路径。`ApplXcpDisconnect`（`xcpappl.c:81`）为**空壳**——`void ApplXcpDisconnect(void) { DBG_PRINT4("ApplXcpDisconnect\n"); }`，**不存在 `__callback_disconnect` 变量**，故从站结构上无法获得断开回调，只能轮询 `XcpIsConnected()`。对比主站 `src/command_executor.cpp` 的 `IPacketListener`（`include/libxcp/ixcp_transport.hpp:36-50`）位于收发路径外层，固能取得完整字节——这是"库内 vs 库外"的架构差异，非 XCPlite 能力不足。
+
+**XCPlite 自身日志无重定向接缝**：`DBG_PRINTF*` 宏直接展开为 `printf`/`fprintf(stderr, ...)`（`thirdparty/XCPlite/src/dbg_print.h:97`、`:104-144`），无回调。可用控制手段仅 `XcpSetLogLevel`（`xcplib.h:875`，仅在未定义 `OPTION_FIXED_DBG_LEVEL` 时生效）与配置头编译期开关（`OPTION_ENABLE_DBG_PRINTS` / `OPTION_DEFAULT_DBG_LEVEL` / `OPTION_ENABLE_DBG_STDERR`），均无法并入 glog。

@@ -38,6 +38,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -96,10 +97,31 @@ public:
             raw.empty() ? 0U : static_cast<unsigned>(raw[0]))};
     }
 
+    /// @brief Fake 的元素换算按数组下标返回独立物理值，验证适配器不丢失下标。
+    Result<PhysicalValue> ToPhysicalElement(std::string_view name,
+                                            std::uint64_t element_index,
+                                            a2l::BytesView raw) const override {
+        const std::string key(name);
+        observed_element_indices.push_back(element_index);
+        const auto array_it = element_conversions.find(key);
+        if (array_it != element_conversions.end()) {
+            const auto value_it = array_it->second.find(element_index);
+            if (value_it != array_it->second.end()) return value_it->second;
+        }
+        return ToPhysical(name, raw);
+    }
+
     Result<a2l::Bytes> FromPhysical(
         std::string_view /*name*/,
         const PhysicalValue& /*value*/) const override {
         return Error(MakeErr(ErrorCode::UnsupportedOperation, "from"));
+    }
+
+    /// @brief Fake 的元素编码复用标量拒绝行为；不模拟数组布局。
+    Result<a2l::Bytes> FromPhysicalElement(
+        std::string_view name, std::uint64_t /*element_index*/,
+        const PhysicalValue& value) const override {
+        return FromPhysical(name, value);
     }
 
     /// @brief 构造注入错误（symbol 置为查询名，核对透传）
@@ -114,6 +136,9 @@ public:
 
     std::map<std::string, SymbolInfo> symbols;         ///< 符号表
     std::map<std::string, PhysicalValue> conversions;  ///< 换算值表
+    std::map<std::string, std::map<std::uint64_t, PhysicalValue>>
+        element_conversions;  ///< 按数组下标注入元素换算值
+    mutable std::vector<std::uint64_t> observed_element_indices;  ///< 观察调用下标
     std::map<std::string, ErrorCode> find_errors;      ///< Find 注入错误
     std::map<std::string, ErrorCode> conv_errors;      ///< ToPhysical 注入错误
 };
@@ -140,6 +165,8 @@ public:
     std::uint8_t daq_properties{0x11};
     std::uint8_t timestamp_mode{0x0C};
     std::uint16_t timestamp_ticks{3};
+    std::uint8_t daq_granularity{1};
+    std::uint8_t max_daq_entry_size{8};
     std::uint8_t event_cycle{5};
     std::uint8_t event_unit{2};
     std::uint8_t resource_protection{0};
@@ -151,7 +178,8 @@ public:
         const auto command = static_cast<CommandCode>(packet[0]);
         switch (command) {
             case CommandCode::Connect:
-                return Res({0x15, connect_mode_basic, 0x08, 0x00, 0x08, 0x10, 0x10});
+                return Res(
+                    {0x15, connect_mode_basic, 0x08, 0x00, 0x08, 0x10, 0x10});
             case CommandCode::GetStatus:
                 return Res({0x00, resource_protection, 0x01, 0x07, 0x00});
             case CommandCode::GetCommModeInfo:
@@ -162,15 +190,15 @@ public:
             case CommandCode::Disconnect:
                 return Res({});
             case CommandCode::GetDaqProcessorInfo:
-                return Res({
-                    daq_properties,
-                    static_cast<std::uint8_t>(max_daq & 0xFFU),
-                    static_cast<std::uint8_t>(max_daq >> 8U),
-                    static_cast<std::uint8_t>(max_event_channel & 0xFFU),
-                    static_cast<std::uint8_t>(max_event_channel >> 8U),
-                    min_daq, key_byte});
+                return Res(
+                    {daq_properties, static_cast<std::uint8_t>(max_daq & 0xFFU),
+                     static_cast<std::uint8_t>(max_daq >> 8U),
+                     static_cast<std::uint8_t>(max_event_channel & 0xFFU),
+                     static_cast<std::uint8_t>(max_event_channel >> 8U),
+                     min_daq, key_byte});
             case CommandCode::GetDaqResolutionInfo:
-                return Res({0x01, 0x08, 0x01, 0x08, timestamp_mode,
+                return Res({daq_granularity, max_daq_entry_size, 0x01, 0x08,
+                            timestamp_mode,
                             static_cast<std::uint8_t>(timestamp_ticks & 0xFFU),
                             static_cast<std::uint8_t>(timestamp_ticks >> 8U)});
             case CommandCode::GetDaqEventInfo:
@@ -230,24 +258,63 @@ TEST(A2lMeasurementDatabase, FindMapsScalarFieldsWithAddressNarrowing) {
               0U);  // v0.5 默认（SymbolInfo 无事件通道）
 }
 
-TEST(A2lMeasurementDatabase, FindArrayElementCountIsProductAndClamped) {
+TEST(A2lMeasurementDatabase, FindPreservesOneElementAndOneDimensionalArrayShape) {
     FakeA2l db;
-    SymbolInfo arr = MakeScalar(0x4000U, 0U, 2U);
-    arr.dimensions = {Dimension{0, 2, 2}, Dimension{0, 3, 4}};  // 2×3 = 6
-    db.symbols["Arr"] = arr;
-    SymbolInfo big = MakeScalar(0x5000U, 0U, 1U);
-    big.dimensions = {Dimension{0, 16, 16},
-                      Dimension{0, 16, 256}};  // 256 → 截断
-    db.symbols["Big"] = big;
+    SymbolInfo scalar = MakeScalar(0x3000U, 0U, 4U);
+    scalar.kind = a2l::SymbolKind::Measurement;
+    db.symbols["Scalar"] = scalar;
+    SymbolInfo one = MakeScalar(0x3100U, 0U, 4U);
+    one.kind = a2l::SymbolKind::Measurement;
+    one.dimensions = {Dimension{0, 1, 4}};
+    db.symbols["One"] = one;
+    SymbolInfo array = MakeScalar(0x4000U, 0U, 2U);
+    array.kind = a2l::SymbolKind::Measurement;
+    array.dimensions = {Dimension{0, 6, 2}};
+    db.symbols["Array"] = array;
     A2lMeasurementDatabase adapter(db);
 
-    const MeasurementResult<MeasurementSymbolInfo> r = adapter.Find("Arr");
-    ASSERT_TRUE(r.HasValue());
-    EXPECT_EQ(r.Value().element_count, 6U);
+    const MeasurementResult<MeasurementSymbolInfo> scalar_info =
+        adapter.Find("Scalar");
+    const MeasurementResult<MeasurementSymbolInfo> one_info = adapter.Find("One");
+    const MeasurementResult<MeasurementSymbolInfo> array_info = adapter.Find("Array");
+    ASSERT_TRUE(scalar_info.HasValue());
+    ASSERT_TRUE(one_info.HasValue());
+    ASSERT_TRUE(array_info.HasValue());
+    EXPECT_FALSE(scalar_info.Value().is_array);
+    EXPECT_TRUE(one_info.Value().is_array);
+    EXPECT_EQ(one_info.Value().element_count, 1U);
+    EXPECT_TRUE(array_info.Value().is_array);
+    EXPECT_EQ(array_info.Value().element_count, 6U);
+    EXPECT_EQ(array_info.Value().element_size_bytes, 2U);
+}
 
-    const MeasurementResult<MeasurementSymbolInfo> r2 = adapter.Find("Big");
-    ASSERT_TRUE(r2.HasValue());
-    EXPECT_EQ(r2.Value().element_count, 255U);
+TEST(A2lMeasurementDatabase, FindRejectsUnsupportedArrayShapesAndCounts) {
+    FakeA2l db;
+    SymbolInfo multidimensional = MakeScalar(0x4000U, 0U, 2U);
+    multidimensional.kind = a2l::SymbolKind::Measurement;
+    multidimensional.dimensions = {Dimension{0, 2, 2}, Dimension{0, 3, 4}};
+    db.symbols["Multidimensional"] = multidimensional;
+    SymbolInfo too_many = MakeScalar(0x5000U, 0U, 1U);
+    too_many.kind = a2l::SymbolKind::Measurement;
+    too_many.dimensions = {Dimension{0, 256, 1}};
+    db.symbols["TooMany"] = too_many;
+    SymbolInfo strided = MakeScalar(0x6000U, 0U, 2U);
+    strided.kind = a2l::SymbolKind::Measurement;
+    strided.dimensions = {Dimension{0, 4, 4}};
+    db.symbols["Strided"] = strided;
+    SymbolInfo wrong_kind = MakeScalar(0x7000U, 0U, 2U);
+    wrong_kind.kind = a2l::SymbolKind::Characteristic;
+    wrong_kind.dimensions = {Dimension{0, 4, 2}};
+    db.symbols["CharacteristicArray"] = wrong_kind;
+    A2lMeasurementDatabase adapter(db);
+
+    for (const std::string& name : {"Multidimensional", "TooMany", "Strided",
+                                    "CharacteristicArray"}) {
+        const MeasurementResult<MeasurementSymbolInfo> result = adapter.Find(name);
+        ASSERT_FALSE(result.HasValue()) << name;
+        EXPECT_EQ(result.ErrorInfo().code, MeasurementErrorCode::InvalidLayout)
+            << name;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,7 +383,8 @@ TEST(A2lMeasurementDatabase, ToPhysicalCopiesAllVariantAlternatives) {
     A2lMeasurementDatabase adapter(db);
 
     const Bytes one{0x01};
-    const BytesView raw8{std::array<std::uint8_t, 8>{}};
+    const std::array<std::uint8_t, 8> eight{};
+    const BytesView raw8{eight};
 
     auto rd = adapter.ToPhysical("d", raw8);
     ASSERT_TRUE(rd.HasValue());
@@ -420,7 +488,8 @@ TEST(A2lMeasurementDatabase, ToPhysicalErrorCodesMapToCoreCodes) {
     }
 }
 
-TEST(GenericMeasurementRuntimeProfile, AcceptsOnlyAbsoluteTimestampFreeProfile) {
+TEST(GenericMeasurementRuntimeProfile,
+     AcceptsOnlyAbsoluteTimestampFreeProfile) {
     RuntimeProfileSlave slave;
     slave.key_byte = 0x00U;
     slave.timestamp_mode = 0x00U;
@@ -448,14 +517,16 @@ TEST(GenericMeasurementRuntimeProfile, RejectsUnverifiedModesAndEvents) {
         slave.key_byte = 0x10U;  // ODT address-extension mode is not verified.
         slave.timestamp_mode = 0x00U;
         auto master = MakeProfileMaster(slave);
-        EXPECT_FALSE(BuildGenericMeasurementRuntimeProfile(*master, event).HasValue());
+        EXPECT_FALSE(
+            BuildGenericMeasurementRuntimeProfile(*master, event).HasValue());
     }
     {
         RuntimeProfileSlave slave;
         slave.key_byte = 0x00U;
         slave.timestamp_mode = 0x0CU;  // fixed timestamps cannot be disabled.
         auto master = MakeProfileMaster(slave);
-        EXPECT_FALSE(BuildGenericMeasurementRuntimeProfile(*master, event).HasValue());
+        EXPECT_FALSE(
+            BuildGenericMeasurementRuntimeProfile(*master, event).HasValue());
     }
     {
         RuntimeProfileSlave slave;
@@ -464,7 +535,9 @@ TEST(GenericMeasurementRuntimeProfile, RejectsUnverifiedModesAndEvents) {
         auto master = MakeProfileMaster(slave);
         auto no_daq_event = event;
         no_daq_event[0].max_daq_list = 0U;
-        EXPECT_FALSE(BuildGenericMeasurementRuntimeProfile(*master, no_daq_event).HasValue());
+        EXPECT_FALSE(
+            BuildGenericMeasurementRuntimeProfile(*master, no_daq_event)
+                .HasValue());
     }
 }
 
@@ -484,6 +557,11 @@ TEST(XcpliteMeasurementRuntimeProfile,
     EXPECT_EQ(profile.Value().identification_header_bytes, 4U);
     EXPECT_EQ(profile.Value().timestamp_unit_ns, 3U);
     EXPECT_TRUE(profile.Value().timestamp_first_odt_only);
+    EXPECT_TRUE(profile.Value().daq_entry_capabilities
+                    .supports_contiguous_1d_arrays);
+    EXPECT_EQ(profile.Value().daq_entry_capabilities.entry_granularity_bytes,
+              1U);
+    EXPECT_EQ(profile.Value().daq_entry_capabilities.max_entry_size_bytes, 8U);
     EXPECT_EQ(slave.queried_events, (std::vector<std::uint16_t>{0U, 4U}));
 
     FakeA2l db;
@@ -491,6 +569,24 @@ TEST(XcpliteMeasurementRuntimeProfile,
     EventBoundMeasurementDatabase bound(inner, {{"x", {0U}}});
     MeasurementSession session(bound);
     EXPECT_NO_THROW(ApplyMeasurementRuntimeProfile(session, profile.Value()));
+}
+
+TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownEntryLimitsBeforeEvents) {
+    const std::array<A2lEventMetadata, 1> event{{
+        {"event", "event", 0U, 5U, 2U, 1U, 0xFFU},
+    }};
+    for (const auto [granularity, max_entry] :
+         {std::pair<std::uint8_t, std::uint8_t>{0U, 8U},
+          std::pair<std::uint8_t, std::uint8_t>{1U, 0U},
+          std::pair<std::uint8_t, std::uint8_t>{2U, 8U}}) {
+        RuntimeProfileSlave slave;
+        slave.daq_granularity = granularity;
+        slave.max_daq_entry_size = max_entry;
+        auto master = MakeProfileMaster(slave);
+        const auto profile = BuildXcpliteMeasurementRuntimeProfile(*master, event);
+        EXPECT_FALSE(profile.HasValue());
+        EXPECT_TRUE(slave.queried_events.empty());
+    }
 }
 
 TEST(DaqRuntimeProfiles, RejectsProtectedDaqBeforeConfiguration) {
@@ -501,17 +597,21 @@ TEST(DaqRuntimeProfiles, RejectsProtectedDaqBeforeConfiguration) {
         RuntimeProfileSlave slave;
         slave.resource_protection = static_cast<std::uint8_t>(Resource::Daq);
         auto master = MakeProfileMaster(slave);
-        const auto result = BuildGenericMeasurementRuntimeProfile(*master, event);
+        const auto result =
+            BuildGenericMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
-        EXPECT_NE(result.ErrorInfo().message.find("不发送 FREE_DAQ"), std::string::npos);
+        EXPECT_NE(result.ErrorInfo().message.find("不发送 FREE_DAQ"),
+                  std::string::npos);
     }
     {
         RuntimeProfileSlave slave;
         slave.resource_protection = static_cast<std::uint8_t>(Resource::Daq);
         auto master = MakeProfileMaster(slave);
-        const auto result = BuildXcpliteMeasurementRuntimeProfile(*master, event);
+        const auto result =
+            BuildXcpliteMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
-        EXPECT_NE(result.ErrorInfo().message.find("不发送 FREE_DAQ"), std::string::npos);
+        EXPECT_NE(result.ErrorInfo().message.find("不发送 FREE_DAQ"),
+                  std::string::npos);
     }
 }
 

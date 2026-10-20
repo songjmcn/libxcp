@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <limits>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "libxcp/a2l/a2l_types.hpp"
 #include "libxcp/protocol_types.hpp"
@@ -25,6 +27,48 @@ namespace calmcar::xcp::tools {
         symbol.characteristic_type != a2l::CharacteristicType::Value) {
         return "仅支持 MEASUREMENT 与 CHARACTERISTIC/VALUE 标量观测";
     }
+    return {};
+}
+
+[[nodiscard]] inline std::string SymbolDetailReadUnsupportedReason(
+    const a2l::SymbolInfo& symbol);
+
+/// @brief 根据A2L静态声明判断变量是否能加入DAQ观测集合。
+/// @param symbol 待观测符号。
+/// @param available_events A2L声明的EVENT_CHANNEL编号集合。
+/// @return 空串表示静态合格；否则为明确的中文拒绝原因。
+[[nodiscard]] inline std::string SymbolDaqObservationUnsupportedReason(
+    const a2l::SymbolInfo& symbol,
+    std::span<const std::uint16_t> available_events,
+    bool allow_contiguous_1d_array = false) {
+    if (symbol.kind != a2l::SymbolKind::Measurement)
+        return "DAQ 仅支持 MEASUREMENT";
+    if (!symbol.dimensions.empty()) {
+        if (!allow_contiguous_1d_array)
+            return "Generic profile 不支持 DAQ 数组";
+        const auto array_reason =
+            SymbolDetailReadUnsupportedReason(symbol);
+        if (!array_reason.empty()) return array_reason;
+        // F6 的静态限制须与核心 uint8 元素计数及单 Entry 字节字段一致；
+        // XCPlite 实际粒度、最大 Entry 和 DTO 容量留待 watch 运行期再核实。
+        const auto& dimension = symbol.dimensions.front();
+        if (dimension.extent > 255U ||
+            dimension.extent > 255U / symbol.element_size_bytes)
+            return "DAQ 数组元素数或总字节数超过单 Entry 静态上限";
+    } else {
+        const auto read_reason = SymbolReadUnsupportedReason(symbol);
+        if (!read_reason.empty()) return read_reason;
+    }
+
+    // 与启动DAQ时一致：同一固定事件号重复声明只计作一个事件。
+    auto fixed = symbol.daq_event_fixed;
+    std::sort(fixed.begin(), fixed.end());
+    fixed.erase(std::unique(fixed.begin(), fixed.end()), fixed.end());
+    if (fixed.size() != 1U)
+        return "需要唯一 FIXED_EVENT_LIST；不回退到 DEFAULT/AVAILABLE。";
+    if (std::find(available_events.begin(), available_events.end(),
+                  fixed.front()) == available_events.end())
+        return "A2L 缺少对应 EVENT_CHANNEL 元数据。";
     return {};
 }
 

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -21,12 +22,14 @@ namespace calmcar::xcp {
 MeasurementPlanner::MeasurementPlanner(
     const IMeasurementDatabase& database, std::uint16_t max_dto,
     AddressGranularity address_granularity, std::size_t timestamp_bytes,
-    std::size_t identification_bytes)
+    std::size_t identification_bytes,
+    MeasurementDaqCapabilities daq_capabilities)
     : m_database_(database),
       m_max_dto_(max_dto),
       m_ag_bytes_(AgToBytes(address_granularity)),
       m_timestamp_bytes_(timestamp_bytes),
-      m_identification_bytes_(identification_bytes) {}
+      m_identification_bytes_(identification_bytes),
+      m_daq_capabilities_(daq_capabilities) {}
 
 MeasurementPlanner::~MeasurementPlanner() = default;
 
@@ -37,7 +40,7 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
         std::string name;
         MeasurementSymbolInfo info;
         std::size_t byte_width;  // 实占字节 = 元素宽度 × 元素数（字节口径）
-        std::size_t ag_units;   // 以 AG 为单位的元素数（DaqEntrySpec.size 口径）
+        std::size_t ag_units;   // 以 AG 为单位的 Entry.size
     };
     std::vector<Row> rows;
     rows.reserve(names.size());
@@ -50,22 +53,59 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
                     found.ErrorInfo().message,
                 name);
         }
-        const auto& info = found.Value();
-        if (info.element_size_bytes == 0U || info.element_count == 0U) {
+        const MeasurementSymbolInfo& info = found.Value();
+        if (info.element_size_bytes == 0U || info.element_count == 0U ||
+            (!info.is_array && info.element_count != 1U)) {
             return detail::MakeMeasurementError<MeasurementPlan>(
                 MeasurementErrorCode::UnsupportedDataType,
-                "测量 '" + name + "' 元素宽度/数量非法（element_size_bytes=" +
+                "测量 '" + name + "' 元素宽度/形状非法（element_size_bytes=" +
                     std::to_string(info.element_size_bytes) +
                     " element_count=" + std::to_string(info.element_count) +
-                    "）",
+                    " is_array=" + (info.is_array ? "true" : "false") + "）",
                 name);
         }
-        const std::size_t byte_width =
-            static_cast<std::size_t>(info.element_size_bytes) *
-            static_cast<std::size_t>(info.element_count);
-        // DaqEntrySpec.size 以 AG 为单位（xcp_master 逐 ODT 预检按
-        // payload = Σ size*ag_bytes 计数）。字节→AG 换算必须在规划器内做
-        // （计划 §5.3 硬核对项）；不可整除 → 非法布局。
+        if (info.is_array &&
+            !m_daq_capabilities_.supports_contiguous_1d_arrays) {
+            return detail::MakeMeasurementError<MeasurementPlan>(
+                MeasurementErrorCode::DaqConfigurationError,
+                "当前 DAQ runtime profile 不允许数组 Entry",
+                name);
+        }
+        if (info.is_array &&
+            (m_daq_capabilities_.entry_granularity_bytes == 0U ||
+             m_daq_capabilities_.max_entry_size_bytes == 0U)) {
+            return detail::MakeMeasurementError<MeasurementPlan>(
+                MeasurementErrorCode::DaqConfigurationError,
+                "数组 Entry 缺少已验证的粒度或最大长度",
+                name);
+        }
+        const std::size_t element_size = info.element_size_bytes;
+        const std::size_t element_count = info.element_count;
+        if (element_count >
+            std::numeric_limits<std::size_t>::max() / element_size) {
+            return detail::MakeMeasurementError<MeasurementPlan>(
+                MeasurementErrorCode::InvalidLayout,
+                "测量 '" + name + "' 数组总字节数乘法溢出",
+                name);
+        }
+        const std::size_t byte_width = element_size * element_count;
+        if (m_daq_capabilities_.max_entry_size_bytes != 0U &&
+            byte_width > m_daq_capabilities_.max_entry_size_bytes) {
+            return detail::MakeMeasurementError<MeasurementPlan>(
+                MeasurementErrorCode::DaqConfigurationError,
+                "测量 '" + name + "' 单 Entry 需 " +
+                    std::to_string(byte_width) + " 字节，超过 Slave 最大值 " +
+                    std::to_string(m_daq_capabilities_.max_entry_size_bytes),
+                name);
+        }
+        if (m_daq_capabilities_.entry_granularity_bytes != 0U &&
+            byte_width % m_daq_capabilities_.entry_granularity_bytes != 0U) {
+            return detail::MakeMeasurementError<MeasurementPlan>(
+                MeasurementErrorCode::InvalidLayout,
+                "测量 '" + name + "' 单 Entry 字节数不能被 DAQ 粒度整除",
+                name);
+        }
+        // DaqEntrySpec.size 以当前 XCP 地址粒度为单位。
         if (byte_width % m_ag_bytes_ != 0U) {
             return detail::MakeMeasurementError<MeasurementPlan>(
                 MeasurementErrorCode::InvalidLayout,
@@ -75,13 +115,10 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
                 name);
         }
         const std::size_t ag_units = byte_width / m_ag_bytes_;
-        // DaqEntrySpec.size 是 uint8_t：AG 单位超 8 位上限的巨型变量无法装箱
         if (ag_units > 255U) {
             return detail::MakeMeasurementError<MeasurementPlan>(
                 MeasurementErrorCode::DaqConfigurationError,
-                "测量 '" + name + "' 需 " + std::to_string(ag_units) +
-                    " 个 AG(" + std::to_string(m_ag_bytes_) + "字节) 元素，超过 "
-                    "DaqEntrySpec.size 8 位上限(255)或单 ODT 覆盖能力",
+                "测量 '" + name + "' 的 Entry 超过 DaqEntrySpec.size 8 位上限",
                 name);
         }
         rows.push_back(Row{name, info, byte_width, ag_units});
@@ -214,7 +251,8 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
             static_cast<std::uint8_t>(cur.spec.odts.size() - 1);
         plan.routes.push_back(MeasurementRoute{
             row.name, cur.spec.daq_list, odt_number, payload_offset,
-            row.byte_width});
+            row.byte_width, row.info.is_array, row.info.element_count,
+            row.info.element_size_bytes});
     }
 
     if (has_active) {

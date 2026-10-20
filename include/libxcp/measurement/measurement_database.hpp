@@ -25,14 +25,16 @@ namespace calmcar::xcp {
  * @details 适配器从 A2L `IA2lDatabase::Find` 的 `SymbolInfo` 投影而来（v0.5）。
  *          核心规划器只依赖此结构，不感知 A2L 的地址模式/换算细节：
  *          - element_size_bytes：单元素**实占字节**（B-1 口径，不除 AG）；
- *          - element_count：元素数（首版仅标量=1；数组在后续里程碑）。
+ *          - is_array：A2L 是否声明了数组维度；一元素数组仍为数组；
+ *          - element_count：已验证的元素数（标量固定为 1）。
  */
 struct MeasurementSymbolInfo {
     Address address{0};        ///< 32 位地址（AG 无关；实际存取按 AG 换算）
     AddressExtension extension{0};  ///< 8 位地址扩展
     std::uint16_t event_channel{0};  ///< 来自 A2L Event（仅用于规划分组；0=不由通道触发）
     std::uint8_t element_size_bytes{0};  ///< 单元素实占字节（B-1 口径，不除 AG）
-    std::uint8_t element_count{1};       ///< 元素数（首版仅标量=1）
+    std::uint8_t element_count{1};       ///< 已验证的元素数（标量固定为 1）
+    bool is_array{false};                ///< 是否为数组；用于区分标量与一元素数组
 };
 
 /**
@@ -57,6 +59,23 @@ public:
     /// @brief 原始字节（元素宽度）→ 物理值（长度不符 → RawSizeMismatch）
     [[nodiscard]] virtual MeasurementResult<MeasurementValue> ToPhysical(
         std::string_view name, BytesView raw) const = 0;
+
+    /**
+     * @brief 将数组某个元素的原始字节换算为物理值。
+     * @param name 数据库中的数组符号名
+     * @param element_index 从零开始的元素下标
+     * @param raw 恰好一个元素宽度的原始字节（B-1 口径，不除 AG）
+     * @return 元素物理值；旧数据库适配器默认明确报告不支持，保持派生类源码兼容
+     */
+    [[nodiscard]] virtual MeasurementResult<MeasurementValue> ToPhysicalElement(
+        std::string_view name, std::uint64_t element_index, BytesView raw) const {
+        static_cast<void>(element_index);
+        static_cast<void>(raw);
+        return MeasurementError{MeasurementErrorCode::UnsupportedConversion,
+                                "数据库适配器未实现数组元素换算",
+                                std::string{name}};
+    }
+
 };
 
 }  // namespace calmcar::xcp

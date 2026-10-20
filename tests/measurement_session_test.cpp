@@ -75,8 +75,25 @@ class FakeDb final : public IMeasurementDatabase {
     return detail::MakeMeasurementOk(MeasurementValue{v});
   }
 
+  /// @brief 测试数组元素按下标换算；默认保留旧数据库明确不支持的行为。
+  MeasurementResult<MeasurementValue> ToPhysicalElement(
+      std::string_view name, std::uint64_t element_index,
+      BytesView raw) const override {
+    if (!support_array_elements)
+      return IMeasurementDatabase::ToPhysicalElement(name, element_index, raw);
+    if (failing_element && *failing_element == element_index)
+      return detail::MakeMeasurementError<MeasurementValue>(
+          MeasurementErrorCode::UnsupportedConversion, "注入的数组元素换算失败",
+          std::string(name));
+    const auto value = static_cast<std::int64_t>(element_index * 100U) +
+                       (raw.empty() ? 0 : static_cast<std::int64_t>(raw[0]));
+    return detail::MakeMeasurementOk(MeasurementValue{value});
+  }
+
   std::map<std::string, MeasurementSymbolInfo> symbols;
   std::set<std::string> failing;  ///< 命中即 ToPhysical 报错的符号
+  bool support_array_elements = false;  ///< 测试显式启用元素级换算
+  std::optional<std::uint64_t> failing_element;  ///< 注入失败的数组下标
 };
 
 /// @brief 构造符号信息（地址/扩展/事件通道/元素宽/元素数）
@@ -457,6 +474,101 @@ TEST(MeasurementSessionPipeline, MultiEventRoutesToSeparateLists) {
   rig.session.Stop();
 }
 
+TEST(MeasurementSessionPipeline, ArrayDtoConvertsAtomicallyWithScalarSample) {
+  Rig rig;
+  rig.db.symbols["array"] = MeasurementSymbolInfo{
+      0x4000U, 0x12U, 0U, 4U, 8U, true};
+  rig.db.support_array_elements = true;
+  rig.session.SetDaqEntryCapabilities(MeasurementDaqCapabilities{true, 1, 248});
+  rig.session.Add("array");
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+  ASSERT_EQ(rig.slave.Count(CommandCode::WriteDaq), 2);
+
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& f) { collector(f); }));
+  Bytes payload(36U, 0U);
+  for (std::size_t i = 0; i < 8U; ++i)
+    payload[i * 4U] = static_cast<std::uint8_t>(i + 1U);
+  payload[32U] = 17U;
+  rig.transport->InjectPacket(BytesView{MakeFrame(0, 0, 5, BytesView{payload})});
+  ASSERT_TRUE(collector.WaitFor(1));
+  const auto frames = collector.Frames();
+  ASSERT_EQ(frames.size(), 1U);
+  ASSERT_EQ(frames[0].samples.size(), 2U);
+  const auto& array = frames[0].samples[0];
+  EXPECT_TRUE(array.is_array);
+  EXPECT_TRUE(array.valid);
+  EXPECT_EQ(array.raw, Bytes(payload.begin(), payload.begin() + 32));
+  ASSERT_EQ(array.elements.size(), 8U);
+  for (std::size_t i = 0; i < 8U; ++i)
+    EXPECT_EQ(std::get<std::int64_t>(array.elements[i]),
+              static_cast<std::int64_t>(i * 101U + 1U));
+  EXPECT_FALSE(frames[0].samples[1].is_array);
+  EXPECT_TRUE(frames[0].samples[1].valid);
+  EXPECT_EQ(std::get<std::int64_t>(frames[0].samples[1].value), 21);
+  rig.session.Stop();
+}
+
+TEST(MeasurementSessionPipeline, ArrayElementFailureDropsWholeArrayOnly) {
+  Rig rig;
+  rig.db.symbols["array"] = MeasurementSymbolInfo{
+      0x4000U, 0U, 0U, 4U, 8U, true};
+  rig.db.support_array_elements = true;
+  rig.db.failing_element = 3U;
+  rig.session.SetDaqEntryCapabilities(MeasurementDaqCapabilities{true, 1, 248});
+  rig.session.Add("array");
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& f) { collector(f); }));
+  Bytes payload(36U, 0U);
+  payload[32U] = 17U;
+  rig.transport->InjectPacket(BytesView{MakeFrame(0, 0, 5, BytesView{payload})});
+  ASSERT_TRUE(collector.WaitFor(1));
+  const auto frames = collector.Frames();
+  ASSERT_EQ(frames.size(), 1U);
+  ASSERT_EQ(frames[0].samples.size(), 2U);
+  EXPECT_FALSE(frames[0].samples[0].valid);
+  EXPECT_TRUE(frames[0].samples[0].is_array);
+  EXPECT_TRUE(frames[0].samples[0].elements.empty());
+  EXPECT_EQ(frames[0].samples[0].raw.size(), 32U);
+  EXPECT_FALSE(frames[0].samples[0].error.empty());
+  EXPECT_TRUE(frames[0].samples[1].valid);
+  EXPECT_EQ(rig.session.Statistics().decode_errors, 1U);
+  rig.session.Stop();
+}
+
+/// @brief 未实现元素换算的旧数据库不会退化为标量首元素的伪成功。
+TEST(MeasurementSessionPipeline, LegacyDatabaseFailsArrayConversionExplicitly) {
+  Rig rig;
+  rig.db.symbols["array"] = MeasurementSymbolInfo{
+      0x4000U, 0U, 0U, 4U, 8U, true};
+  rig.session.SetDaqEntryCapabilities(MeasurementDaqCapabilities{true, 1, 248});
+  rig.session.Add("array");
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& frame) { collector(frame); }));
+  Bytes payload(36U, 0U);
+  payload[32U] = 17U;
+  rig.transport->InjectPacket(BytesView{MakeFrame(0, 0, 5, BytesView{payload})});
+  ASSERT_TRUE(collector.WaitFor(1));
+  const auto frames = collector.Frames();
+  ASSERT_EQ(frames.size(), 1U);
+  ASSERT_EQ(frames[0].samples.size(), 2U);
+  EXPECT_TRUE(frames[0].samples[0].is_array);
+  EXPECT_FALSE(frames[0].samples[0].valid);
+  EXPECT_TRUE(frames[0].samples[0].elements.empty());
+  EXPECT_NE(frames[0].samples[0].error.find("未实现数组元素换算"),
+            std::string::npos);
+  EXPECT_TRUE(frames[0].samples[1].valid);
+  rig.session.Stop();
+}
+
 TEST(MeasurementSessionPipeline, MalformedFrameCountsDecodeErrorWithoutCallback) {
   Rig rig;
   rig.session.Add("EngineSpeed");
@@ -558,6 +670,25 @@ TEST(MeasurementSessionPipeline, PrepareIssuesDynamicDaqTransaction) {
   EXPECT_EQ(rig.slave.Count(CommandCode::SetDaqListMode), 1);
   // 规划期取证：分辨率（时间戳 4 字节）被查询
   EXPECT_GE(rig.slave.Count(CommandCode::GetDaqResolutionInfo), 1);
+}
+
+TEST(MeasurementSessionPipeline, UnsupportedArraysNeverSendFreeDaq) {
+  for (const auto capabilities : {
+           MeasurementDaqCapabilities{},
+           MeasurementDaqCapabilities{true, 1, 16}}) {
+    Rig rig;
+    rig.db.symbols["array"] = MeasurementSymbolInfo{
+        0x4000U, 0U, 0U, 4U, 8U, true};
+    rig.session.SetDaqEntryCapabilities(capabilities);
+    rig.session.Add("array");
+    EXPECT_THROW(rig.session.Prepare(), XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
+    EXPECT_EQ(rig.slave.Count(CommandCode::WriteDaq), 0);
+  }
+  Rig rig;
+  EXPECT_THROW(rig.session.SetDaqEntryCapabilities(
+                   MeasurementDaqCapabilities{true, 0, 248}), XcpException);
+  EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
 }
 
 TEST(MeasurementSessionPipeline, PrepareFailureWithUnknownSymbolThrowsBeforeDaq) {

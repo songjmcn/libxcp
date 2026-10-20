@@ -72,4 +72,19 @@ void TriggerSlowEvent(const SlaveRegistry& registry) noexcept;
 [[nodiscard]] bool CopyCalibrationSnapshot(
     const SlaveRegistry& registry, CalibrationParameters& parameters) noexcept;
 
+/**
+ * @brief 注册 XCPlite 语义级协议回调（CONNECT、START_DAQ、STOP_DAQ）。
+ *
+ * 仅使用 XCPlite 公开回调接口，不修改第三方代码；回调内部只记录日志，
+ * 保持默认准入语义（连接总是接受、DAQ 启动总是允许）。
+ */
+void RegisterSlaveProtocolCallbacks() noexcept;
+
+/**
+ * @brief 观察并记录 XCP 连接与 DAQ 状态的边沿变化。
+ *
+ * 由常驻服务主循环按周期调用；仅在状态跳变时写日志，避免高频刷盘。
+ */
+void ObserveSlaveProtocolState() noexcept;
+
 }  // namespace xcp_slave_demo

@@ -142,6 +142,10 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
             XCP_THIRDPARTY_DIR="${PROJECT_SOURCE_DIR}/thirdparty")
   endif()
 
+  # 该目标包含从站日志布点的黑盒用例（xcp_slave_demo_integration_test.cpp
+  # 的 ServiceEmitsPeriodicHeartbeatLog），需要与示例一致的 0/1 开关。
+  libxcp_configure_program_logging(XcpliteIntegration)
+
   gtest_discover_tests(XcpliteIntegration DISCOVERY_TIMEOUT 120)
 endif()
 

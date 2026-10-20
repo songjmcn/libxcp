@@ -16,21 +16,30 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include <gtest/gtest.h>
 
+#include "a2l/a2l_measurement_database.hpp"
+#include "a2l/measurement_runtime_profile.hpp"
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/command_executor.hpp"
 #include "libxcp/daq/dto_envelope_decoder.hpp"
+#include "libxcp/log.hpp"
+#include "libxcp/measurement/measurement_planner.hpp"
+#include "libxcp/measurement/measurement_session.hpp"
 #include "libxcp/protocol_types.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "libxcp/xcp_error.hpp"
 #include "libxcp/xcp_master.hpp"
 #include "slave_model.hpp"
 #include "xcplite_slave_fixture.hpp"
+#include "../tools/xcp_master/symbol_policy.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -795,6 +804,232 @@ TEST(XcpSlaveDemoIntegrationTest,
     EXPECT_TRUE(reservation.IsExclusive());
 }
 
+/// @brief 真实生成 A2L 中实例的固定事件必须传递到测量叶子和 Master 准入。
+TEST(XcpSlaveDemoIntegrationTest,
+     GeneratedA2lPropagatesFixedEventsToMeasurementLeaves) {
+    TemporaryDirectory directory("instance_daq_events");
+    const auto output_dir = directory.Path() / "a2l";
+    UdpPortReservation reservation;
+    ASSERT_TRUE(reservation.BindFree());
+    const auto generation_exit =
+        GenerateA2l(directory.Path(), output_dir, reservation.Port(), false);
+    ASSERT_TRUE(generation_exit.has_value());
+    ASSERT_EQ(*generation_exit, 0);
+
+    auto loaded =
+        a2l::A2lBridge::Load((output_dir / "xcp_slave_demo.a2l").string());
+    ASSERT_TRUE(loaded.HasValue()) << loaded.ErrorInfo().message;
+    const auto* database = loaded.Value()->Database();
+    ASSERT_NE(database, nullptr);
+    const auto fast_event =
+        FindEventChannel(loaded.Value()->XcpInfo(), "meas_fast_10ms");
+    const auto slow_event =
+        FindEventChannel(loaded.Value()->XcpInfo(), "meas_slow_100ms");
+    ASSERT_TRUE(fast_event.has_value());
+    ASSERT_TRUE(slow_event.has_value());
+    EXPECT_EQ(*fast_event, 0U);
+    EXPECT_EQ(*slow_event, 1U);
+    const std::array<std::uint16_t, 2> events{*fast_event, *slow_event};
+
+    // 根成员与嵌套成员继承各自实例事件；不能把合法事件号 0 当作空值。
+    for (const auto& [name, expected_event] :
+         {std::pair{"meas_fast.input", *fast_event},
+          std::pair{"meas_fast.state.raw_output", *fast_event},
+          std::pair{"meas_slow.basic.real_32", *slow_event},
+          std::pair{"meas_slow.statistics.sample_count", *slow_event}}) {
+        auto symbol = database->Find("xcp_slave_demo::" + std::string(name));
+        ASSERT_TRUE(symbol.HasValue()) << name;
+        EXPECT_EQ(symbol.Value().daq_event_fixed,
+                  (std::vector<std::uint16_t>{expected_event}))
+            << name;
+        EXPECT_TRUE(
+            tools::SymbolDaqObservationUnsupportedReason(symbol.Value(), events)
+                .empty())
+            << name;
+    }
+    // 重演工具入口：Search 全库 → 按规范名绑定事件 → Adapter → DAQ 规划。
+    auto count = database->Count();
+    ASSERT_TRUE(count.HasValue());
+    auto all_symbols = database->Search("*", count.Value());
+    ASSERT_TRUE(all_symbols.HasValue());
+    MeasurementEventBindingCandidates bindings;
+    for (const auto& symbol : all_symbols.Value()) {
+        if (symbol.kind != a2l::SymbolKind::Measurement) continue;
+        auto& candidates = bindings[symbol.module_name + "::" + symbol.name];
+        candidates.assign(symbol.daq_event_fixed.begin(),
+                          symbol.daq_event_fixed.end());
+    }
+    A2lMeasurementDatabase inner(*database);
+    EventBoundMeasurementDatabase bound(inner, std::move(bindings));
+    const std::string fast_name = "xcp_slave_demo::meas_fast.input";
+    const std::string slow_name = "xcp_slave_demo::meas_slow.basic.real_32";
+    auto fast_binding = bound.Find(fast_name);
+    auto slow_binding = bound.Find(slow_name);
+    ASSERT_TRUE(fast_binding.HasValue());
+    ASSERT_TRUE(slow_binding.HasValue());
+    EXPECT_EQ(fast_binding.Value().event_channel, 0U);
+    EXPECT_EQ(slow_binding.Value().event_channel, 1U);
+    MeasurementPlanner planner(bound, /*max_dto=*/256, AddressGranularity::Byte,
+                               /*timestamp_bytes=*/4,
+                               /*identification_bytes=*/1);
+    auto plan = planner.Build({fast_name, slow_name});
+    ASSERT_TRUE(plan.HasValue()) << plan.ErrorInfo().message;
+    ASSERT_EQ(plan.Value().daq_lists.size(), 2U);
+    EXPECT_EQ(plan.Value().daq_lists[0].event_channel, *fast_event);
+    EXPECT_EQ(plan.Value().daq_lists[1].event_channel, *slow_event);
+    ASSERT_EQ(plan.Value().routes.size(), 2U);
+    EXPECT_EQ(plan.Value().routes[0].name, fast_name);
+    EXPECT_EQ(plan.Value().routes[1].name, slow_name);
+
+    // INSTANCE 中的数组与标定叶子不因固定事件继承而变成 DAQ 标量。
+    auto array = database->Find("xcp_slave_demo::meas_fast.samples");
+    ASSERT_TRUE(array.HasValue());
+    EXPECT_FALSE(
+        tools::SymbolDaqObservationUnsupportedReason(array.Value(), events)
+            .empty());
+    auto cal = database->Find("xcp_slave_demo::cal.basic.real_32");
+    ASSERT_TRUE(cal.HasValue());
+    EXPECT_TRUE(cal.Value().daq_event_fixed.empty());
+    EXPECT_FALSE(
+        tools::SymbolDaqObservationUnsupportedReason(cal.Value(), events)
+            .empty());
+
+    // 将真实快速实例改为结构数组：逐元素嵌套的叶子仍归同一 INSTANCE。
+    std::ifstream input(output_dir / "xcp_slave_demo.a2l", std::ios::binary);
+    ASSERT_TRUE(input.is_open());
+    std::string array_source((std::istreambuf_iterator<char>(input)),
+                             std::istreambuf_iterator<char>());
+    const auto instance_begin = array_source.find(
+        "INSTANCE meas_fast \"10 ms 快速测量组\" FastMeasurements 0x0 "
+        "ECU_ADDRESS_EXTENSION 3 READ_WRITE");
+    ASSERT_NE(instance_begin, std::string::npos);
+    const std::string instance_prefix =
+        "INSTANCE meas_fast \"10 ms 快速测量组\" FastMeasurements 0x0 "
+        "ECU_ADDRESS_EXTENSION 3";
+    array_source.insert(instance_begin + instance_prefix.size(),
+                        " MATRIX_DIM 2");
+    const auto array_path = output_dir / "structure_array.a2l";
+    {
+        std::ofstream output(array_path, std::ios::binary);
+        ASSERT_TRUE(output.is_open());
+        output << array_source;
+        ASSERT_TRUE(output.good());
+    }
+    auto array_bridge = a2l::A2lBridge::Load(array_path.string());
+    ASSERT_TRUE(array_bridge.HasValue()) << array_bridge.ErrorInfo().message;
+    for (const char* name : {"xcp_slave_demo::meas_fast[0].state.raw_output",
+                             "xcp_slave_demo::meas_fast[1].state.raw_output"}) {
+        auto leaf = array_bridge.Value()->Database()->Find(name);
+        ASSERT_TRUE(leaf.HasValue()) << name;
+        EXPECT_EQ(leaf.Value().daq_event_fixed,
+                  (std::vector<std::uint16_t>{*fast_event}))
+            << name;
+        EXPECT_TRUE(
+            tools::SymbolDaqObservationUnsupportedReason(leaf.Value(), events)
+                .empty())
+            << name;
+    }
+}
+
+/// @brief 真实 A2L 的实例多固定事件和仅有默认事件均不允许 DAQ 加入。
+TEST(XcpSlaveDemoIntegrationTest,
+     GeneratedA2lRejectsAmbiguousOrMissingFixedEvents) {
+    TemporaryDirectory directory("instance_daq_rejections");
+    const auto output_dir = directory.Path() / "a2l";
+    UdpPortReservation reservation;
+    ASSERT_TRUE(reservation.BindFree());
+    const auto generation_exit =
+        GenerateA2l(directory.Path(), output_dir, reservation.Port(), false);
+    ASSERT_TRUE(generation_exit.has_value());
+    ASSERT_EQ(*generation_exit, 0);
+    std::ifstream input(output_dir / "xcp_slave_demo.a2l", std::ios::binary);
+    ASSERT_TRUE(input.is_open());
+    const std::string original((std::istreambuf_iterator<char>(input)),
+                               std::istreambuf_iterator<char>());
+    const std::array<std::uint16_t, 2> events{0, 1};
+
+    // INSTANCE 声明两个不同事件，绝不能任选一个给测量叶子采样。
+    std::string conflicting = original;
+    const auto multi_begin = conflicting.find("FIXED_EVENT_LIST EVENT 0x0");
+    ASSERT_NE(multi_begin, std::string::npos);
+    conflicting.replace(multi_begin,
+                        std::string("FIXED_EVENT_LIST EVENT 0x0").size(),
+                        "FIXED_EVENT_LIST EVENT 0x0 EVENT 0x1");
+    const auto conflict_path = output_dir / "conflicting_event.a2l";
+    {
+        std::ofstream output(conflict_path, std::ios::binary);
+        ASSERT_TRUE(output.is_open());
+        output << conflicting;
+        ASSERT_TRUE(output.good());
+    }
+    auto conflict_bridge = a2l::A2lBridge::Load(conflict_path.string());
+    ASSERT_TRUE(conflict_bridge.HasValue())
+        << conflict_bridge.ErrorInfo().message;
+    auto conflict = conflict_bridge.Value()->Database()->Find(
+        "xcp_slave_demo::meas_fast.input");
+    ASSERT_TRUE(conflict.HasValue());
+    EXPECT_EQ(conflict.Value().daq_event_fixed,
+              (std::vector<std::uint16_t>{0, 1}));
+    EXPECT_FALSE(
+        tools::SymbolDaqObservationUnsupportedReason(conflict.Value(), events)
+            .empty());
+
+    // 同号重复不造成伪冲突：策略按不同事件号计数。
+    std::string repeated = original;
+    const auto repeated_begin = repeated.find("FIXED_EVENT_LIST EVENT 0x0");
+    ASSERT_NE(repeated_begin, std::string::npos);
+    repeated.replace(repeated_begin,
+                     std::string("FIXED_EVENT_LIST EVENT 0x0").size(),
+                     "FIXED_EVENT_LIST EVENT 0x0 EVENT 0x0");
+    const auto repeated_path = output_dir / "repeated_event.a2l";
+    {
+        std::ofstream output(repeated_path, std::ios::binary);
+        ASSERT_TRUE(output.is_open());
+        output << repeated;
+        ASSERT_TRUE(output.good());
+    }
+    auto repeated_bridge = a2l::A2lBridge::Load(repeated_path.string());
+    ASSERT_TRUE(repeated_bridge.HasValue())
+        << repeated_bridge.ErrorInfo().message;
+    auto duplicate = repeated_bridge.Value()->Database()->Find(
+        "xcp_slave_demo::meas_fast.input");
+    ASSERT_TRUE(duplicate.HasValue());
+    EXPECT_EQ(duplicate.Value().daq_event_fixed,
+              (std::vector<std::uint16_t>{0, 0}));
+    EXPECT_TRUE(
+        tools::SymbolDaqObservationUnsupportedReason(duplicate.Value(), events)
+            .empty());
+
+    // DEFAULT_EVENT_LIST 即使包含事件 0，也不能补足缺失的固定事件。
+    std::string default_only = original;
+    const auto fixed_begin = default_only.find("FIXED_EVENT_LIST EVENT 0x0");
+    ASSERT_NE(fixed_begin, std::string::npos);
+    default_only.replace(fixed_begin, std::string("FIXED_EVENT_LIST").size(),
+                         "DEFAULT_EVENT_LIST");
+    const auto default_path = output_dir / "default_only.a2l";
+    {
+        std::ofstream output(default_path, std::ios::binary);
+        ASSERT_TRUE(output.is_open());
+        output << default_only;
+        ASSERT_TRUE(output.good());
+    }
+    auto default_bridge = a2l::A2lBridge::Load(default_path.string());
+    ASSERT_TRUE(default_bridge.HasValue())
+        << default_bridge.ErrorInfo().message;
+    auto missing = default_bridge.Value()->Database()->Find(
+        "xcp_slave_demo::meas_fast.input");
+    ASSERT_TRUE(missing.HasValue());
+    EXPECT_TRUE(missing.Value().daq_event_fixed.empty());
+    EXPECT_FALSE(
+        tools::SymbolDaqObservationUnsupportedReason(missing.Value(), events)
+            .empty());
+    // 修改快速实例的声明不能污染另一慢速 INSTANCE。
+    auto slow = default_bridge.Value()->Database()->Find(
+        "xcp_slave_demo::meas_slow.basic.real_32");
+    ASSERT_TRUE(slow.HasValue());
+    EXPECT_EQ(slow.Value().daq_event_fixed, (std::vector<std::uint16_t>{1}));
+}
+
 /// @brief 验证独立服务进程使用同布局相对地址、标定写入及 10 ms DAQ。
 TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     TemporaryDirectory directory("cross_process");
@@ -821,13 +1056,25 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
         FindEventChannel(loaded.Value()->XcpInfo(), "meas_slow_100ms");
     ASSERT_TRUE(fast_event.has_value()) << "A2L 缺少快速 DAQ 事件通道";
     ASSERT_TRUE(slow_event.has_value()) << "A2L 缺少慢速 DAQ 事件通道";
+    const std::array<std::uint16_t, 2> events{*fast_event, *slow_event};
+    auto fast_leaf =
+        loaded.Value()->Database()->Find("xcp_slave_demo::meas_fast.output");
+    auto slow_leaf = loaded.Value()->Database()->Find(
+        "xcp_slave_demo::meas_slow.statistics.fast_cycle_count");
+    ASSERT_TRUE(fast_leaf.HasValue());
+    ASSERT_TRUE(slow_leaf.HasValue());
+    // 与 Master 一样从 A2L 展开叶子获取地址、扩展和固定事件，不再手填 event。
+    for (const auto* leaf : {&fast_leaf.Value(), &slow_leaf.Value()}) {
+        EXPECT_TRUE(
+            tools::SymbolDaqObservationUnsupportedReason(*leaf, events).empty())
+            << leaf->name;
+        ASSERT_EQ(leaf->daq_event_fixed.size(), 1U);
+    }
+    EXPECT_EQ(fast_leaf.Value().daq_event_fixed.front(), *fast_event);
+    EXPECT_EQ(slow_leaf.Value().daq_event_fixed.front(), *slow_event);
 
     const auto cal_symbol = demo_test::ResolveA2lSymbol(a2l_path, "cal");
-    const auto fast_symbol = demo_test::ResolveA2lSymbol(a2l_path, "meas_fast");
-    const auto slow_symbol = demo_test::ResolveA2lSymbol(a2l_path, "meas_slow");
     ASSERT_TRUE(cal_symbol.has_value()) << "A2L 缺少 cal 标定段实例";
-    ASSERT_TRUE(fast_symbol.has_value()) << "A2L 缺少 meas_fast 测量实例";
-    ASSERT_TRUE(slow_symbol.has_value()) << "A2L 缺少 meas_slow 测量实例";
     ASSERT_EQ(cal_symbol->extension, 0U) << "CalSeg 应使用段相对地址扩展";
 
     DemoChildProcess slave_process;
@@ -888,15 +1135,14 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     EXPECT_FLOAT_EQ(observed_correction, kArrayCorrection);
 
     DaqEntrySpec output_entry;
-    output_entry.address = static_cast<Address>(
-        fast_symbol->address + offsetof(FastMeasurements, output));
-    output_entry.extension = fast_symbol->extension;
-    output_entry.size = static_cast<std::uint8_t>(sizeof(double));
+    output_entry.address = static_cast<Address>(fast_leaf.Value().xcp_address);
+    output_entry.extension = fast_leaf.Value().address_extension;
+    output_entry.size = fast_leaf.Value().element_size_bytes;
     DaqOdtSpec odt;
     odt.entries.push_back(output_entry);
     DaqListSpec daq_list;
     daq_list.daq_list = 0U;
-    daq_list.event_channel = *fast_event;
+    daq_list.event_channel = fast_leaf.Value().daq_event_fixed.front();
     daq_list.timestamp = true;
     daq_list.odts.push_back(odt);
     ASSERT_NO_THROW(master->ConfigureDaqListsDynamic({daq_list}));
@@ -908,16 +1154,14 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     ASSERT_NO_THROW(master->StopDaq());
 
     DaqEntrySpec slow_entry;
-    slow_entry.address = static_cast<Address>(
-        slow_symbol->address + offsetof(SlowMeasurements, statistics) +
-        offsetof(SlowMeasurementStatistics, fast_cycle_count));
-    slow_entry.extension = slow_symbol->extension;
-    slow_entry.size = static_cast<std::uint8_t>(sizeof(std::uint32_t));
+    slow_entry.address = static_cast<Address>(slow_leaf.Value().xcp_address);
+    slow_entry.extension = slow_leaf.Value().address_extension;
+    slow_entry.size = slow_leaf.Value().element_size_bytes;
     DaqOdtSpec slow_odt;
     slow_odt.entries.push_back(slow_entry);
     DaqListSpec slow_daq_list;
     slow_daq_list.daq_list = 0U;
-    slow_daq_list.event_channel = *slow_event;
+    slow_daq_list.event_channel = slow_leaf.Value().daq_event_fixed.front();
     slow_daq_list.timestamp = true;
     slow_daq_list.odts.push_back(slow_odt);
     ASSERT_NO_THROW(master->ConfigureDaqListsDynamic({slow_daq_list}));
@@ -927,6 +1171,344 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     ASSERT_NO_THROW(master->StopDaq());
     master->Disconnect();
     slave_process.Stop();
+}
+
+/// @brief 真实 Slave DTO 经固定事件绑定、规划及会话解码后产生快慢测量样本。
+TEST(XcpSlaveDemoIntegrationTest, GeneratedA2lFeedsLiveMeasurementSession) {
+    TemporaryDirectory directory("live_measurement_session");
+    const auto output_dir = directory.Path() / "a2l";
+    UdpPortReservation reservation;
+    ASSERT_TRUE(reservation.BindFree());
+    const std::uint16_t port = reservation.Port();
+    const auto generation_exit =
+        GenerateA2l(directory.Path(), output_dir, port, false);
+    ASSERT_TRUE(generation_exit.has_value());
+    ASSERT_EQ(*generation_exit, 0);
+    reservation.Close();
+
+    auto loaded =
+        a2l::A2lBridge::Load((output_dir / "xcp_slave_demo.a2l").string());
+    ASSERT_TRUE(loaded.HasValue()) << loaded.ErrorInfo().message;
+    auto* database = loaded.Value()->Database();
+    ASSERT_NE(database, nullptr);
+    auto count = database->Count();
+    ASSERT_TRUE(count.HasValue());
+    auto symbols = database->Search("*", count.Value());
+    ASSERT_TRUE(symbols.HasValue());
+    MeasurementEventBindingCandidates bindings;
+    for (const auto& symbol : symbols.Value()) {
+        if (symbol.kind != a2l::SymbolKind::Measurement) continue;
+        auto& candidates = bindings[symbol.module_name + "::" + symbol.name];
+        candidates.assign(symbol.daq_event_fixed.begin(),
+                          symbol.daq_event_fixed.end());
+    }
+    A2lMeasurementDatabase adapter(*database);
+    EventBoundMeasurementDatabase bound(adapter, std::move(bindings));
+    std::vector<A2lEventMetadata> event_metadata;
+    const auto* xcp_info = loaded.Value()->XcpInfo();
+    ASSERT_NE(xcp_info, nullptr);
+    for (const auto& event : xcp_info->event_channels) {
+        event_metadata.push_back(A2lEventMetadata{
+            event.name, event.short_name, event.channel_number,
+            event.time_cycle, event.time_unit, event.type, event.max_daq_list});
+    }
+
+    const auto service_directory = directory.Path() / "service";
+    std::filesystem::create_directories(service_directory);
+    DemoChildProcess slave_process;
+    std::string start_error;
+    ASSERT_TRUE(StartDemoProcess(
+        slave_process, {"--bind", "127.0.0.1", "--port", std::to_string(port)},
+        service_directory, &start_error))
+        << start_error;
+    // master 先声明，确保 session 析构前监听器所依赖的 master 仍存活。
+    std::unique_ptr<XcpMaster> master;
+    MeasurementSession session(bound);
+    master = ConnectToDemo(port, &session);
+    ASSERT_NE(master, nullptr);
+    session.Bind(*master);
+    auto profile =
+        BuildXcpliteMeasurementRuntimeProfile(*master, event_metadata);
+    ASSERT_TRUE(profile.HasValue()) << profile.ErrorInfo().message;
+    ApplyMeasurementRuntimeProfile(session, profile.Value());
+    const std::string fast_name = "xcp_slave_demo::meas_fast.output";
+    const std::string slow_name =
+        "xcp_slave_demo::meas_slow.statistics.fast_cycle_count";
+    session.Add(fast_name);
+    session.Add(slow_name);
+    ASSERT_NO_THROW(session.Prepare());
+
+    std::mutex samples_mutex;
+    std::condition_variable samples_ready;
+    std::set<std::string> observed;
+    ASSERT_NO_THROW(session.Start([&](const MeasurementFrame& frame) {
+        std::lock_guard<std::mutex> lock(samples_mutex);
+        for (const auto& sample : frame.samples) {
+            if (sample.valid && !sample.raw.empty()) {
+                observed.insert(sample.name);
+            }
+        }
+        samples_ready.notify_all();
+    }));
+    bool complete = false;
+    {
+        std::unique_lock<std::mutex> lock(samples_mutex);
+        complete = samples_ready.wait_for(lock, std::chrono::seconds(4), [&] {
+            return observed.contains(fast_name) && observed.contains(slow_name);
+        });
+    }
+    const auto statistics = session.Statistics();
+    session.Stop();
+    master->Disconnect();
+    slave_process.Stop();
+    EXPECT_TRUE(complete) << "未同时解码快慢实例叶子，DTO="
+                          << statistics.dto_received
+                          << " 解码失败=" << statistics.decode_errors;
+}
+
+/// @brief 真实跨进程 DAQ 将快慢数组分别作为一条 Entry 送达，并逐元素换算。
+TEST(XcpSlaveDemoIntegrationTest, GeneratedA2lFeedsLiveContiguousArrayDaq) {
+    TemporaryDirectory directory("live_array_daq");
+    const auto output_dir = directory.Path() / "a2l";
+    UdpPortReservation reservation;
+    ASSERT_TRUE(reservation.BindFree());
+    const auto port = reservation.Port();
+    const auto generation_exit =
+        GenerateA2l(directory.Path(), output_dir, port, false);
+    ASSERT_TRUE(generation_exit.has_value());
+    ASSERT_EQ(*generation_exit, 0);
+    reservation.Close();
+
+    const auto a2l_path = output_dir / "xcp_slave_demo.a2l";
+    auto loaded = a2l::A2lBridge::Load(a2l_path.string());
+    ASSERT_TRUE(loaded.HasValue()) << loaded.ErrorInfo().message;
+    const auto* database = loaded.Value()->Database();
+    const auto* xcp_info = loaded.Value()->XcpInfo();
+    ASSERT_NE(database, nullptr);
+    ASSERT_NE(xcp_info, nullptr);
+    const auto fast_event = FindEventChannel(xcp_info, "meas_fast_10ms");
+    const auto slow_event = FindEventChannel(xcp_info, "meas_slow_100ms");
+    ASSERT_TRUE(fast_event.has_value());
+    ASSERT_TRUE(slow_event.has_value());
+    const std::array<std::uint16_t, 2> events{*fast_event, *slow_event};
+    const std::string fast_array = "xcp_slave_demo::meas_fast.samples";
+    const std::string slow_array = "xcp_slave_demo::meas_slow.history";
+    const std::string fast_scalar = "xcp_slave_demo::meas_fast.input";
+    const std::string slow_scalar =
+        "xcp_slave_demo::meas_slow.statistics.fast_cycle_count";
+    for (const auto& [name, event] : {std::pair{fast_array, *fast_event},
+                                      std::pair{slow_array, *slow_event}}) {
+        auto symbol = database->Find(name);
+        ASSERT_TRUE(symbol.HasValue()) << name;
+        ASSERT_EQ(symbol.Value().daq_event_fixed,
+                  (std::vector<std::uint16_t>{event}));
+        ASSERT_EQ(symbol.Value().dimensions.size(), 1U);
+        EXPECT_EQ(symbol.Value().dimensions.front().extent,
+                  xcp_slave_demo::kSampleCount);
+        EXPECT_EQ(symbol.Value().dimensions.front().byte_stride,
+                  symbol.Value().element_size_bytes);
+        EXPECT_TRUE(tools::SymbolDaqObservationUnsupportedReason(symbol.Value(),
+                                                                 events, true)
+                        .empty())
+            << name;
+        EXPECT_FALSE(
+            tools::SymbolDaqObservationUnsupportedReason(symbol.Value(), events)
+                .empty())
+            << "Generic profile 必须继续拒绝数组";
+    }
+    auto count = database->Count();
+    ASSERT_TRUE(count.HasValue());
+    auto symbols = database->Search("*", count.Value());
+    ASSERT_TRUE(symbols.HasValue());
+    MeasurementEventBindingCandidates bindings;
+    for (const auto& symbol : symbols.Value()) {
+        if (symbol.kind != a2l::SymbolKind::Measurement) continue;
+        auto& candidates = bindings[symbol.module_name + "::" + symbol.name];
+        candidates.assign(symbol.daq_event_fixed.begin(),
+                          symbol.daq_event_fixed.end());
+    }
+    A2lMeasurementDatabase adapter(*database);
+    EventBoundMeasurementDatabase bound(adapter, std::move(bindings));
+    for (const auto& [name, event] : {std::pair{fast_array, *fast_event},
+                                      std::pair{slow_array, *slow_event}}) {
+        auto found = bound.Find(name);
+        ASSERT_TRUE(found.HasValue()) << found.ErrorInfo().message;
+        EXPECT_EQ(found.Value().event_channel, event);
+        EXPECT_TRUE(found.Value().is_array);
+        EXPECT_EQ(found.Value().element_count, xcp_slave_demo::kSampleCount);
+        EXPECT_EQ(found.Value().element_size_bytes, sizeof(std::uint32_t));
+    }
+    std::vector<A2lEventMetadata> event_metadata;
+    for (const auto& event : xcp_info->event_channels) {
+        event_metadata.push_back(A2lEventMetadata{
+            event.name, event.short_name, event.channel_number,
+            event.time_cycle, event.time_unit, event.type, event.max_daq_list});
+    }
+
+    const auto service_directory = directory.Path() / "service";
+    std::filesystem::create_directories(service_directory);
+    DemoChildProcess slave_process;
+    std::string start_error;
+    ASSERT_TRUE(StartDemoProcess(
+        slave_process, {"--bind", "127.0.0.1", "--port", std::to_string(port)},
+        service_directory, &start_error))
+        << start_error;
+    // 会话先于 Master 构造，以确保 DTO 监听器在连接生命周期内有效。
+    std::unique_ptr<XcpMaster> master;
+    MeasurementSession session(bound);
+    master = ConnectToDemo(port, &session);
+    ASSERT_NE(master, nullptr);
+    session.Bind(*master);
+    auto profile =
+        BuildXcpliteMeasurementRuntimeProfile(*master, event_metadata);
+    ASSERT_TRUE(profile.HasValue()) << profile.ErrorInfo().message;
+    ASSERT_TRUE(
+        profile.Value().daq_entry_capabilities.supports_contiguous_1d_arrays);
+    ASSERT_GE(profile.Value().daq_entry_capabilities.max_entry_size_bytes,
+              sizeof(std::uint32_t) * xcp_slave_demo::kSampleCount);
+    ApplyMeasurementRuntimeProfile(session, profile.Value());
+    // 使用协商的 MAX_DTO/AG 与运行时 Entry 能力证明每个数组恰占一条 Entry。
+    const auto negotiated = master->GetSessionParameters();
+    MeasurementPlanner planner(bound, negotiated.connect.max_dto,
+                               negotiated.connect.address_granularity,
+                               /*timestamp_bytes=*/4,
+                               profile.Value().identification_header_bytes,
+                               profile.Value().daq_entry_capabilities);
+    auto plan =
+        planner.Build({fast_array, fast_scalar, slow_array, slow_scalar});
+    ASSERT_TRUE(plan.HasValue()) << plan.ErrorInfo().message;
+    ASSERT_EQ(plan.Value().daq_lists.size(), 2U);
+    for (std::size_t index = 0; index < 2U; ++index) {
+        const auto& list = plan.Value().daq_lists[index];
+        EXPECT_EQ(list.event_channel, index == 0U ? *fast_event : *slow_event);
+        ASSERT_EQ(list.odts.size(), 1U);
+        ASSERT_EQ(list.odts.front().entries.size(), 2U);
+        EXPECT_EQ(list.odts.front().entries.front().size,
+                  sizeof(std::uint32_t) * xcp_slave_demo::kSampleCount);
+    }
+    ASSERT_EQ(plan.Value().routes.size(), 4U);
+    EXPECT_TRUE(plan.Value().routes[0].is_array);
+    EXPECT_EQ(plan.Value().routes[0].size,
+              sizeof(std::uint32_t) * xcp_slave_demo::kSampleCount);
+    EXPECT_TRUE(plan.Value().routes[2].is_array);
+    EXPECT_EQ(plan.Value().routes[2].size,
+              sizeof(std::uint32_t) * xcp_slave_demo::kSampleCount);
+
+    // 标定最后一个通道：数组逐元素校验不能只检查长度或首元素。
+    const auto cal = demo_test::ResolveA2lSymbol(a2l_path, "cal");
+    ASSERT_TRUE(cal.has_value());
+    constexpr float kLastCorrection = -1.25F;
+    const Address correction_address = static_cast<Address>(
+        cal->address + offsetof(CalibrationParameters, corrections) +
+        (xcp_slave_demo::kSampleCount - 1U) * sizeof(float));
+    master->WriteMemoryBytes(correction_address, cal->extension,
+                             EncodeFloat(kLastCorrection));
+    const auto correction_readback = master->ReadMemoryBytes(
+        correction_address, cal->extension, sizeof(float));
+    ASSERT_EQ(correction_readback, EncodeFloat(kLastCorrection));
+
+    session.Add(fast_array);
+    session.Add(fast_scalar);
+    session.Add(slow_array);
+    session.Add(slow_scalar);
+    ASSERT_NO_THROW(session.Prepare());
+    std::mutex samples_mutex;
+    std::condition_variable samples_ready;
+    bool fast_complete = false;
+    bool slow_complete = false;
+    std::size_t complete_arrays = 0U;
+    ASSERT_NO_THROW(session.Start([&](const MeasurementFrame& frame) {
+        const MeasurementSample* array = nullptr;
+        const MeasurementSample* scalar = nullptr;
+        const bool fast = frame.daq_list == 0U;
+        for (const auto& sample : frame.samples) {
+            if (sample.name == (fast ? fast_array : slow_array))
+                array = &sample;
+            if (sample.name == (fast ? fast_scalar : slow_scalar))
+                scalar = &sample;
+        }
+        if (array == nullptr || scalar == nullptr || !array->valid ||
+            !scalar->valid || !array->is_array || scalar->is_array ||
+            array->elements.size() != xcp_slave_demo::kSampleCount ||
+            array->raw.size() !=
+                sizeof(std::uint32_t) * xcp_slave_demo::kSampleCount) {
+            return;
+        }
+        bool consistent = true;
+        if (fast) {
+            const auto* input = std::get_if<double>(&scalar->value);
+            if (input == nullptr) return;
+            for (std::size_t index = 0; index < xcp_slave_demo::kSampleCount;
+                 ++index) {
+                const auto* element =
+                    std::get_if<double>(&array->elements[index]);
+                float raw = 0.0F;
+                std::memcpy(&raw, array->raw.data() + index * sizeof(raw),
+                            sizeof(raw));
+                const float expected =
+                    static_cast<float>(*input) +
+                    (index + 1U == xcp_slave_demo::kSampleCount
+                         ? kLastCorrection
+                         : 0.0F);
+                consistent =
+                    consistent && element != nullptr &&
+                    std::abs(raw - expected) < 1e-4F &&
+                    std::abs(*element - static_cast<double>(raw)) < 1e-4;
+            }
+        } else {
+            if (scalar->raw.size() != sizeof(std::uint32_t)) return;
+            std::uint32_t tick = 0U;
+            std::memcpy(&tick, scalar->raw.data(), sizeof(tick));
+            if (tick == 0U) return;
+            for (std::size_t index = 0; index < xcp_slave_demo::kSampleCount;
+                 ++index) {
+                std::uint32_t raw = 0U;
+                std::memcpy(&raw, array->raw.data() + index * sizeof(raw),
+                            sizeof(raw));
+                // 数据库可选择 int64/uint64/double 展示物理值，原始逐元素字节
+                // 与同一 DTO 内统计标量可直接验证 Slave 的真实环形历史。
+                const auto* unsigned_value =
+                    std::get_if<std::uint64_t>(&array->elements[index]);
+                const auto* signed_value =
+                    std::get_if<std::int64_t>(&array->elements[index]);
+                const auto* real_value =
+                    std::get_if<double>(&array->elements[index]);
+                consistent =
+                    consistent &&
+                    ((unsigned_value != nullptr && *unsigned_value == raw) ||
+                     (signed_value != nullptr && *signed_value == raw) ||
+                     (real_value != nullptr && *real_value == raw));
+                if (index == tick % xcp_slave_demo::kSampleCount) {
+                    consistent = consistent && raw == tick;
+                }
+            }
+        }
+        if (!consistent) return;
+        {
+            std::lock_guard<std::mutex> lock(samples_mutex);
+            ++complete_arrays;
+            if (fast)
+                fast_complete = true;
+            else
+                slow_complete = true;
+        }
+        samples_ready.notify_all();
+    }));
+    bool complete = false;
+    {
+        std::unique_lock<std::mutex> lock(samples_mutex);
+        complete = samples_ready.wait_for(lock, std::chrono::seconds(5), [&] {
+            return fast_complete && slow_complete;
+        });
+    }
+    const auto statistics = session.Statistics();
+    session.Stop();
+    master->Disconnect();
+    slave_process.Stop();
+    EXPECT_TRUE(complete) << "快慢数组未同时收到完整且与标量一致的八元素回调，"
+                          << "完整数组帧=" << complete_arrays
+                          << " DTO=" << statistics.dto_received
+                          << " 解码失败=" << statistics.decode_errors;
 }
 
 /// @brief 验证非法 CLI 配置失败退出且不会启动服务。
@@ -947,6 +1529,78 @@ TEST(XcpSlaveDemoIntegrationTest, InvalidCliArgumentsReturnUsageError) {
     ASSERT_TRUE(unsafe_endpoint_exit.has_value()) << error_message;
     EXPECT_EQ(*unsafe_endpoint_exit, 2);
     EXPECT_FALSE(std::filesystem::exists(unsafe_output));
+}
+
+/**
+ * @brief 汇总指定程序工作目录下从站产生的全部 glog 文件内容。
+ * @param service_directory 从站工作目录，日志位于其 logs 子目录下。
+ * @return 合并后的日志文本；目录或文件不存在时返回空字符串。
+ */
+std::string ReadSlaveLogs(const std::filesystem::path& service_directory) {
+    const auto log_directory =
+        service_directory / "logs" / "examples" / "xcp_slave_demo";
+    std::string merged;
+    if (!std::filesystem::is_directory(log_directory)) {
+        return merged;
+    }
+    for (const auto& entry :
+         std::filesystem::directory_iterator(log_directory)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        std::ifstream input(entry.path(), std::ios::binary);
+        if (!input.is_open()) {
+            continue;
+        }
+        merged.append(std::string((std::istreambuf_iterator<char>(input)),
+                                  std::istreambuf_iterator<char>()));
+    }
+    return merged;
+}
+
+/// @brief 常驻服务必须按固定间隔输出降频心跳，且心跳需反映真实协议状态。
+/// @note 仅在 LIBXCP_ENABLE_LOG=ON 时日志文件有内容；关闭时本用例退化为
+///       校验"不产生日志目录内容"且进程可正常启停。
+TEST(XcpSlaveDemoIntegrationTest, ServiceEmitsPeriodicHeartbeatLog) {
+    TemporaryDirectory directory("heartbeat");
+    const auto service_directory = directory.Path();
+    UdpPortReservation reservation;
+    ASSERT_TRUE(reservation.BindFree());
+    const auto port = reservation.Port();
+    // 让从站自行绑定：释放预留端口，避免与子进程争用。
+    reservation.Close();
+
+    DemoChildProcess slave_process;
+    std::string start_error;
+    ASSERT_TRUE(StartDemoProcess(
+        slave_process, {"--bind", "127.0.0.1", "--port", std::to_string(port)},
+        service_directory, &start_error))
+        << start_error;
+
+    // 心跳间隔为 5 秒（500 次 10 ms 快速循环）；等待覆盖至少一个心跳周期。
+    // glog 会缓冲写入，日志通常在进程退出（ShutdownGoogleLogging）时才落盘，
+    // 因此这里只等待足够时长，随后停止进程再读取文件。
+    const std::chrono::seconds kWaitForHeartbeat{9};
+    std::this_thread::sleep_for(kWaitForHeartbeat);
+
+    slave_process.Stop();
+    const std::string logs = ReadSlaveLogs(service_directory);
+
+#if LIBXCP_ENABLE_LOG
+    ASSERT_NE(logs.find("从站心跳"), std::string::npos)
+        << "常驻服务未在 " << kWaitForHeartbeat.count()
+        << " 秒内产生降频心跳日志；实际日志：" << logs;
+    // 心跳必须携带存活证据与真实协议状态字段。
+    EXPECT_NE(logs.find("累计快事件次数="), std::string::npos);
+    EXPECT_NE(logs.find("已连接="), std::string::npos);
+    EXPECT_NE(logs.find("DAQ 运行中="), std::string::npos);
+    // 无主站连接时，心跳应如实报告未连接。
+    EXPECT_NE(logs.find("已连接=false"), std::string::npos);
+#endif
+#if !LIBXCP_ENABLE_LOG
+    EXPECT_TRUE(logs.empty())
+        << "LIBXCP_ENABLE_LOG=OFF 时不应写入日志文件：" << logs;
+#endif
 }
 
 }  // namespace

@@ -205,6 +205,10 @@ function(libxcp_configure_program_logging target)
   else()
     target_compile_definitions(${target} PRIVATE LIBXCP_ENABLE_LOG=0)
   endif()
+  # log.hpp 为公共头。不链接 libxcp 核心或 libxcp_program_logging 的目标
+  # （如纯 XCPlite 的 xcp_slave_demo）必须显式获得 include 搜索路径，
+  # 否则关闭日志时 #include "libxcp/log.hpp" 会编译失败。
+  target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/include)
 endfunction()
 
 # ----------------------------------------------------------------------------

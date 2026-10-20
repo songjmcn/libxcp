@@ -60,6 +60,24 @@ MeasurementResult<MeasurementValue> EventBoundMeasurementDatabase::ToPhysical(
     return m_inner_.ToPhysical(name, raw);
 }
 
+MeasurementResult<MeasurementValue>
+EventBoundMeasurementDatabase::ToPhysicalElement(
+    std::string_view name, std::uint64_t element_index, BytesView raw) const {
+    const MeasurementResult<MeasurementSymbolInfo> info = Find(name);
+    if (!info.HasValue()) return info.ErrorInfo();
+    if (!info.Value().is_array || element_index >= info.Value().element_count) {
+        return MeasurementError{MeasurementErrorCode::InvalidLayout,
+                                "数组元素索引超出已绑定 A2L 布局",
+                                std::string{name}};
+    }
+    if (raw.size() != info.Value().element_size_bytes) {
+        return MeasurementError{MeasurementErrorCode::RawSizeMismatch,
+                                "数组元素原始长度与元素宽度不匹配",
+                                std::string{name}};
+    }
+    return m_inner_.ToPhysicalElement(name, element_index, raw);
+}
+
 MeasurementResult<GenericMeasurementRuntimeProfile>
 BuildGenericMeasurementRuntimeProfile(
     XcpMaster& master, std::span<const A2lEventMetadata> a2l_events) {
@@ -183,6 +201,13 @@ BuildXcpliteMeasurementRuntimeProfile(
     if (!resolution.has_value()) {
         return ProfileError("Slave 不支持或未返回 GET_DAQ_RESOLUTION_INFO");
     }
+    const auto session = master.GetSessionParameters();
+    const std::size_t ag_bytes = AgToBytes(session.connect.address_granularity);
+    if (resolution->granularity_daq == 0U ||
+        resolution->granularity_daq != ag_bytes ||
+        resolution->max_odt_entry_size_daq == 0U) {
+        return ProfileError("XCPlite DAQ Entry 粒度/最大长度与地址粒度不兼容");
+    }
     if (!resolution->timestamp_mode.fixed ||
         resolution->timestamp_mode.size_code != 4U) {
         return ProfileError("XCPlite profile 要求固定 32-bit 时间戳");
@@ -190,7 +215,6 @@ BuildXcpliteMeasurementRuntimeProfile(
     if (resolution->timestamp_ticks == 0U) {
         return ProfileError("DAQ 时间戳 ticks 必须大于 0");
     }
-    const auto session = master.GetSessionParameters();
     if (session.connect.byte_order != ByteOrder::Intel) {
         return ProfileError("当前 XCPlite 时间戳解码仅验证 Intel 字节序");
     }
@@ -243,6 +267,9 @@ BuildXcpliteMeasurementRuntimeProfile(
     XcpliteMeasurementRuntimeProfile profile;
     profile.timestamp_unit_ns =
         unit_ns * static_cast<std::uint64_t>(resolution->timestamp_ticks);
+    profile.daq_entry_capabilities = MeasurementDaqCapabilities{
+        true, resolution->granularity_daq,
+        resolution->max_odt_entry_size_daq};
     return profile;
 }
 
@@ -253,6 +280,7 @@ void ApplyMeasurementRuntimeProfile(
                             profile.identification_header_bytes);
     session.SetTimestampFirstOdtOnly(profile.timestamp_first_odt_only);
     session.SetTimestampUnit(profile.timestamp_unit_ns);
+    session.SetDaqEntryCapabilities(profile.daq_entry_capabilities);
 }
 
 }  // namespace calmcar::xcp

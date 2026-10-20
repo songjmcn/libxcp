@@ -137,6 +137,7 @@ void Reject(LayoutContext& ctx, const std::string& module,
  * @param member_path 完整路径（instance.member.…）
  * @param byte_offset 相对实例基址的字节偏移
  * @param count 元素数（MATRIX_DIM 乘积；标量=1）
+ * @param instance_fixed_events 所属 INSTANCE 原始固定事件列表
  * @return 组装好的叶子（宽度/换算/边界取自 tm；寻址取自实例+偏移）
  */
 [[nodiscard]] SymbolInfo MakeScalarLeaf(
@@ -144,7 +145,8 @@ void Reject(LayoutContext& ctx, const std::string& module,
     std::uint64_t base_address, std::uint8_t address_extension,
     bool instance_read_write, const std::string& ref_memory_segment,
     const std::string& member_path, std::uint64_t byte_offset,
-    std::uint64_t count) {
+    std::uint64_t count,
+    const std::vector<std::uint16_t>& instance_fixed_events) {
     SymbolInfo info;
     info.module_name = tm.module_name;
     info.name = member_path;  // 全限定路径（MODULE::instance.member.…）
@@ -187,6 +189,8 @@ void Reject(LayoutContext& ctx, const std::string& module,
     info.have_limit = tm.have_limit;
     info.lower_limit = tm.lower_limit;
     info.upper_limit = tm.upper_limit;
+    // 仅继承当前 INSTANCE 的固定事件；同一号重复声明由策略去重。
+    info.daq_event_fixed = instance_fixed_events;
     return info;
 }
 
@@ -317,6 +321,7 @@ void Reject(LayoutContext& ctx, const std::string& module,
  * @param depth 当前递归深度
  * @param chain 类型访问链（环检测，含当前 st 的 TypeKey）
  * @param leaf_budget_left 本实例剩余叶子预算（按引用递减）
+ * @param instance_fixed_events 所属 INSTANCE 固定 DAQ 事件（递归保持不变）
  */
 void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                   const std::string& inst_name, std::uint64_t base_address,
@@ -324,7 +329,8 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                   const std::string& ref_memory_segment,
                   const std::string& prefix, std::uint64_t struct_base,
                   int depth, std::vector<std::string>& chain,
-                  std::size_t& leaf_budget_left) {
+                  std::size_t& leaf_budget_left,
+                  const std::vector<std::uint16_t>& instance_fixed_events) {
     if (depth > kMaxDepth) {
         Reject(ctx, st.module_name, prefix,
                "结构递归深度超过上界 " + std::to_string(kMaxDepth) +
@@ -407,10 +413,10 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                 return;
             }
             --leaf_budget_left;
-            ctx.leaves.push_back(
-                MakeScalarLeaf(tm, inst_name, base_address, address_extension,
-                               instance_read_write, ref_memory_segment, path,
-                               struct_base + m->address_offset, count));
+            ctx.leaves.push_back(MakeScalarLeaf(
+                tm, inst_name, base_address, address_extension,
+                instance_read_write, ref_memory_segment, path,
+                struct_base + m->address_offset, count, instance_fixed_events));
             continue;
         }
 
@@ -487,11 +493,11 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
             for (std::uint64_t i = 0; i < count; ++i) {
                 std::string elem_prefix =
                     count == 1 ? path : (path + "[" + std::to_string(i) + "]");
-                ExpandStruct(ctx, child, inst_name, base_address,
-                             address_extension, instance_read_write,
-                             ref_memory_segment, elem_prefix,
-                             struct_base + m->address_offset + i * child_size,
-                             depth + 1, chain, leaf_budget_left);
+                ExpandStruct(
+                    ctx, child, inst_name, base_address, address_extension,
+                    instance_read_write, ref_memory_segment, elem_prefix,
+                    struct_base + m->address_offset + i * child_size, depth + 1,
+                    chain, leaf_budget_left, instance_fixed_events);
             }
             chain.pop_back();
             continue;
@@ -570,7 +576,7 @@ StructureLayoutResult BuildStructureLeaves(
             ExpandStruct(ctx, st, inst.name, inst.address,
                          inst.address_extension, inst.read_write,
                          inst.ref_memory_segment, prefix, i * st.size_bytes, 1,
-                         chain, budget);
+                         chain, budget, inst.daq_event_fixed);
         }
     }
     result.leaves = std::move(ctx.leaves);

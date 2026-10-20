@@ -19,11 +19,14 @@ using calmcar::xcp::tools::CommandHistory;
 using calmcar::xcp::tools::ConfirmationDecision;
 using calmcar::xcp::tools::ConfirmationGate;
 using calmcar::xcp::tools::LatestObservationModel;
+using calmcar::xcp::tools::NextPreviewFocusTarget;
 using calmcar::xcp::tools::NextViewIndex;
 using calmcar::xcp::tools::PanelViewport;
+using calmcar::xcp::tools::PreviewFocusTarget;
 using calmcar::xcp::tools::PreviewRowAction;
 using calmcar::xcp::tools::PreviewRowSource;
 using calmcar::xcp::tools::SearchInputRevision;
+using calmcar::xcp::tools::TuiInputModeState;
 using calmcar::xcp::tools::TuiLayoutMetrics;
 using calmcar::xcp::tools::VariableModalPage;
 using calmcar::xcp::tools::VariableModalState;
@@ -88,6 +91,61 @@ TEST(LatestObservationModelTest, EvictsOldestSymbolAtCapacity) {
     ASSERT_EQ(model.Size(), 2U);
     EXPECT_EQ(model.Lines()[0], "B=1");
     EXPECT_EQ(model.Lines()[1], "C=1");
+}
+
+/** @brief 预览焦点的正反向 Tab 均只在三个控件内循环。 */
+TEST(TuiInputModeStateTest, PreviewTabCyclesWithinSearchScopeAndList) {
+    EXPECT_EQ(NextPreviewFocusTarget(PreviewFocusTarget::List, false),
+              PreviewFocusTarget::Search);
+    EXPECT_EQ(NextPreviewFocusTarget(PreviewFocusTarget::Search, false),
+              PreviewFocusTarget::Scope);
+    EXPECT_EQ(NextPreviewFocusTarget(PreviewFocusTarget::Scope, false),
+              PreviewFocusTarget::List);
+    EXPECT_EQ(NextPreviewFocusTarget(PreviewFocusTarget::List, true),
+              PreviewFocusTarget::Scope);
+    EXPECT_EQ(NextPreviewFocusTarget(PreviewFocusTarget::Scope, true),
+              PreviewFocusTarget::Search);
+    EXPECT_EQ(NextPreviewFocusTarget(PreviewFocusTarget::Search, true),
+              PreviewFocusTarget::List);
+}
+
+/** @brief 默认只可操作预览列表，F7 入命令、Esc 回列表且不碰草稿。 */
+TEST(TuiInputModeStateTest,
+     CommandModeRequiresExplicitEntryAndKeepsDraftOnExit) {
+    TuiInputModeState mode;
+    int view = 0;
+    std::string draft = "watch";
+    EXPECT_FALSE(mode.InCommandMode());
+    EXPECT_EQ(*mode.Selector(), 0);
+    EXPECT_TRUE(mode.AllowsPreviewListAction(view, true));
+    EXPECT_FALSE(mode.AllowsPreviewListAction(view, false));
+
+    mode.EnterCommandMode();
+    mode.EnterCommandMode();
+    EXPECT_TRUE(mode.InCommandMode());
+    EXPECT_EQ(*mode.Selector(), 1);
+    EXPECT_FALSE(mode.AllowsPreviewListAction(view, true));
+    view = NextViewIndex(view, 3);
+    EXPECT_EQ(view, 1);
+    EXPECT_TRUE(mode.InCommandMode());
+
+    mode.LeaveCommandMode(view);
+    EXPECT_FALSE(mode.InCommandMode());
+    EXPECT_EQ(view, 0);
+    EXPECT_EQ(draft, "watch");
+    mode.EnterCommandMode();
+    EXPECT_EQ(draft, "watch");
+}
+
+/** @brief F2 浏览结果/日志不得在预览模式误触发列表快捷键。 */
+TEST(TuiInputModeStateTest, PreviewShortcutsNeedPreviewViewAndListFocus) {
+    TuiInputModeState mode;
+    EXPECT_FALSE(mode.AllowsPreviewListAction(1, true));
+    EXPECT_FALSE(mode.AllowsPreviewListAction(2, true));
+    EXPECT_FALSE(mode.AllowsPreviewListAction(0, false));
+    EXPECT_TRUE(mode.AllowsPreviewListAction(0, true));
+    mode.EnterCommandMode();
+    EXPECT_FALSE(mode.AllowsPreviewListAction(0, true));
 }
 
 /** @brief 验证历史浏览后恢复进入历史前的输入草稿。 */

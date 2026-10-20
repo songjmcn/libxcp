@@ -155,6 +155,12 @@ public:
      */
     void SetTimestampFirstOdtOnly(bool first_only);
 
+    /**
+     * @brief 注入已验证的 DAQ Entry 限制（须在 Prepare 前调用）
+     * @param capabilities 仅来自运行时 profile；默认能力不开放数组
+     */
+    void SetDaqEntryCapabilities(MeasurementDaqCapabilities capabilities);
+
     // ---- IEventListener（供 XcpMaster 回调；RX 线程只入队，不阻塞）----
     void OnEvent(const EventPacket& /*event*/) override {}   ///< EV 不处理
     void OnService(const ServicePacket& /*service*/) override {}  ///< SERV 不处理
@@ -172,6 +178,7 @@ private:
     IMeasurementDatabase& m_database_;
     XcpMaster* m_master_{nullptr};         ///< 经 Bind 绑定（可为空）
     bool m_bound_{false};
+    bool m_prepared_{false};
 
     std::vector<std::string> m_names_;     ///< 待测变量（用户线程持有锁访问）
     mutable std::mutex m_names_mutex_;
@@ -189,6 +196,7 @@ private:
     bool m_timestamp_first_odt_only_{
         false};  ///< 时间戳只随首 ODT 帧（v0.9 D13；SetTimestampFirstOdtOnly）
     bool m_timestamp_enabled_{true};  ///< Prepare 前配置；默认保持原有取证行为
+    MeasurementDaqCapabilities m_daq_entry_capabilities_{};  ///< 已验证的 Entry 限制
     std::uint8_t m_first_pid_{0};     ///< Absolute 模式 START 返回的 FIRST_PID
 
     // 运行态 + 队列 + worker（Start/Stop/OnDto/回调共享锁）
@@ -209,10 +217,13 @@ private:
 
     /// @brief 已规划的路由视图（Prepare 时建立；(daq_list,odt) → 有序切片规格）
     struct OdtSlice {
-        std::string name;     ///< 变量名
-        std::size_t offset{0}; ///< 净荷内偏移（相对于 envelope.payload@0）
-        std::size_t size{0};   ///< 实占字节数
+        std::string name;          ///< 变量名
+        std::size_t offset{0};     ///< 净荷内偏移（相对于 envelope.payload@0）
+        std::size_t size{0};       ///< 实占字节数
         bool needs_timestamp{false};
+        bool is_array{false};      ///< 本 Entry 是完整的一维数组
+        std::uint8_t element_count{1};
+        std::uint8_t element_size_bytes{0};
     };
     struct OdtView {
         std::uint8_t odt_number{0};

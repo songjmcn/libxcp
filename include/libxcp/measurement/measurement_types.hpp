@@ -31,6 +31,17 @@ namespace calmcar::xcp {
 using MeasurementValue =
     std::variant<std::int64_t, std::uint64_t, double, std::string, bool>;
 
+/**
+ * @brief 单个 DAQ Entry 的运行时限制（由已验证的运行时 profile 提供）
+ * @details `supports_contiguous_1d_arrays=false` 时数组保持拒绝；粒度或最大
+ *          Entry 长度为 0 表示未知，不能据此开放数组。
+ */
+struct MeasurementDaqCapabilities {
+    bool supports_contiguous_1d_arrays{false};  ///< 是否允许首期连续一维数组 Entry
+    std::uint8_t entry_granularity_bytes{0};     ///< DAQ Entry 粒度，0 表示未知
+    std::uint8_t max_entry_size_bytes{0};        ///< 单 Entry 最大字节数，0 表示未知
+};
+
 }  // namespace calmcar::xcp
 
 #endif  // CALMCAR_XCP_MEASUREMENT_MEASUREMENT_TYPES_HPP_
