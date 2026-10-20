@@ -4,6 +4,7 @@
  */
 
 #include "libxcp/memory_access.hpp"
+#include "libxcp/log.hpp"
 
 #include <string>
 #include <utility>
@@ -31,9 +32,11 @@ ElementCount MemoryAccess::MaxUploadElements() const {
 void MemoryAccess::ValidateRead(Address address,
                                 ElementCount element_count) const {
     if (!m_session_.IsConnected()) {
+        LIBXCP_LOG_ERROR("Memory read rejected: XCP session is not connected");
         throw detail::MakeInvalidState("读取内存前必须先建立 XCP 连接");
     }
     if (element_count == 0U) {
+        LIBXCP_LOG_ERROR("Memory read rejected: element_count is zero");
         throw detail::MakeInvalidArgument("读取元素数必须大于 0");
     }
     const auto ag = m_session_.GetAddressGranularity();
@@ -41,6 +44,10 @@ void MemoryAccess::ValidateRead(Address address,
         static_cast<std::uint64_t>(element_count) * AgToBytes(ag);
     const auto end_exclusive = static_cast<std::uint64_t>(address) + byte_count;
     if (end_exclusive > 0x100000000ULL) {
+        LIBXCP_LOG_ERROR(
+            "Memory read rejected: 32-bit address overflow address={} "
+            "elements={} ag_bytes={}",
+            address, element_count, AgToBytes(ag));
         throw detail::MakeInvalidArgument(
             "读取范围导致 32 位地址溢出: address=0x" + std::to_string(address) +
             ", elements=" + std::to_string(element_count) +
@@ -59,6 +66,8 @@ Bytes MemoryAccess::ShortUpload(Address address, AddressExtension extension,
                                 ElementCount element_count) {
     ValidateRead(address, element_count);
     if (element_count > MaxShortUploadElements()) {
+        LIBXCP_LOG_ERROR("SHORT_UPLOAD rejected: element_count={} maximum={}",
+                         element_count, MaxShortUploadElements());
         throw detail::MakeInvalidArgument(
             "SHORT_UPLOAD 元素数 " + std::to_string(element_count) +
             " 超过单包上限 MAX_CTO/AG = " +
@@ -72,6 +81,7 @@ Bytes MemoryAccess::UploadChunked(Address address, AddressExtension extension,
     ValidateRead(address, element_count);
     const auto chunk_limit = MaxUploadElements();
     if (chunk_limit == 0U) {
+        LIBXCP_LOG_ERROR("UPLOAD rejected: MAX_CTO/AG leaves no chunk capacity");
         throw detail::MakeInvalidArgument(
             "当前 Session 的 MAX_CTO/AG 过小，无法使用 UPLOAD 分块读取");
     }
@@ -109,6 +119,7 @@ Bytes MemoryAccess::UploadChunked(Address address, AddressExtension extension,
         }
         const auto next = cursor.Advance(chunk, ag);
         if (!next) {
+            LIBXCP_LOG_ERROR("UPLOAD rejected: chunk address advance overflow");
             throw detail::MakeInvalidArgument(
                 "UPLOAD 分块推进时 32 位地址溢出");
         }
@@ -143,9 +154,13 @@ Bytes MemoryAccess::ReadBytes(Address address, AddressExtension extension,
                               ByteCount byte_count) {
     const auto ag_bytes = AgToBytes(m_session_.GetAddressGranularity());
     if (byte_count == 0U) {
+        LIBXCP_LOG_ERROR("Memory read rejected: byte_count is zero");
         throw detail::MakeInvalidArgument("读取字节数必须大于 0");
     }
     if ((byte_count % ag_bytes) != 0U) {
+        LIBXCP_LOG_ERROR(
+            "Memory read rejected: byte_count={} is not aligned to ag_bytes={}",
+            byte_count, ag_bytes);
         throw detail::MakeInvalidArgument(
             "读取字节数 " + std::to_string(byte_count) +
             " 不能被 Address Granularity (" + std::to_string(ag_bytes) +
@@ -183,17 +198,24 @@ ElementCount MemoryAccess::MaxShortDownloadElements() const {
 ElementCount MemoryAccess::ValidateWrite(Address address,
                                          BytesView data) const {
     if (!m_session_.IsConnected()) {
+        LIBXCP_LOG_ERROR("Memory write rejected: XCP session is not connected");
         throw detail::MakeInvalidState("写入内存前必须先建立 XCP 连接");
     }
     if (data.empty()) {
+        LIBXCP_LOG_ERROR("Memory write rejected: data is empty");
         throw detail::MakeInvalidArgument("写入数据不能为空");
     }
     const auto ag = m_session_.GetAddressGranularity();
     const auto ag_bytes = static_cast<std::uint64_t>(AgToBytes(ag));
     if (ag_bytes == 0U) {
+        LIBXCP_LOG_ERROR("Memory write rejected: address granularity is zero");
         throw detail::MakeInvalidArgument("地址粒度为 0，Session 参数非法");
     }
     if ((data.size() % ag_bytes) != 0U) {
+        LIBXCP_LOG_ERROR(
+            "Memory write rejected: byte_count={} is not aligned to "
+            "ag_bytes={}",
+            data.size(), ag_bytes);
         throw detail::MakeInvalidArgument(
             "写入字节数 " + std::to_string(data.size()) +
             " 不能被 Address Granularity (" + std::to_string(ag_bytes) +
@@ -205,6 +227,9 @@ ElementCount MemoryAccess::ValidateWrite(Address address,
         static_cast<std::uint64_t>(address) +
         static_cast<std::uint64_t>(element_count) * ag_bytes;
     if (end_exclusive > 0x100000000ULL) {
+        LIBXCP_LOG_ERROR(
+            "Memory write rejected: 32-bit address overflow address={} bytes={} ag_bytes={}",
+            address, data.size(), ag_bytes);
         throw detail::MakeInvalidArgument(
             "写入范围导致 32 位地址溢出: address=0x" + std::to_string(address) +
             ", bytes=" + std::to_string(data.size()) +
@@ -218,6 +243,8 @@ void MemoryAccess::DownloadChunked(Address address, AddressExtension extension,
     const ElementCount element_count = ValidateWrite(address, data);
     const auto chunk_limit = MaxDownloadElements();
     if (chunk_limit == 0U) {
+        LIBXCP_LOG_ERROR(
+            "DOWNLOAD rejected: MAX_CTO/AG leaves no chunk capacity");
         throw detail::MakeInvalidArgument(
             "当前 Session 的 (MAX_CTO-2)/AG 过小，无法使用 DOWNLOAD 分块写入");
     }
@@ -262,6 +289,8 @@ void MemoryAccess::DownloadChunked(Address address, AddressExtension extension,
         // byte_offset = chunk*AG，AG 只做单位换算，绝不乘进地址）
         const auto next = cursor.Advance(chunk, ag);
         if (!next) {
+            LIBXCP_LOG_ERROR(
+                "DOWNLOAD rejected: chunk address advance overflow");
             throw detail::MakeInvalidArgument(
                 "DOWNLOAD 分块推进时 32 位地址溢出");
         }
@@ -303,9 +332,11 @@ void MemoryAccess::ModifyBits(Address address, AddressExtension extension,
                               std::uint8_t shift, std::uint16_t and_mask,
                               std::uint16_t xor_mask) {
     if (!m_session_.IsConnected()) {
+        LIBXCP_LOG_ERROR("MODIFY_BITS rejected: XCP session is not connected");
         throw detail::MakeInvalidState("位修改前必须先建立 XCP 连接");
     }
     if (shift > kModifyBitsMaxShift) {
+        LIBXCP_LOG_ERROR("MODIFY_BITS rejected: shift={} exceeds 16", shift);
         throw detail::MakeInvalidArgument(
             "MODIFY_BITS Shift Value 超出范围 0..16: " +
             std::to_string(shift));
@@ -314,6 +345,9 @@ void MemoryAccess::ModifyBits(Address address, AddressExtension extension,
     const auto end_exclusive =
         static_cast<std::uint64_t>(address) + 4ULL;
     if (end_exclusive > 0x100000000ULL) {
+        LIBXCP_LOG_ERROR(
+            "MODIFY_BITS rejected: target address {} overflows 32-bit range",
+            address);
         throw detail::MakeInvalidArgument(
             "MODIFY_BITS 目标地址 0x" + std::to_string(address) +
             " + 4 Byte 越过 32 位边界");

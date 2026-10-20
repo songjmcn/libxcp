@@ -38,6 +38,12 @@ FetchContent_MakeAvailable(googletest)
 set_property(TARGET gtest PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "")
 set_property(TARGET gtest_main PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "")
 
+# 使用项目自有 main 管理测试进程级日志；测试发现模式不初始化 glog。
+add_library(libxcp_test_main STATIC test_main.cpp)
+target_compile_features(libxcp_test_main PRIVATE cxx_std_20)
+target_link_libraries(libxcp_test_main PUBLIC GTest::gtest)
+libxcp_configure_program_logging(libxcp_test_main)
+
 add_executable(libxcp_tests
         protocol_types_test.cpp
         xcp_error_test.cpp
@@ -59,12 +65,13 @@ add_executable(libxcp_tests
         measurement_planner_test.cpp
         measurement_session_test.cpp
         daq_timestamp_test.cpp
-        measurement_session_hardening_test.cpp)
+        measurement_session_hardening_test.cpp
+        logging_test.cpp)
 
 target_link_libraries(libxcp_tests PRIVATE
         libxcp::libxcp
         GTest::gtest
-        GTest::gtest_main)
+        libxcp_test_main)
 
 # 测试设施头文件目录（mock_transport.hpp 等），仅 tests 内部可见
 target_include_directories(libxcp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -104,7 +111,7 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
           libxcp::libxcp
           libxcp::a2lbridge libxcp_measurement_adapter
           GTest::gtest
-          GTest::gtest_main)
+          libxcp_test_main)
   # 夹具与共享类型头的搜索路径（tests/ 与 tests/xcp_test_slave/）
   target_include_directories(XcpliteIntegration PRIVATE
           ${CMAKE_CURRENT_SOURCE_DIR})
@@ -162,6 +169,7 @@ add_executable(A2lSmoke a2l_smoke_test.cpp)
 target_compile_features(A2lSmoke PRIVATE cxx_std_20)
 # 经桥接层消费（libxcp::a2lbridge PUBLIC 传播 liba2l 导入目标的头与链接库）
 target_link_libraries(A2lSmoke PRIVATE libxcp::a2lbridge)
+libxcp_configure_program_logging(A2lSmoke)
 target_compile_definitions(A2lSmoke PRIVATE A2L_GOLDEN_PATH="${A2L_GOLDEN_FILE}")
 if(MSVC)
   target_compile_options(A2lSmoke PRIVATE /utf-8)
@@ -180,7 +188,7 @@ set_tests_properties(A2lSmoke PROPERTIES FIXTURES_REQUIRED A2lGolden)
 # ----------------------------------------------------------------------------
 add_executable(A2lGolden a2l_golden_test.cpp)
 target_compile_features(A2lGolden PRIVATE cxx_std_20)
-target_link_libraries(A2lGolden PRIVATE libxcp::a2lbridge GTest::gtest_main)
+target_link_libraries(A2lGolden PRIVATE libxcp::a2lbridge libxcp_test_main)
 target_compile_definitions(A2lGolden PRIVATE
         A2L_GOLDEN_DIR="${A2L_GOLDEN_DIR}"
         A2L_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/a2l"
@@ -207,7 +215,7 @@ set_tests_properties(A2lGolden PROPERTIES FIXTURES_REQUIRED A2lGolden
 add_executable(A2lE2E a2l_e2e_test.cpp udp_test_slave.cpp)
 target_compile_features(A2lE2E PRIVATE cxx_std_20)
 target_link_libraries(A2lE2E PRIVATE
-        libxcp::libxcp libxcp::a2lbridge GTest::gtest_main)
+        libxcp::libxcp libxcp::a2lbridge libxcp_test_main)
 target_compile_definitions(A2lE2E PRIVATE
         A2L_GOLDEN_DIR="${A2L_GOLDEN_DIR}")
 target_include_directories(A2lE2E PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -231,7 +239,7 @@ target_compile_features(MeasurementAdapterTest PRIVATE cxx_std_20)
 target_link_libraries(MeasurementAdapterTest PRIVATE
         libxcp_measurement_adapter
         GTest::gtest
-        GTest::gtest_main)
+        libxcp_test_main)
 target_include_directories(MeasurementAdapterTest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR})
 if(MSVC)
@@ -293,7 +301,7 @@ if(LIBXCP_BUILD_TOOLS)
   target_include_directories(XcpMasterSymbolPolicyTest PRIVATE
           ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
   target_link_libraries(XcpMasterSymbolPolicyTest PRIVATE
-          libxcp::a2lbridge GTest::gtest GTest::gtest_main Threads::Threads)
+          libxcp::a2lbridge GTest::gtest libxcp_test_main Threads::Threads)
   if(MSVC)
     target_compile_options(XcpMasterSymbolPolicyTest PRIVATE /utf-8)
   endif()
@@ -306,5 +314,39 @@ target_compile_features(A2lLogTimestampTest PRIVATE cxx_std_20)
 target_include_directories(A2lLogTimestampTest PRIVATE
         ${PROJECT_SOURCE_DIR}/thirdparty/a2l-sdk/src)
 target_link_libraries(A2lLogTimestampTest PRIVATE
-        a2l Boost::locale GTest::gtest GTest::gtest_main)
+        a2l Boost::locale GTest::gtest libxcp_test_main)
 gtest_discover_tests(A2lLogTimestampTest DISCOVERY_TIMEOUT 60)
+
+if(LIBXCP_ENABLE_LOG)
+  # 独立探针用于黑盒检查日志文件、标准流隔离、不可写目录与 discovery。
+  add_executable(libxcp_logging_probe logging_probe.cpp)
+  target_compile_features(libxcp_logging_probe PRIVATE cxx_std_20)
+  target_link_libraries(libxcp_logging_probe PRIVATE libxcp::libxcp)
+  libxcp_configure_program_logging(libxcp_logging_probe)
+
+  set(LIBXCP_LOG_TEST_ROOT "${CMAKE_CURRENT_BINARY_DIR}/log-behavior")
+  add_test(NAME LibxcpLogFileOutput
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=file-output"
+                   "-DPROBE_EXE=$<TARGET_FILE:libxcp_logging_probe>"
+                   "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
+  add_test(NAME LibxcpLogControlRecovery
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=control-recovery"
+                   "-DTEST_EXE=$<TARGET_FILE:libxcp_tests>"
+                   "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
+  add_test(NAME LibxcpLogUnwritableDirectory
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=unwritable"
+                   "-DPROBE_EXE=$<TARGET_FILE:libxcp_logging_probe>"
+                   "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
+  add_test(NAME LibxcpLogDiscoveryNoDirectory
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=discovery"
+                   "-DTEST_EXE=$<TARGET_FILE:libxcp_tests>"
+                   "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
+endif()

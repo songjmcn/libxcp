@@ -17,6 +17,10 @@
 
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "slave_registry.hpp"
+
+#if LIBXCP_ENABLE_LOG
+#include "program_logging.hpp"
+#endif
 #include "xcplib.h"
 
 #ifndef XCP_104_AML_FILE
@@ -572,6 +576,14 @@ int main(int argc, char* argv[]) {
         xcp_slave_demo::PrintUsage();
         return 0;
     }
+#if LIBXCP_ENABLE_LOG
+    calmcar::xcp::internal::ProgramLogSession logging;
+    std::string log_error;
+    if (!logging.Initialize(argv[0], "examples", log_error)) {
+        std::cerr << "日志初始化失败: " << log_error << '\n';
+        return 2;
+    }
+#endif
     if (options.generate_a2l) {
         return xcp_slave_demo::GenerateA2l(options);
     }

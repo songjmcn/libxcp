@@ -15,6 +15,7 @@ target_compile_features(xcp_slave_demo PRIVATE cxx_std_20)
 target_link_libraries(xcp_slave_demo PRIVATE
         xcplite::xcplite
         libxcp::a2lbridge)
+libxcp_configure_program_logging(xcp_slave_demo)
 target_compile_definitions(xcp_slave_demo PRIVATE
         XCP_104_AML_FILE="${XCPLITE_A2L_INCLUDE_DIR}/XCP_104.aml"
         XCP_THIRDPARTY_DIR="${PROJECT_SOURCE_DIR}/thirdparty")

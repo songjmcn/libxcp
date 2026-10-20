@@ -27,11 +27,16 @@
 #include <libxcp/measurement/measurement_database.hpp>
 #include <libxcp/measurement/measurement_sample.hpp>
 #include <libxcp/measurement/measurement_session.hpp>
+#include <libxcp/log.hpp>
 #include <libxcp/protocol_types.hpp>
 #include <libxcp/udp_transport.hpp>
 #include <libxcp/udp_transport_config.hpp>
 #include <libxcp/xcp_error.hpp>
 #include <libxcp/xcp_master.hpp>
+
+#if LIBXCP_ENABLE_LOG
+#include "program_logging.hpp"
+#endif
 
 #include <a2l/a2l_measurement_database.hpp>
 #include <a2l/measurement_runtime_profile.hpp>
@@ -813,8 +818,20 @@ Bytes FetchAndSaveA2l(const Options& o) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if LIBXCP_ENABLE_LOG
+    calmcar::xcp::internal::ProgramLogSession logging;
+    bool logging_initialized = false;
+#endif
     try {
         const Options options = ParseOptions(argc, argv);
+#if LIBXCP_ENABLE_LOG
+        std::string log_error;
+        if (!logging.Initialize(argv[0], "examples", log_error)) {
+            std::fprintf(stderr, "日志初始化失败: %s\n", log_error.c_str());
+            return 2;
+        }
+        logging_initialized = true;
+#endif
         xcp_example::DemoProcess cpp_demo_process;
         if (options.cpp_demo_profile) {
             StartLocalCppDemo(options, cpp_demo_process);
@@ -937,9 +954,21 @@ int main(int argc, char** argv) {
         master->Disconnect();
         return 0;
     } catch (const XcpException& error) {
+#if LIBXCP_ENABLE_LOG
+        if (logging_initialized) {
+            LIBXCP_LOG_ERROR(
+                "XCP integration example failed with XcpException");
+        }
+#endif
         std::fprintf(stderr, "XCP error: %s\n", error.what());
         return 1;
     } catch (const std::exception& error) {
+#if LIBXCP_ENABLE_LOG
+        if (logging_initialized) {
+            LIBXCP_LOG_ERROR(
+                "XCP integration example failed with std::exception");
+        }
+#endif
         std::fprintf(stderr, "Error: %s\n", error.what());
         return 2;
     }

@@ -40,6 +40,10 @@
 #include <libxcp/xcp_error.hpp>
 #include <libxcp/xcp_master.hpp>
 
+#if LIBXCP_ENABLE_LOG
+#include "program_logging.hpp"
+#endif
+
 #include "demo_process.hpp"
 
 namespace fs = std::filesystem;
@@ -454,8 +458,19 @@ int main(int argc, char** argv) {
     }
 #endif
 
+#if LIBXCP_ENABLE_LOG
+    calmcar::xcp::internal::ProgramLogSession logging;
+    std::string log_error;
+    if (!logging.Initialize(argv[0], "examples", log_error)) {
+        std::fprintf(stderr, "日志初始化失败: %s\n", log_error.c_str());
+        return 2;
+    }
+#endif
+
     if (PortLooksOccupied(opt)) {
-        std::printf("[env] 端口 %u 已被占用（疑似已有 XCP slave 在跑），请先停止\n", opt.port);
+        std::printf(
+            "[env] 端口 %u 已被占用（疑似已有 XCP slave 在跑），请先停止\n",
+            opt.port);
         return 2;
     }
 

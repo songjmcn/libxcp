@@ -30,6 +30,10 @@
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/a2l/compu_method.hpp"
 
+#if LIBXCP_ENABLE_LOG
+#include "program_logging.hpp"
+#endif
+
 #ifndef A2L_GOLDEN_PATH
 #error "A2L_GOLDEN_PATH 编译定义缺失（由 tests/CMakeLists.txt 注入）"
 #endif
@@ -385,7 +389,17 @@ void CheckAsyncLoad() {
 }  // namespace
 
 /// @brief 入口：按 G1→G6 顺序执行；返回失败断言数作为进程退出码
-int main() {
+int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
+#if LIBXCP_ENABLE_LOG
+    calmcar::xcp::internal::ProgramLogSession logging;
+    std::string log_error;
+    if (!logging.Initialize(argv[0], "tests", log_error)) {
+        std::fprintf(stderr, "日志初始化失败: %s\n", log_error.c_str());
+        return 2;
+    }
+#endif
     // G1 —— DLL 可加载 + ABI 校验
     Gate1AbiCheck();
     // G1b —— LastErrorChain 通道契约（批次12 ABI v3）

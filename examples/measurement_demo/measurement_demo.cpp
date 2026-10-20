@@ -69,6 +69,10 @@
 #include <libxcp/xcp_error.hpp>
 #include <libxcp/xcp_master.hpp>
 
+#if LIBXCP_ENABLE_LOG
+#include "program_logging.hpp"
+#endif
+
 #include <a2l/a2l_measurement_database.hpp>
 #include <a2l/measurement_runtime_profile.hpp>
 
@@ -1030,6 +1034,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+    }
+#endif
+
+#if LIBXCP_ENABLE_LOG
+    calmcar::xcp::internal::ProgramLogSession logging;
+    std::string log_error;
+    if (!logging.Initialize(argv[0], "examples", log_error)) {
+        std::fprintf(stderr, "日志初始化失败: %s\n", log_error.c_str());
+        return 2;
     }
 #endif
 

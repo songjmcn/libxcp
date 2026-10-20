@@ -7,8 +7,11 @@
 
 #include "libxcp/command_executor.hpp"
 
+#include <algorithm>
 #include <string>
 #include <utility>
+
+#include "libxcp/log.hpp"
 
 namespace calmcar::xcp {
 
@@ -22,6 +25,59 @@ std::string toHex(std::uint8_t value) {
     out.push_back(kDigits[value & 0x0FU]);
     return out;
 }
+
+#if LIBXCP_ENABLE_LOG
+/// @brief 判断命令是否包含 Seed 或 Key 敏感内容。
+bool IsSeedKeyCommand(CommandCode command) noexcept {
+    return command == CommandCode::GetSeed || command == CommandCode::Unlock;
+}
+
+/// @brief 报文摘要及长度/脱敏元信息。
+struct PacketLogSummary {
+    std::string data;         ///< 十六进制摘要或脱敏标记。
+    std::size_t shown_bytes;  ///< 实际显示的原始字节数。
+    bool truncated;           ///< 是否因长度上限截断。
+    bool redacted;            ///< 是否因敏感信息规则脱敏。
+};
+
+/// @brief 生成受长度上限与 Seed/Key 规则保护的报文摘要。
+PacketLogSummary SummarizePacket(BytesView packet, bool redact) {
+    if (redact) {
+        return {"<redacted>", 0, false, true};
+    }
+
+    constexpr std::size_t kMaximumBytes = 64;
+    const std::size_t shown = std::min(packet.size(), kMaximumBytes);
+    std::string summary;
+    for (std::size_t index = 0; index < shown; ++index) {
+        if (!summary.empty()) {
+            summary.push_back(' ');
+        }
+        summary += toHex(packet[index]);
+    }
+    if (packet.size() > shown) {
+        summary += " ... (" + std::to_string(packet.size() - shown) +
+                   " bytes omitted)";
+    }
+    return {std::move(summary), shown, packet.size() > shown, false};
+}
+
+/// @brief 返回 PID 的协议包类型名称。
+std::string_view PacketTypeName(std::uint8_t pid) noexcept {
+    switch (pid) {
+        case static_cast<std::uint8_t>(PacketType::Res):
+            return "RES";
+        case static_cast<std::uint8_t>(PacketType::Err):
+            return "ERR";
+        case static_cast<std::uint8_t>(PacketType::Ev):
+            return "EV";
+        case static_cast<std::uint8_t>(PacketType::Serv):
+            return "SERV";
+        default:
+            return "DTO";
+    }
+}
+#endif
 
 /// @brief 构造带命令上下文的 ProtocolError 消息
 std::string protocolMessage(std::string_view prefix, CommandCode cmd,
@@ -126,15 +182,47 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
     // 解析必须在锁外完成：parser 无共享状态，且避免长时间持有 m_mutex_。
     // expectedCommand 仅在 PositiveResponse 中作上下文标记；响应匹配依赖
     // “单 Pending Command + RES/ERR PID”，不使用 CTR 匹配（计划 §4.7）。
-    const auto expected =
-        m_session_.PendingCommand().value_or(CommandCode::GetStatus);
+    // 日志另行保留真实 Pending Command，不能把解析用的默认值当作真实上下文。
+    const auto pending_command = m_session_.PendingCommand();
+    const auto expected = pending_command.value_or(CommandCode::GetStatus);
+    if (packet.empty()) {
+        LIBXCP_LOG_WARNING("收到空 XCP Packet");
+        return;
+    }
     if (!m_parser_) {
+        LIBXCP_LOG_WARNING("Parser 尚未就绪时收到 XCP Packet: pid={}, bytes={}",
+                           toHex(packet.front()), packet.size());
         return;  // CONNECT 之前尚无 Parser：此时不应有任何 Slave 流量
     }
     const auto parsed = m_parser_->Parse(packet, expected);
     if (!parsed) {
+        LIBXCP_LOG_WARNING("收到畸形 XCP Packet: pid={}, bytes={}",
+                           toHex(packet.front()), packet.size());
         return;  // 空包/畸形包：报告但不终止会话
     }
+
+#if LIBXCP_ENABLE_LOG
+    const bool response_packet =
+        packet.front() == static_cast<std::uint8_t>(PacketType::Res) ||
+        packet.front() == static_cast<std::uint8_t>(PacketType::Err);
+    // 响应没有事务关联 ID，不能根据当前 pending 命令判断其内容安全；迟到的
+    // GET_SEED/UNLOCK 响应可能落入其他命令上下文，因此所有 RES/ERR 正文均脱敏。
+    const bool redact_packet = response_packet;
+    const PacketLogSummary packet_summary =
+        SummarizePacket(packet, redact_packet);
+    const std::string command_context =
+        !response_packet
+            ? "n/a"
+            : (pending_command
+                   ? toHex(static_cast<std::uint8_t>(*pending_command))
+                   : "unknown");
+    LIBXCP_LOG_INFO(
+        "XCP RX {} pid={} bytes={} command={} shown_bytes={} truncated={} "
+        "redacted={} data={}",
+        PacketTypeName(packet.front()), toHex(packet.front()), packet.size(),
+        command_context, packet_summary.shown_bytes, packet_summary.truncated,
+        packet_summary.redacted, packet_summary.data);
+#endif
 
     bool notify_response = false;
     bool notify_synch = false;
@@ -142,10 +230,17 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
     std::optional<ServicePacket> async_service;
     std::optional<DtoPacket> async_dto;
     bool notify_malformed = false;
+    // 控制包的分流结论在锁内决定，在锁外记录；DTO 不增加逐帧处理日志。
+    std::string_view control_route;
 
     {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         if (m_transport_closed_) {
+            if (!std::holds_alternative<DtoPacket>(*parsed)) {
+                LIBXCP_LOG_INFO(
+                    "XCP RX ignored: transport already closed pid={}",
+                    toHex(packet.front()));
+            }
             return;  // 关闭后到达的迟到包忽略
         }
 
@@ -153,10 +248,13 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
             // 响应槽位已被占用说明协议失步：丢弃并上报畸形，绝不覆盖前一条响应
             if (m_response_ready_) {
                 notify_malformed = true;
+                control_route =
+                    "duplicate RES discarded; response slot occupied";
             } else {
                 m_pending_response_ = *res;
                 m_response_ready_ = true;
                 notify_response = true;
+                control_route = "RES stored; waiter notified";
             }
         } else if (const auto* err = std::get_if<NegativeResponse>(&*parsed)) {
             if (m_in_recovery_ && err->error_code &&
@@ -165,12 +263,17 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
                 // 条）
                 m_synch_confirmed_ = true;
                 notify_synch = true;
+                control_route =
+                    "ERR_CMD_SYNCH confirms recovery; SYNCH waiter notified";
             } else if (m_response_ready_) {
                 notify_malformed = true;
+                control_route =
+                    "duplicate ERR discarded; response slot occupied";
             } else {
                 m_pending_response_ = *err;
                 m_response_ready_ = true;
                 notify_response = true;
+                control_route = "ERR stored; waiter notified";
             }
         } else if (const auto* ev = std::get_if<EventPacket>(&*parsed)) {
             if (ev->event_code && *ev->event_code == EventCode::CmdPending) {
@@ -179,15 +282,26 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
                 // 只置标记并唤醒等待循环，不占用响应槽位；事件本身仍需上报。
                 m_cmd_pending_received_ = true;
                 notify_response = true;
+                control_route =
+                    "EV_CMD_PENDING marked; waiter notified; command not "
+                    "replayed";
+            } else {
+                control_route =
+                    "EV delivered asynchronously; response slot unchanged";
             }
             async_event = *ev;
         } else if (const auto* serv = std::get_if<ServicePacket>(&*parsed)) {
+            control_route =
+                "SERV delivered asynchronously; response slot unchanged";
             async_service = *serv;
         } else if (const auto* dto = std::get_if<DtoPacket>(&*parsed)) {
             async_dto = *dto;
         }
     }
 
+    if (!control_route.empty()) {
+        LIBXCP_LOG_INFO("XCP control route: {}", control_route);
+    }
     if (notify_response) {
         m_response_cv_.notify_all();
     }
@@ -216,6 +330,7 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
 }
 
 void CommandExecutor::OnTransportClosed(std::string_view reason) {
+    LIBXCP_LOG_INFO("XCP Transport closed: {}", reason);
     {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         m_transport_closed_ = true;
@@ -225,9 +340,12 @@ void CommandExecutor::OnTransportClosed(std::string_view reason) {
     m_synch_cv_.notify_all();
 }
 
-void CommandExecutor::OnTransportWarning(std::string_view /*message*/) {
-    // Transport 层的可恢复诊断（畸形 Datagram、CTR 缺口等）不影响命令事务，
-    // 本阶段不上抛；后续批次可按需接入日志设施。
+void CommandExecutor::OnTransportWarning(std::string_view message) {
+    // 关闭日志后宏不求值参数；此处仍明确消费参数，避免OFF构建未使用警告。
+    (void)message;
+    // Transport 层可恢复诊断（畸形 Datagram、CTR
+    // 缺口等）只记录，不改变事务状态。
+    LIBXCP_LOG_WARNING("XCP Transport warning: {}", message);
 }
 
 // ---------------------------------------------------------------------------
@@ -236,6 +354,7 @@ void CommandExecutor::OnTransportWarning(std::string_view /*message*/) {
 
 std::optional<ParsedPacket> CommandExecutor::WaitForResponse(
     std::chrono::milliseconds timeout) {
+    LIBXCP_LOG_INFO("XCP response wait started timeout_ms={}", timeout.count());
     std::unique_lock<std::mutex> lock(m_mutex_);
     auto deadline = std::chrono::steady_clock::now() + timeout;
 
@@ -245,10 +364,17 @@ std::optional<ParsedPacket> CommandExecutor::WaitForResponse(
             m_pending_response_.reset();
             m_response_ready_ = false;
             m_cmd_pending_received_ = false;
+            // 槽位状态在临界区内确定，解锁后再输出，避免 sink 阻塞接收线程。
+            lock.unlock();
+            LIBXCP_LOG_INFO(
+                "XCP response slot consumed; pending event cleared");
             return out;
         }
         if (m_transport_closed_) {
             m_cmd_pending_received_ = false;
+            lock.unlock();
+            LIBXCP_LOG_WARNING(
+                "XCP response wait interrupted: transport closed");
             return std::nullopt;
         }
 
@@ -256,11 +382,19 @@ std::optional<ParsedPacket> CommandExecutor::WaitForResponse(
         if (m_cmd_pending_received_) {
             m_cmd_pending_received_ = false;
             deadline = std::chrono::steady_clock::now() + timeout;
+            // 必须记录和 deadline 同一次原子状态决定，低频控制事件锁内输出。
+            LIBXCP_LOG_INFO(
+                "XCP EV_CMD_PENDING restarted response timer timeout_ms={}; "
+                "command not replayed",
+                timeout.count());
         }
 
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline) {
             m_cmd_pending_received_ = false;
+            lock.unlock();
+            LIBXCP_LOG_WARNING("XCP response wait expired timeout_ms={}",
+                               timeout.count());
             return std::nullopt;
         }
         if (m_response_cv_.wait_until(lock, deadline) ==
@@ -273,6 +407,24 @@ std::optional<ParsedPacket> CommandExecutor::WaitForResponse(
 ParsedPacket CommandExecutor::DispatchResponse(CommandCode cmd,
                                                const ParsedPacket& response) {
     if (const auto* err = std::get_if<NegativeResponse>(&response)) {
+        const std::string error_code =
+            err->error_code ? std::string(ErrorCodeName(*err->error_code))
+                            : toHex(err->raw_error_code);
+        const bool optional_command_unsupported =
+            err->error_code && *err->error_code == ErrorCode::CmdUnknown &&
+            (cmd == CommandCode::GetCommModeInfo ||
+             cmd == CommandCode::ShortUpload);
+        if (optional_command_unsupported) {
+            LIBXCP_LOG_WARNING(
+                "Optional XCP command unsupported cmd={} code={} "
+                "additional_bytes={}",
+                toHex(static_cast<std::uint8_t>(cmd)), error_code,
+                err->additional_info.size());
+        } else {
+            LIBXCP_LOG_ERROR("XCP RX ERR cmd={} code={} additional_bytes={}",
+                             toHex(static_cast<std::uint8_t>(cmd)), error_code,
+                             err->additional_info.size());
+        }
         // 未知错误码：保留原值并上报 ProtocolError（计划 §6.4）；不使用 Generic
         // 顶替， 以免让上层误判为已识别的标准错误码。
         const std::string message =
@@ -343,6 +495,9 @@ void CommandExecutor::CheckResLength(CommandCode cmd, PositiveResponse& res,
         return;
     }
 
+    LIBXCP_LOG_ERROR(
+        "XCP 响应长度错误 cmd={} actual_bytes={} expected_bytes={}",
+        toHex(static_cast<std::uint8_t>(cmd)), res.data.size(), expected);
     throw XcpException(
         ErrorCategory::MalformedPacket,
         "命令 " + std::to_string(static_cast<int>(cmd)) + " 响应数据长度 " +
@@ -360,7 +515,20 @@ std::optional<ParsedPacket> CommandExecutor::PerformAttempt(
     m_session_.MarkCommandSent(cmd);
     try {
         m_transport_.Send(encoded_packet);
+#if LIBXCP_ENABLE_LOG
+        const PacketLogSummary packet_summary =
+            SummarizePacket(encoded_packet, IsSeedKeyCommand(cmd));
+        LIBXCP_LOG_INFO(
+            "XCP TX cmd={} bytes={} shown_bytes={} truncated={} redacted={} "
+            "data={}",
+            toHex(static_cast<std::uint8_t>(cmd)), encoded_packet.size(),
+            packet_summary.shown_bytes, packet_summary.truncated,
+            packet_summary.redacted, packet_summary.data);
+#endif
     } catch (...) {
+        LIBXCP_LOG_ERROR("XCP TX failed cmd={} bytes={}",
+                         toHex(static_cast<std::uint8_t>(cmd)),
+                         encoded_packet.size());
         m_session_.ClearPendingCommand();
         throw;
     }
@@ -376,9 +544,12 @@ void CommandExecutor::RestoreUploadMta() {
         mta = m_last_mta_;
     }
     if (!mta) {
+        LIBXCP_LOG_INFO("XCP recovery: no cached MTA to restore");
         return;  // 本 Session 未设置过 MTA，无可恢复的隐含状态
     }
 
+    // 不记录地址、扩展或数据，避免泄露标定位置。
+    LIBXCP_LOG_INFO("XCP recovery: restoring cached MTA");
     EnsureCodec(m_session_.GetByteOrder());
     const Bytes encoded = m_codec_->EncodeSetMta(mta->extension, mta->address);
     const auto response = PerformAttempt(CommandCode::SetMta, encoded);
@@ -397,11 +568,15 @@ void CommandExecutor::PerformRecovery(CommandCode cmd) {
             const std::lock_guard<std::mutex> lock(m_mutex_);
             reason = m_transport_close_reason_;
         }
+        LIBXCP_LOG_ERROR("XCP recovery unavailable: transport closed cmd={}",
+                         toHex(static_cast<std::uint8_t>(cmd)));
         throw XcpException(ErrorCategory::RecoveryFailed,
                            "Transport 已关闭，无法执行 SYNCH 恢复", cmd,
                            std::nullopt, 0, reason);
     }
     if (!SendSynch()) {
+        LIBXCP_LOG_ERROR("XCP SYNCH recovery failed for cmd={}",
+                         toHex(static_cast<std::uint8_t>(cmd)));
         throw XcpException(ErrorCategory::RecoveryFailed,
                            "SYNCH 未得到 ERR_CMD_SYNCH 确认", cmd);
     }
@@ -418,12 +593,24 @@ bool CommandExecutor::SendSynch() {
         m_pending_response_.reset();
         m_response_ready_ = false;
     }
+    LIBXCP_LOG_INFO(
+        "XCP recovery initialized: response slot cleared; awaiting "
+        "ERR_CMD_SYNCH");
 
     m_session_.BeginRecovery();
     bool confirmed = false;
     try {
         m_session_.MarkCommandSent(CommandCode::Synch);
         m_transport_.Send(synch);
+#if LIBXCP_ENABLE_LOG
+        const PacketLogSummary packet_summary = SummarizePacket(synch, false);
+        LIBXCP_LOG_INFO(
+            "XCP TX cmd={} bytes={} shown_bytes={} truncated={} redacted={} "
+            "data={}",
+            toHex(static_cast<std::uint8_t>(CommandCode::Synch)), synch.size(),
+            packet_summary.shown_bytes, packet_summary.truncated,
+            packet_summary.redacted, packet_summary.data);
+#endif
 
         std::unique_lock<std::mutex> lock(m_mutex_);
         const auto deadline =
@@ -436,6 +623,7 @@ bool CommandExecutor::SendSynch() {
         }
         confirmed = m_synch_confirmed_;
     } catch (const XcpException&) {
+        LIBXCP_LOG_WARNING("XCP SYNCH 发送或等待确认失败");
         confirmed = false;
     }
 
@@ -446,8 +634,10 @@ bool CommandExecutor::SendSynch() {
     m_session_.ClearPendingCommand();
 
     if (confirmed) {
+        LIBXCP_LOG_INFO("XCP recovery confirmed by ERR_CMD_SYNCH");
         m_session_.CompleteRecovery();
     } else {
+        LIBXCP_LOG_ERROR("XCP recovery unconfirmed; Session will fail");
         m_session_.Fail("SYNCH 恢复失败");
     }
     return confirmed;
@@ -478,12 +668,18 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
             return DispatchResponse(cmd, *response);
         }
 
+        LIBXCP_LOG_WARNING("XCP command response timeout cmd={} retries={}",
+                           toHex(static_cast<std::uint8_t>(cmd)), retries);
+
         // 这些标定变更命令可能已在 Slave 生效；响应超时后即便 SYNCH 恢复
         // 成功也不得重放，否则可能重复写入或覆盖并发状态变化。报告结果未知，
         // 由调用方读回/对账。
         if (HasUnknownOutcomeOnTimeout(cmd)) {
             const std::string command_name(NonReplayableCommandName(cmd));
             if (retries >= m_timeouts_.max_retries) {
+                LIBXCP_LOG_ERROR(
+                    "XCP operation outcome unknown cmd={} retries={}",
+                    command_name, retries);
                 throw XcpException(
                     ErrorCategory::OperationOutcomeUnknown,
                     command_name +
@@ -491,15 +687,26 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
                     cmd, std::nullopt, retries);
             }
             ++retries;
+            LIBXCP_LOG_WARNING(
+                "XCP outcome-unknown command requires SYNCH; will not replay "
+                "cmd={} retry={}",
+                command_name, retries);
             try {
                 PerformRecovery(cmd);
             } catch (const XcpException& e) {
+                LIBXCP_LOG_ERROR(
+                    "XCP recovery failed for outcome-unknown cmd={} retry={}",
+                    command_name, retries);
                 throw XcpException(
                     ErrorCategory::OperationOutcomeUnknown,
                     command_name + " 响应超时，执行结果未知；SYNCH 恢复失败：" +
                         std::string(e.what()),
-                    cmd, std::nullopt, retries, std::string(e.TransportError()));
+                    cmd, std::nullopt, retries,
+                    std::string(e.TransportError()));
             }
+            LIBXCP_LOG_ERROR(
+                "XCP operation outcome unknown after recovery cmd={} retry={}",
+                command_name, retries);
             throw XcpException(
                 ErrorCategory::OperationOutcomeUnknown,
                 command_name +
@@ -509,12 +716,17 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
 
         // 其他支持重试的命令超时：进入 SYNCH 恢复并有限重试（计划 §6.2）
         if (retries >= m_timeouts_.max_retries) {
+            LIBXCP_LOG_ERROR(
+                "XCP command recovery retries exhausted cmd={} retries={}",
+                toHex(static_cast<std::uint8_t>(cmd)), retries);
             throw XcpException(ErrorCategory::RecoveryFailed,
                                "命令超时且恢复重试已耗尽（" +
                                    std::to_string(retries) + " 次）",
                                cmd, std::nullopt, retries);
         }
         ++retries;
+        LIBXCP_LOG_WARNING("XCP starting recovery cmd={} retry={}",
+                           toHex(static_cast<std::uint8_t>(cmd)), retries);
         PerformRecovery(cmd);
         // 可安全重试的 UPLOAD 依赖隐含 MTA，恢复后须重建 MTA（docs L1907）。
         // DOWNLOAD 在上方被归为不可重放命令，不会进入此恢复重试分支。

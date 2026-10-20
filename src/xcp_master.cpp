@@ -4,6 +4,7 @@
  */
 
 #include "libxcp/xcp_master.hpp"
+#include "libxcp/log.hpp"
 
 #include <algorithm>
 #include <cstddef>
@@ -134,11 +135,16 @@ XcpMaster::~XcpMaster() {
             try {
                 m_executor_->ExecuteDisconnect();
             } catch (...) {
+                LIBXCP_LOG_WARNING(
+                    "XCP disconnect failed during master destruction; "
+                    "resetting local session");
                 m_session_.Reset();
             }
         }
         m_transport_->Close();
     } catch (...) {
+        LIBXCP_LOG_WARNING(
+            "XCP transport cleanup failed during master destruction");
     }
     // Executor 持有 Transport 引用，必须先于 Transport 销毁
     m_memory_access_.reset();
@@ -148,8 +154,11 @@ XcpMaster::~XcpMaster() {
 void XcpMaster::Connect() {
     // 已连接时拒绝重复连接（避免在活跃会话上重放 CONNECT）
     if (m_session_.IsConnected()) {
+        LIBXCP_LOG_ERROR("XCP Connect rejected: Session is already connected");
         throw detail::MakeInvalidState("Session 已处于 Connected 状态");
     }
+    LIBXCP_LOG_INFO(
+        "XCP Connect started: resetting local Session and DAQ state");
     m_session_.Reset();  // 清理 Failed/残留状态
     // 新会话：本端 WRITE_DAQ 账本随之作废（Session 的 DAQ 运行态在
     // EstablishConnection 里一并归零）
@@ -171,6 +180,8 @@ void XcpMaster::Connect() {
         try {
             m_transport_->Close();
         } catch (...) {
+            LIBXCP_LOG_WARNING(
+                "XCP connection failure cleanup could not close transport");
         }
     };
 
@@ -186,6 +197,7 @@ void XcpMaster::Connect() {
 
         // GET_STATUS 为 Mandatory，失败即视为连接失败
         (void)m_executor_->ExecuteGetStatus();
+        LIBXCP_LOG_INFO("XCP Connect: mandatory GET_STATUS confirmed");
 
         // 变量标定批次：CONNECT 协商出 CAL/PAG 资源时探测 Paging 子系统
         // （GET_PAG_PROCESSOR_INFO，Optional）。Slave 不支持（nullopt）或
@@ -200,14 +212,21 @@ void XcpMaster::Connect() {
                     m_session_.SetPagProcessorInfo(*m_pag_processor_info_);
                 }
             } catch (const XcpException&) {
+                LIBXCP_LOG_WARNING(
+                    "Optional GET_PAG_PROCESSOR_INFO failed; continuing "
+                    "connection");
                 m_pag_processor_info_.reset();
             }
         }
+        LIBXCP_LOG_INFO("XCP Connect completed; Session connected");
     } catch (const XcpException&) {
+        LIBXCP_LOG_WARNING(
+            "XCP Connect aborted: resetting Session and closing transport");
         cleanup_on_failure();
         throw;
     } catch (const std::exception& e) {
         cleanup_on_failure();
+        LIBXCP_LOG_ERROR("XCP connection failed with non-protocol exception");
         throw detail::MakeTransportError("连接过程中发生非协议异常", e.what());
     }
 }
@@ -215,9 +234,13 @@ void XcpMaster::Connect() {
 void XcpMaster::Disconnect() {
     // 未连接：本地幂等，仅确保通道关闭
     if (m_session_.State() == SessionState::Disconnected) {
+        LIBXCP_LOG_INFO(
+            "XCP Disconnect: already disconnected; closing transport");
         m_transport_->Close();
         return;
     }
+    LIBXCP_LOG_INFO("XCP Disconnect started state={}",
+                    SessionStateName(m_session_.State()));
 
     // 批次14（T14-07）：断连前尽力补发 START_STOP_SYNCH(stop all)。
     // 不停就断开会留下"逻辑上仍在跑表"的 Slave 状态；但 STOP 失败也不得
@@ -229,6 +252,8 @@ void XcpMaster::Disconnect() {
             m_session_.ClearStartedDaqLists();
         } catch (const XcpException&) {
             // 见上：断连清理路径不做二次抛错
+            LIBXCP_LOG_WARNING(
+                "XCP stop-all failed during disconnect; continuing cleanup");
         }
     }
 
@@ -251,8 +276,11 @@ void XcpMaster::Disconnect() {
     }
 
     if (failure) {
+        LIBXCP_LOG_ERROR(
+            "XCP Disconnect completed cleanup with reported failure");
         throw *failure;
     }
+    LIBXCP_LOG_INFO("XCP Disconnect completed");
 }
 
 bool XcpMaster::IsConnected() const { return m_session_.IsConnected(); }
@@ -308,6 +336,9 @@ void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
     ValidateDaqListAgainstMaxDto(spec, header_bytes, ag_bytes,
                                  m_session_.MaxDto());
 
+    // 仅记录编排元信息，不输出 Entry 的地址或数据。
+    LIBXCP_LOG_INFO("DAQ static configure started list={} odts={}",
+                    spec.daq_list, spec.odts.size());
     // ---- 2) 下发；任何一步失败都回滚账本（B-6：解码只信完整账本） ----
     const std::size_t ledger_mark = m_daq_ledger_.size();
     auto rollback = [this, ledger_mark] {
@@ -363,12 +394,22 @@ void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
                                            spec.priority);
     } catch (const XcpException&) {
         rollback();
+        LIBXCP_LOG_WARNING(
+            "DAQ static configure failed list={}; local ledger rolled back",
+            spec.daq_list);
         throw;
     } catch (const std::exception& e) {
         rollback();
+        LIBXCP_LOG_WARNING(
+            "DAQ static configure failed list={}; local ledger rolled back",
+            spec.daq_list);
         throw detail::MakeTransportError("DAQ 配置过程中发生非协议异常",
                                          e.what());
     }
+    LIBXCP_LOG_INFO(
+        "DAQ static configure completed list={} entries={} generation={}",
+        spec.daq_list, m_daq_ledger_.size() - ledger_mark,
+        m_session_.DaqConfigGeneration());
 }
 
 std::uint8_t XcpMaster::StartDaqList(std::uint16_t daq_list) {
@@ -376,6 +417,9 @@ std::uint8_t XcpMaster::StartDaqList(std::uint16_t daq_list) {
         m_daq_ledger_.begin(), m_daq_ledger_.end(),
         [daq_list](const DaqLedgerEntry& e) { return e.daq_list == daq_list; });
     if (!configured) {
+        LIBXCP_LOG_ERROR(
+            "XCP StartDaqList rejected: DAQ list {} is not configured",
+            daq_list);
         throw detail::MakeInvalidState(
             "DAQ List " + std::to_string(daq_list) +
             " 未在本端登记（ConfigureDaqList 未成功），拒绝启动");
@@ -392,18 +436,24 @@ std::uint8_t XcpMaster::StartDaqList(std::uint16_t daq_list) {
         }
     }
     m_session_.MarkDaqListStarted(daq_list);
+    LIBXCP_LOG_INFO("DAQ list started list={} first_pid={} running_lists={}",
+                    daq_list, resp.first_pid,
+                    m_session_.StartedDaqLists().size());
     return resp.first_pid;
 }
 
 void XcpMaster::StopDaqList(std::uint16_t daq_list) {
     (void)m_executor_->ExecuteStartStopDaqList(DaqListAction::Stop, daq_list);
     m_session_.MarkDaqListStopped(daq_list);
+    LIBXCP_LOG_INFO("DAQ list stopped list={} running_lists={}", daq_list,
+                    m_session_.StartedDaqLists().size());
 }
 
 void XcpMaster::StopDaq() {
     m_executor_->ExecuteStartStopSynch(DaqSynchAction::StopAll);
     // 配置仍在 Slave 里，账本保留；只清运行态（重新 Start 不需要重写）
     m_session_.ClearStartedDaqLists();
+    LIBXCP_LOG_INFO("DAQ stop-all confirmed; running_lists=0");
 }
 
 void XcpMaster::ClearDaqList(std::uint16_t daq_list) {
@@ -416,6 +466,9 @@ void XcpMaster::ClearDaqList(std::uint16_t daq_list) {
                            return e.daq_list == daq_list;
                        }),
         m_daq_ledger_.end());
+    LIBXCP_LOG_INFO("DAQ list cleared list={} generation={} ledger_entries={}",
+                    daq_list, m_session_.DaqConfigGeneration(),
+                    m_daq_ledger_.size());
 }
 
 std::size_t XcpMaster::DaqTimestampBytesCached() {
@@ -443,10 +496,16 @@ void XcpMaster::ClearDynamicTableBestEffort() {
     m_daq_ledger_.clear();
     m_session_.ClearStartedDaqLists();
     m_session_.BumpDaqConfigGeneration();
+    LIBXCP_LOG_WARNING(
+        "DAQ dynamic configure failed: local ledger and running lists cleared; "
+        "generation={}; attempting best-effort FREE_DAQ",
+        m_session_.DaqConfigGeneration());
     try {
         m_executor_->ExecuteFreeDaq();
     } catch (...) {
         // 尽力而为：下次 ConfigureDaqListsDynamic 开头的 FREE 会再次收口
+        LIBXCP_LOG_WARNING(
+            "Best-effort FREE_DAQ failed while clearing dynamic table");
     }
 }
 
@@ -460,15 +519,14 @@ void XcpMaster::ConfigureDaqListsDynamic(
     ConfigureDaqListsDynamicImpl(legacy_specs, 1U, true);
 }
 
-void XcpMaster::ConfigureDaqListsDynamic(
-    const std::vector<DaqListSpec>& specs,
-    std::size_t dto_identification_bytes) {
+void XcpMaster::ConfigureDaqListsDynamic(const std::vector<DaqListSpec>& specs,
+                                         std::size_t dto_identification_bytes) {
     ConfigureDaqListsDynamicImpl(specs, dto_identification_bytes, false);
 }
 
 void XcpMaster::ConfigureDaqListsDynamicImpl(
-    const std::vector<DaqListSpec>& specs,
-    std::size_t dto_identification_bytes, bool legacy_timestamp) {
+    const std::vector<DaqListSpec>& specs, std::size_t dto_identification_bytes,
+    bool legacy_timestamp) {
     // ---- 1) 入参预检（非法不发命令；整表 FREE 之前一切本地可拦的错误
     //         都不该让 Slave 的既有表白白陪葬）----
     if (dto_identification_bytes == 0U || dto_identification_bytes > 4U) {
@@ -524,15 +582,18 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
         if (spec.timestamp && cached_timestamp_bytes == 0U &&
             !legacy_timestamp) {
             throw detail::MakeUnsupportedFeature(
-                "DAQ List 请求时间戳，但 GET_DAQ_RESOLUTION_INFO 未提供可用宽度");
+                "DAQ List 请求时间戳，但 GET_DAQ_RESOLUTION_INFO "
+                "未提供可用宽度");
         }
-        const std::size_t header_bytes = dto_identification_bytes +
-            (spec.dto_counter ? 1U : 0U) +
+        const std::size_t header_bytes =
+            dto_identification_bytes + (spec.dto_counter ? 1U : 0U) +
             (spec.timestamp || legacy_timestamp ? cached_timestamp_bytes : 0U);
         ValidateDaqListAgainstMaxDto(spec, header_bytes, ag_bytes,
                                      m_session_.MaxDto());
     }
 
+    LIBXCP_LOG_INFO("DAQ dynamic configure started lists={} dto_id_bytes={}",
+                    specs.size(), dto_identification_bytes);
     // ---- 3) 整表重建事务：FREE → ALLOC_DAQ → ALLOC_ODT* → ALLOC_ODT_ENTRY*
     //         → (SET_DAQ_PTR+WRITE_DAQ)* → SET_DAQ_LIST_MODE*。时序硬门
     //         （xcplite.c:1143-1186）：ALLOC_DAQ 一次给足总数；一个 List 的
@@ -542,6 +603,10 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
     m_daq_ledger_.clear();
     m_session_.ClearStartedDaqLists();
     m_session_.BumpDaqConfigGeneration();
+    LIBXCP_LOG_INFO(
+        "DAQ FREE_DAQ confirmed; old ledger/running lists cleared "
+        "generation={}",
+        m_session_.DaqConfigGeneration());
 
     try {
         m_executor_->ExecuteAllocDaq(static_cast<std::uint16_t>(specs.size()));
@@ -585,8 +650,8 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
             }
         }
         for (const auto& spec : specs) {
-            // List mode 精确按 spec 下发；XCPlite 兼容 profile 显式设置 timestamp，
-            // generic profile 可安全选择无时间戳布局。
+            // List mode 精确按 spec 下发；XCPlite 兼容 profile 显式设置
+            // timestamp， generic profile 可安全选择无时间戳布局。
             const DaqListModeBit mode = DaqModeBitsFromSpec(spec);
             m_executor_->ExecuteSetDaqListMode(mode, spec.daq_list,
                                                spec.event_channel,
@@ -600,6 +665,10 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
         throw detail::MakeTransportError("动态 DAQ 编排过程中发生非协议异常",
                                          e.what());
     }
+    LIBXCP_LOG_INFO(
+        "DAQ dynamic configure completed lists={} ledger_entries={} "
+        "generation={}",
+        specs.size(), m_daq_ledger_.size(), m_session_.DaqConfigGeneration());
 }
 
 void XcpMaster::StartDaqSync() {
@@ -611,9 +680,12 @@ void XcpMaster::StartDaqSync() {
         }
     }
     if (lists.empty()) {
+        LIBXCP_LOG_ERROR(
+            "XCP StartDaqSync rejected: no DAQ lists are configured");
         throw detail::MakeInvalidState(
             "没有任何已配置的 DAQ List（账本为空），拒绝同步启动");
     }
+    LIBXCP_LOG_INFO("DAQ synchronized start selecting lists={}", lists.size());
     // 逐表 SELECT → START_STOP_SYNCH(START)：XCPlite 下单表 START(mode=1)
     // 被 TEST_CHECKS 拒为 CRC_MODE_NOT_VALID（D12），SELECT+SYNCH 是唯一
     // 实证可走的启动路径。不做 FIRST_PID 回填（识别字段非 Absolute，pid
@@ -625,6 +697,8 @@ void XcpMaster::StartDaqSync() {
     for (const std::uint16_t list : lists) {
         m_session_.MarkDaqListStarted(list);
     }
+    LIBXCP_LOG_INFO("DAQ synchronized start confirmed running_lists={}",
+                    lists.size());
 }
 
 Bytes XcpMaster::FetchA2lViaUpload() {

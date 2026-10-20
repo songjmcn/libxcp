@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "libxcp/log.hpp"
+
 // ---------------------------------------------------------------------------
 // 平台 Socket 适配层
 // ---------------------------------------------------------------------------
@@ -185,22 +187,32 @@ void UdpTransport::Open(IPacketListener& listener) {
 
     // ---- 配置校验（设计文档 §7 / 计划文档 §4.8）----
     if (m_config_.remote_port == 0U) {
+        LIBXCP_LOG_ERROR("UDP open rejected because remote_port is zero");
         throw detail::MakeInvalidArgument(
             "UdpTransportConfig::remote_port 不能为 0");
     }
     if (m_config_.max_frame_packet_size == 0U ||
         m_config_.max_frame_packet_size > kUdpMaxXcpPacket) {
+        LIBXCP_LOG_ERROR(
+            "UDP open rejected max_frame_packet_size={} maximum={}",
+            m_config_.max_frame_packet_size, kUdpMaxXcpPacket);
         throw detail::MakeInvalidArgument("max_frame_packet_size 必须在 1.." +
                                           std::to_string(kUdpMaxXcpPacket) +
                                           " 之间");
     }
     if (m_config_.max_datagram_size < kUdpHeaderSize + 1 ||
         m_config_.max_datagram_size > kUdpMaxDatagramSize) {
+        LIBXCP_LOG_ERROR(
+            "UDP open rejected max_datagram_size={} allowed={}..{}",
+            m_config_.max_datagram_size, kUdpHeaderSize + 1,
+            kUdpMaxDatagramSize);
         throw detail::MakeInvalidArgument(
             "max_datagram_size 必须在 " + std::to_string(kUdpHeaderSize + 1) +
             ".." + std::to_string(kUdpMaxDatagramSize) + " 之间");
     }
     if (m_config_.receive_poll_interval_ms == 0U) {
+        LIBXCP_LOG_ERROR(
+            "UDP open rejected because receive poll interval is zero");
         throw detail::MakeInvalidArgument(
             "receive_poll_interval_ms 必须大于 0");
     }
@@ -208,15 +220,17 @@ void UdpTransport::Open(IPacketListener& listener) {
     auto impl = std::make_unique<SocketImpl>();
 #if defined(_WIN32)
     if (!impl->winsock.ok()) {
-        throw detail::MakeTransportError("Winsock 初始化失败",
-                                         lastSocketError());
+        const auto error = lastSocketError();
+        LIBXCP_LOG_ERROR("UDP Winsock initialization failed: {}", error);
+        throw detail::MakeTransportError("Winsock 初始化失败", error);
     }
 #endif
 
     impl->handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (impl->handle == kInvalidSocket) {
-        throw detail::MakeTransportError("创建 UDP Socket 失败",
-                                         lastSocketError());
+        const auto error = lastSocketError();
+        LIBXCP_LOG_ERROR("UDP socket creation failed: {}", error);
+        throw detail::MakeTransportError("创建 UDP Socket 失败", error);
     }
 
     // ---- 绑定本地端点 ----
@@ -226,17 +240,22 @@ void UdpTransport::Open(IPacketListener& listener) {
     if (!parseIpv4(m_config_.local_host.empty() ? std::string("0.0.0.0")
                                                 : m_config_.local_host,
                    &local.sin_addr)) {
+        LIBXCP_LOG_ERROR("UDP invalid local bind address='{}'",
+                         m_config_.local_host);
         closeSocket(impl->handle);
         throw detail::MakeInvalidArgument("无法解析本地绑定地址: " +
                                           m_config_.local_host);
     }
     if (::bind(impl->handle, reinterpret_cast<sockaddr*>(&local),
                sizeof(local)) != 0) {
+        const auto error = lastSocketError();
+        LIBXCP_LOG_ERROR("UDP bind failed local={}:{} error={}",
+                         m_config_.local_host, m_config_.local_port, error);
         closeSocket(impl->handle);
         throw detail::MakeTransportError(
             "绑定本地端点失败: " + m_config_.local_host + ":" +
                 std::to_string(m_config_.local_port),
-            lastSocketError());
+            error);
     }
     impl->bound = true;
 
@@ -255,6 +274,8 @@ void UdpTransport::Open(IPacketListener& listener) {
     remote.sin_family = AF_INET;
     remote.sin_port = htons(m_config_.remote_port);
     if (!parseIpv4(m_config_.remote_host, &remote.sin_addr)) {
+        LIBXCP_LOG_ERROR("UDP invalid remote address='{}'",
+                         m_config_.remote_host);
         closeSocket(impl->handle);
         throw detail::MakeInvalidArgument("无法解析远端地址: " +
                                           m_config_.remote_host);
@@ -264,19 +285,20 @@ void UdpTransport::Open(IPacketListener& listener) {
     int timeout_result = 0;
 #if defined(_WIN32)
     DWORD tv_ms = m_config_.receive_poll_interval_ms;
-    timeout_result = ::setsockopt(
-        impl->handle, SOL_SOCKET, SO_RCVTIMEO,
-        reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
+    timeout_result =
+        ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
 #else
     timeval tv{};
     tv.tv_sec = m_config_.receive_poll_interval_ms / 1000U;
     tv.tv_usec = (m_config_.receive_poll_interval_ms % 1000U) * 1000U;
-    timeout_result = ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO, &tv,
-                                  sizeof(tv));
+    timeout_result =
+        ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
     if (timeout_result != 0) {
         // 先取平台错误文本；closeSocket 可能覆盖 errno / WSAGetLastError。
         const std::string error = lastSocketError();
+        LIBXCP_LOG_ERROR("UDP receive timeout setup failed: {}", error);
         closeSocket(impl->handle);
         throw detail::MakeTransportError("设置 UDP 接收超时失败", error);
     }
@@ -299,12 +321,16 @@ void UdpTransport::Open(IPacketListener& listener) {
     try {
         m_receive_thread_ = std::thread([this] { ReceiveLoop(); });
     } catch (const std::system_error& e) {
+        LIBXCP_LOG_ERROR("UDP receive thread creation failed: {}", e.what());
         m_running_.store(false, std::memory_order_release);
         closeSocket(m_socket_->handle);
         m_socket_.reset();
         m_listener_ = nullptr;
         throw detail::MakeTransportError("启动接收线程失败", e.what());
     }
+    LIBXCP_LOG_INFO("UDP transport open local={}:{} remote={}:{}",
+                    m_config_.local_host, m_config_.local_port,
+                    m_config_.remote_host, m_config_.remote_port);
 }
 
 void UdpTransport::Close() {
@@ -339,12 +365,16 @@ void UdpTransport::Send(BytesView packet) {
     std::lock_guard<std::mutex> lock(m_send_mutex_);
 
     if (!IsOpen()) {
+        LIBXCP_LOG_ERROR("UDP send rejected because transport is closed");
         throw detail::MakeInvalidState("UdpTransport 未打开时调用 send()");
     }
     if (packet.empty()) {
+        LIBXCP_LOG_ERROR("UDP send rejected because XCP Packet is empty");
         throw detail::MakeInvalidArgument("XCP Packet 不能为空");
     }
     if (packet.size() > m_config_.max_frame_packet_size) {
+        LIBXCP_LOG_ERROR("UDP send rejected XCP packet bytes={} maximum={}",
+                         packet.size(), m_config_.max_frame_packet_size);
         throw detail::MakeInvalidArgument(
             "XCP Packet 长度 " + std::to_string(packet.size()) +
             " 超过配置上限 max_frame_packet_size=" +
@@ -360,12 +390,16 @@ void UdpTransport::Send(BytesView packet) {
     try {
         frame = EncodeUdpFrame(packet, ctr);
     } catch (...) {
+        LIBXCP_LOG_ERROR("UDP frame encoding failed ctr={} xcp_bytes={}", ctr,
+                         packet.size());
         // 编码失败不回退 CTR：保持"发送方向每 Frame 独立消耗一个
         // CTR"的可观察语义
         throw;
     }
 
     if (frame.data.size() > m_config_.max_datagram_size) {
+        LIBXCP_LOG_ERROR("UDP send rejected datagram bytes={} maximum={}",
+                         frame.data.size(), m_config_.max_datagram_size);
         throw detail::MakeInvalidArgument(
             "编码后 Datagram 长度 " + std::to_string(frame.data.size()) +
             " 超过配置上限 max_datagram_size=" +
@@ -378,14 +412,20 @@ void UdpTransport::Send(BytesView packet) {
         reinterpret_cast<const sockaddr*>(&m_socket_->remote),
         sizeof(m_socket_->remote));
     if (sent < 0) {
-        throw detail::MakeTransportError("发送 UDP Datagram 失败",
-                                         lastSocketError());
+        const auto error = lastSocketError();
+        LIBXCP_LOG_ERROR("UDP sendto failed: {}", error);
+        throw detail::MakeTransportError("发送 UDP Datagram 失败", error);
     }
     if (static_cast<std::size_t>(sent) != frame.data.size()) {
+        LIBXCP_LOG_ERROR("UDP partial datagram send sent={} expected={}", sent,
+                         frame.data.size());
         throw detail::MakeTransportError(
             "UDP Datagram 部分发送: " + std::to_string(sent) + "/" +
             std::to_string(frame.data.size()));
     }
+    // 仅在完整发送成功后记录 UDP 元信息，不输出 XCP/Datagram 载荷。
+    LIBXCP_LOG_INFO("UDP TX datagram_bytes={} xcp_bytes={} ctr={}",
+                    frame.data.size(), packet.size(), ctr);
 }
 
 bool UdpTransport::IsOpen() const noexcept {
@@ -426,6 +466,8 @@ void UdpTransport::ReceiveLoop() {
 #else
             ::inet_ntop(AF_INET, &src.sin_addr, ip_text, sizeof(ip_text));
 #endif
+            LIBXCP_LOG_INFO("UDP RX datagram_bytes={} peer={}:{}", received,
+                            ip_text, ntohs(src.sin_port));
             const bool keep_running = HandleDatagram(
                 buffer.data(), static_cast<std::size_t>(received),
                 std::string(ip_text), ntohs(src.sin_port));
@@ -456,8 +498,9 @@ void UdpTransport::ReceiveLoop() {
             break;
         }
         // 其它错误：报告警告并继续（避免瞬时错误终止会话）
+        const auto error = lastSocketError();
         if (listener != nullptr) {
-            listener->OnTransportWarning("recvfrom 失败: " + lastSocketError());
+            listener->OnTransportWarning("recvfrom 失败: " + error);
         }
     }
 
@@ -531,6 +574,9 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
         if (!HandleFrame(frame)) {
             continue;  // CTR 规则丢弃
         }
+        // XCP 内容由 CommandExecutor 按敏感信息规则记录；UDP 层仅记录帧元信息。
+        LIBXCP_LOG_INFO("UDP RX frame ctr={} packet_bytes={}", frame.header.ctr,
+                        frame.xcp_packet.size());
         if (listener != nullptr) {
             try {
                 listener->OnPacketReceived(frame.xcp_packet);

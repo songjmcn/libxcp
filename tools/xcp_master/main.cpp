@@ -51,8 +51,13 @@
 #include "libxcp/a2l/ia2l_database.hpp"
 #include "libxcp/measurement/measurement_planner.hpp"
 #include "libxcp/measurement/measurement_session.hpp"
+#include "libxcp/log.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "a2l/a2l_measurement_database.hpp"
+
+#if LIBXCP_ENABLE_LOG
+#include "program_logging.hpp"
+#endif
 #include "a2l/measurement_runtime_profile.hpp"
 #include "libxcp/xcp_master.hpp"
 #include "symbol_policy.hpp"
@@ -3067,6 +3072,15 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+#if LIBXCP_ENABLE_LOG
+    calmcar::xcp::internal::ProgramLogSession logging;
+    std::string log_error;
+    if (!logging.Initialize(argv[0], "tools", log_error)) {
+        std::cerr << "日志初始化失败: " << log_error << '\n';
+        return 1;
+    }
+#endif
+
     auto loaded = A2lBridge::Load(options->a2l_path);
     if (!loaded.HasValue()) {
         std::cerr << "A2L 加载失败: " << loaded.ErrorInfo().message << '\n';
@@ -3137,6 +3151,7 @@ int main(int argc, char** argv) {
         if (measurement_session.Running()) measurement_session.Stop();
         master.Disconnect();
     } catch (const std::exception& e) {
+        LIBXCP_LOG_ERROR("XCP master connection or run failed");
         std::cerr << "XCP 连接/运行失败: " << e.what() << '\n';
         return 1;
     }

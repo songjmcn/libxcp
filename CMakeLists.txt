@@ -28,6 +28,7 @@ project(libxcp
 # 全局构建选项
 # ----------------------------------------------------------------------------
 option(LIBXCP_BUILD_TESTS "构建 libxcp 单元测试与集成测试" ON)
+option(LIBXCP_ENABLE_LOG "启用 libxcp 日志（默认 glog 后端）" OFF)
 
 # ----------------------------------------------------------------------------
 # MSVC 工具链定位
@@ -61,6 +62,69 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# 日志开启时才要求 C++20 std::format 并解析/获取 glog；关闭时不触碰后端依赖。
+if(LIBXCP_ENABLE_LOG)
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles([[
+    #include <format>
+    int main() {
+      const auto formatted = std::format("value={} hex={:02x}", 42, 42);
+      return formatted.empty();
+    }
+  ]] LIBXCP_HAS_CXX20_STD_FORMAT)
+  if(NOT LIBXCP_HAS_CXX20_STD_FORMAT)
+    message(FATAL_ERROR
+      "LIBXCP_ENABLE_LOG=ON 需要支持 C++20 <format> 的编译器与标准库；"
+      "请更换工具链或关闭 LIBXCP_ENABLE_LOG。")
+  endif()
+
+  if(NOT TARGET glog::glog)
+    # 程序日志生命周期依赖 IsGoogleLoggingInitialized，旧版 glog 不满足此接口。
+    find_package(glog 0.7.1 CONFIG QUIET)
+  endif()
+  if(NOT TARGET glog::glog)
+    include(FetchContent)
+    # 在函数作用域为按需构建的 glog 关闭可选测试/依赖，避免改写父工程缓存。
+    function(libxcp_fetch_glog)
+      set(BUILD_SHARED_LIBS OFF)
+      set(BUILD_TESTING OFF)
+      set(WITH_GFLAGS OFF)
+      set(WITH_GTEST OFF)
+      set(WITH_UNWIND OFF)
+      set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+      FetchContent_Declare(
+        glog
+        URL https://github.com/google/glog/archive/v0.7.1.zip
+        URL_HASH SHA256=c17d85c03ad9630006ef32c7be7c65656aba2e7e2fbfc82226b7e680c771fc88
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+      FetchContent_MakeAvailable(glog)
+    endfunction()
+    libxcp_fetch_glog()
+  endif()
+  if(NOT TARGET glog::glog)
+    message(FATAL_ERROR
+      "LIBXCP_ENABLE_LOG=ON 但未能提供 glog::glog；请安装 glog 0.7.1+ CONFIG 包、"
+      "设置 FETCHCONTENT_SOURCE_DIR_GLOG，或关闭 LIBXCP_ENABLE_LOG。")
+  endif()
+
+  # 复用父工程预建 target 时也校验版本，不能绕过 IsGoogleLoggingInitialized 要求。
+  if(DEFINED glog_VERSION AND NOT glog_VERSION STREQUAL "")
+    set(LIBXCP_GLOG_VERSION "${glog_VERSION}")
+  else()
+    get_target_property(LIBXCP_GLOG_VERSION glog::glog VERSION)
+  endif()
+  if(NOT LIBXCP_GLOG_VERSION OR LIBXCP_GLOG_VERSION STREQUAL "LIBXCP_GLOG_VERSION-NOTFOUND")
+    message(FATAL_ERROR
+      "LIBXCP_ENABLE_LOG=ON 但无法确认 glog 版本；请使用 glog 0.7.1+ CONFIG 包"
+      "或固定版本 FetchContent 源码。")
+  elseif(LIBXCP_GLOG_VERSION VERSION_LESS 0.7.1)
+    message(FATAL_ERROR
+      "LIBXCP_ENABLE_LOG=ON 需要 glog 0.7.1+，当前检测到 ${LIBXCP_GLOG_VERSION}。")
+  endif()
+  unset(LIBXCP_GLOG_VERSION)
+
+endif()
 
 if(MSVC)
   # 将源文件字符集声明为 UTF-8，避免中文注释在非英文 Windows 控制台下解析异常
@@ -98,11 +162,17 @@ target_include_directories(libxcp
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_definitions(libxcp PUBLIC
+        LIBXCP_ENABLE_LOG=$<BOOL:${LIBXCP_ENABLE_LOG}>)
 
 # 协议核心仅依赖线程库（Session/Executor 内部同步）；
 # UdpTransport 使用平台 Socket，Windows 需显式链接 ws2_32。
 find_package(Threads REQUIRED)
 target_link_libraries(libxcp PUBLIC Threads::Threads)
+if(LIBXCP_ENABLE_LOG)
+  # log.hpp 是安装的公共头文件；静态库消费者也必须获得 glog 链接依赖。
+  target_link_libraries(libxcp PUBLIC glog::glog)
+endif()
 
 if(WIN32)
   target_link_libraries(libxcp PUBLIC ws2_32)
@@ -111,6 +181,31 @@ endif()
 set_target_properties(libxcp PROPERTIES
         OUTPUT_NAME xcp
         POSITION_INDEPENDENT_CODE ON)
+
+if(LIBXCP_ENABLE_LOG)
+  # 自有程序入口的内部初始化辅助代码，不作为 libxcp 公共接口或安装目标。
+  add_library(libxcp_program_logging STATIC src/program_logging.cpp)
+  target_compile_features(libxcp_program_logging PUBLIC cxx_std_20)
+  target_compile_definitions(libxcp_program_logging PUBLIC LIBXCP_ENABLE_LOG=1)
+  target_include_directories(libxcp_program_logging PUBLIC
+          ${PROJECT_SOURCE_DIR}/include
+          ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(libxcp_program_logging PUBLIC glog::glog)
+  set_target_properties(libxcp_program_logging PROPERTIES
+          POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# 所有自有工具/示例/测试入口均显式获得 0/1 开关；ON 时共享内部文件日志初始化器。
+function(libxcp_configure_program_logging target)
+  if(NOT TARGET ${target})
+    message(FATAL_ERROR "libxcp_configure_program_logging: 未知 target '${target}'")
+  endif()
+  if(LIBXCP_ENABLE_LOG)
+    target_link_libraries(${target} PRIVATE libxcp_program_logging)
+  else()
+    target_compile_definitions(${target} PRIVATE LIBXCP_ENABLE_LOG=0)
+  endif()
+endfunction()
 
 # ----------------------------------------------------------------------------
 # 安装规则

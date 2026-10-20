@@ -21,6 +21,7 @@ target_compile_features(measurement_demo PRIVATE cxx_std_20)
 target_link_libraries(measurement_demo PRIVATE
         libxcp::libxcp
         libxcp_measurement_adapter)
+libxcp_configure_program_logging(measurement_demo)
 # cpp_demo 可执行文件路径经 CMake 注入，禁止硬编码
 # （沿用 examples/xcp_master_udp/CMakeLists.txt:37-41 先例）
 # XCP_104.aml 路径经 CMake 注入（照抄 examples/xcp_master_udp/CMakeLists.txt:18,41

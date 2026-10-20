@@ -7,9 +7,10 @@
  * IMeasurementDatabase::ToPhysical 换算 → MeasurementFrame 回调。
  *
  * 兼容性说明：本实现的构造形态（MeasurementSession(IMeasurementDatabase&)
- * + Bind(XcpMaster&)）是计划 §5.5 字面签名 `(XcpMaster&, IMeasurementDatabase&)`
- * 的偏差——因为 XcpMaster 的事件监听器仅在构造时固定，session 必须先构造并以
- * &session 作为 master 监听器，master 引用随后 Bind。详见 v0.5 记录"偏差说明"。
+ * + Bind(XcpMaster&)）是计划 §5.5 字面签名 `(XcpMaster&,
+ * IMeasurementDatabase&)` 的偏差——因为 XcpMaster
+ * 的事件监听器仅在构造时固定，session 必须先构造并以 &session 作为 master
+ * 监听器，master 引用随后 Bind。详见 v0.5 记录"偏差说明"。
  */
 
 #include "libxcp/measurement/measurement_session.hpp"
@@ -31,6 +32,7 @@
 #include <vector>
 
 #include "libxcp/daq/daq_timestamp.hpp"
+#include "libxcp/log.hpp"
 #include "libxcp/daq/dto_payload_decoder.hpp"
 #include "libxcp/daq/dto_envelope_decoder.hpp"
 #include "libxcp/measurement/measurement_planner.hpp"
@@ -406,6 +408,7 @@ void MeasurementSession::WorkerLoop() {
         try {
             envelope = decoder.Decode(BytesView{frame}, layout);
         } catch (const XcpException&) {
+            LIBXCP_LOG_WARNING("DTO envelope decode failed; frame dropped");
             m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
