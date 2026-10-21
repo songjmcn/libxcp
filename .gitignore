@@ -30,6 +30,9 @@ ZERO_CHECK/
 compile_commands.json
 CMakeLists.txt.*.swp
 cmake-build*
+*.glog
+*.log
+logs
 
 # ---- 编译器 / 链接器中间产物 ----
 *.obj
@@ -99,3 +102,6 @@ __pycache__/
 scripts/
 # XCPlite protocol-debug slave run artifacts (A2L/AML per-test workdirs)
 xcplite_runs/
+
+#工具文件
+.pdftools
