@@ -893,6 +893,13 @@ TEST(XcpSlaveDemoIntegrationTest,
     EXPECT_FALSE(
         tools::SymbolDaqObservationUnsupportedReason(cal.Value(), events)
             .empty());
+    // 「不能周期采集」与「可以被标定」是两件独立的事：独立标定段的叶子必须
+    // 拿到 A2L READ_WRITE 权限。XCPlite 在段相对寻址下不输出该关键字，示例
+    // 程序会在生成后局部补齐；此处从桥接层复核补齐结果确实生效。
+    EXPECT_TRUE(cal.Value().read_write) << "标定叶子缺少 A2L READ_WRITE 权限";
+    EXPECT_TRUE(tools::SymbolWriteUnsupportedReason(cal.Value()).empty())
+        << "标定叶子未通过写入策略："
+        << tools::SymbolWriteUnsupportedReason(cal.Value());
 
     // 将真实快速实例改为结构数组：逐元素嵌套的叶子仍归同一 INSTANCE。
     std::ifstream input(output_dir / "xcp_slave_demo.a2l", std::ios::binary);

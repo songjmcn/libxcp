@@ -658,6 +658,26 @@ struct TuiLayoutMetrics {
 /** @brief 变量详情弹窗的当前交互页面。 */
 enum class VariableModalPage { Closed, Details, Calibration, Confirmation };
 
+/**
+ * @brief 判断标定表单的读取或写入控件是否可用。
+ * @details 该谓词只描述「界面尺寸、页面、选中状态、静态策略」四项准入条件，
+ *          刻意不接收 DAQ 运行状态：标定读写与 DAQ 采集共用同一标定页与命令
+ *          写入流程，二者合法并行，因此 DAQ 是否运行不得影响标定准入。任何
+ *          试图把 DAQ 状态重新引入本判断的改动都必须修改函数签名，从而被
+ *          单元测试立刻发现。
+ * @param terminal_too_small 终端尺寸是否低于交互下限。
+ * @param page 变量弹窗当前所处的交互页面。
+ * @param has_symbol 是否已选中一个符号。
+ * @param policy_reason 静态策略层返回的拒绝原因，空串表示策略合格。
+ * @return 四项条件全部满足时返回 true，表示控件应当可用。
+ */
+[[nodiscard]] inline bool CalibrationCommandPermitted(
+    bool terminal_too_small, VariableModalPage page, bool has_symbol,
+    const std::string& policy_reason) {
+    return !terminal_too_small && page == VariableModalPage::Calibration &&
+           has_symbol && policy_reason.empty();
+}
+
 /** @brief 管理变量详情弹窗、写入确认和关闭时的稳定选择。 */
 class VariableModalState {
 public:

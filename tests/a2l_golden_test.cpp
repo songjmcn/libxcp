@@ -1206,6 +1206,12 @@ TEST_F(A2lGoldenTest, StructLeafRealCorpusFourForms) {
         // 关键词，
         // CalSeg 实例走分段相对寻址故缺省只读——物理可写性由批次17 裸地址
         // 写通路实证，A2L 元数据层不伪造读写位）
+        // 与本用例的分工：这里是对上游输出的忠实快照（回归基线），职责是
+        // 记录 XCPlite 的实际行为，故 rw 保持 0 不动；examples/xcp_slave_demo
+        // 作为交付给主站的示例，会主动补齐该缺失位（段相对寻址物理可写，
+        // xcplite.c 的 XcpWriteMta 为 XcpAddrIsSeg 开了专门分支）。两者目的
+        // 不同，差异在此显式记录，详见
+        // examples/xcp_slave_demo/main.cpp 的 PatchCalibrationInstanceWriteAccess。
         {"kDefaultCalParams.cal_factor", 0x80010000, 0, 2, 0, 0, true},
         {"kDefaultCalParams.cal_offset", 0x80010004, 0, 4, 0, 0, true},
     };

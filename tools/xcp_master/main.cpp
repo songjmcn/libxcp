@@ -416,26 +416,20 @@ public:
         auto target_label = Renderer([] { return text("目标值："); });
         auto target_control =
             Maybe(Container::Horizontal({target_label, target_input}), [this] {
-                return !terminal_too_small_.load() && !DaqRunning() &&
-                       variable_modal_.Page() ==
-                           calmcar::xcp::tools::VariableModalPage::
-                               Calibration &&
-                       modal_symbol_info_.has_value() &&
-                       ModalWriteUnsupportedReason().empty();
+                return calmcar::xcp::tools::CalibrationCommandPermitted(
+                    terminal_too_small_.load(), variable_modal_.Page(),
+                    modal_symbol_info_.has_value(),
+                    ModalWriteUnsupportedReason());
             });
         auto calibration_read_control = Maybe(calibration_read_button, [this] {
-            return !terminal_too_small_.load() && !DaqRunning() &&
-                   variable_modal_.Page() ==
-                       calmcar::xcp::tools::VariableModalPage::Calibration &&
-                   modal_symbol_info_.has_value() &&
-                   ModalReadUnsupportedReason().empty();
+            return calmcar::xcp::tools::CalibrationCommandPermitted(
+                terminal_too_small_.load(), variable_modal_.Page(),
+                modal_symbol_info_.has_value(), ModalReadUnsupportedReason());
         });
         auto write_control = Maybe(write_button, [this] {
-            return !terminal_too_small_.load() && !DaqRunning() &&
-                   variable_modal_.Page() ==
-                       calmcar::xcp::tools::VariableModalPage::Calibration &&
-                   modal_symbol_info_.has_value() &&
-                   ModalWriteUnsupportedReason().empty();
+            return calmcar::xcp::tools::CalibrationCommandPermitted(
+                terminal_too_small_.load(), variable_modal_.Page(),
+                modal_symbol_info_.has_value(), ModalWriteUnsupportedReason());
         });
         auto details_container = Container::Vertical({close_button});
         auto calibration_container =
@@ -905,13 +899,25 @@ private:
         }
         label += watched ? " | 已加入采样" : " | 未采样";
         const auto observation_reason = ObservationUnsupportedReason(symbol);
-        if (!observation_reason.empty())
-            label += " | 观测拒绝: " + observation_reason;
+        if (!observation_reason.empty()) {
+            // 标定量本就不属于周期采集范畴，用中性表述；其余是真正的
+            // 观测缺陷，保留「观测拒绝」以维持警示强度。
+            label += symbol.kind == SymbolKind::Characteristic
+                         ? " | 不适用周期采集: " + observation_reason
+                         : " | 观测拒绝: " + observation_reason;
+        }
         if (symbol.kind != SymbolKind::Measurement) {
             const auto write_reason =
                 calmcar::xcp::tools::SymbolWriteUnsupportedReason(symbol);
-            label += write_reason.empty() ? " | 可写标量候选"
-                                          : " | 写入拒绝: " + write_reason;
+            if (write_reason.empty()) {
+                // 明确区分「可标定」与「可周期采集」两件事：标定量既不能
+                // 被 DAQ 采集，也仍然可以通过标定表单按需读写。
+                label += symbol.kind == SymbolKind::Characteristic
+                             ? " | 可标定（可标定表单读写）"
+                             : " | 可标量候选";
+            } else {
+                label += " | 写入拒绝: " + write_reason;
+            }
         }
         return label;
     }
@@ -2008,12 +2014,7 @@ private:
             Say("标定选择已改变，取消旧读取请求。");
             return;
         }
-        if (DaqRunning()) {
-            UpdateCalibrationState(selection,
-                                   "DAQ 运行期间禁止读取，请先 stop");
-            Say("DAQ 运行期间不能手动 read；请先 stop。");
-            return;
-        }
+        // 标定表单读取与 DAQ 并行合法：DAQ 运行期间不再拒绝读取请求。
         auto found = database_.Find(selection.name);
         if (!found.HasValue()) {
             UpdateCalibrationState(selection, "A2L 查找失败", "读取失败");
@@ -2340,13 +2341,7 @@ private:
             Say("标定选择已改变，取消旧写入请求。");
             return;
         }
-        if (DaqRunning()) {
-            if (selection)
-                UpdateCalibrationState(*selection,
-                                       "DAQ 运行期间禁止写入，请先 stop");
-            Say("DAQ 运行期间不能 write；请先 stop。");
-            return;
-        }
+        // 标定写入与 DAQ 并行合法：DAQ 运行期间不再拒绝写入请求。
         if (name.empty() || value_text.empty()) {
             if (from_calibration_view)
                 UpdateCalibrationState(*selection, "目标变量或物理值为空");
@@ -2480,11 +2475,13 @@ private:
             std::string readback_failure;
             {
                 std::lock_guard command_lock(command_mutex_);
-                if (DaqRunning() ||
-                    (selection && !CalibrationSelectionMatches(*selection))) {
+                // 标定写入不再受 DAQ 运行状态限制：DAQ 与标定共用同一标定页
+                // 与命令写入流程，二者可安全并行。此处只保留代际校验，防止
+                // 用户在确认期间切换变量后仍把旧目标写进 ECU。
+                if (selection && !CalibrationSelectionMatches(*selection)) {
                     static_cast<void>(
                         confirmation_gate_.CancelBeforeDispatch());
-                    dispatch_failure = "许可已撤销、DAQ 已运行或变量选择已变化";
+                    dispatch_failure = "确认许可已失效或变量选择已变化";
                 } else {
                     std::uint8_t dispatch_page = 0;
                     dispatch_failure =

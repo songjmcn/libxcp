@@ -9,11 +9,15 @@
 #include <csignal>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <vector>
 
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/log.hpp"
@@ -379,6 +383,264 @@ void RemoveGeneratedOutputs(const OutputPaths& paths) noexcept {
     std::filesystem::remove(paths.aml_file, error);
 }
 
+/// @brief 标定段 INSTANCE 声明的期望名字（项目前缀之后的部分）。
+constexpr char kCalibrationInstanceName[] = "cal";
+/// @brief 标定段 INSTANCE 声明的期望类型名。
+constexpr char kCalibrationInstanceType[] = "CalibrationParameters";
+/// @brief 标定段 INSTANCE 声明的期望描述文本。
+constexpr char kCalibrationInstanceComment[] = "独立标定段";
+
+/**
+ * @brief 判断字符是否可作为 A2L 记号的分隔空白。
+ * @param ch 待判断字符。
+ * @return 为空格、制表符、回车或换行时返回 true。
+ */
+bool IsA2lSpace(char ch) noexcept {
+    return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
+}
+
+/**
+ * @brief 解析以 "0x" 开头的十六进制无符号整数。
+ * @param text 待解析文本，长度至少为 3。
+ * @return 解析成功返回值；文本非法或溢出时返回 std::nullopt。
+ */
+std::optional<std::uint64_t> ParseHexAddress(std::string_view text) noexcept {
+    if (text.size() < 3U || text[0] != '0' ||
+        (text[1] != 'x' && text[1] != 'X')) {
+        return std::nullopt;
+    }
+    std::uint64_t value = 0U;
+    const char* const begin = text.data() + 2;
+    const char* const end = text.data() + text.size();
+    const auto result = std::from_chars(begin, end, value, 16);
+    if (result.ec != std::errc{} || result.ptr != end) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+/**
+ * @brief 在生成模式下为独立标定段的 INSTANCE 声明补齐 READ_WRITE。
+ *
+ * XCPlite 只在绝对、应用与动态寻址下输出 READ_WRITE（见
+ * `thirdparty/XCPlite/src/a2l.c` 的 A2lCreateInstance_），标定段使用的段相对
+ * 寻址拿不到该标记，导致主站按 A2L 权限拒绝 cal.* 的静态写资格。本函数只对
+ * 唯一一个同时满足「名字 cal + 类型 CalibrationParameters + 描述匹配」的
+ * INSTANCE 声明做局部补齐，绝不改动 meas_* 或其他段。
+ *
+ * 为什么这里补齐、而 tests/a2l_golden_test.cpp 的 CalSeg 语料不补：
+ * 段相对寻址（当前默认构建 XCPLITE__CASDD，XCP_ADDR_EXT_SEG=0x00）的标定段
+ * 在物理上完全可写——xcplite.c 的 XcpWriteMta/XcpReadMta 都为
+ * XcpAddrIsSeg 开了专门分支（XcpCalSegWriteMemory/XcpCalSegReadMemory）。
+ * a2l.c 未给 SEG 打 READ_WRITE 属于该白名单只枚举 ABS/APP/DYN 的实现遗漏，
+ * 并非「该段不可写」。A2L 是交付给主站的能力描述，标成只读会造成虚假的能力
+ * 缺失（本次「DAQ 模式下无法标定」即由此引发），因此本示例主动纠正。
+ * a2l_golden_test 的语料是对上游输出的忠实快照（回归基线），职责是记录而非
+ * 纠正上游行为，故保持 rw=0 不动。两者目的不同，差异在此显式记录。
+ *
+ * @param a2l_file 本次生成的 A2L 文件路径。
+ * @param error_message 用于接收失败原因的字符串。
+ * @return 修正并发布成功返回 true；定位不唯一、字段不符或 I/O 失败返回 false。
+ */
+bool PatchCalibrationInstanceWriteAccess(const std::filesystem::path& a2l_file,
+                                         std::string* error_message) {
+    std::string text;
+    {
+        std::ifstream input(a2l_file, std::ios::binary);
+        if (!input) {
+            *error_message = "A2L 修正失败：无法打开生成文件";
+            return false;
+        }
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        if (input.bad()) {
+            *error_message = "A2L 修正失败：读取生成文件不完整";
+            return false;
+        }
+        text = buffer.str();
+    }
+
+    const std::string begin_token = "/begin INSTANCE";
+    std::size_t match_count = 0U;
+    std::size_t match_insert = std::string::npos;
+
+    std::size_t cursor = 0U;
+    while (true) {
+        const std::size_t found = text.find(begin_token, cursor);
+        if (found == std::string::npos) {
+            break;
+        }
+        // 确认这是独立记号：前一个字符必须是空白或文件起始。
+        if (found != 0U && !IsA2lSpace(text[found - 1U])) {
+            cursor = found + begin_token.size();
+            continue;
+        }
+        cursor = found + begin_token.size();
+
+        std::vector<std::string_view> fields;
+        std::size_t scan = cursor;
+        while (scan < text.size() && IsA2lSpace(text[scan])) {
+            ++scan;
+        }
+        // 声明内所有字段都在同一行内以空白分隔，直到 /end INSTANCE。
+        const std::size_t line_end = text.find('\n', scan);
+        const std::size_t bounds =
+            line_end == std::string::npos ? text.size() : line_end;
+        while (scan < bounds) {
+            std::size_t token_end = scan;
+            while (token_end < bounds && !IsA2lSpace(text[token_end])) {
+                ++token_end;
+            }
+            if (token_end == scan) {
+                ++scan;
+                continue;
+            }
+            fields.emplace_back(text.data() + scan, token_end - scan);
+            scan = token_end;
+            while (scan < bounds && IsA2lSpace(text[scan])) {
+                ++scan;
+            }
+        }
+
+        // 声明必须完整闭合：末尾两个字段是 "/end INSTANCE"。
+        if (fields.size() < 5U ||
+            fields[fields.size() - 2U] != "/end" ||
+            fields.back() != "INSTANCE") {
+            continue;
+        }
+        const std::string_view name = fields[0];
+        const std::string_view comment_literal = fields[1];
+        const std::string_view type_name = fields[2];
+        const std::string_view address_text = fields[3];
+
+        if (name != kCalibrationInstanceName ||
+            type_name != kCalibrationInstanceType) {
+            continue;
+        }
+        // 描述必须完整匹配带引号的期望文本。
+        const std::string expected_literal =
+            std::string("\"") + kCalibrationInstanceComment + "\"";
+        if (comment_literal != expected_literal) {
+            continue;
+        }
+        // 段相对寻址下该地址只是模式标识值，不具备基址语义，
+        // 因此只校验它确实是合法的 0x 十六进制字面量。
+        if (!ParseHexAddress(address_text).has_value()) {
+            continue;
+        }
+        // 已经带 READ_WRITE 时视为幂等命中：无需再插入。
+        bool already_writable = false;
+        for (const auto& field : fields) {
+            if (field == "READ_WRITE") {
+                already_writable = true;
+                break;
+            }
+        }
+        ++match_count;
+        if (match_count > 1U) {
+            break;
+        }
+        // 插入点取地址字段结束处，紧跟其后补 READ_WRITE。
+        match_insert = static_cast<std::size_t>(address_text.data() -
+                                                text.data()) +
+                       address_text.size();
+        if (already_writable) {
+            // 幂等命中：记录后直接成功返回，不做任何改写。
+            *error_message = "";
+            return true;
+        }
+    }
+
+    if (match_count == 0U) {
+        *error_message = "A2L 修正失败：未找到唯一匹配的标定段 INSTANCE 声明";
+        return false;
+    }
+    if (match_count > 1U) {
+        *error_message = "A2L 修正失败：匹配到多个标定段 INSTANCE 声明";
+        return false;
+    }
+
+    // 先写同目录临时产物，全部成功后再整体替换，避免部分覆写。
+    const std::filesystem::path temporary_file =
+        a2l_file.parent_path() /
+        (a2l_file.filename().string() + ".patch.tmp");
+    std::string patched = text;
+    patched.insert(match_insert, " READ_WRITE");
+    {
+        std::ofstream output(temporary_file,
+                             std::ios::binary | std::ios::trunc);
+        if (!output) {
+            *error_message = "A2L 修正失败：无法创建临时文件";
+            return false;
+        }
+        output << patched;
+        output.flush();
+        if (!output) {
+            output.close();
+            std::error_code ignored;
+            std::filesystem::remove(temporary_file, ignored);
+            *error_message = "A2L 修正失败：写入临时文件不完整";
+            return false;
+        }
+    }
+    // 校验临时产物与期望内容完全一致后再发布。
+    {
+        std::ifstream verify(temporary_file, std::ios::binary);
+        std::ostringstream buffer;
+        buffer << verify.rdbuf();
+        if (!verify || buffer.str() != patched) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary_file, ignored);
+            *error_message = "A2L 修正失败：临时文件内容校验不一致";
+            return false;
+        }
+    }
+    std::error_code rename_error;
+    std::filesystem::rename(temporary_file, a2l_file, rename_error);
+    if (rename_error) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary_file, ignored);
+        *error_message = "A2L 修正失败：发布替换失败";
+        return false;
+    }
+    *error_message = "";
+    return true;
+}
+
+/// @brief 修正后必须验证可写的标定叶子样例（值类型与结构体成员各一）。
+constexpr char kCalibrationProbeLeaves[][2][48] = {
+    {"xcp_slave_demo::cal.basic.real_32", "real_32"},
+    {"xcp_slave_demo::cal.model.offset", "offset"},
+};
+
+/**
+ * @brief 断言修正后的 A2L 中标定叶子确实已获得写权限。
+ *
+ * 只验证解析成功并不足以证明修正生效：必须回到桥接层按名字查到具体叶子，
+ * 确认 read_write 已为 true。任一叶子缺失或仍不可写即判定修正失败。
+ *
+ * @param database 修正后重新加载得到的 A2L 数据库。
+ * @param error_message 用于接收失败原因的字符串。
+ * @return 全部探针叶子均可写返回 true，否则返回 false。
+ */
+bool VerifyCalibrationWriteAccess(const calmcar::xcp::a2l::IA2lDatabase& database,
+                                  std::string* error_message) {
+    for (const auto& probe : kCalibrationProbeLeaves) {
+        const auto found = database.Find(probe[0]);
+        if (!found.HasValue()) {
+            *error_message =
+                std::string("A2L 修正后校验失败：找不到标定叶子 ") + probe[0];
+            return false;
+        }
+        if (!found.Value().read_write) {
+            *error_message =
+                std::string("A2L 修正后校验失败：标定叶子仍不可写 ") + probe[0];
+            return false;
+        }
+    }
+    return true;
+}
+
 /**
  * @brief 生成 A2L，校验输出完整性后返回，不启动 Ethernet server。
  * @param options 已解析的命令行配置。
@@ -455,6 +717,16 @@ int GenerateA2l(const CommandLineOptions& options) {
             return 1;
         }
 
+        // 在桥接层解析之前补齐标定段的写权限标记：段相对寻址拿不到
+        // XCPlite 自动输出的 READ_WRITE，必须在此处严格局部修正。
+        if (!PatchCalibrationInstanceWriteAccess(paths.a2l_file,
+                                                 &error_message)) {
+            RemoveGeneratedOutputs(paths);
+            std::cerr << error_message << '\n';
+            LIBXCP_LOG_ERROR("A2L 生成失败：{}", error_message);
+            return 1;
+        }
+
         auto loaded =
             calmcar::xcp::a2l::A2lBridge::Load(paths.a2l_file.string());
         if (!loaded.HasValue() || loaded.Value()->Database() == nullptr) {
@@ -477,6 +749,15 @@ int GenerateA2l(const CommandLineOptions& options) {
             LIBXCP_LOG_ERROR(
                 "A2L 生成失败：A2L 端点与 CLI 配置不一致，期望 {}:{}",
                 options.bind_address, options.port);
+            return 1;
+        }
+
+        // 解析成功不等于权限修正生效：回到桥接层确认标定叶子真的可写。
+        if (!VerifyCalibrationWriteAccess(*loaded.Value()->Database(),
+                                          &error_message)) {
+            RemoveGeneratedOutputs(paths);
+            std::cerr << error_message << '\n';
+            LIBXCP_LOG_ERROR("A2L 生成失败：{}", error_message);
             return 1;
         }
 

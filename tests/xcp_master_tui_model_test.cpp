@@ -13,6 +13,7 @@ using calmcar::xcp::tools::ActionForPreviewRow;
 using calmcar::xcp::tools::BoundedLineBuffer;
 using calmcar::xcp::tools::BuildPreviewRows;
 using calmcar::xcp::tools::CalculateTuiLayout;
+using calmcar::xcp::tools::CalibrationCommandPermitted;
 using calmcar::xcp::tools::CalibrationFormModel;
 using calmcar::xcp::tools::CalibrationSelection;
 using calmcar::xcp::tools::CommandHistory;
@@ -799,6 +800,78 @@ TEST(PreviewRowsTest, ExpandedWatchedArrayDoesNotOfferManualReadAction) {
     EXPECT_FALSE(rows[1].is_read_action);
     EXPECT_EQ(rows[1].element_index, 0U);
     EXPECT_EQ(rows[2].element_index, 1U);
+}
+
+/**
+ * @brief 标定准入只由尺寸、页面、选中状态与静态策略决定。
+ *
+ * 本用例固化「标定读写与 DAQ 采集解耦」这一设计决定：谓词签名中不含 DAQ
+ * 状态，因此无论 DAQ 是否运行，同一组输入必然得到同一结果。若有人试图把
+ * DAQ 运行状态重新引入标定准入，必须修改函数签名，本用例即随之失效。
+ */
+TEST(CalibrationCommandPermittedTest, AcceptsCalibrationPageWithCleanPolicy) {
+    EXPECT_TRUE(CalibrationCommandPermitted(
+        /*terminal_too_small=*/false, VariableModalPage::Calibration,
+        /*has_symbol=*/true, /*policy_reason=*/""));
+}
+
+/** @brief 终端尺寸不足时标定控件必须不可用。 */
+TEST(CalibrationCommandPermittedTest, RejectsTooSmallTerminal) {
+    EXPECT_FALSE(CalibrationCommandPermitted(
+        /*terminal_too_small=*/true, VariableModalPage::Calibration,
+        /*has_symbol=*/true, /*policy_reason=*/""));
+}
+
+/** @brief 非标定页面（详情、确认、关闭）一律不开放标定控件。 */
+TEST(CalibrationCommandPermittedTest, RejectsNonCalibrationPages) {
+    for (const auto page : {VariableModalPage::Closed, VariableModalPage::Details,
+                            VariableModalPage::Confirmation}) {
+        EXPECT_FALSE(CalibrationCommandPermitted(
+            /*terminal_too_small=*/false, page, /*has_symbol=*/true,
+            /*policy_reason=*/""))
+            << "页面应被拒绝：static_cast<int>(page)="
+            << static_cast<int>(page);
+    }
+}
+
+/** @brief 未选中符号时标定控件必须不可用。 */
+TEST(CalibrationCommandPermittedTest, RejectsMissingSymbol) {
+    EXPECT_FALSE(CalibrationCommandPermitted(
+        /*terminal_too_small=*/false, VariableModalPage::Calibration,
+        /*has_symbol=*/false, /*policy_reason=*/""));
+}
+
+/** @brief 静态策略返回任何拒绝原因时标定控件必须不可用。 */
+TEST(CalibrationCommandPermittedTest, RejectsNonEmptyPolicyReason) {
+    EXPECT_FALSE(CalibrationCommandPermitted(
+        /*terminal_too_small=*/false, VariableModalPage::Calibration,
+        /*has_symbol=*/true, /*policy_reason=*/"A2L 未标记为可写"));
+    EXPECT_FALSE(CalibrationCommandPermitted(
+        /*terminal_too_small=*/false, VariableModalPage::Calibration,
+        /*has_symbol=*/true,
+        /*policy_reason=*/"DAQ 仅支持 MEASUREMENT"));
+}
+
+/**
+ * @brief 同一输入组合在任意调用顺序下结果稳定，且不受外部 DAQ 状态干扰。
+ *
+ * 谓词无状态、无隐藏输入：连续多次调用与穿插其它页面调用都不得改变结果。
+ */
+TEST(CalibrationCommandPermittedTest, IsPureAndIndependentOfExternalState) {
+    const bool baseline = CalibrationCommandPermitted(
+        /*terminal_too_small=*/false, VariableModalPage::Calibration,
+        /*has_symbol=*/true, /*policy_reason=*/"");
+    EXPECT_TRUE(baseline);
+
+    // 穿插一次非标定页面的调用，模拟 DAQ 运行期间界面切页。
+    static_cast<void>(CalibrationCommandPermitted(
+        /*terminal_too_small=*/false, VariableModalPage::Details,
+        /*has_symbol=*/true, /*policy_reason=*/""));
+
+    EXPECT_EQ(CalibrationCommandPermitted(
+                  /*terminal_too_small=*/false, VariableModalPage::Calibration,
+                  /*has_symbol=*/true, /*policy_reason=*/""),
+              baseline);
 }
 
 }  // namespace
