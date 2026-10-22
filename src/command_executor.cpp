@@ -142,13 +142,87 @@ std::string_view NonReplayableCommandName(CommandCode cmd) {
 
 }  // namespace
 
+std::string RecoveryPolicy::Validate() const {
+    // 方案 §4.6 第 7 条：负数、零值、溢出在构造或 Connect 前失败。
+    // 使用 milliseconds 的 rep（通常为 int64）判定，避免窄化比较。
+    const auto busy_delay = busy_retry_delay.count();
+    const auto total = busy_total_timeout.count();
+    if (busy_retry_enabled) {
+        if (busy_delay <= 0) {
+            return "busy_retry_delay 必须为正数（当前 " +
+                   std::to_string(busy_delay) + " ms）";
+        }
+        if (total <= 0) {
+            return "busy_total_timeout 必须为正数（当前 " +
+                   std::to_string(total) + " ms）";
+        }
+        // 总 deadline 必须足以容纳至少一次等待，否则配置自相矛盾。
+        if (total < busy_delay) {
+            return "busy_total_timeout(" + std::to_string(total) +
+                   " ms) 小于 busy_retry_delay(" + std::to_string(busy_delay) +
+                   " ms)：总体 deadline 无法容纳任何一次 BUSY 等待";
+        }
+    }
+    return {};
+}
+
 CommandExecutor::CommandExecutor(IXcpTransport& transport, Session& session,
                                  CommandTimeouts timeouts,
-                                 IEventListener* event_listener)
+                                 IEventListener* event_listener,
+                                 RecoveryPolicy recovery_policy)
     : m_transport_(transport),
       m_session_(session),
       m_timeouts_(timeouts),
+      m_recovery_policy_(recovery_policy),
       m_event_listener_(event_listener) {}
+
+bool CommandExecutor::IsCancelled() const {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_cancelled_;
+}
+
+bool CommandExecutor::IsBusyResponse(const ParsedPacket& response) {
+    const auto* err = std::get_if<NegativeResponse>(&response);
+    return err != nullptr && err->error_code.has_value() &&
+           *err->error_code == ErrorCode::CmdBusy;
+}
+
+bool CommandExecutor::WaitBusyDelay(std::chrono::milliseconds delay) {
+    if (delay.count() <= 0) {
+        return !IsCancelled();
+    }
+    std::unique_lock<std::mutex> lock(m_mutex_);
+    const auto deadline = std::chrono::steady_clock::now() + delay;
+    // 复用 m_response_cv_：任一 Packet 到达、取消或关闭都会唤醒；被唤醒后
+    // 循环顶部统一判定取消/关闭，未满足条件则继续睡到本段 deadline。
+    while (!m_cancelled_ && !m_transport_closed_) {
+        if (m_response_cv_.wait_until(lock, deadline) ==
+            std::cv_status::timeout) {
+            break;
+        }
+    }
+    const bool ok = !m_cancelled_ && !m_transport_closed_;
+    lock.unlock();
+    if (!ok) {
+        LIBXCP_LOG_INFO("XCP BUSY wait interrupted (cancelled or closed)");
+    }
+    return ok;
+}
+
+void CommandExecutor::CancelPendingOperation() {
+    // 线程安全：置取消标志并唤醒全部等待者。被唤醒的等待循环看到标志后
+    // 统一抛出 Cancelled（不伪装成 Timeout/ProtocolError）。
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_cancelled_ = true;
+        m_cmd_pending_received_ = false;
+    }
+    m_response_cv_.notify_all();
+    m_synch_cv_.notify_all();
+    LIBXCP_LOG_INFO("XCP pending operation cancelled by caller");
+}
+
+RecoveryPolicy CommandExecutor::GetRecoveryPolicy() const { return m_recovery_policy_; }
 
 CommandExecutor::~CommandExecutor() {
     // 唤醒任何仍在等待的调用方，避免析构后条件变量被永久阻塞
@@ -165,12 +239,45 @@ CommandExecutor::~CommandExecutor() {
 
 IPacketListener& CommandExecutor::AsListener() noexcept { return *this; }
 
-void CommandExecutor::EnsureCodec(ByteOrder byte_order) {
-    if (!m_codec_ || m_codec_->GetByteOrder() != byte_order) {
-        m_codec_ = std::make_unique<CommandCodec>(byte_order);
+void CommandExecutor::OnTransportReopened() noexcept {
+    // 只清"通道级"状态。这里刻意**不清** m_cancelled_：
+    // 取消语义由 RunCommand 在每条顶层命令开始前自行清除（见该函数注释），
+    // 两处都清会让"重连前的取消意图"渗入新会话的判定，反而模糊责任边界。
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_transport_closed_ = false;
+    m_transport_close_reason_.clear();
+    // 迟到响应槽位：上一会话的残留响应绝不能喂给新会话的第一条命令，
+    // 否则会对错包做出"成功"判定——比超时更危险，因此必须丢弃。
+    m_pending_response_.reset();
+    m_response_ready_ = false;
+    m_cmd_pending_received_ = false;
+    // 恢复/同步标志：二者本就在 SendSynch 入口与出口各自复位，命令之间正常
+    // 情况下已是 false。这里显式清零属**防御性**收尾——它们跨会话存在没有
+    // 意义，留着只会让"新会话从干净状态起步"这一契约依赖别处的时序假设。
+    m_synch_confirmed_ = false;
+    m_in_recovery_ = false;
+    LIBXCP_LOG_INFO(
+        "XCP CommandExecutor reset for reopened transport; stale channel "
+        "state cleared");
+}
+
+bool CommandExecutor::IsTransportClosed() const noexcept {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    return m_transport_closed_;
+}
+
+void CommandExecutor::EnsureCodec(ByteOrder byte_order, AddressGranularity ag) {
+    // AG 参与 Codec 重建判定：CONNECT 后 AG 才确定，且 DOWNLOAD 的
+    // 对齐字节数依赖它（原始 PDF 第 142 页 Table 82），故 AG 变化必须重建。
+    if (!m_codec_ || m_codec_->GetByteOrder() != byte_order ||
+        m_codec_->GetAddressGranularity() != ag) {
+        m_codec_ = std::make_unique<CommandCodec>(byte_order, ag);
     }
-    if (!m_parser_ || m_parser_->GetByteOrder() != byte_order) {
-        m_parser_ = std::make_unique<ResponseParser>(byte_order);
+    // 解析器同样按 AG 重建：GET_ID 的 Length mod AG 判据（F-03c）依赖
+    // 会话实际 AG，AG 变化后沿用旧解析器会按错误粒度判定。
+    if (!m_parser_ || m_parser_->GetByteOrder() != byte_order ||
+        m_parser_->GetAddressGranularity() != ag) {
+        m_parser_ = std::make_unique<ResponseParser>(byte_order, ag);
     }
 }
 
@@ -335,6 +442,10 @@ void CommandExecutor::OnTransportClosed(std::string_view reason) {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         m_transport_closed_ = true;
         m_transport_close_reason_ = std::string(reason);
+        // F-11（§4.6 第 6 条）：Transport Close 属「取消类」唤醒——等待者
+        // 必须返回 Cancelled 而非 Timeout，避免调用方把通道关闭误判为对端
+        // 无响应并触发无意义的恢复。
+        m_cancelled_ = true;
     }
     m_response_cv_.notify_all();
     m_synch_cv_.notify_all();
@@ -369,6 +480,14 @@ std::optional<ParsedPacket> CommandExecutor::WaitForResponse(
             LIBXCP_LOG_INFO(
                 "XCP response slot consumed; pending event cleared");
             return out;
+        }
+        // F-11：调用方取消优先于超时判定——必须在临界区内确定并返回 nullopt，
+        // 由 RunCommand 统一转换为 Cancelled（而非伪装成 Timeout）。
+        if (m_cancelled_) {
+            m_cmd_pending_received_ = false;
+            lock.unlock();
+            LIBXCP_LOG_INFO("XCP response wait interrupted: cancelled");
+            return std::nullopt;
         }
         if (m_transport_closed_) {
             m_cmd_pending_received_ = false;
@@ -550,7 +669,7 @@ void CommandExecutor::RestoreUploadMta() {
 
     // 不记录地址、扩展或数据，避免泄露标定位置。
     LIBXCP_LOG_INFO("XCP recovery: restoring cached MTA");
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeSetMta(mta->extension, mta->address);
     const auto response = PerformAttempt(CommandCode::SetMta, encoded);
     if (!response) {
@@ -558,6 +677,89 @@ void CommandExecutor::RestoreUploadMta() {
         return;
     }
     (void)DispatchResponse(CommandCode::SetMta, *response);
+}
+
+void CommandExecutor::SetSeedKeySegment(SeedKeySegment segment) {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_seed_key_segment_ = segment;
+}
+
+void CommandExecutor::ResetSeedKeyTransaction() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_seed_key_segment_ = SeedKeySegment::NotSegmented;
+    m_seed_key_restarts_ = 0;
+}
+
+void CommandExecutor::ClearSeedKeySegment() {
+    const std::lock_guard<std::mutex> lock(m_mutex_);
+    m_seed_key_segment_ = SeedKeySegment::NotSegmented;
+}
+
+void CommandExecutor::RunSegmentedRecovery(CommandCode cmd,
+                                           SeedKeySegment segment) {
+    const std::string command_name =
+        cmd == CommandCode::GetSeed ? "GET_SEED" : "UNLOCK";
+
+    // 末段：资源可能已经（对被解锁而言）或已经完整交付（对 GET_SEED 而言），
+    // 属结果未知写操作。规范要求 Key 直到序列完成后才校验，因此末段既不能
+    // 重放、也不能自动重连后重启，更不能继续受保护操作（方案 §2C.2）。
+    if (segment == SeedKeySegment::Final) {
+        LIBXCP_LOG_ERROR(
+            "XCP segmented seed&key final segment timeout cmd={}",
+            command_name);
+        // 只清段位置：事务将由调用方放弃，重启计数由 ResetSeedKeyTransaction
+        // 在事务层收尾时清零，此处保留以维持诊断信息
+        ClearSeedKeySegment();
+        throw XcpException(
+            ErrorCategory::OperationOutcomeUnknown,
+            command_name +
+                " 末段响应超时，执行结果未知；已禁止自动重放，"
+                "请由调用方决定是否断开重连",
+            cmd, std::nullopt, 0);
+    }
+
+    // 非末段：事务级重启上限（与单命令 repeat 2 times 语义不同）
+    constexpr int kMaxTransactionRestarts = 1;
+    int restarts = 0;
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        restarts = m_seed_key_restarts_;
+    }
+    if (restarts >= kMaxTransactionRestarts) {
+        LIBXCP_LOG_ERROR(
+            "XCP segmented seed&key restart budget exhausted cmd={}",
+            command_name);
+        ClearSeedKeySegment();
+        throw XcpException(ErrorCategory::RecoveryFailed,
+                           command_name + " 分段事务重启次数已用尽（" +
+                               std::to_string(restarts) + " 次）",
+                           cmd, std::nullopt, restarts);
+    }
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        ++m_seed_key_restarts_;
+    }
+
+    // UNLOCK 非末段：Slave 可能已缓存部分 Key，单独 SYNCH 不足以证明分段
+    // 状态已复位（Key 最后才校验，失步不会立即暴露）。必须先断开重连。
+    if (cmd == CommandCode::Unlock) {
+        LIBXCP_LOG_WARNING(
+            "XCP segmented UNLOCK mid-segment timeout; requiring reconnect");
+        ClearSeedKeySegment();
+        throw XcpException(
+            ErrorCategory::OperationOutcomeUnknown,
+            "UNLOCK 非末段响应超时，Slave 可能已缓存部分 Key；"
+            "须先断开重连，再从 GET_SEED 完整重启解锁序列",
+            cmd, std::nullopt, restarts);
+    }
+
+    // GET_SEED 任一段：清除本地分段状态后 SYNCH。SYNCH 成功后由事务层
+    // （XcpMaster::Unlock）从 GET_SEED(Mode=0) 完整重启。
+    LIBXCP_LOG_WARNING(
+        "XCP segmented GET_SEED timeout; resetting transaction and SYNCH");
+    // 保留重启计数：预算须在整个事务期间累积，只有事务层收尾才清零
+    ClearSeedKeySegment();
+    PerformRecovery(cmd);
 }
 
 void CommandExecutor::PerformRecovery(CommandCode cmd) {
@@ -583,7 +785,7 @@ void CommandExecutor::PerformRecovery(CommandCode cmd) {
 }
 
 bool CommandExecutor::SendSynch() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes synch = m_codec_->EncodeSynch();
 
     {
@@ -615,7 +817,7 @@ bool CommandExecutor::SendSynch() {
         std::unique_lock<std::mutex> lock(m_mutex_);
         const auto deadline =
             std::chrono::steady_clock::now() + m_timeouts_.synch_timeout;
-        while (!m_synch_confirmed_ && !m_transport_closed_) {
+        while (!m_synch_confirmed_ && !m_transport_closed_ && !m_cancelled_) {
             if (m_synch_cv_.wait_until(lock, deadline) ==
                 std::cv_status::timeout) {
                 break;
@@ -650,6 +852,16 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
         throw detail::MakeInvalidState("已有待响应的命令，拒绝并发发送");
     }
 
+    // F-11：进入顶层命令前清除上一轮遗留的取消标志，使新操作不被历史取消
+    // 影响。同时建立本次顶层操作的总体 deadline——自首次发送前开始计时，
+    // 覆盖全部 BUSY 等待、重发与响应时间，**重试后不得重新计时**（§4.6 第 3 条）。
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_cancelled_ = false;
+    }
+    const auto busy_deadline =
+        std::chrono::steady_clock::now() + m_recovery_policy_.busy_total_timeout;
+
     int retries = 0;
     while (true) {
         std::optional<ParsedPacket> response;
@@ -663,13 +875,84 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
             throw detail::MakeTransportError("发送命令时底层异常", e.what());
         }
 
+        // F-11：取消优先于一切恢复策略。取消时不再 SYNCH、不再重试，直接以
+        // Cancelled 返回给调用方（§4.6 第 6 条：不得与 Timeout 混用）。
+        if (IsCancelled()) {
+            LIBXCP_LOG_INFO("XCP command cancelled cmd={}",
+                            toHex(static_cast<std::uint8_t>(cmd)));
+            throw detail::MakeCancelled("命令等待被调用方取消", cmd);
+        }
+
         if (response) {
+            // F-11：ERR_CMD_BUSY 是**可恢复**错误——按规范恢复矩阵
+            // 「ERR_CMD_BUSY → wait t7 → repeat ∞ times」，等待 t7 后重发。
+            // 但库实现必须受总体 deadline 与取消控制，不能真正无限等待。
+            if (IsBusyResponse(*response)) {
+                if (!m_recovery_policy_.busy_retry_enabled) {
+                    return DispatchResponse(cmd, *response);  // 关闭重试：旧行为
+                }
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= busy_deadline) {
+                    LIBXCP_LOG_ERROR(
+                        "XCP BUSY retry deadline exhausted cmd={} elapsed_ms={}",
+                        toHex(static_cast<std::uint8_t>(cmd)),
+                        m_recovery_policy_.busy_total_timeout.count());
+                    throw XcpException(
+                        ErrorCategory::RecoveryFailed,
+                        "对端持续返回 ERR_CMD_BUSY，总体 deadline（" +
+                            std::to_string(
+                                m_recovery_policy_.busy_total_timeout.count()) +
+                            " ms）已耗尽",
+                        cmd, std::nullopt, retries);
+                }
+                // 等待 t7：取「剩余 deadline」与「配置间隔」的较小值，确保
+                // 不会越过总体 deadline。等待可被取消/断连/析构唤醒。
+                const auto remaining =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        busy_deadline - now);
+                const auto wait_for =
+                    (std::min)(remaining, m_recovery_policy_.busy_retry_delay);
+                LIBXCP_LOG_WARNING(
+                    "XCP ERR_CMD_BUSY; waiting t7 ms={} before retry cmd={}",
+                    wait_for.count(),
+                    toHex(static_cast<std::uint8_t>(cmd)));
+                if (!WaitBusyDelay(wait_for)) {
+                    // 等待期间被取消或 Transport 关闭：按取消语义返回。
+                    throw detail::MakeCancelled(
+                        "在 ERR_CMD_BUSY 等待期间被取消", cmd);
+                }
+                // 不增加 retries：BUSY 表示资源暂时不可用，不是超时恢复，
+                // 其预算由上面的总体 deadline 约束，与「timeout 重试 2 次」
+                // 是两套独立计数（§4.6 第 3 条）。
+                continue;
+            }
             // dispatchResponse 可能抛 ProtocolError 等结构化错误，交由上层处理
             return DispatchResponse(cmd, *response);
         }
 
         LIBXCP_LOG_WARNING("XCP command response timeout cmd={} retries={}",
                            toHex(static_cast<std::uint8_t>(cmd)), retries);
+
+        // F-10：分段 Seed&Key 事务超时不得走通用重放路径。规范对「多段
+        // 序列中途超时」未给出专门处理，通用路径的「SYNCH + 重放当前段」
+        // 会因 Slave 侧段偏移不确定而静默失步（Key 直到序列末尾才校验，
+        // 原始 PDF 第 130 页）。这里改为按段位置分派事务级恢复策略。
+        {
+            SeedKeySegment segment = SeedKeySegment::NotSegmented;
+            {
+                const std::lock_guard<std::mutex> lock(m_mutex_);
+                segment = m_seed_key_segment_;
+            }
+            if (segment != SeedKeySegment::NotSegmented) {
+                RunSegmentedRecovery(cmd, segment);
+                // RunSegmentedRecovery 正常返回表示事务已重启，本段由事务层
+                // 重新编排；此处不得重放原 encoded_packet。
+                throw XcpException(
+                    ErrorCategory::RecoveryFailed,
+                    "分段 Seed&Key 事务已重启，原分段不再重放", cmd,
+                    std::nullopt, retries);
+            }
+        }
 
         // 这些标定变更命令可能已在 Slave 生效；响应超时后即便 SYNCH 恢复
         // 成功也不得重放，否则可能重复写入或覆盖并发状态变化。报告结果未知，
@@ -749,7 +1032,8 @@ ParsedPacket CommandExecutor::RunCommand(CommandCode cmd,
 ConnectResponse CommandExecutor::ExecuteConnect(std::uint8_t mode) {
     // CONNECT 之前尚无 Session 字节序，按 Intel 编码（reserved/mode
     // 均为单字节， 不受字节序影响），成功后再按协商结果重建 Codec/Parser。
-    EnsureCodec(ByteOrder::Intel);
+    // AG 此时也未协商，按 Byte 占位；CONNECT 成功后用协商值重建。
+    EnsureCodec(ByteOrder::Intel, AddressGranularity::Byte);
     const Bytes encoded = m_codec_->EncodeConnect(mode);
 
     m_session_.BeginConnecting();
@@ -796,13 +1080,14 @@ ConnectResponse CommandExecutor::ExecuteConnect(std::uint8_t mode) {
         m_session_.Fail("CONNECT 参数校验失败");
         throw;
     }
-    // 协商出的字节序立即生效
-    EnsureCodec(connect->byte_order);
+    // 协商出的字节序立即生效；AG 同样来自 CONNECT 响应
+    // （COMM_MODE_BASIC bit1-2），后续 DOWNLOAD 对齐依赖它
+    EnsureCodec(connect->byte_order, m_session_.GetAddressGranularity());
     return *connect;
 }
 
 void CommandExecutor::ExecuteDisconnect() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeDisconnect();
     m_session_.BeginDisconnecting();
     try {
@@ -822,7 +1107,7 @@ void CommandExecutor::ExecuteDisconnect() {
 }
 
 GetStatusResponse CommandExecutor::ExecuteGetStatus() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetStatus();
     auto response = RunCommand(CommandCode::GetStatus, encoded);
     const auto& res = std::get<PositiveResponse>(response);
@@ -838,7 +1123,7 @@ GetStatusResponse CommandExecutor::ExecuteGetStatus() {
 
 std::optional<GetCommModeInfoResponse>
 CommandExecutor::ExecuteGetCommModeInfo() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetCommModeInfo();
 
     ParsedPacket response;
@@ -866,7 +1151,7 @@ CommandExecutor::ExecuteGetCommModeInfo() {
 
 void CommandExecutor::ExecuteSetMta(AddressExtension extension,
                                     Address address) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeSetMta(extension, address);
     (void)RunCommand(CommandCode::SetMta, encoded);
     // 记录隐含状态，供 UPLOAD 超时恢复时重建 MTA
@@ -877,7 +1162,7 @@ void CommandExecutor::ExecuteSetMta(AddressExtension extension,
 }
 
 Bytes CommandExecutor::ExecuteUpload(ElementCount number_of_elements) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeUpload(number_of_elements);
     auto response = RunCommand(CommandCode::Upload, encoded);
     auto& res = std::get<PositiveResponse>(response);
@@ -888,19 +1173,34 @@ Bytes CommandExecutor::ExecuteUpload(ElementCount number_of_elements) {
 Bytes CommandExecutor::ExecuteShortUpload(ElementCount number_of_elements,
                                           AddressExtension extension,
                                           Address address) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded =
         m_codec_->EncodeShortUpload(number_of_elements, extension, address);
     auto response = RunCommand(CommandCode::ShortUpload, encoded);
     auto& res = std::get<PositiveResponse>(response);
     CheckResLength(CommandCode::ShortUpload, res, number_of_elements);
+    // F-09：规范要求 SHORT_UPLOAD 成功后把 MTA 设为「上传数据块之后的第一个
+    // 数据字节」。须同步本端隐含 MTA，否则此后若发生 UPLOAD 超时恢复，
+    // 会按陈旧的 m_last_mta_ 重放 SET_MTA，导致读到的地址与预期错位。
+    {
+        const auto advanced = XcpAddress40{address, extension}.Advance(
+            number_of_elements, m_session_.GetAddressGranularity());
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        if (advanced.has_value()) {
+            m_last_mta_ = *advanced;
+        } else {
+            // 地址推进溢出 32 位：无法表达块末位置，作废本端记录而不是
+            // 保留陈旧值（陈旧值会让恢复把 MTA 拉回块首，与本命令语义相反）。
+            m_last_mta_.reset();
+        }
+    }
     return std::move(res.data);
 }
 
 GetIdResponse CommandExecutor::ExecuteGetId(std::uint8_t identification_type) {
     // GET_ID 在 XCPlite 侧是同步命令、无副作用恢复语义之外的分支：直接复用
     // RunCommand 的 SYNCH 恢复通路。
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetId(identification_type);
     auto response = RunCommand(CommandCode::GetId, encoded);
     const auto& res = std::get<PositiveResponse>(response);
@@ -913,11 +1213,85 @@ GetIdResponse CommandExecutor::ExecuteGetId(std::uint8_t identification_type) {
     return *parsed;
 }
 
+CommandExecutor::GetVersionProbe CommandExecutor::ExecuteGetVersion() {
+    // 批次 B1：GET_VERSION 是 optional 命令（原始 PDF 第 106 页 §7.4 /
+    // 第 114 页 Table 44）。规范明文规定未实现的 optional 命令返回
+    // ERR_CMD_UNKNOWN 且不产生副作用，该机制存在的目的就是让 Master 能
+    // 低成本探测（P106："This lets the master device detect not implemented
+    // optional commands easily."）。
+    //
+    // 因此本方法把"命令不可用"表达为正常返回值而非异常：三种不可用情形
+    // （未实现命令 / 未实现子命令 / 超时）都返回 GetVersionProbe。
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    const Bytes encoded = m_codec_->EncodeGetVersion();
+
+    GetVersionProbe probe;
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetVersion, encoded);
+    } catch (const XcpException& e) {
+        // 超时：不得据此断言对端为老版本，仅表示版本未确认。
+        if (e.Category() == ErrorCategory::Timeout) {
+            probe.outcome = GetVersionOutcome::TimedOut;
+            return probe;
+        }
+        // 恢复重试耗尽：`RunCommand` 在重试用尽后抛的是 RecoveryFailed 而非
+        // Timeout（见本文件 "命令超时且恢复重试已耗尽" 分支），但成因仍是
+        // **响应始终未到**。若如实上抛，连接期的自动探测会因一个慢对端直接
+        // 让 CONNECT 失败——这正好违反本方法的契约（探测失败必须只降级为
+        // "版本未确认"）。因此这部分同样归类为 TimedOut。
+        // 注意：仍**不**断言对端版本低，只表达"未确认"。
+        if (e.Category() == ErrorCategory::RecoveryFailed) {
+            probe.outcome = GetVersionOutcome::TimedOut;
+            return probe;
+        }
+        // ERR_CMD_UNKNOWN：对端不认识 0xC0 族（或其视为未实现的 optional 命令）
+        if (e.Category() == ErrorCategory::ProtocolError && e.GetErrorCode() &&
+            *e.GetErrorCode() == ErrorCode::CmdUnknown) {
+            probe.outcome = GetVersionOutcome::UnimplementedCommand;
+            return probe;
+        }
+        // ERR_SUBCMD_UNKNOWN：对端认识 0xC0 族但不认识 0x00 子命令
+        if (e.Category() == ErrorCategory::ProtocolError && e.GetErrorCode() &&
+            *e.GetErrorCode() == ErrorCode::SubcmdUnknown) {
+            probe.outcome = GetVersionOutcome::UnimplementedSubcommand;
+            return probe;
+        }
+        // 其余（传输故障等）不是"命令不可用"，如实上抛
+        throw;
+    }
+
+    if (!std::holds_alternative<PositiveResponse>(response)) {
+        // 负响应走到这里说明 RunCommand 未按预期转换；按畸形响应处理，
+        // 不伪装成"不可用"以免掩盖真实协议故障。
+        throw detail::MakeMalformedPacket(
+            "GET_VERSION 返回了非正响应且未携带可识别错误码");
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetVersionResponse(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_VERSION 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) +
+            " 字节，原始 PDF 第 114 页 Table 45 要求 6 字节含 0xFF）");
+    }
+    probe.outcome = GetVersionOutcome::Available;
+    probe.response = *parsed;
+    return probe;
+}
+
 GetSeedResponse CommandExecutor::ExecuteGetSeed(Resource resource,
                                                 SeedMode mode) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetSeed(resource, mode);
+    // F-10：标记段位置。Mode=Remainder 属多段序列的中间段，其超时不可由
+    // 通用路径重放（Slave 侧段偏移不确定）。Mode=First 开启事务，本身可
+    // 安全重启，不进入分段恢复分支。
+    SetSeedKeySegment(mode == SeedMode::Remainder
+                          ? SeedKeySegment::NonFinal
+                          : SeedKeySegment::NotSegmented);
     auto response = RunCommand(CommandCode::GetSeed, encoded);
+    SetSeedKeySegment(SeedKeySegment::NotSegmented);
     const auto& res = std::get<PositiveResponse>(response);
     auto parsed = m_parser_->ParseGetSeedResponse(BytesView{res.data});
     if (!parsed) {
@@ -929,14 +1303,20 @@ GetSeedResponse CommandExecutor::ExecuteGetSeed(Resource resource,
 }
 
 UnlockResponse CommandExecutor::ExecuteUnlock(std::uint8_t length_field,
-                                              BytesView key_segment) {
-    EnsureCodec(m_session_.GetByteOrder());
+                                              BytesView key_segment,
+                                              bool is_final_segment) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeUnlock(length_field, key_segment);
+    // F-10：标记段位置。末段属结果未知（资源可能已解锁），超时后禁止自动
+    // 重放；非末段则须先断开重连再从 GET_SEED 完整重启。
+    SetSeedKeySegment(is_final_segment ? SeedKeySegment::Final
+                                       : SeedKeySegment::NonFinal);
 
     ParsedPacket response;
     try {
         response = RunCommand(CommandCode::Unlock, encoded);
     } catch (const XcpException& e) {
+        SetSeedKeySegment(SeedKeySegment::NotSegmented);
         // Key 校验失败：Slave 已主动断开会话（规范 §7.5.1.9），本地会话
         // 不可继续，标记 Failed（XcpMaster::Connect() 会自动 Reset 重连）
         if (e.Category() == ErrorCategory::ProtocolError && e.GetErrorCode() &&
@@ -945,6 +1325,7 @@ UnlockResponse CommandExecutor::ExecuteUnlock(std::uint8_t length_field,
         }
         throw;
     }
+    SetSeedKeySegment(SeedKeySegment::NotSegmented);
 
     const auto& res = std::get<PositiveResponse>(response);
     auto parsed = m_parser_->ParseUnlockResponse(BytesView{res.data});
@@ -969,7 +1350,7 @@ void CommandExecutor::RestoreDaqPtr() {
     if (!ptr) {
         return;  // 未记录或被 CLEAR_DAQ_LIST 作废：无可重放的隐含状态
     }
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeSetDaqPtr(
         ptr->daq_list, ptr->odt_number, ptr->odt_entry);
     const auto response = PerformAttempt(CommandCode::SetDaqPtr, encoded);
@@ -984,7 +1365,7 @@ void CommandExecutor::RestoreDaqPtr() {
 void CommandExecutor::ExecuteSetDaqPtr(std::uint16_t daq_list,
                                        std::uint8_t odt_number,
                                        std::uint8_t odt_entry_number) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded =
         m_codec_->EncodeSetDaqPtr(daq_list, odt_number, odt_entry_number);
     (void)RunCommand(CommandCode::SetDaqPtr, encoded);
@@ -999,7 +1380,7 @@ void CommandExecutor::ExecuteWriteDaq(std::uint8_t bit_offset,
                                       std::uint8_t size,
                                       AddressExtension extension,
                                       Address address) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded =
         m_codec_->EncodeWriteDaq(bit_offset, size, extension, address);
     (void)RunCommand(CommandCode::WriteDaq, encoded);
@@ -1008,7 +1389,7 @@ void CommandExecutor::ExecuteWriteDaq(std::uint8_t bit_offset,
 }
 
 void CommandExecutor::ExecuteClearDaqList(std::uint16_t daq_list) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeClearDaqList(daq_list);
     (void)RunCommand(CommandCode::ClearDaqList, encoded);
     // CLEAR 后该列表的 Entry 全部复位，隐含指针语义不再成立 → 作废记录，
@@ -1022,7 +1403,7 @@ void CommandExecutor::ExecuteClearDaqList(std::uint16_t daq_list) {
 }
 
 void CommandExecutor::ExecuteFreeDaq() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeFreeDaq();
     (void)RunCommand(CommandCode::FreeDaq, encoded);
     // 全表作废：隐含指针记录一律失效（口径与 ExecuteClearDaqList 一致，
@@ -1034,7 +1415,7 @@ void CommandExecutor::ExecuteFreeDaq() {
 }
 
 void CommandExecutor::ExecuteAllocDaq(std::uint16_t count) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeAllocDaq(count);
     (void)RunCommand(CommandCode::AllocDaq, encoded);
     // 全表已被 FREE_DAQ 清空后才会走到这里（编排层时序，D9）；防御性地
@@ -1047,7 +1428,7 @@ void CommandExecutor::ExecuteAllocDaq(std::uint16_t count) {
 
 void CommandExecutor::ExecuteAllocOdt(std::uint16_t daq_list,
                                       std::uint8_t count) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeAllocOdt(daq_list, count);
     (void)RunCommand(CommandCode::AllocOdt, encoded);
 }
@@ -1055,7 +1436,7 @@ void CommandExecutor::ExecuteAllocOdt(std::uint16_t daq_list,
 void CommandExecutor::ExecuteAllocOdtEntry(std::uint16_t daq_list,
                                            std::uint8_t odt_number,
                                            std::uint8_t count) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded =
         m_codec_->EncodeAllocOdtEntry(daq_list, odt_number, count);
     (void)RunCommand(CommandCode::AllocOdtEntry, encoded);
@@ -1066,7 +1447,7 @@ void CommandExecutor::ExecuteSetDaqListMode(DaqListModeBit mode,
                                             std::uint16_t event_channel,
                                             std::uint8_t prescaler,
                                             std::uint8_t priority) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeSetDaqListMode(
         mode, daq_list, event_channel, prescaler, priority);
     (void)RunCommand(CommandCode::SetDaqListMode, encoded);
@@ -1074,7 +1455,7 @@ void CommandExecutor::ExecuteSetDaqListMode(DaqListModeBit mode,
 
 StartStopDaqListResponse CommandExecutor::ExecuteStartStopDaqList(
     DaqListAction action, std::uint16_t daq_list) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeStartStopDaqList(action, daq_list);
     auto response = RunCommand(CommandCode::StartStopDaqList, encoded);
     const auto& res = std::get<PositiveResponse>(response);
@@ -1088,14 +1469,14 @@ StartStopDaqListResponse CommandExecutor::ExecuteStartStopDaqList(
 }
 
 void CommandExecutor::ExecuteStartStopSynch(DaqSynchAction action) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeStartStopSynch(action);
     (void)RunCommand(CommandCode::StartStopSynch, encoded);
 }
 
 std::optional<GetDaqListInfoResponse> CommandExecutor::ExecuteGetDaqListInfo(
     std::uint16_t daq_list) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetDaqListInfo(daq_list);
     ParsedPacket response;
     try {
@@ -1120,7 +1501,7 @@ std::optional<GetDaqListInfoResponse> CommandExecutor::ExecuteGetDaqListInfo(
 
 std::optional<GetDaqEventInfoResponse> CommandExecutor::ExecuteGetDaqEventInfo(
     std::uint16_t event_channel) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetDaqEventInfo(event_channel);
     ParsedPacket response;
     try {
@@ -1145,7 +1526,7 @@ std::optional<GetDaqEventInfoResponse> CommandExecutor::ExecuteGetDaqEventInfo(
 
 std::optional<GetDaqProcessorInfoResponse>
 CommandExecutor::ExecuteGetDaqProcessorInfo() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetDaqProcessorInfo();
     ParsedPacket response;
     try {
@@ -1168,7 +1549,7 @@ CommandExecutor::ExecuteGetDaqProcessorInfo() {
 
 std::optional<GetDaqResolutionInfoResponse>
 CommandExecutor::ExecuteGetDaqResolutionInfo() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetDaqResolutionInfo();
     ParsedPacket response;
     try {
@@ -1190,7 +1571,7 @@ CommandExecutor::ExecuteGetDaqResolutionInfo() {
 }
 
 std::optional<ReadDaqResponse> CommandExecutor::ExecuteReadDaq() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeReadDaq();
     ParsedPacket response;
     try {
@@ -1213,7 +1594,9 @@ std::optional<ReadDaqResponse> CommandExecutor::ExecuteReadDaq() {
 
 void CommandExecutor::ExecuteDownload(ElementCount number_of_elements,
                                       BytesView data) {
-    EnsureCodec(m_session_.GetByteOrder());
+    // 显式传 AG：EncodeDownload 在 AG=DWORD 时须插 2 字节对齐
+    // （原始 PDF 第 142 页 Table 82）
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeDownload(number_of_elements, data);
     (void)RunCommand(CommandCode::Download, encoded);
     // Slave 写完自动前移 MTA（docs L1983）：本端 m_last_mta_ 记录的仍是
@@ -1224,7 +1607,8 @@ void CommandExecutor::ExecuteDownload(ElementCount number_of_elements,
 void CommandExecutor::ExecuteShortDownload(ElementCount number_of_elements,
                                            AddressExtension extension,
                                            Address address, BytesView data) {
-    EnsureCodec(m_session_.GetByteOrder());
+    // SHORT_DOWNLOAD 头固定 8 字节，数据自然 4 字节对齐，不需按 AG 插对齐
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeShortDownload(
         number_of_elements, extension, address, data);
     // 写回必须有确认：ERR_CMD_UNKNOWN 不降级为成功，原样上抛由
@@ -1239,7 +1623,7 @@ void CommandExecutor::ExecuteShortDownload(ElementCount number_of_elements,
 void CommandExecutor::ExecuteModifyBits(std::uint8_t shift,
                                         std::uint16_t and_mask,
                                         std::uint16_t xor_mask) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded =
         m_codec_->EncodeModifyBits(shift, and_mask, xor_mask);
     // CRM 仅 RES（xcp.h CRM_MODIFY_BITS_LEN=1），无数据字段可解析。
@@ -1250,14 +1634,14 @@ void CommandExecutor::ExecuteModifyBits(std::uint8_t shift,
 void CommandExecutor::ExecuteSetCalPage(CalPageModeBit mode,
                                        std::uint8_t segment,
                                        std::uint8_t page) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeSetCalPage(mode, segment, page);
     (void)RunCommand(CommandCode::SetCalPage, encoded);
 }
 
 std::optional<GetCalPageResponse> CommandExecutor::ExecuteGetCalPage(
     CalPageAccessMode access_mode, std::uint8_t segment) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetCalPage(access_mode, segment);
     ParsedPacket response;
     try {
@@ -1280,7 +1664,7 @@ std::optional<GetCalPageResponse> CommandExecutor::ExecuteGetCalPage(
 
 std::optional<GetPagProcessorInfoResponse>
 CommandExecutor::ExecuteGetPagProcessorInfo() {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetPagProcessorInfo();
     ParsedPacket response;
     try {
@@ -1304,7 +1688,7 @@ CommandExecutor::ExecuteGetPagProcessorInfo() {
 std::optional<GetSegmentInfoResponse> CommandExecutor::ExecuteGetSegmentInfo(
     SegmentInfoMode mode, std::uint8_t segment, SegmentInfoSelector info,
     std::uint8_t mapping_index) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded =
         m_codec_->EncodeGetSegmentInfo(mode, segment, info, mapping_index);
     ParsedPacket response;
@@ -1330,7 +1714,7 @@ std::optional<GetSegmentInfoResponse> CommandExecutor::ExecuteGetSegmentInfo(
 
 std::optional<GetPageInfoResponse> CommandExecutor::ExecuteGetPageInfo(
     std::uint8_t segment, std::uint8_t page) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetPageInfo(segment, page);
     ParsedPacket response;
     try {
@@ -1353,14 +1737,14 @@ std::optional<GetPageInfoResponse> CommandExecutor::ExecuteGetPageInfo(
 
 void CommandExecutor::ExecuteSetSegmentMode(SegmentModeBit mode,
                                            std::uint8_t segment) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeSetSegmentMode(mode, segment);
     (void)RunCommand(CommandCode::SetSegmentMode, encoded);
 }
 
 std::optional<GetSegmentModeResponse> CommandExecutor::ExecuteGetSegmentMode(
     std::uint8_t segment) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeGetSegmentMode(segment);
     ParsedPacket response;
     try {
@@ -1382,7 +1766,7 @@ std::optional<GetSegmentModeResponse> CommandExecutor::ExecuteGetSegmentMode(
 }
 
 void CommandExecutor::ExecuteCopyCalPage(const CopyCalPageRequest& request) {
-    EnsureCodec(m_session_.GetByteOrder());
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeCopyCalPage(request);
     (void)RunCommand(CommandCode::CopyCalPage, encoded);
 }

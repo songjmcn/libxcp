@@ -42,6 +42,47 @@ struct CommandTimeouts {
 };
 
 /**
+ * @brief 错误恢复策略参数（F-11，方案 §4.6 的冻结默认值）
+ *
+ * @details 恢复策略不继续扩展现有 `CommandTimeouts`，而是由本结构集中表达，
+ *          以区分「单命令超时/重试」与「BUSY 等待/总体 deadline」两类语义。
+ *
+ * @par 冻结默认值（方案 §4.6）
+ * @verbatim
+ *          timeout_retry_limit                = 2
+ *          busy_retry_delay                   = 100 ms
+ *          busy_total_timeout                 = 10 s
+ *          seed_key_transaction_restart_limit = 1
+ * @endverbatim
+ *
+ * @warning 上述数值是**项目工程默认值**，不得表述为 XCP V1.5 的固定常量
+ *          （方案 §4.6 第 8 条）。调用方显式值或来自可信 A2L 的 t7 必须
+ *          保留来源并参与诊断。
+ */
+struct RecoveryPolicy {
+    /// @brief `ERR_CMD_BUSY` 的默认等待间隔 t7（方案 §4.6 第 3 条）
+    /// @details 有可信 A2L/调用方 t7 时覆盖本默认值。
+    std::chrono::milliseconds busy_retry_delay{100};
+
+    /// @brief 顶层操作的总体 deadline（方案 §4.6 第 3 条）
+    /// @details 自顶层调用**首次发送前**开始计时，覆盖全部等待、重发与响应
+    ///          时间；**重试后不得重新计时**（与 `EV_CMD_PENDING` 重启单轮
+    ///          响应计时不同）。
+    std::chrono::milliseconds busy_total_timeout{10000};
+
+    /// @brief `ERR_CMD_BUSY` 是否为可恢复错误而重试
+    /// @details 置 false 可关闭 BUSY 重试（退回旧行为），供调用方在已知对端
+    ///          不实现 t7 等待语义时使用。默认为 true。
+    bool busy_retry_enabled{true};
+
+    /// @brief 校验参数合法性
+    /// @return 合法返回空字符串；否则返回中文原因
+    /// @details 方案 §4.6 第 7 条：负数、零值、溢出及 `retry_limit < 0` 须在
+    ///          构造或 Connect 前失败。本方法不做抛出，便于调用方汇总诊断。
+    [[nodiscard]] std::string Validate() const;
+};
+
+/**
  * @brief 事件观察者接口（可选，用于上层接收异步 EV/SERV/DTO）
  *
  * 回调在 Transport 工作线程执行；实现者不得在其中阻塞等待命令响应，
@@ -87,7 +128,8 @@ public:
      */
     explicit CommandExecutor(IXcpTransport& transport, Session& session,
                              CommandTimeouts timeouts = {},
-                             IEventListener* event_listener = nullptr);
+                             IEventListener* event_listener = nullptr,
+                             RecoveryPolicy recovery_policy = {});
 
     /// @brief 析构；唤醒并终止内部等待
     ~CommandExecutor() override;
@@ -95,6 +137,22 @@ public:
     // 禁止拷贝
     CommandExecutor(const CommandExecutor&) = delete;
     CommandExecutor& operator=(const CommandExecutor&) = delete;
+
+    /**
+     * @brief 取消当前挂起的操作（F-11）
+     * @details 线程安全。唤醒所有等待者（响应等待、SYNCH 确认、BUSY 等待），
+     *          清理 pending 状态，并让被取消的调用返回
+     *          `ErrorCategory::Cancelled`。重复调用幂等；无挂起操作时为空操作。
+     *
+     * @par 与 `repeat ∞ times` 的关系
+     *      规范恢复矩阵中 `ERR_CMD_BUSY → wait t7 → repeat ∞ times` 表示协议
+     *      语义上持续等待资源，但库实现**必须**允许调用方取消，不能形成不可
+     *      中断的同步调用（方案 §4.6 第 6 条）。
+     */
+    void CancelPendingOperation();
+
+    /// @brief 当前恢复策略（供诊断与测试）
+    [[nodiscard]] RecoveryPolicy GetRecoveryPolicy() const;
 
     /// @brief Transport 收到一个完整 XCP Packet 时的回调
     /// @details 在 Transport 工作线程执行；按单 Outstanding Command 模型把响应
@@ -112,6 +170,34 @@ public:
     /// 时登记监听器，避免调用点自行转型。
     /// @return 指向自身 IPacketListener 子对象的引用
     [[nodiscard]] IPacketListener& AsListener() noexcept;
+
+    /**
+     * @brief 通知执行器底层 Transport 已重新打开，复位通道级关闭状态
+     *
+     * @details 修复「一次 Disconnect 后再也无法 Connect」的既有缺陷：
+     *          `Disconnect()` 会关闭 Transport，从而由 `OnTransportClosed()`
+     *          把 `m_transport_closed_` 置位；而 `XcpMaster::Connect()` 重新
+     *          `Open()` 时没有任何地方把它清回 false。后果是重连后第一条
+     *          命令的 `WaitForResponse` 立刻看到"通道已关闭"而提前返回，
+     *          CONNECT 随之超时，恢复又因会话处于 `Connecting` 而抛
+     *          `InvalidState`——即重连恒定失败。
+     *
+     *          本方法只复位**通道级**状态（关闭标志、原因文本、迟到响应槽位、
+     *          同步/恢复标志），不触碰会话状态——会话由 `XcpMaster` 与
+     *          `Session` 各自管理，执行器不得越权修改。
+     *
+     * @note 必须在 `Transport::Open()` 之后立即调用；由 `XcpMaster::Connect()`
+     *       负责，不依赖调用方自觉。
+     * @warning 不得在仍有命令在途时调用：复位会丢弃迟到响应，属新会话语义。
+     */
+    void OnTransportReopened() noexcept;
+
+    /**
+     * @brief 查询底层 Transport 是否已被观察到关闭
+     * @return true 表示自上次成功打开以来 Transport 已关闭
+     * @details 供上层诊断"命令为何立即失败"，也便于测试直接断言复位效果。
+     */
+    [[nodiscard]] bool IsTransportClosed() const noexcept;
 
     // ---- 命令执行 ----
 
@@ -158,12 +244,71 @@ public:
     /// @throws XcpException 超时、协议错误或恢复失败
     [[nodiscard]] GetIdResponse ExecuteGetId(std::uint8_t identification_type);
 
-    /// @brief 执行 SHORT_UPLOAD 命令（一次命令完成定址读取，不改动 MTA）
+    /// @brief GET_VERSION 探测结果分类（批次 B1）
+    ///
+    /// @details 命名的用意是把「命令成功但版本不可用」与「命令本身失败」严格
+    ///          分开，使版本裁决器不必解析错误文本。
+    enum class GetVersionOutcome {
+        /// @brief 成功：响应携带完整 PL/TL Major+Minor
+        Available,
+
+        /// @brief 对端未实现该 optional 命令（`ERR_CMD_UNKNOWN`）
+        /// @details 原始 PDF 第 106 页 §7.4："An attempt to execute a not
+        ///          implemented optional command will return ERR_CMD_UNKNOWN
+        ///          and does not have any effect."
+        UnimplementedCommand,
+
+        /// @brief 对端认识 `0xC0` 族但不认识 `0x00` 子命令（`ERR_SUBCMD_UNKNOWN`）
+        /// @details 与上者同为「不可用」。注意：本条与上条的**区分机制属推论**
+        ///          （PDF 无逐字对应句），实施上把两者同等对待是保守且安全的
+        ///          做法（方案 §1.4 证据强度标注）。
+        UnimplementedSubcommand,
+
+        /// @brief 对端不响应（超时）
+        /// @details **不得**据此推断对端为老版本（方案 §5 批次 B1：
+        ///          「不得以 timeout 冒充老版本」）。仅表示版本未确认。
+        TimedOut,
+    };
+
+    /// @brief GET_VERSION 探测返回（结果分类 + 可选数据）
+    struct GetVersionProbe {
+        /// @brief 结果分类
+        GetVersionOutcome outcome{GetVersionOutcome::TimedOut};
+
+        /// @brief 仅在 `outcome == Available` 时有值
+        std::optional<GetVersionResponse> response;
+
+        /// @brief 该结果是否表示"命令成功且版本可用"
+        [[nodiscard]] bool IsAvailable() const noexcept {
+            return outcome == GetVersionOutcome::Available &&
+                   response.has_value();
+        }
+    };
+
+    /**
+     * @brief 执行 GET_VERSION 命令（批次 B1，Level-1 双字节命令码）
+     * @return 探测结果（**不抛异常表示命令不可用**，只抛真正的传输/恢复故障）
+     *
+     * @details 三种「不可用」情形（未实现命令、未实现子命令、超时）都以
+     *          `GetVersionProbe` 的正常返回值表达，**不作为异常上抛**。这是本
+     *          方法与其余 `Execute*` 的刻意差异：GET_VERSION 是 optional 命令
+     *          且其"不可用"是**预期内的正常结果**（原始 PDF 第 106 页：规范
+     *          设计该机制正是 "This lets the master device detect not
+     *          implemented optional commands easily."），把它做成异常会让
+     *          调用方用 catch 表达正常控制流。
+     *
+     * @throws XcpException 真正的传输故障、恢复失败或畸形响应（非上述三类）
+     */
+    [[nodiscard]] GetVersionProbe ExecuteGetVersion();
+
+    /// @brief 执行 SHORT_UPLOAD 命令（一次命令完成定址读取，**会**改动 MTA）
     /// @param number_of_elements 元素数
     /// @param extension 地址扩展（8 位）
     /// @param address 32 位地址
     /// @return 读取到的原始字节
     /// @throws XcpException 超时、协议错误、响应长度不符或恢复失败
+    /// @note F-09：规范要求成功后 MTA 指向「上传数据块之后的第一个数据字节」
+    ///       （原始 PDF §7.5.1.8），本方法会同步本端隐含 MTA。
     [[nodiscard]] Bytes ExecuteShortUpload(ElementCount number_of_elements,
                                            AddressExtension extension,
                                            Address address);
@@ -183,6 +328,8 @@ public:
      * @brief 执行 UNLOCK 命令（发送 Key 的一个分段，批次 7）
      * @param length_field Length 字段：首帧填 Key 总长度，后续帧填剩余长度
      * @param key_segment 本帧携带的 Key 字节
+     * @param is_final_segment 本帧是否为序列末段（F-10：决定超时恢复策略，
+     *        末段超时属结果未知，禁止自动重放）
      * @return 响应解析结果（Current Resource Protection Status）
      * @throws XcpException 超时、协议错误或恢复失败
      * @note Key 校验失败时 Slave 返回 ERR_ACCESS_LOCKED 并主动断开会话
@@ -190,11 +337,28 @@ public:
      *       后原样上抛，调用方需重新 Connect() 才能继续。
      */
     [[nodiscard]] UnlockResponse ExecuteUnlock(std::uint8_t length_field,
-                                               BytesView key_segment);
+                                               BytesView key_segment,
+                                               bool is_final_segment);
 
     /// @brief 发送 SYNCH 并等待 ERR_CMD_SYNCH 确认（超时恢复路径的第一步）
     /// @return true 表示 Slave 已用 ERR_CMD_SYNCH 确认；false 表示未获确认
     bool SendSynch();
+
+    /**
+     * @brief 把分段 Seed&Key 事务整体重置（F-10）
+     * @details 清除段位置与重启计数。由事务编排层（XcpMaster::Unlock）
+     *          在事务完成或放弃时调用，避免分段状态泄漏到后续调用。
+     *          注意：恢复路径内部只清段位置、**保留**重启计数（见
+     *          ClearSeedKeySegment），否则重启预算永远无法累积。
+     */
+    void ResetSeedKeyTransaction();
+
+    /**
+     * @brief 只清除分段 Seed&Key 的段位置，保留重启计数（F-10）
+     * @details 供恢复路径内部使用：段位置必须立刻失效（防止误重放），
+     *          但重启预算要在整个事务期间累积，故不可一并清零。
+     */
+    void ClearSeedKeySegment();
 
     /**
      * @brief 隐含 DAQ 指针的本端记录（批次14，T14-05）
@@ -504,6 +668,20 @@ public:
      * @throws XcpException 超时或协议错误
      */
     void ExecuteCopyCalPage(const CopyCalPageRequest& request);
+/// @brief 分段 Seed&Key 事务的段位置（F-10，隐含状态）
+    /// @details 规范对「多段序列中途超时」未给出专门处理，而通用恢复路径
+    ///          （SYNCH + 重放当前段）在该空白下会失步：某段超时后 Slave 侧
+    ///          段偏移可能已推进或复位，重放本端认为的当前段会导致错位；
+    ///          加之 Key 在序列完成后才校验（原始 PDF 第 130 页），错位
+    ///          **不会立即报错**，属静默失步。
+    ///          本枚举让 RunCommand 识别段位置，从而拒绝盲重放并按事务
+    ///          语义分派恢复策略（见 CommandExecutor::RunSegmentedRecovery）。
+    enum class SeedKeySegment {
+        NotSegmented,  ///< 非分段 Seed&Key 命令（GET_SEED Mode=0 属此列）
+        NonFinal,      ///< 多段序列的中间段：重放不安全，须完整重启事务
+        Final          ///< 末段：结果未知，禁止自动重放
+    };
+
 private:
     /// @brief 单条命令的执行流程：状态检查 -> 发送 -> 等待 -> 错误分派 ->
     /// 恢复重试；MODIFY_BITS 超时不重放并报告 OperationOutcomeUnknown
@@ -546,9 +724,36 @@ private:
     /// @details 与 RestoreDaqPtr 同属"隐含状态重放"，见上面 RunCommand 注释。
     void RestoreUploadMta();
 
+    /**
+     * @brief 分段 Seed&Key 事务的超时恢复（F-10）
+     * @param cmd 触发恢复的命令码（GetSeed 或 Unlock）
+     * @param segment 出事段的位置（NonFinal / Final）
+     * @throws XcpException(OperationOutcomeUnknown) 末段超时（结果未知，不重放）
+     * @throws XcpException(RecoveryFailed) 重启上限用尽或 SYNCH 失败
+     * @details 规范对「多段序列中途超时」未给出专门处理，通用路径的
+     *          「SYNCH + 重放当前段」会失步（方案 §2C.2 工程策略）：
+     *          - GET_SEED 任一段：清本地分段状态 + SYNCH，成功后由事务层
+     *            从 GET_SEED(Mode=0) 完整重启，最多 1 次；
+     *          - UNLOCK 非末段：Slave 可能已缓存部分 Key，单独 SYNCH 不足以
+     *            证明分段状态已复位，必须先断开重连再完整重启，最多 1 次；
+     *          - UNLOCK 末段：资源可能已解锁，属结果未知，禁止自动重放，
+     *            立即返回 OperationOutcomeUnknown 交由调用方决定。
+     */
+    void RunSegmentedRecovery(CommandCode cmd, SeedKeySegment segment);
+
+    /**
+     * @brief 设置当前 Seed&Key 命令的段位置（F-10）
+     * @param segment 段位置；命令返回后须复位为 NotSegmented
+     */
+    void SetSeedKeySegment(SeedKeySegment segment);
+
     /// @brief 按 Session 字节序惰性创建/重建 Codec 与 Parser
     /// @param byte_order CONNECT 协商出的字节序
-    void EnsureCodec(ByteOrder byte_order);
+    /// @param ag Session 地址粒度。默认取 Session 当前值；只有 DOWNLOAD
+    /// 家族（EncodeDownload 需按 AG 插对齐字节）关心它，但 Codec 是共享
+    /// 实例，故一律按 AG 参与重建判定，避免同一 Codec 在不同 AG 间串用。
+    void EnsureCodec(ByteOrder byte_order,
+                     AddressGranularity ag = AddressGranularity::Byte);
 
     /**
      * @brief 恢复成功后重建 WRITE_DAQ/READ_DAQ 依赖的隐含 DAQ 指针
@@ -557,6 +762,22 @@ private:
      *          未记录（含被 CLEAR_DAQ_LIST 作废）时直接返回。
      */
     void RestoreDaqPtr();
+
+    /// @brief 查询取消标志（F-11）
+    /// @return 已被调用方取消返回 true
+    [[nodiscard]] bool IsCancelled() const;
+
+    /// @brief 判断解析结果是否为 `ERR_CMD_BUSY` 负响应（F-11）
+    /// @param response 已解析的 Packet
+    /// @details 仅识别 `ERR_CMD_BUSY`。其他负响应（含未知错误码）不在此处理，
+    ///          交由 `DispatchResponse` 维持既有结构化报错语义。
+    [[nodiscard]] static bool IsBusyResponse(const ParsedPacket& response);
+
+    /// @brief 在 `ERR_CMD_BUSY` 后等待 t7（F-11）
+    /// @param delay 本次等待时长
+    /// @return `true` 等待期满；`false` 期间被取消或 Transport 关闭
+    /// @details 使用条件变量而非 `sleep`，使取消、断连与析构能立即唤醒。
+    bool WaitBusyDelay(std::chrono::milliseconds delay);
 
     /// @brief 校验上传响应长度，并裁剪精确匹配的 XCPlite 对齐填充
     /// @param cmd 命令码（用于错误定位）
@@ -570,6 +791,7 @@ private:
     IXcpTransport& m_transport_;        ///< 传输层（非拥有）
     Session& m_session_;                ///< 会话（非拥有）
     CommandTimeouts m_timeouts_;        ///< 超时与重试配置
+    RecoveryPolicy m_recovery_policy_;  ///< 错误恢复策略（F-11）
     IEventListener* m_event_listener_;  ///< 事件监听器（非拥有，可空）
 
     std::unique_ptr<CommandCodec>
@@ -582,6 +804,11 @@ private:
     std::condition_variable m_response_cv_;           ///< 最终响应到达通知
     std::condition_variable m_synch_cv_;              ///< SYNCH 确认到达通知
     std::optional<ParsedPacket> m_pending_response_;  ///< 待取走的最终响应
+    /// @brief 取消标志（F-11）
+    /// @details 由 `CancelPendingOperation()`、Transport 关闭、Disconnect 与
+    ///          析构置位；等待循环据此提前返回并抛出 `Cancelled`。下一次
+    ///          顶层命令开始前由 `RunCommand` 清除。
+    bool m_cancelled_{false};
     bool m_response_ready_{false};                    ///< 响应槽位已被填充
     bool m_synch_confirmed_{false};                   ///< 已收到 ERR_CMD_SYNCH
     bool m_in_recovery_{false};             ///< 当前正在等待 SYNCH 确认
@@ -595,6 +822,16 @@ private:
     /// @details WRITE_DAQ/READ_DAQ 超时恢复时重放本值；CLEAR_DAQ_LIST 与
     ///          CONNECT/DISCONNECT 会将其作废（置 nullopt）。
     std::optional<DaqPointer> m_last_daq_ptr_;
+
+    /// @brief 当前 Seed&Key 分段事务的段位置（F-10）
+    /// @details 由 ExecuteGetSeed / ExecuteUnlock 在执行前设置，命令返回后
+    ///          复位。仅在分段事务进行中为非 NotSegmented。
+    SeedKeySegment m_seed_key_segment_{SeedKeySegment::NotSegmented};
+
+    /// @brief 分段 Seed&Key 事务的重启次数（F-10）
+    /// @details 事务级重启上限，与单命令 `repeat 2 times` 语义不同，
+    ///          不得混为一谈（方案 §2C.2）。
+    int m_seed_key_restarts_{0};
 };
 
 }  // namespace calmcar::xcp

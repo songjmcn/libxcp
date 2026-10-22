@@ -6,6 +6,7 @@
 #include "xcplite_slave_fixture.hpp"
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
@@ -122,42 +123,71 @@ struct XcpliteSlaveProcess::Impl {
     }
 #else
     pid_t pid{-1};       ///< 子进程 pid；-1 = 未启动或已回收
-    bool exited{false};  ///< 已回收（waitpid 成功）标记
+    bool exited{false};  ///< 子进程已退出（已被回收）标记
 
-    /// @brief 进程是否仍在运行（WNOHANG 收割，退出状态记录到 exited）
+    /// @brief 进程是否仍在运行（非破坏性判定，不回收子进程）
+    /// @return 仍在运行 true；已退出或未启动 false
+    /// @details 探测循环会高频调用本函数，因此这里**只观察不收割**：
+    ///          若在此处 waitpid 回收，随后 Kill() 会因 exited 已置位而
+    ///          整段短路，导致仍存活的子进程永远不被清理（孤儿进程泄漏）。
     bool Alive() {
-        if (pid <= 0 || exited) {
+        if (pid <= 0) {
+            return false;
+        }
+        if (exited) {
             return false;
         }
         int status = 0;
-        const pid_t r = waitpid(pid, &status, WNOHANG);
+        pid_t r = waitpid(pid, &status, WNOHANG);
         if (r == pid) {
+            // 子进程已退出且已被回收：记录状态即可
             exited = true;
             return false;
         }
+        if (r == -1 && errno == ECHILD) {
+            // 子进程已不存在（已被别处回收）：视为已退出
+            exited = true;
+            return false;
+        }
+        // r == 0：子进程仍在运行；r == -1 且 EINTR：被信号中断，
+        // 无法判定，按"仍存活"处理并交由后续轮次或 Kill() 收尾。
         return true;
     }
 
-    /// @brief SIGTERM 优雅退出，超时后 SIGKILL，最后回收
+    /// @brief SIGTERM 优雅退出，超时后 SIGKILL，最后确认回收
+    /// @details 只要 pid > 0 就必须尝试回收：**不能以 exited 为提前返回
+    ///          条件**，因为 exited 可能由 Alive() 的观察置位，而子进程
+    ///          未必真的被回收干净。仅当确认回收成功才置 pid = -1。
     void Kill() {
-        if (pid > 0 && !exited) {
-            kill(pid, SIGTERM);
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::seconds(2);
-            int status = 0;
-            while (std::chrono::steady_clock::now() < deadline) {
-                if (waitpid(pid, &status, WNOHANG) == pid) {
-                    exited = true;
-                    pid = -1;
-                    return;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            }
-            kill(pid, SIGKILL);
-            waitpid(pid, &status, 0);
+        if (pid <= 0) {
+            return;
         }
-        pid = -1;
+        // 先做一次非阻塞回收，已退出则直接收尾，避免无谓的 SIGTERM
+        int status = 0;
+        pid_t r = waitpid(pid, &status, WNOHANG);
+        if (r == pid || (r == -1 && errno == ECHILD)) {
+            exited = true;
+            pid = -1;
+            return;
+        }
+        // 仍在运行：SIGTERM 优雅退出，2 秒内未退出则升级为 SIGKILL
+        kill(pid, SIGTERM);
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            r = waitpid(pid, &status, WNOHANG);
+            if (r == pid || (r == -1 && errno == ECHILD)) {
+                exited = true;
+                pid = -1;
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        kill(pid, SIGKILL);
+        // 阻塞回收，确保不留僵尸
+        waitpid(pid, &status, 0);
         exited = true;
+        pid = -1;
     }
 #endif
 
@@ -206,6 +236,9 @@ struct XcpliteSlaveProcess::Impl {
                   static_cast<char*>(nullptr));
             _exit(126);  // exec 失败
         }
+        // 新一轮子进程已就绪：必须重置 exited，否则上一轮遗留的
+        // exited=true 会让 Kill() 跳过回收，造成跨轮孤儿进程泄漏。
+        exited = false;
         return true;
 #endif
     }
@@ -239,10 +272,11 @@ bool ProbeOnce(std::uint16_t port) {
     cfg.local_port = 0;
     cfg.receive_poll_interval_ms = 20;
     try {
+        XcpMasterOptions options;
+        options.timeouts = CommandTimeouts{std::chrono::milliseconds(300),
+                                           std::chrono::milliseconds(300), 0};
         auto master = std::make_unique<XcpMaster>(
-            std::make_unique<UdpTransport>(cfg),
-            CommandTimeouts{std::chrono::milliseconds(300),
-                            std::chrono::milliseconds(300), 0});
+            std::make_unique<UdpTransport>(cfg), options);
         master->Connect();
         master->Disconnect();
         return true;
@@ -578,11 +612,12 @@ std::unique_ptr<XcpMaster> XcpliteSlaveTest::MakeMaster(
     cfg.local_port = 0;
     cfg.receive_poll_interval_ms = 20;
     // 真实进程对手端：命令超时放宽到 2s（本机回环正常时远低于此）
-    return std::make_unique<XcpMaster>(
-        std::make_unique<UdpTransport>(cfg),
-        CommandTimeouts{std::chrono::milliseconds(2000),
-                        std::chrono::milliseconds(2000), 1},
-        listener);
+    XcpMasterOptions options;
+    options.timeouts = CommandTimeouts{std::chrono::milliseconds(2000),
+                                       std::chrono::milliseconds(2000), 1};
+    options.event_listener = listener;
+    return std::make_unique<XcpMaster>(std::make_unique<UdpTransport>(cfg),
+                                       options);
 }
 
 std::unique_ptr<XcpMaster> XcpliteSlaveTest::MakeConnectedMaster(

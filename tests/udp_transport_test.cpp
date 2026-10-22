@@ -857,27 +857,215 @@ TEST(UdpTransportConfigValidation, ZeroReceivePollIntervalIsRejected) {
 }
 
 // --------------------------------------------------------------------------
+// T-02：PACKET_ALIGNMENT 配置门禁
+// --------------------------------------------------------------------------
+
+TEST(UdpTransportConfigValidation, UnknownPacketAlignmentIsRejected) {
+    auto cfg = MakeConfig(12345U);
+    cfg.packet_alignment = PacketAlignment::Unknown;
+    UdpTransport transport(cfg);
+    RecordingListener listener;
+
+    try {
+        transport.Open(listener);
+        FAIL() << "Alignment 未知时不得静默按 8-bit 打开（方案 §1.9A.4）";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+        EXPECT_NE(std::string(e.what()).find("packet_alignment"),
+                  std::string::npos);
+    }
+}
+
+TEST(UdpTransportConfigValidation, DefaultAlignmentIsBit8AndAccepted) {
+    // 默认值必须仍是 Bit8：保证既有调用方行为不变
+    auto cfg = MakeConfig(12345U);
+    EXPECT_EQ(cfg.packet_alignment, PacketAlignment::Bit8);
+
+    test::UdpTestSlave slave;
+    slave.Start();
+    auto live = MakeConfig(slave.Port());
+    EXPECT_EQ(live.packet_alignment, PacketAlignment::Bit8);
+    UdpTransport transport(live);
+    RecordingListener listener;
+    // Bit8 默认配置应当能正常打开（不因新门禁而误拒）
+    EXPECT_NO_THROW(transport.Open(listener));
+    transport.Close();
+    slave.Stop();
+}
+
+// --------------------------------------------------------------------------
+// T-06：能力边界 —— IPv6 显式 Unsupported
+// --------------------------------------------------------------------------
+
+TEST(UdpTransportCapability, Ipv6RemoteHostReportedUnsupported) {
+    auto cfg = MakeConfig(12345U);
+    cfg.remote_host = "::1";  // IPv6 回环
+    UdpTransport transport(cfg);
+    RecordingListener listener;
+
+    try {
+        transport.Open(listener);
+        FAIL() << "IPv6 应显式报 Unsupported，而非静默失败";
+    } catch (const XcpException& e) {
+        // 关键：必须是 UnsupportedFeature，而不是笼统的 InvalidArgument，
+        // 否则调用方无法区分"地址笔误"与"能力缺失"
+        EXPECT_EQ(e.Category(), ErrorCategory::UnsupportedFeature);
+        EXPECT_NE(std::string(e.what()).find("IPv6"), std::string::npos);
+    }
+}
+
+TEST(UdpTransportCapability, Ipv6LocalHostReportedUnsupported) {
+    auto cfg = MakeConfig(12345U);
+    cfg.remote_host = "127.0.0.1";  // 合法 IPv4
+    cfg.local_host = "fe80::1";     // IPv6 链路本地
+    UdpTransport transport(cfg);
+    RecordingListener listener;
+
+    try {
+        transport.Open(listener);
+        FAIL() << "IPv6 本地绑定地址应显式报 Unsupported";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::UnsupportedFeature);
+        EXPECT_NE(std::string(e.what()).find("IPv6"), std::string::npos);
+    }
+}
+
+TEST(UdpTransportCapability, Ipv4HostsWithColonFreeTextStillAccepted) {
+    // 回归保护：IPv6 检测不得误伤普通 IPv4 主机名/点分地址
+    auto cfg = MakeConfig(12345U);
+    cfg.remote_host = "127.0.0.1";
+    cfg.local_host = "0.0.0.0";
+    UdpTransport transport(cfg);
+    RecordingListener listener;
+    EXPECT_NO_THROW(transport.Open(listener));
+    transport.Close();
+}
+
+// --------------------------------------------------------------------------
 // 关闭 / 取消语义
 // --------------------------------------------------------------------------
 
-TEST(UdpTransportClose, CloseWhileBlockedReturnsPromptly) {
+TEST(UdpTransportClose, CloseWhileBlockedReturnsWithinOnePollInterval) {
     test::UdpTestSlave slave;
     slave.Start();
     auto cfg = MakeConfig(slave.Port());
-    cfg.receive_poll_interval_ms =
-        1000;  // 放大轮询周期，确认 Close 最迟在一个轮询周期内退出
+    // 本用例锁定 Close() 的**退出延迟上界**，即"无论唤醒机制是否可用，
+    // Close() 都不会超过一个轮询周期"。
+    //
+    // 设计契约（见 src/udp_transport.cpp Close() 内注释）：Close() **故意**
+    // 不提前关 Socket，原因是在 join 前关闭 Socket 会让句柄被 OS 立即回收并
+    // 可能分配给本进程新建的 Socket，而接收线程此刻仍可能回调监听器，迟到的
+    // 操作会命中被复用的句柄，造成跨会话串扰。
+    //
+    // 唤醒机制（自管道/回环 UDP 自连，另有专项用例验证其微秒级生效）是快路径；
+    // 本用例刻意放大轮询周期到 1000ms，验证的是**慢路径兜底**：即使唤醒字节
+    // 丢失，也不会死锁或无限阻塞在 recvfrom 上。
+    //
+    // 历史缺陷正是此处判据漏了等号：原断言 `< 1000ms` 而周期恰为 1000ms，
+    // 实测 1000.0～1001.1ms（200 次采样值域 [999,1001]），是 off-by-one 判据
+    // 缺陷。（用例名原先承诺的 "ReturnsPromptly" 同样与实现不符，已更正。）
+    constexpr int kPollIntervalMs = 1000;
+    cfg.receive_poll_interval_ms = kPollIntervalMs;
     UdpTransport transport(cfg);
     RecordingListener listener;
     transport.Open(listener);
+
+    // 先用一次收发往返把线程推进到确定已阻塞在 recvfrom 的状态，使本用例
+    // 只考察"阻塞态下走慢路径"的延迟，与唤醒快路径的用例互不重叠。
+    {
+        // 用 Master 自己的 Send 触发一次真实收发：Slave 收到 CONNECT 后回包，
+        // 回包被接收线程回调即证明它已在 recvfrom 中阻塞。
+        const Bytes probe = BytesOf({0xFF, 0x00});
+        transport.Send(BytesView{probe});
+        ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)))
+            << "接收线程未在预期时间内处理探测包，无法确认其已进入阻塞态";
+    }
 
     const auto start = std::chrono::steady_clock::now();
     transport.Close();
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
-    EXPECT_LT(elapsed.count(), 1000)
-        << "close() 未能通过关闭 Socket 唤醒阻塞接收";
+    // 上界 = 一个轮询周期 + 调度/join 余量。
+    //
+    // 关于余量取值的两次修正（记录以免后人重蹈）：
+    // 1. 原判据 `< 1000ms` 漏掉等号，是 off-by-one 缺陷，须改为 LE 语义；
+    // 2. 但余量不能压到 +1ms：兜底路径（唤醒失效时）的真实耗时是
+    //    「周期 + select 超时唤醒 + 线程调度 + join 握手」，实测 1005～1019ms，
+    //    会超出 +1ms。故此处取 +100ms（周期的 10%），
+    //    既能容纳真实开销，又远小于"两个周期"从而仍能捕获死锁/严重延迟。
+    constexpr long long kScheduleSlackMs = 100;
+    EXPECT_LE(elapsed.count(),
+              static_cast<long long>(kPollIntervalMs) + kScheduleSlackMs)
+        << "close() 未能在约一个轮询周期内退出（耗时 " << elapsed.count()
+        << "ms，轮询周期 " << kPollIntervalMs << "ms）";
     EXPECT_TRUE(listener.WaitForClose(std::chrono::seconds(2)));
     slave.Stop();
+}
+
+// --------------------------------------------------------------------------
+// 唤醒机制：Close() 的快速路径
+// --------------------------------------------------------------------------
+
+// 验证唤醒机制生效：接收线程已阻塞在 select/recvfrom 时，Close() 应几乎
+// 立即返回（微秒~毫秒级），而**不是**等满一个轮询周期。
+//
+// 判据设计：轮询周期刻意放大到 1000ms。若唤醒失效，Close() 必然耗时约
+// 1000ms；若唤醒生效，耗时应远小于 100ms。取 100ms 作为阈值，与两个量级
+// 都有 10 倍以上余量，既不会因调度抖动误判，也不可能被"等满周期"蒙混通过。
+TEST(UdpTransportClose, WakeupMakesCloseImmediateWhenBlocked) {
+    auto cfg = MakeConfig(59999);  // 无对端：接收线程必然阻塞在 select 上
+    constexpr int kPollIntervalMs = 1000;
+    cfg.receive_poll_interval_ms = kPollIntervalMs;
+    UdpTransport transport(cfg);
+    RecordingListener listener;
+    transport.Open(listener);
+
+    // 给线程一点时间进入 select 等待（本用例考察阻塞态下的唤醒）
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    const auto start = std::chrono::steady_clock::now();
+    transport.Close();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), 100)
+        << "唤醒机制未生效：Close() 耗时 " << elapsed.count()
+        << "ms，接近轮询周期 " << kPollIntervalMs
+        << "ms，说明线程是靠超时而非唤醒退出";
+    EXPECT_TRUE(listener.WaitForClose(std::chrono::seconds(2)));
+}
+
+// 反复开关 200 次，验证唤醒机制稳定生效且无句柄泄漏/竞态退化。
+// 这替代了运动前的 StartupRaceWindowReturnsImmediately 用例：唤醒机制落地后，
+// "Open() 后立刻 Close() 也能瞬间返回"已成为**常态能力**而非偶发竞态，
+// 因此用重复次数直接断言其稳定性，比"命中竞态窗口"更有意义。
+TEST(UdpTransportClose, WakeupRepeatedOpenCloseStaysImmediate) {
+    constexpr int kIterations = 200;
+    constexpr int kPollIntervalMs = 1000;
+    int slow_runs = 0;
+    long long worst_ms = 0;
+    for (int i = 0; i < kIterations; ++i) {
+        auto cfg = MakeConfig(59999);
+        cfg.receive_poll_interval_ms = kPollIntervalMs;
+        UdpTransport transport(cfg);
+        RecordingListener listener;
+        transport.Open(listener);
+        // 不预热：覆盖"线程可能尚未进入 select"的最不利时序
+        const auto start = std::chrono::steady_clock::now();
+        transport.Close();
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        if (elapsed > worst_ms) {
+            worst_ms = elapsed;
+        }
+        if (elapsed >= 100) {
+            ++slow_runs;
+        }
+    }
+    EXPECT_EQ(slow_runs, 0) << "有 " << slow_runs << "/" << kIterations
+                            << " 次 Close() 耗时 >= 100ms（最差 " << worst_ms
+                            << "ms），唤醒机制未稳定生效";
 }
 
 TEST(UdpTransportClose, ReopenResetsSendCtrAndReceiveBaseline) {

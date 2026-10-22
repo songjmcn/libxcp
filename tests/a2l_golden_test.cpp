@@ -28,6 +28,9 @@
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/a2l/a2l_types.hpp"
 #include "libxcp/a2l/ia2l_database.hpp"
+// T-05：A2L PACKET_ALIGNMENT 贯通到 libxcp 强类型与本侧 Tail 公式
+#include "libxcp/link_budget.hpp"
+#include "libxcp/protocol_types.hpp"
 
 #ifndef A2L_GOLDEN_DIR
 #error "A2L_GOLDEN_DIR 缺失（tests/CMakeLists.txt 注入）"
@@ -784,6 +787,45 @@ TEST_F(A2lGoldenTest, UdpEndpointAndProtocolLayer) {
     EXPECT_EQ(mx->transports[0].sub_commands[1], 0xFC);
 }
 
+TEST_F(A2lGoldenTest, PacketAlignmentFlowsIntoLibxcpType) {
+    // T-05：A2L 的 PACKET_ALIGNMENT -> libxcp 强类型 PacketAlignment 的贯通。
+    // 上游 a2lbridge 已把原码（0/1/2）换算成**位宽**（8/16/32），
+    // libxcp 侧用 ParsePacketAlignment() 收强类型。
+    //
+    // golden_basic：未声明 PACKET_ALIGNMENT -> 上游默认位宽 8
+    auto basic = LoadOk(Golden("golden_basic.a2l"));
+    ASSERT_NE(basic, nullptr);
+    const IfDataXcpInfo* bi = basic->XcpInfo();
+    ASSERT_NE(bi, nullptr);
+    ASSERT_EQ(bi->transports.size(), 1u);
+    EXPECT_EQ(calmcar::xcp::ParsePacketAlignment(
+                  bi->transports[0].packet_alignment),
+              calmcar::xcp::PacketAlignment::Bit8);
+    EXPECT_EQ(calmcar::xcp::AlignmentBytes(calmcar::xcp::ParsePacketAlignment(
+                  bi->transports[0].packet_alignment)),
+              1U);
+
+    // golden_mask：声明 PACKET_ALIGNMENT_32 -> 位宽 32 -> Bit32 -> 4 字节
+    auto mask = LoadOk(Golden("golden_mask.a2l"));
+    ASSERT_NE(mask, nullptr);
+    const IfDataXcpInfo* mi = mask->XcpInfo();
+    ASSERT_NE(mi, nullptr);
+    ASSERT_EQ(mi->transports.size(), 1u);
+    EXPECT_EQ(calmcar::xcp::ParsePacketAlignment(
+                  mi->transports[0].packet_alignment),
+              calmcar::xcp::PacketAlignment::Bit32);
+    EXPECT_EQ(calmcar::xcp::AlignmentBytes(calmcar::xcp::ParsePacketAlignment(
+                  mi->transports[0].packet_alignment)),
+              4U);
+
+    // 贯通后的对齐必须真的影响 Tail 计算（不是只存了个枚举）
+    // 32-bit 下 packet 17 字节 -> 无 tail 帧长 21 -> 补 3 到 24
+    EXPECT_EQ(calmcar::xcp::XcpFrameBytes(17, calmcar::xcp::PacketAlignment::Bit32),
+              24U);
+    EXPECT_EQ(calmcar::xcp::XcpFrameBytes(17, calmcar::xcp::PacketAlignment::Bit8),
+              21U);
+}
+
 TEST_F(A2lGoldenTest, EventChannelSnapshot) {
     // 批次10 事件通道透传 + EVENT_FIXED 反查（golden_mask: event#1 ↔ list#2）
     auto b = LoadOk(Golden("golden_mask.a2l"));
@@ -1467,12 +1509,15 @@ TEST_F(A2lGoldenTest, StructLeafBrokenCorpusWarnsEveryRejection) {
 namespace {
 
 /// @brief 按 envelope 规则组装测试帧（独立重算 header 字节数，B-7 字节规则）
+/// @details 识别字段长度与 a2lbridge::EnvelopeExtraBytes 同源，按原始 PDF
+///          第 95-96 页 Figure 51/52/53 计算：Absolute=PID、RelativeByte=+1、
+///          RelativeWord=+2、RelativeWordAligned=+3（含 FILL）。
+///          CTR 仅 RelativeWordAligned 时取代 FILL，不额外占字节。
 Bytes MakeEnvelope(const DtoFrameLayout& f, std::uint8_t pid,
                    const Bytes& payload) {
     Bytes b;
     b.push_back(pid);
     std::size_t extra = 0;
-    if (f.counter_enabled) extra += 1;
     if (f.timestamp_enabled) extra += (f.timestamp_size_bits + 7) / 8;
     if (f.first_odt) extra += 1;
     switch (f.identification_field_type) {
@@ -1482,13 +1527,80 @@ Bytes MakeEnvelope(const DtoFrameLayout& f, std::uint8_t pid,
             extra += 1;
             break;
         case DaqInfo::IdFieldType::RelativeWord:
-        case DaqInfo::IdFieldType::RelativeWordAligned:
             extra += 2;
             break;
+        case DaqInfo::IdFieldType::RelativeWordAligned:
+            extra += 3;
+            break;
+    }
+    if (f.counter_enabled &&
+        f.identification_field_type != DaqInfo::IdFieldType::RelativeWordAligned) {
+        extra += 1;
     }
     b.insert(b.end(), extra, 0xEE);  // 填充字节（Decode 只按长度校验）
     b.insert(b.end(), payload.begin(), payload.end());
     return b;
+}
+
+// ============================================================================
+// V-04 回归：A2L 声明的 PROTOCOL_LAYER VERSION 必须透传，不得被桥接层改写
+// ============================================================================
+// 背景：`a2l_dto_map.cpp` 中 `layer->version` 曾硬编码为 0x0100，导致任何 A2L
+// 都被报告成 V1.0。上游 liba2l 早已正确解析该字段（语法层 xcpdataparser.y ->
+// ProtocolLayer::GetVersion -> IfDataXcpDto::protocol_version），桥接层把它丢弃
+// 属于实现错误。
+//
+// 之所以此前无测试发现：`golden_basic.a2l` 恰好也声明 0x100，与硬编码值
+// **巧合一致**；而 VersionResolver 的 A2L 用例是直接注入 inputs，根本不过
+// 桥接层。本组用例专门把「文件里的声明」与「桥接层的输出」对账，堵住该漏洞。
+
+/// @brief 真实 A2L 文件声明的 0x104（V1.4）必须原样透出
+TEST_F(A2lGoldenTest, V04A2lDeclaredVersionIsNotRewritten) {
+    auto b = LoadOk(Data("cpp_demo_V201_corrected.a2l"));
+    ASSERT_NE(b, nullptr);
+    const IfDataXcpInfo* xcp = b->XcpInfo();
+    ASSERT_NE(xcp, nullptr);
+    // 该文件 /begin PROTOCOL_LAYER 首字段声明 0x104（V1.4）。
+    // 硬编码时代这里会得到 0x0100——测试会失败，正是本用例的价值。
+    EXPECT_EQ(xcp->protocol_layer.version, 0x0104)
+        << "A2L 声明的 V1.4 被改写；V-04 回归（应透传 dto.protocol_version）";
+}
+
+/// @brief 合成 A2L：非 V1.x 的声明同样必须透传（防止再次写死）
+TEST_F(A2lGoldenTest, V04SyntheticNonV1VersionIsPropagated) {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / "libxcp_v04";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path path = dir / "v04_declared.a2l";
+    // 声明 0x201（V2.1）：与 0x0100 差异显著，任何写死都会暴露。
+    {
+        std::ofstream out(path);
+        out << "ASAP2_VERSION 1 61\n"
+               "/begin PROJECT P \"\"\n"
+               "/begin MODULE M \"\"\n"
+               "/begin IF_DATA XCP\n"
+               "/begin PROTOCOL_LAYER\n"
+               " 0x201 1000 2000 0 0 0 0 0 248 1024 "
+               "BYTE_ORDER_MSB_LAST ADDRESS_GRANULARITY_BYTE\n"
+               "/end PROTOCOL_LAYER\n"
+               "/end IF_DATA\n"
+               "/end MODULE\n"
+               "/end PROJECT\n";
+    }
+    auto r = A2lBridge::Load(path.string());
+    if (!r.HasValue()) {
+        std::error_code rm;
+        std::filesystem::remove(path, rm);
+        GTEST_SKIP() << "最小 IF_DATA 样本解析失败（需完整 MODULE 结构）："
+                     << r.ErrorInfo().message;
+    }
+    const IfDataXcpInfo* xcp = r.Value()->XcpInfo();
+    ASSERT_NE(xcp, nullptr);
+    EXPECT_EQ(xcp->protocol_layer.version, 0x0201)
+        << "A2L 声明的 V2.1 被改写；V-04 回归";
+    std::error_code rm;
+    std::filesystem::remove(path, rm);
 }
 
 }  // namespace

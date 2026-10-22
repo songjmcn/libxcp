@@ -69,8 +69,10 @@ TEST(XcpMasterSymbolPolicyTest, DaqRejectsCalibrationAndGenericArrays) {
     array.dimensions.push_back({0, 8, 4});
     array.daq_event_fixed = {3};
     EXPECT_TRUE(SymbolDetailReadUnsupportedReason(array).empty());
+    // 数组准入不再按厂商 profile 门控；未开启 allow_contiguous_1d_array 时
+    // 一律给出「暂不支持 DAQ 数组」。
     EXPECT_NE(SymbolDaqObservationUnsupportedReason(array, event_channels)
-                  .find("Generic profile"),
+                  .find("暂不支持 DAQ 数组"),
               std::string::npos);
     EXPECT_TRUE(SymbolDaqObservationUnsupportedReason(
                     array, event_channels, /*allow_contiguous_1d_array=*/true)

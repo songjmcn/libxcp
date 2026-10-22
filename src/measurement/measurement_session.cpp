@@ -95,21 +95,21 @@ void MeasurementSession::SetEnvelopeMode(IdentificationFieldType type,
     if (!m_routes_.empty()) {
         ThrowState("MeasurementSession::SetEnvelopeMode 须在 Prepare 前调用");
     }
-    std::size_t minimum_bytes = 0U;
+    // 识别字段最小长度按规范 Figure 51/52/53 逐模式校验（N-02）：
+    //   Absolute=1、RelativeByte=2、RelativeWord=3、RelativeWordAligned=4。
+    // 长度统一取自 IdentificationFieldMinimumBytes，避免各处硬编码漂移。
+    // 未知枚举值先拒（解码器同样会拒，此处提前给出更明确的失败点）。
     switch (type) {
         case IdentificationFieldType::Absolute:
-            minimum_bytes = 1U;
-            break;
         case IdentificationFieldType::RelativeByte:
-            minimum_bytes = 4U;
-            break;
         case IdentificationFieldType::RelativeWord:
         case IdentificationFieldType::RelativeWordAligned:
-            minimum_bytes = 2U;
             break;
         default:
             ThrowInvalid("MeasurementSession::SetEnvelopeMode 未知识别字段模式");
     }
+    const std::size_t minimum_bytes =
+        IdentificationFieldMinimumBytes(type);
     if (id_field_bytes < minimum_bytes) {
         ThrowInvalid("MeasurementSession::SetEnvelopeMode 识别字段长度不足");
     }
@@ -152,7 +152,7 @@ void MeasurementSession::SetDaqEntryCapabilities(
     }
     if (capabilities.supports_contiguous_1d_arrays &&
         (capabilities.entry_granularity_bytes == 0U ||
-         capabilities.max_entry_size_bytes == 0U)) {
+         capabilities.max_entry_size_elements == 0U)) {
         ThrowInvalid("数组准入缺少已验证的 DAQ Entry 粒度或最大长度");
     }
     m_daq_entry_capabilities_ = capabilities;

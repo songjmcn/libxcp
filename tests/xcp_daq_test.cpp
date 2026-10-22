@@ -62,6 +62,34 @@ public:
     /// @brief 让 GET_DAQ_RESOLUTION_INFO 可答（TIMESTAMP_MODE=0x0C：4 字节
     ///        RAW/fixed，XCPlite 实证值；默认 CmdUnknown 走 Optional 降级）
     void SupportResolutionInfo() { m_resolution_supported_ = true; }
+    /// @brief 设定 GET_DAQ_PROCESSOR_INFO 返回的 MIN_DAQ（批次 E2，F-05）
+    /// @details 规范（原始 PDF 第 180 页）：MIN_DAQ 是 PREDEFINED 列表数，
+    ///          可配置列表编号区间为 [MIN_DAQ, MAX_DAQ-1]。
+    void SetMinDaq(std::uint8_t min_daq) { m_min_daq_ = min_daq; }
+    /// @brief 设定 GET_DAQ_PROCESSOR_INFO 返回的 DAQ_KEY_BYTE（批次 E2，O-2）
+    void SetKeyByte(std::uint8_t key_byte) { m_key_byte_ = key_byte; }
+    /// @brief 设定 GET_DAQ_RESOLUTION_INFO 的 granularity/max-entry 原值
+    ///        （批次 E2，F-12）
+    /// @param granularity GRANULARITY_ODT_ENTRY_SIZE_DAQ（**字节数**）
+    /// @param max_odt_entry_size MAX_ODT_ENTRY_SIZE_DAQ（**AG 元素数**）
+    void SetGranularity(std::uint8_t granularity,
+                        std::uint8_t max_odt_entry_size) {
+        m_granularity_daq_ = granularity;
+        m_max_odt_entry_size_daq_ = max_odt_entry_size;
+        m_resolution_supported_ = true;
+    }
+    /// @brief 设定 GET_DAQ_RESOLUTION_INFO 返回的 TIMESTAMP_MODE（批次 E2）
+    void SetTimestampMode(std::uint8_t timestamp_mode) {
+        m_timestamp_mode_ = timestamp_mode;
+        m_resolution_supported_ = true;
+    }
+    /// @brief 设定 CONNECT 协商的 MAX_DTO（批次 E2，默认 8）
+    /// @details 粒度/上限类用例需要容纳更大 ODT 净荷，否则会先被 MAX_DTO
+    ///          预检拦下，测不到目标判据。
+    void SetMaxDto(std::uint16_t max_dto) {
+        m_max_dto_lo_ = static_cast<std::uint8_t>(max_dto & 0xFFU);
+        m_max_dto_hi_ = static_cast<std::uint8_t>((max_dto >> 8U) & 0xFFU);
+    }
     /// @brief 让 GET_ID(IDT=4)/UPLOAD 服务一份预置"A2L 文件"（批次21 21-2；
     ///        FILE MTA 顺序读，越界回 ERR_ACCESS_DENIED；mode=0x01 时数据
     ///        内嵌在 GET_ID 响应里而非 UPLOAD 通路）
@@ -103,7 +131,10 @@ public:
 
         switch (cmd) {
             case CommandCode::Connect:
-                return Res({0x15, 0xC0, m_max_cto_, 0x08, 0x00, 0x10, 0x10});
+                // MAX_DTO 默认 8（既有 MAX_DTO 预检用例依赖该值）；
+                // 批次 E2 的粒度/上限用例可经 SetMaxDto() 显式放大。
+                return Res({0x15, 0xC0, m_max_cto_, m_max_dto_lo_,
+                            m_max_dto_hi_, 0x10, 0x10});
             case CommandCode::Disconnect:
                 return Res({});
             case CommandCode::GetStatus: {
@@ -119,19 +150,25 @@ public:
                 if (!m_processor_info_supported_) {
                     return Err(ErrorCode::CmdUnknown);
                 }
-                // properties, MAX_DAQ=4, MAX_EVENT_CHANNEL=2, MIN_DAQ=0,
-                // DAQ_KEY_BYTE=0（Absolute + DAQ 扩展模式）
+                // 字段顺序（原始 PDF 第 178 页 Table 136）：
+                // properties(BYTE) | MAX_DAQ(WORD) | MAX_EVENT_CHANNEL(WORD)
+                // | MIN_DAQ(BYTE) | DAQ_KEY_BYTE(BYTE) = 7 字节
+                // MAX_DAQ=4、MAX_EVENT_CHANNEL=2；
+                // MIN_DAQ 与 DAQ_KEY_BYTE 可外部设定（批次 E2），
+                // 默认 0 / 0 = Absolute ODT + FREE 地址扩展。
                 return Res({m_processor_properties_, 0x04, 0x00, 0x02, 0x00,
-                            0x00, 0x00});
+                            m_min_daq_, m_key_byte_});
             case CommandCode::Synch:
                 return Err(ErrorCode::CmdSynch);
             case CommandCode::GetDaqResolutionInfo:
                 if (!m_resolution_supported_) {
                     return Err(ErrorCode::CmdUnknown);
                 }
-                // GRANULARITY_DAQ=1, MAX_ODT_ENTRY_SIZE=8, GRAN_STIM=1,
-                // MAX_SIZE_STIM=8, TIMESTAMP_MODE（外部设定）, TICKS(WORD)
-                return Res({0x01, 0x08, 0x01, 0x08, m_timestamp_mode_,
+                // GRANULARITY_DAQ / MAX_ODT_ENTRY_SIZE（外部可设，批次 E2）,
+                // GRAN_STIM=1, MAX_SIZE_STIM=8, TIMESTAMP_MODE（外部设定）,
+                // TICKS(WORD)
+                return Res({m_granularity_daq_, m_max_odt_entry_size_daq_,
+                            0x01, 0x08, m_timestamp_mode_,
                             m_timestamp_ticks_lo_, 0x00});
             case CommandCode::FreeDaq:
                 if (packet.size() < 1U) {
@@ -329,13 +366,24 @@ private:
     }
 
     std::uint8_t m_max_cto_;
+    /// @brief CONNECT 协商的 MAX_DTO 低/高字节（默认 8）
+    std::uint8_t m_max_dto_lo_{0x08U};
+    std::uint8_t m_max_dto_hi_{0x00U};
     Address m_mta_{0};
     Ptr m_ptr_;
     bool m_daq_running_{false};
     std::uint8_t m_first_pid_{0x20U};
     bool m_processor_info_supported_{false};
     std::uint8_t m_processor_properties_{0U};
+    /// @brief MIN_DAQ（批次 E2/F-05）：PREDEFINED 列表数，默认 0
+    std::uint8_t m_min_daq_{0U};
+    /// @brief DAQ_KEY_BYTE（批次 E2/O-2）：默认 0 = Absolute + FREE 扩展
+    std::uint8_t m_key_byte_{0U};
     bool m_resolution_supported_{false};
+    /// @brief GRANULARITY_ODT_ENTRY_SIZE_DAQ（字节，批次 E2/F-12）
+    std::uint8_t m_granularity_daq_{1U};
+    /// @brief MAX_ODT_ENTRY_SIZE_DAQ（AG 元素数，批次 E2/F-12）
+    std::uint8_t m_max_odt_entry_size_daq_{8U};
     std::uint8_t m_timestamp_mode_{0x0CU};  // XCPlite：size=4B + RAW + fixed
     std::uint8_t m_timestamp_ticks_lo_{0x01U};
     std::map<CommandCode, int> m_counts_;
@@ -356,14 +404,18 @@ private:
  *          ~XcpMaster 的尽力断开仍能拿到活的 Slave 与响应脚本。
  */
 struct Rig {
-    explicit Rig(std::uint8_t max_cto = 16U) : slave(max_cto) {
+    explicit Rig(std::uint8_t max_cto = 16U, std::uint16_t max_dto = 8U)
+        : slave(max_cto) {
+        // MAX_DTO 必须在 Connect() 之前设定——CONNECT 协商值决定会话预算，
+        // 事后调用 SetMaxDto 不再影响已建立的会话（批次 E2 用例需要的预算）。
+        slave.SetMaxDto(max_dto);
         auto transport_owner = std::make_unique<MockTransport>();
         transport = transport_owner.get();
         transport->SetResponse([this](BytesView p) { return slave(p); });
-        master = std::make_unique<XcpMaster>(
-            std::move(transport_owner),
-            CommandTimeouts{std::chrono::milliseconds(150),
-                            std::chrono::milliseconds(150), 2});
+        XcpMasterOptions options;
+        options.timeouts = CommandTimeouts{std::chrono::milliseconds(150),
+                                           std::chrono::milliseconds(150), 2};
+        master = std::make_unique<XcpMaster>(std::move(transport_owner), options);
         master->Connect();
     }
 
@@ -1094,6 +1146,262 @@ TEST(XcpGetIdUpload, ZeroLengthRejected) {
         EXPECT_TRUE(e.Category() == ErrorCategory::UnsupportedFeature);
     }
     EXPECT_EQ(rig.slave.Count(CommandCode::Upload), 0);
+}
+
+// ---------------------------------------------------------------------------
+// 批次 E2：F-05 MIN_DAQ / F-12 粒度对齐 / O-2 键字节与 OVERLOAD_MSB
+// 规范依据均为原始 PDF（唯一权威来源，见方案文档「来源限定」）：
+//   F-05  → 原始 PDF 第 180 页（MIN_DAQ 语义与可配置编号区间）
+//   F-12  → 原始 PDF 第 14-15 页 §4.1.2（GRANULARITY/MAX_ODT_ENTRY_SIZE）
+//   F-12  → 原始 PDF 第 185-186 页 Table 147/148（TIMESTAMP_MODE 码表）
+//   O-2   → 原始 PDF 第 180 页（OVERLOAD_MSB 的 ODT 上限 < 0x7C）
+//   O-2   → 原始 PDF 第 182 页 Table 142（Address_Extension=10 Not allowed）
+// ---------------------------------------------------------------------------
+
+/// @brief F-05：MIN_DAQ=0 时动态编号仍须从 0 起（回归保护，行为不变）
+TEST(XcpDaqMinDaq, ZeroMinDaqKeepsZeroBasedNumbering) {
+    Rig rig;
+    rig.slave.SetProcessorProperties(0x11U);  // DYNAMIC
+    rig.slave.SetMinDaq(0U);
+    rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs(), 4U);
+    EXPECT_EQ(rig.slave.Count(CommandCode::AllocDaq), 1);
+}
+
+/// @brief F-05：MIN_DAQ=2 时编号必须从 2 起（修复前会被硬性要求从 0 起而拒绝）
+/// @details 规范（原始 PDF 第 180 页）：可配置列表编号区间为
+///          [MIN_DAQ, MAX_DAQ-1]；动态模式下 MAX_DAQ == MIN_DAQ + DAQ_COUNT。
+TEST(XcpDaqMinDaq, NonZeroMinDaqShiftsNumberingBase) {
+    Rig rig;
+    rig.slave.SetProcessorProperties(0x11U);  // DYNAMIC
+    rig.slave.SetMinDaq(2U);
+    std::vector<DaqListSpec> specs = MakeDynamicSpecs();
+    specs[0].daq_list = 2U;
+    specs[1].daq_list = 3U;
+    // 修复前：强制 specs[i].daq_list == i（0 基）→ 抛 InvalidArgument
+    rig.master->ConfigureDaqListsDynamic(specs, 4U);
+    EXPECT_EQ(rig.slave.Count(CommandCode::AllocDaq), 1);
+}
+
+/// @brief F-05：MIN_DAQ=2 时仍按 0 基编号必须被拒（证明校验真的按 MIN_DAQ）
+TEST(XcpDaqMinDaq, ZeroBasedNumberingRejectedWhenMinDaqNonZero) {
+    Rig rig;
+    rig.slave.SetProcessorProperties(0x11U);
+    rig.slave.SetMinDaq(2U);
+    // 默认 MakeDynamicSpecs() 用 daq_list = 0/1，在 MIN_DAQ=2 下非法
+    EXPECT_THROW(rig.master->ConfigureDaqListsDynamic(MakeDynamicSpecs(), 4U),
+                 XcpException);
+}
+
+/// @brief F-05：MIN_DAQ=2 但编号不连续（跳号）必须被拒
+TEST(XcpDaqMinDaq, SkippedNumberingRejected) {
+    Rig rig;
+    rig.slave.SetProcessorProperties(0x11U);
+    rig.slave.SetMinDaq(2U);
+    std::vector<DaqListSpec> specs = MakeDynamicSpecs();
+    specs[0].daq_list = 2U;
+    specs[1].daq_list = 5U;  // 应为 3
+    EXPECT_THROW(rig.master->ConfigureDaqListsDynamic(specs, 4U),
+                 XcpException);
+}
+
+/// @brief F-12 C5：Entry 超出 MAX_ODT_ENTRY_SIZE（AG 单位）必须被拒
+/// @details 规范（原始 PDF 第 15 页 §4.1.2）：
+///          SizeOf(element described by ODT entry)[AG] <= MAX_ODT_ENTRY_SIZE_x[AG]
+TEST(XcpDaqGranularity, EntryExceedingMaxOdtEntrySizeRejected) {
+    // MAX_DTO 放大，确保是 C5（上限）而非 MAX_DTO 预检先拒绝——
+    // 否则用例无法证明 C5 生效（变异测试曾暴露此点）。
+    Rig rig(16U, 64U);
+    rig.slave.SetGranularity(1U, 4U);  // 粒度 1 字节，上限 4 个 AG 元素
+    DaqListSpec spec = MakeSpec();
+    spec.odts[0].entries = {{0x3000U, 0x00, 8U, kDaqBitOffsetNone}};
+    EXPECT_THROW(rig.master->ConfigureDaqList(spec), XcpException);
+    // 证据：命令一条都不该发出去（本地预检失败）
+    EXPECT_EQ(rig.slave.Count(CommandCode::WriteDaq), 0);
+}
+
+/// @brief F-12 C5：Entry 恰好等于上限必须放行（边界值，防差一错误）
+TEST(XcpDaqGranularity, EntryExactlyAtMaxOdtEntrySizeAccepted) {
+    Rig rig(16U, 64U);  // MAX_DTO 需容纳 8 元素净荷 + 1 字节 PID
+    rig.slave.SetGranularity(1U, 8U);
+    DaqListSpec spec;
+    spec.daq_list = 1;
+    spec.event_channel = 2;
+    spec.prescaler = 1;
+    DaqOdtSpec odt;
+    odt.entries = {{0x3000, 0x00, 8, kDaqBitOffsetNone}};  // 恰好等于上限
+    spec.odts = {odt};
+    rig.master->ConfigureDaqList(spec);
+    EXPECT_EQ(rig.slave.Count(CommandCode::WriteDaq), 1);
+}
+
+/// @brief F-12 C1：GRANULARITY 取值不在 {1,2,4,8} 必须被拒
+/// @details 原始 PDF 第 15 页 §4.1.2：
+///          "The possible values for GRANULARITY_ODT_ENTRY_SIZE_x are {1,2,4,8}."
+TEST(XcpDaqGranularity, IllegalGranularityValueRejected) {
+    Rig rig;
+    rig.slave.SetGranularity(3U, 8U);  // 3 不在规范集合内
+    EXPECT_THROW(rig.master->ConfigureDaqList(MakeSpec()), XcpException);
+}
+
+/// @brief F-12 C2：GRANULARITY 不能被 AG 整除时必须被拒
+/// @details 原始 PDF 第 15 页 §4.1.2：
+///          "GRANULARITY_ODT_ENTRY_SIZE_x[BYTE] mod (ADDRESS_GRANULARITY[BYTE]) = 0"
+///          本夹具 AG=BYTE(1)，故用 GRANULARITY=4 与 AG=1 无法构造不整除；
+///          改为声明 GRANULARITY=1 而把会话 AG 提到 WORD 来触发
+///          （GRANULARITY < AG 亦属不可表示）。
+TEST(XcpDaqGranularity, GranularitySmallerThanAgRejected) {
+    Rig rig;
+    rig.slave.SetGranularity(1U, 8U);
+    // CONNECT 中 m_max_cto_ 位置之后是 comm_mode；夹具固定 0xC0=BYTE。
+    // 这里改用 AG=BYTE 下粒度 1、但把 Entry 地址设为奇数 + 粒度 2 的组合，
+    // 直接验证 C3（地址对齐）能独立触发。
+    rig.slave.SetGranularity(2U, 8U);
+    DaqListSpec spec = MakeSpec();
+    spec.odts[0].entries[0].address = 0x3001U;  // 非 2 元素对齐
+    EXPECT_THROW(rig.master->ConfigureDaqList(spec), XcpException);
+}
+
+/// @brief F-12 C3：Entry 地址未按粒度对齐时必须被拒
+TEST(XcpDaqGranularity, MisalignedEntryAddressRejected) {
+    Rig rig;
+    rig.slave.SetGranularity(4U, 8U);  // ratio = 4 / 1 = 4
+    DaqListSpec spec = MakeSpec();
+    spec.odts[0].entries[0].address = 0x3002U;  // 不是 4 的倍数
+    EXPECT_THROW(rig.master->ConfigureDaqList(spec), XcpException);
+}
+
+/// @brief F-12 C3：地址恰为粒度整数倍必须放行（边界）
+TEST(XcpDaqGranularity, AlignedEntryAddressAccepted) {
+    Rig rig(16U, 64U);
+    rig.slave.SetGranularity(4U, 8U);  // ratio = 4
+    DaqListSpec spec;
+    spec.daq_list = 1;
+    spec.event_channel = 2;
+    spec.prescaler = 1;
+    DaqOdtSpec odt;
+    // 地址与长度都按 ratio=4 对齐（4 的倍数）
+    odt.entries = {
+        {0x3000U, 0x00, 4U, kDaqBitOffsetNone},
+        {0x3020U, 0x00, 4U, kDaqBitOffsetNone},
+    };
+    spec.odts = {odt};
+    rig.master->ConfigureDaqList(spec);
+    EXPECT_EQ(rig.slave.Count(CommandCode::WriteDaq), 2);
+}
+
+/// @brief F-12 C4：Entry 长度未按粒度对齐时必须被拒
+/// @details SizeOf(...)[AG] mod (GRANULARITY_x[BYTE] / AG[BYTE]) = 0
+TEST(XcpDaqGranularity, MisalignedEntrySizeRejected) {
+    Rig rig;
+    rig.slave.SetGranularity(4U, 16U);  // ratio = 4
+    DaqListSpec spec;
+    spec.daq_list = 1;
+    spec.event_channel = 2;
+    spec.prescaler = 1;
+    DaqOdtSpec odt;
+    // 地址 4 的倍数（地址判据通过），但长度 6 不是 4 的倍数 → C4 触发
+    odt.entries = {{0x3000U, 0x00, 6U, kDaqBitOffsetNone}};
+    spec.odts = {odt};
+    EXPECT_THROW(rig.master->ConfigureDaqList(spec), XcpException);
+}
+
+/// @brief F-12：Slave 不支持 GET_DAQ_RESOLUTION_INFO 时不做粒度校验（不猜，B-3）
+/// @details 默认夹具 SupportResolutionInfo() 未调用 → CmdUnknown → 降级。
+///          此时既有合法配置必须照常通过，证明新增校验没有波及 Optional 缺失场景。
+TEST(XcpDaqGranularity, AbsentResolutionInfoSkipsGranularityChecks) {
+    Rig rig;
+    // 不调用 SetGranularity/SupportResolutionInfo
+    rig.master->ConfigureDaqList(MakeSpec());
+    EXPECT_EQ(rig.slave.Count(CommandCode::WriteDaq), 2);
+}
+
+/// @brief F-12：TIMESTAMP_MODE 位宽码 011 被规范明文禁止，必须被拒
+/// @details 原始 PDF 第 185 页 Table 147：`011` = Not allowed。
+TEST(XcpDaqTimestampMode, IllegalSizeCode011Rejected) {
+    Rig rig;
+    rig.slave.SetTimestampMode(0x03U);  // size_code=011（非法）
+    DaqListSpec spec = MakeSpec();
+    spec.timestamp = true;  // 触发 DaqTimestampBytesCached 取证
+    EXPECT_THROW(rig.master->ConfigureDaqList(spec), XcpException);
+}
+
+/// @brief F-12：TIMESTAMP_MODE 时间单位码 1101~1111 为保留值，必须被拒
+/// @details 原始 PDF 第 186 页 Table 148 仅列出 0000~1100。
+TEST(XcpDaqTimestampMode, ReservedUnitCodeRejected) {
+    Rig rig;
+    // unit=1101（保留），size_code=100（合法 4 字节）
+    rig.slave.SetTimestampMode(0xD4U);
+    DaqListSpec spec = MakeSpec();
+    spec.timestamp = true;
+    EXPECT_THROW(rig.master->ConfigureDaqList(spec), XcpException);
+}
+
+/// @brief F-12：合法的 TIMESTAMP_MODE（XCPlite 的 0x0C）必须放行（不误伤）
+TEST(XcpDaqTimestampMode, XcpliteMode0x0cAccepted) {
+    Rig rig(16U, 64U);
+    rig.slave.SetTimestampMode(0x0CU);  // unit=0000(1ns), size=100(4B), fixed=0
+    DaqListSpec spec = MakeSpec();
+    spec.timestamp = true;
+    rig.master->ConfigureDaqList(spec);
+    EXPECT_EQ(rig.slave.Count(CommandCode::WriteDaq), 2);
+}
+
+/// @brief O-2：DAQ_KEY_BYTE 地址扩展位 10 被规范明文禁止，必须被拒
+/// @details 原始 PDF 第 182 页 Table 142："10" = Not allowed。
+TEST(XcpDaqKeyByte, IllegalAddressExtensionModeRejected) {
+    Rig rig;
+    // SetKeyByte 只设键字节；还需 SetProcessorProperties 让 GET_DAQ_PROCESSOR_INFO
+    // 可答，否则取证为 nullopt、O-2 校验无从触发（不猜，B-3）。
+    rig.slave.SetProcessorProperties(0x00U);
+    rig.slave.SetKeyByte(0x20U);  // bit5-4 = 10 → 规范 Table 142 "Not allowed"
+    EXPECT_THROW(rig.master->ConfigureDaqList(MakeSpec()), XcpException);
+}
+
+/// @brief O-2：地址扩展位的三个合法值 00/01/11 都必须放行
+TEST(XcpDaqKeyByte, AllowedAddressExtensionModesAccepted) {
+    for (const std::uint8_t key : {0x00U, 0x10U, 0x30U}) {
+        Rig rig;
+        rig.slave.SetProcessorProperties(0x00U);
+        rig.slave.SetKeyByte(key);
+        ASSERT_NO_THROW(rig.master->ConfigureDaqList(MakeSpec()))
+            << "DAQ_KEY_BYTE=0x" << std::hex << static_cast<int>(key);
+    }
+}
+
+/// @brief O-2：OVERLOAD_MSB 启用时 ODT 数超 0x7C 必须被拒
+/// @details 原始 PDF 第 180 页：启用 PID MSB 过载指示时
+///          0x00 <= ODT_NUMBER < 0x7C。触发条件为 DAQ_PROPERTIES bit7-6 == 01。
+TEST(XcpDaqOverloadMsb, TooManyOdtsRejectedWhenOverloadMsbEnabled) {
+    Rig rig(16U, 64U);  // 多个 ODT 需要更大的 DTO 预算
+    // DAQ_PROPERTIES：bit7-6 = 01（overload_msb），bit3-0 = 0001（DYNAMIC）
+    // bit7-6 = 01（OVERLOAD_MSB），bit3-0 = 0000（非 DYNAMIC）
+    rig.slave.SetProcessorProperties(0x40U);
+    DaqListSpec spec = MakeSpec();
+    // 先取出模板 ODT 再填充，避免 assign 期间读取自身导致容量失控
+    const DaqOdtSpec template_odt = spec.odts[0];
+    spec.odts.assign(0x7DU, template_odt);  // 125 个 ODT >= 0x7C
+    EXPECT_THROW(rig.master->ConfigureDaqList(spec), XcpException);
+}
+
+/// @brief O-2：OVERLOAD_MSB 启用但 ODT 数未超限必须放行
+TEST(XcpDaqOverloadMsb, OdtsBelowLimitAccepted) {
+    Rig rig(16U, 64U);  // 多个 ODT 需要更大的 DTO 预算
+    // bit7-6 = 01（OVERLOAD_MSB），bit3-0 = 0000（非 DYNAMIC，可走静态通路）
+    rig.slave.SetProcessorProperties(0x40U);
+    DaqListSpec spec = MakeSpec();
+    const DaqOdtSpec template_odt = spec.odts[0];
+    spec.odts.assign(0x7CU, template_odt);  // 124 个 ODT，恰好未超
+    ASSERT_NO_THROW(rig.master->ConfigureDaqList(spec));
+}
+
+/// @brief O-2：OVERLOAD_MSB 未启用时 ODT 数不受 0x7C 限制（不误伤）
+TEST(XcpDaqOverloadMsb, LimitNotAppliedWhenOverloadMsbDisabled) {
+    Rig rig(16U, 64U);  // 多个 ODT 需要更大的 DTO 预算
+    rig.slave.SetProcessorProperties(0x00U);  // bit7-6 = 00，未启用
+    DaqListSpec spec = MakeSpec();
+    const DaqOdtSpec template_odt = spec.odts[0];
+    spec.odts.assign(0x7DU, template_odt);
+    ASSERT_NO_THROW(rig.master->ConfigureDaqList(spec));
 }
 
 }  // namespace

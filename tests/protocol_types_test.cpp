@@ -150,7 +150,10 @@ TEST(ResourceMask, CombinesWithBitOr) {
 }
 
 // --------------------------------------------------------------------------
-// XcpAddress40::Advance：按 AG 换算并检查 32 位溢出
+// XcpAddress40::Advance：按元素推进并检查 32 位溢出
+// 依据 XCP V1.5.0 原始 PDF 第 112 页（AG 是单个地址所含元素的尺寸）与
+// 第 113 页 Table 43（WORD 下 Address n+1 = Byte 02）：地址按元素计数，
+// 前进 n 个元素即 address + n，AG 不参与地址推进。
 // --------------------------------------------------------------------------
 
 TEST(XcpAddress40, AdvancesByElementsInByteAg) {
@@ -163,8 +166,25 @@ TEST(XcpAddress40, AdvancesByElementsInByteAg) {
 
 TEST(XcpAddress40, AdvancesByElementsInWordAndDwordAg) {
     XcpAddress40 addr{0x1000U, 0x00U};
-    EXPECT_EQ(addr.Advance(3, AddressGranularity::Word)->address, 0x1006U);
-    EXPECT_EQ(addr.Advance(2, AddressGranularity::DWord)->address, 0x1008U);
+    // 前进 3 个元素即地址 +3（修正前误按 3*2=6 推进）
+    EXPECT_EQ(addr.Advance(3, AddressGranularity::Word)->address, 0x1003U);
+    // 前进 2 个元素即地址 +2（修正前误按 2*4=8 推进）
+    EXPECT_EQ(addr.Advance(2, AddressGranularity::DWord)->address, 0x1002U);
+}
+
+TEST(XcpAddress40, AdvanceIsIndependentOfGranularity) {
+    // 地址推进量与 AG 无关：同一元素数在三种粒度下结果相同
+    const XcpAddress40 addr{0x2000U, 0x00U};
+    constexpr ElementCount kElements = 7;
+    const auto byte_ag = addr.Advance(kElements, AddressGranularity::Byte);
+    const auto word_ag = addr.Advance(kElements, AddressGranularity::Word);
+    const auto dword_ag = addr.Advance(kElements, AddressGranularity::DWord);
+    ASSERT_TRUE(byte_ag.has_value());
+    ASSERT_TRUE(word_ag.has_value());
+    ASSERT_TRUE(dword_ag.has_value());
+    EXPECT_EQ(byte_ag->address, 0x2007U);
+    EXPECT_EQ(word_ag->address, 0x2007U);
+    EXPECT_EQ(dword_ag->address, 0x2007U);
 }
 
 TEST(XcpAddress40, DetectsOverflow) {
@@ -173,10 +193,16 @@ TEST(XcpAddress40, DetectsOverflow) {
     EXPECT_EQ(near_end.Advance(0, AddressGranularity::Byte)->address,
               0xFFFFFFFFU);
 
+    // 溢出判定以元素单位：DWORD 下前进 4 个元素只前进 4 个地址单位，
+    // 0xFFFFFFF0 + 4 = 0xFFFFFFF4 未溢出
     XcpAddress40 last_byte{0xFFFFFFF0U, 0x00U};
-    EXPECT_EQ(last_byte.Advance(4, AddressGranularity::DWord), std::nullopt);
-    EXPECT_EQ(last_byte.Advance(3, AddressGranularity::DWord)->address,
-              0xFFFFFFFCU);
+    EXPECT_EQ(last_byte.Advance(4, AddressGranularity::DWord)->address,
+              0xFFFFFFF4U);
+    // 前进到 0xFFFFFFFF 是最后一个合法地址
+    EXPECT_EQ(last_byte.Advance(15, AddressGranularity::DWord)->address,
+              0xFFFFFFFFU);
+    // 再加 1 即溢出
+    EXPECT_EQ(last_byte.Advance(16, AddressGranularity::DWord), std::nullopt);
 }
 
 TEST(XcpAddress40, EqualityComparesBothParts) {

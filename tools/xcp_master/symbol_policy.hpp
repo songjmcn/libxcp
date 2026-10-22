@@ -36,7 +36,12 @@ namespace calmcar::xcp::tools {
 /// @brief 根据A2L静态声明判断变量是否能加入DAQ观测集合。
 /// @param symbol 待观测符号。
 /// @param available_events A2L声明的EVENT_CHANNEL编号集合。
+/// @param allow_contiguous_1d_array 是否允许定长连续一维测量数组。
 /// @return 空串表示静态合格；否则为明确的中文拒绝原因。
+/// @details 数组准入已不再按厂商 profile 门控（原 `--daq-profile` 已移除）：
+///          本函数只做保守的静态上限检查，真实的 Entry 容量核对
+///          （MAX_ODT_ENTRY_SIZE_DAQ 与元素长度）由 watch 运行期用取证到的
+///          从站能力完成，故此处无需也无法得知从站布局。
 [[nodiscard]] inline std::string SymbolDaqObservationUnsupportedReason(
     const a2l::SymbolInfo& symbol,
     std::span<const std::uint16_t> available_events,
@@ -44,13 +49,12 @@ namespace calmcar::xcp::tools {
     if (symbol.kind != a2l::SymbolKind::Measurement)
         return "DAQ 仅支持 MEASUREMENT";
     if (!symbol.dimensions.empty()) {
-        if (!allow_contiguous_1d_array)
-            return "Generic profile 不支持 DAQ 数组";
+        if (!allow_contiguous_1d_array) return "暂不支持 DAQ 数组";
         const auto array_reason =
             SymbolDetailReadUnsupportedReason(symbol);
         if (!array_reason.empty()) return array_reason;
-        // F6 的静态限制须与核心 uint8 元素计数及单 Entry 字节字段一致；
-        // XCPlite 实际粒度、最大 Entry 和 DTO 容量留待 watch 运行期再核实。
+        // 静态限制须与核心 uint8 元素计数及单 Entry 字节字段一致；
+        // 从站实际粒度、最大 Entry 和 DTO 容量留待 watch 运行期再核实。
         const auto& dimension = symbol.dimensions.front();
         if (dimension.extent > 255U ||
             dimension.extent > 255U / symbol.element_size_bytes)

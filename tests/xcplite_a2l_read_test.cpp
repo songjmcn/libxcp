@@ -110,9 +110,10 @@ TEST_F(XcpliteA2lReadTest, FindAndReadBasicVariables) {
     cfg.local_host = "127.0.0.1";
     cfg.local_port = 0;
     cfg.receive_poll_interval_ms = 20;
-    XcpMaster master(std::make_unique<UdpTransport>(cfg),
-                     CommandTimeouts{std::chrono::milliseconds(2000),
-                                     std::chrono::milliseconds(2000), 1});
+    XcpMasterOptions options;
+    options.timeouts = CommandTimeouts{std::chrono::milliseconds(2000),
+                                       std::chrono::milliseconds(2000), 1};
+    XcpMaster master(std::make_unique<UdpTransport>(cfg), options);
     master.Connect();
 
     // u8：地址/扩展/尺寸来自 A2L；raw 读回后 IDENTICAL 换算

@@ -108,10 +108,20 @@ public:
           m_max_dto_(max_dto),
           m_optional_(optional) {}
 
-    /// @brief 写入模拟 ECU 内存
+    /// @brief 写入模拟 ECU 内存（按元素装载）
+    /// @param address 起始**元素**地址
+    /// @param data 数据字节；长度必须是 AG 的整数倍
+    /// @note 第 k 个元素位于地址 address + k，承载 AG 字节
     void SetMemory(Address address, const Bytes& data) {
-        for (std::size_t i = 0; i < data.size(); ++i) {
-            m_memory_[address + static_cast<Address>(i)] = data[i];
+        const auto ag_bytes = AgToBytes(m_ag_);
+        if (ag_bytes == 0U) {
+            return;
+        }
+        const auto count = data.size() / ag_bytes;
+        for (std::size_t k = 0; k < count; ++k) {
+            Bytes element(data.begin() + k * ag_bytes,
+                          data.begin() + (k + 1) * ag_bytes);
+            m_memory_[address + static_cast<Address>(k)] = std::move(element);
         }
     }
 
@@ -185,9 +195,18 @@ public:
                               (static_cast<std::uint32_t>((*data)[2]) << 16) |
                               (static_cast<std::uint32_t>((*data)[3]) << 24);
         value = (value & (and_mask << s)) ^ (xor_mask << s);
+        // MODIFY_BITS 操作当前 MTA 处的 32bit 字（docs §7.5.2.5），
+        // 按元素写入：每元素 AG 字节，地址以元素计数
+        const auto ag_bytes = AgToBytes(m_ag_);
+        Bytes word;
+        word.reserve(4U);
         for (std::size_t i = 0; i < 4U; ++i) {
-            m_memory_[m_mta_ + static_cast<Address>(i)] =
-                static_cast<std::uint8_t>((value >> (8U * i)) & 0xFFU);
+            word.push_back(
+                static_cast<std::uint8_t>((value >> (8U * i)) & 0xFFU));
+        }
+        for (std::size_t off = 0; off < 4U; off += ag_bytes) {
+            m_memory_[m_mta_ + static_cast<Address>(off / ag_bytes)] =
+                Bytes(word.begin() + off, word.begin() + off + ag_bytes);
         }
         // MODIFY_BITS 不修改 MTA（docs §7.5.2.5）——此处刻意不自增
         return Res({});
@@ -206,6 +225,7 @@ public:
         }
         const auto cmd = static_cast<CommandCode>(packet[0]);
         ++m_counts_[cmd];
+
 
         if (m_dropped_.count(cmd) > 0) {
             return {};
@@ -261,31 +281,46 @@ public:
                 if (packet.size() < 2U) {
                     return Err(ErrorCode::CmdSyntax);
                 }
-                const auto count = static_cast<std::size_t>(packet[1]) *
-                                   AgToBytes(m_ag_);
-                if (count == 0U || packet.size() < 2U + count) {
+                const auto elements =
+                    static_cast<std::size_t>(packet[1]);
+                const auto ag_bytes = AgToBytes(m_ag_);
+                // AG>2（DWORD）时 [F0][SIZE] 之后有 2 字节对齐
+                // （原始 PDF 第 142 页 Table 82："only if AG >2"）
+                const auto header = 2U + static_cast<std::size_t>(
+                                              DownloadAlignmentBytes(m_ag_));
+                const auto count = elements * ag_bytes;
+                if (elements == 0U || packet.size() < header + count) {
                     return Err(ErrorCode::CmdSyntax);
                 }
-                for (std::size_t i = 0; i < count; ++i) {
-                    m_memory_[m_mta_ + static_cast<Address>(i)] = packet[2U + i];
+                for (std::size_t k = 0; k < elements; ++k) {
+                    Bytes element(packet.begin() + header + k * ag_bytes,
+                                  packet.begin() + header + (k + 1) * ag_bytes);
+                    m_memory_[m_mta_ + static_cast<Address>(k)] =
+                        std::move(element);
                 }
-                m_mta_ += static_cast<Address>(count);
+                // 地址按元素计数，推进量为元素数
+                m_mta_ += static_cast<Address>(elements);
                 return ShouldDropResponseAfterExecute(cmd) ? Bytes{} : Res({});
             }
             case CommandCode::ShortDownload: {
                 if (packet.size() < 8U) {
                     return Err(ErrorCode::CmdSyntax);
                 }
-                const auto count = static_cast<std::size_t>(packet[1]) *
-                                   AgToBytes(m_ag_);
-                if (count == 0U || packet.size() < 8U + count) {
+                const auto elements =
+                    static_cast<std::size_t>(packet[1]);
+                const auto ag_bytes = AgToBytes(m_ag_);
+                const auto count = elements * ag_bytes;
+                if (elements == 0U || packet.size() < 8U + count) {
                     return Err(ErrorCode::CmdSyntax);
                 }
                 const Address address = decodeAddress(packet.subspan(4, 4));
-                for (std::size_t i = 0; i < count; ++i) {
-                    m_memory_[address + static_cast<Address>(i)] = packet[8U + i];
+                for (std::size_t k = 0; k < elements; ++k) {
+                    Bytes element(packet.begin() + 8U + k * ag_bytes,
+                                  packet.begin() + 8U + (k + 1) * ag_bytes);
+                    m_memory_[address + static_cast<Address>(k)] =
+                        std::move(element);
                 }
-                m_mta_ = address + static_cast<Address>(count);
+                m_mta_ = address + static_cast<Address>(elements);
                 return ShouldDropResponseAfterExecute(cmd) ? Bytes{} : Res({});
             }
             case CommandCode::ModifyBits: {
@@ -413,8 +448,8 @@ private:
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
         if (elements == 0U ||
-            elements + 1U >
-                static_cast<ElementCount>(m_max_cto_ / AgToBytes(m_ag_))) {
+            static_cast<std::size_t>(elements) * AgToBytes(m_ag_) + 1U >
+                m_max_cto_) {
             return Err(ErrorCode::OutOfRange);
         }
         auto data = read(m_mta_, elements);
@@ -425,7 +460,8 @@ private:
         // （docs/XCP_1.3.0_document.md §12.4：UPLOAD(6) -> 6 字节）
         std::vector<std::uint8_t> body;
         body.insert(body.end(), data->begin(), data->end());
-        m_mta_ += static_cast<Address>(elements) * AgToBytes(m_ag_);
+        // 地址按元素计数，推进量为元素数（AG 不参与地址推进）
+        m_mta_ += static_cast<Address>(elements);
         return Res(body);
     }
 
@@ -437,8 +473,9 @@ private:
             return Err(ErrorCode::CmdSyntax);
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
-        if (elements == 0U || elements > static_cast<ElementCount>(
-                                             m_max_cto_ / AgToBytes(m_ag_))) {
+        if (elements == 0U ||
+            static_cast<std::size_t>(elements) * AgToBytes(m_ag_) >
+                m_max_cto_) {
             return Err(ErrorCode::OutOfRange);
         }
         const Address address = decodeAddress(packet.subspan(4, 4));
@@ -451,20 +488,23 @@ private:
         std::vector<std::uint8_t> body;
         body.insert(body.end(), data->begin(), data->end());
         // SHORT_UPLOAD 之后 MTA 前进到数据块末尾之后
-        m_mta_ = address + static_cast<Address>(elements) * AgToBytes(m_ag_);
+        m_mta_ = address + static_cast<Address>(elements);
         return Res(body);
     }
 
+    /// @brief 自元素地址读取若干元素
+    /// @note 地址以元素计数：第 k 个元素位于 address + k，承载 AG 字节
+    ///       （原始 PDF 第 112 页 Table 42、第 113 页 Table 43）
     std::optional<Bytes> read(Address address, ElementCount elements) {
         Bytes out;
-        const auto count =
-            static_cast<std::size_t>(elements) * AgToBytes(m_ag_);
-        for (std::size_t i = 0; i < count; ++i) {
-            const auto it = m_memory_.find(address + static_cast<Address>(i));
+        const auto count = static_cast<std::size_t>(elements);
+        out.reserve(count * AgToBytes(m_ag_));
+        for (std::size_t k = 0; k < count; ++k) {
+            const auto it = m_memory_.find(address + static_cast<Address>(k));
             if (it == m_memory_.end()) {
                 return std::nullopt;
             }
-            out.push_back(it->second);
+            out.insert(out.end(), it->second.begin(), it->second.end());
         }
         return out;
     }
@@ -478,7 +518,10 @@ private:
     bool m_short_upload_unsupported_{false};
     std::uint8_t m_resource_mask_{0x15U};  ///< CONNECT RESOURCE（默认含 CAL/PAG|DAQ|PGM）
     Address m_mta_{0};
-    std::map<Address, std::uint8_t> m_memory_;
+    /// @brief 模拟 ECU 内存：按**地址**存元素，每地址 AG 字节
+    /// @note 原始 PDF 第 112 页 Table 42 / 第 113 页 Table 43：XCP 地址以
+    ///       元素计数，一个地址承载 AG 字节（WORD 下 Address n+1 = Byte 02）。
+    std::map<Address, Bytes> m_memory_;
     std::map<CommandCode, ErrorCode> m_errors_;
     std::map<CommandCode, Bytes> m_responses_;
     std::map<CommandCode, std::size_t> m_drop_nth_;
@@ -512,8 +555,10 @@ struct Rig {
         auto transport = std::make_unique<test::MockTransport>();
         transport_ptr = transport.get();
         transport->SetResponse([this](BytesView p) { return slave(p); });
-        master = std::make_unique<XcpMaster>(std::move(transport), timeouts,
-                                             listener);
+        XcpMasterOptions options;
+        options.timeouts = timeouts;
+        options.event_listener = listener;
+        master = std::make_unique<XcpMaster>(std::move(transport), options);
     }
 
     MockXcpSlave slave;  ///< 模拟 Slave
@@ -898,7 +943,7 @@ TEST(XcpMasterIntegration, ConnectTwiceIsRejected) {
 
 TEST(XcpMasterIntegration, NullTransportRejected) {
     try {
-        XcpMaster master(nullptr);
+        XcpMaster master(nullptr, XcpMasterOptions{});
         FAIL() << "空 Transport 应被拒绝";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
@@ -1278,6 +1323,487 @@ TEST(XcpCalibration, CalibrationApiBeforeConnectIsInvalidState) {
         FAIL() << "未连接调用标定 API 应报 InvalidState";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::InvalidState);
+    }
+}
+
+// --------------------------------------------------------------------------
+// 版本发现与裁决（批次 B1）
+//
+// MockXcpSlave 的 default 分支回 ERR_CMD_UNKNOWN，因此**默认即模拟不支持
+// GET_VERSION 的对端**：版本应停在 ConnectMajor + MajorOnly 保守态。
+//
+// CONNECT 响应里硬编码 PL=0x15、TL=0x10。这两个字节是 CONNECT 响应的既有
+// 硬编码值，并非刻意构造的版本号（0x15 与 RESOURCE 掩码默认值撞号，见
+// `m_resource_mask_{0x15U}`）。原始 PDF 第 12 页 §3.1.1 规定 CONNECT 响应
+// 该字节是「XCP Protocol Layer Version Number (most significant byte
+// only)」——XCPlite 实现印证此解：`XCP_PROTOCOL_LAYER_VERSION` 为 0x0104，
+// 发出时 `>> 8` 得 0x01（thirdparty/xcplite/src/xcplite.c:2078）。因此本
+// mock 的 0x15 按规范解读为**主版本 21**，裁决器只据此判定"主版本可用、
+// Minor 未确认"，绝不会当成精确版本——下列断言正是钉住这一点。
+// --------------------------------------------------------------------------
+
+/// @brief 默认（GET_VERSION 未实现）对端：探测被拒 → 保守态，且不伪造 Minor
+TEST(XcpMasterVersion, UnimplementedGetVersionYieldsConservativeState) {
+    Rig rig;
+    rig.master->Connect();
+
+    const ProtocolVersionSnapshot snap = rig.master->GetProtocolVersionSnapshot();
+    // 证据来源必须是 CONNECT 主版本，而不是"运行时确认"
+    EXPECT_EQ(snap.evidence.source, VersionSource::ConnectMajor);
+    EXPECT_EQ(snap.evidence.confidence, VersionConfidence::MajorOnly);
+    EXPECT_FALSE(snap.evidence.minor_confirmed);
+    EXPECT_TRUE(snap.conservative);
+    // CONNECT 原始字节 0x15 就是主版本本身（§3.1.1：只给最高字节）
+    EXPECT_EQ(snap.evidence.reported.major, 0x15U);
+    // Minor 恒为占位 0：**不是**声称对端是 21.0
+    EXPECT_EQ(snap.evidence.reported.minor, 0U);
+    // 保守态生效版本取支持下限 V1.3（能力口径，非对端真实版本）
+    EXPECT_EQ(snap.effective, kProtocolVersion13);
+
+    const TransportVersionSnapshot tls =
+        rig.master->GetTransportVersionSnapshot();
+    EXPECT_EQ(tls.evidence.source, VersionSource::ConnectMajor);
+    EXPECT_TRUE(tls.conservative);
+}
+
+/// @brief GET_VERSION 支持时取得精确 PL/TL 版本
+TEST(XcpMasterVersion, AvailableGetVersionYieldsRuntimeConfirmedVersions) {
+    Rig rig;
+    // 注入 GET_VERSION 响应：[Reserved][Maj PL][Min PL][Maj TL][Min TL]
+    rig.slave.SetResponse(CommandCode::GetVersion,
+                          BytesOf({0xFF, 0x00, 0x01, 0x05, 0x01, 0x04}));
+    rig.master->Connect();
+
+    const ProtocolVersionSnapshot ps = rig.master->GetProtocolVersionSnapshot();
+    EXPECT_EQ(ps.evidence.source, VersionSource::GetVersion);
+    EXPECT_EQ(ps.evidence.confidence, VersionConfidence::RuntimeConfirmed);
+    EXPECT_TRUE(ps.evidence.minor_confirmed);
+    EXPECT_FALSE(ps.conservative);
+    EXPECT_EQ(ps.evidence.reported, (XcpProtocolVersion{1, 5}));
+    EXPECT_EQ(ps.effective, (XcpProtocolVersion{1, 5}));
+
+    // TL 必须独立取值（1.4），不得被 PL 的 1.5 覆盖
+    const TransportVersionSnapshot ts =
+        rig.master->GetTransportVersionSnapshot();
+    EXPECT_EQ(ts.evidence.reported, (XcpProtocolVersion{1, 4}));
+    EXPECT_EQ(ts.effective, (XcpProtocolVersion{1, 4}));
+}
+
+/// @brief 探测确实被发到了线路上（不是"看起来像"而是可观测行为）
+TEST(XcpMasterVersion, ConnectActuallySendsGetVersionProbe) {
+    Rig rig;
+    rig.master->Connect();
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetVersion), 1U)
+        << "Connect 应恰好探测一次 GET_VERSION";
+}
+
+/// @brief 上报版本高于支持上限时封顶，且 conflcits 可见
+TEST(XcpMasterVersion, VersionAboveCapIsCappedAndReported) {
+    Rig rig;
+    rig.slave.SetResponse(CommandCode::GetVersion,
+                          BytesOf({0xFF, 0x00, 0x01, 0x09, 0x01, 0x09}));
+    rig.master->Connect();
+
+    const ProtocolVersionSnapshot ps = rig.master->GetProtocolVersionSnapshot();
+    // reported 保留对端原话
+    EXPECT_EQ(ps.evidence.reported, (XcpProtocolVersion{1, 9}));
+    EXPECT_TRUE(ps.evidence.capped);
+    // effective 压到上限
+    EXPECT_EQ(ps.effective, kProtocolVersion15);
+
+    const std::vector<std::string> conflicts = rig.master->VersionConflicts();
+    EXPECT_FALSE(conflicts.empty()) << "封顶必须产生可见冲突记录";
+}
+
+/// @brief 关闭自动探测后不得发送 GET_VERSION，版本退回 CONNECT 主版本
+TEST(XcpMasterVersion, AutodetectDisabledSkipsProbe) {
+    auto transport = std::make_unique<test::MockTransport>();
+    MockXcpSlave slave;
+    transport->SetResponse([&slave](BytesView p) { return slave(p); });
+    XcpMasterOptions options;
+    options.autodetect_version = false;
+    XcpMaster master(std::move(transport), options);
+
+    master.Connect();
+
+    EXPECT_EQ(slave.Count(CommandCode::GetVersion), 0U)
+        << "关闭自动探测后不得发送 GET_VERSION";
+    const ProtocolVersionSnapshot ps = master.GetProtocolVersionSnapshot();
+    EXPECT_EQ(ps.evidence.source, VersionSource::ConnectMajor);
+    EXPECT_TRUE(ps.conservative);
+}
+
+/// @brief 超时不得被当作"确认的老版本"（方案 B1 硬约束的集成验证）
+TEST(XcpMasterVersion, ProbeTimeoutIsNotTreatedAsConfirmedOldVersion) {
+    Rig rig;
+    rig.slave.DropCommand(CommandCode::GetVersion);  // 永不响应 → 超时
+    rig.master->Connect();
+
+    const ProtocolVersionSnapshot ps = rig.master->GetProtocolVersionSnapshot();
+    // 关键：来源不是 GetVersion、置信度不是 RuntimeConfirmed、Minor 未确认
+    EXPECT_NE(ps.evidence.source, VersionSource::GetVersion);
+    EXPECT_NE(ps.evidence.confidence, VersionConfidence::RuntimeConfirmed);
+    EXPECT_FALSE(ps.evidence.minor_confirmed);
+    // 连接本身必须成功（optional 命令失败不阻断连接）
+    EXPECT_TRUE(rig.master->IsConnected());
+}
+
+/// @brief 连接必须成功：GET_VERSION 不可用不构成连接失败
+TEST(XcpMasterVersion, ConnectSucceedsEvenWhenProbeFails) {
+    Rig rig;
+    rig.slave.SetError(CommandCode::GetVersion, ErrorCode::CmdUnknown);
+    EXPECT_NO_THROW(rig.master->Connect());
+    EXPECT_TRUE(rig.master->IsConnected());
+}
+
+/// @brief require_get_version=true 时探测失败必须连接失败
+TEST(XcpMasterVersion, RequireGetVersionFailsConnectWhenUnavailable) {
+    auto transport = std::make_unique<test::MockTransport>();
+    MockXcpSlave slave;
+    transport->SetResponse([&slave](BytesView p) { return slave(p); });
+    XcpMasterOptions options;
+    options.require_get_version = true;
+    XcpMaster master(std::move(transport), options);
+
+    try {
+        master.Connect();
+        FAIL() << "require_get_version 为真且探测失败时应抛异常";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidState);
+    }
+    EXPECT_FALSE(master.IsConnected());
+}
+
+/// @brief 断连后版本证据必须清空，不得跨会话残留
+TEST(XcpMasterVersion, VersionEvidenceIsClearedOnDisconnect) {
+    Rig rig;
+    rig.slave.SetResponse(CommandCode::GetVersion,
+                          BytesOf({0xFF, 0x00, 0x01, 0x05, 0x01, 0x04}));
+    rig.master->Connect();
+    ASSERT_EQ(rig.master->GetProtocolVersionSnapshot().evidence.source,
+              VersionSource::GetVersion);
+
+    rig.master->Disconnect();
+
+    // 新会话前必须回到 Unknown：否则重连到不同版本对端会沿用旧裁决
+    const ProtocolVersionSnapshot ps = rig.master->GetProtocolVersionSnapshot();
+    EXPECT_EQ(ps.evidence.source, VersionSource::Unknown);
+    EXPECT_FALSE(ps.evidence.IsAvailable());
+    EXPECT_FALSE(ps.conservative);
+    EXPECT_TRUE(rig.master->VersionConflicts().empty());
+}
+
+/// @brief 断连再连到另一个版本的对端时，必须采用新对端的版本
+TEST(XcpMasterVersion, ReconnectAdoptsNewPeerVersion) {
+    auto transport = std::make_unique<test::MockTransport>();
+    MockXcpSlave slave;
+    transport->SetResponse([&slave](BytesView p) { return slave(p); });
+    XcpMaster master(std::move(transport), XcpMasterOptions{});
+
+    slave.SetResponse(CommandCode::GetVersion,
+                      BytesOf({0xFF, 0x00, 0x01, 0x03, 0x01, 0x03}));
+    master.Connect();
+    ASSERT_EQ(master.GetProtocolVersionSnapshot().evidence.reported,
+              (XcpProtocolVersion{1, 3}));
+
+    master.Disconnect();
+    // 换成 V1.5 对端
+    slave.SetResponse(CommandCode::GetVersion,
+                      BytesOf({0xFF, 0x00, 0x01, 0x05, 0x01, 0x05}));
+    master.Connect();
+
+    EXPECT_EQ(master.GetProtocolVersionSnapshot().evidence.reported,
+              (XcpProtocolVersion{1, 5}))
+        << "重连后必须采用新对端版本，不得沿用旧裁决";
+}
+
+/// @brief 调用方配置与运行时冲突时必须记录（m03674：不提供静默模式）
+TEST(XcpMasterVersion, ConfiguredVersusRuntimeConflictIsVisible) {
+    auto transport = std::make_unique<test::MockTransport>();
+    MockXcpSlave slave;
+    transport->SetResponse([&slave](BytesView p) { return slave(p); });
+    slave.SetResponse(CommandCode::GetVersion,
+                      BytesOf({0xFF, 0x00, 0x01, 0x05, 0x01, 0x05}));
+    XcpMasterOptions options;
+    options.version_policy.protocol_version = XcpProtocolVersion{1, 3};
+    XcpMaster master(std::move(transport), options);
+
+    master.Connect();
+
+    // 运行时值优先
+    EXPECT_EQ(master.GetProtocolVersionSnapshot().evidence.reported,
+              (XcpProtocolVersion{1, 5}));
+    const std::vector<std::string> conflicts = master.VersionConflicts();
+    ASSERT_FALSE(conflicts.empty()) << "配置与运行时不一致必须可见";
+}
+
+/// @brief 主动补测：构造时关闭自动探测，之后 ProbeVersion() 仍可取得版本
+TEST(XcpMasterVersion, ExplicitProbeVersionUpdatesSnapshot) {
+    auto transport = std::make_unique<test::MockTransport>();
+    MockXcpSlave slave;
+    transport->SetResponse([&slave](BytesView p) { return slave(p); });
+    XcpMasterOptions options;
+    options.autodetect_version = false;
+    XcpMaster master(std::move(transport), options);
+    master.Connect();
+    ASSERT_TRUE(master.GetProtocolVersionSnapshot().conservative);
+
+    slave.SetResponse(CommandCode::GetVersion,
+                      BytesOf({0xFF, 0x00, 0x01, 0x04, 0x01, 0x04}));
+    const auto probe = master.ProbeVersion();
+
+    EXPECT_TRUE(probe.IsAvailable());
+    const ProtocolVersionSnapshot ps = master.GetProtocolVersionSnapshot();
+    EXPECT_EQ(ps.evidence.source, VersionSource::GetVersion);
+    EXPECT_EQ(ps.evidence.reported, (XcpProtocolVersion{1, 4}));
+    EXPECT_FALSE(ps.conservative);
+}
+
+/// @brief 构造期拒绝自相矛盾的版本策略
+TEST(XcpMasterVersion, ContradictoryPolicyIsRejectedAtConstruction) {
+    auto transport = std::make_unique<test::MockTransport>();
+    XcpMasterOptions options;
+    options.version_policy.probe_get_version = true;
+    options.version_policy.allow_version_probe_roundtrip = false;
+    try {
+        XcpMaster master(std::move(transport), options);
+        FAIL() << "自相矛盾的版本策略应在构造期被拒绝";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+}
+
+// =============================================================================
+// 批次 G：`1.x-conservative` 能力基线（方案 §4.2.1 冻结表）
+//
+// 这组用例给方案 §4.2.1 表中判为 **Block** 的分组分派 DoD 测试 ID。
+// 全部为**本地判定**——不依赖对端响应，不需要 Slave 配合。
+// =============================================================================
+
+/// @brief `VersionUnknown.HighVersionBlocked`：0xC0 族除 GET_VERSION 外全部 Block
+/// @details 原始 PDF 第 106 页 §7.4：Level-1 命令以双字节 0xC0 起始；
+///          本实现只登记 GET_VERSION（0xC0,0x00）。方案要求"禁止内容探测式
+///          尝试"——即不得靠发送命令看错误码来推断能力。
+TEST(VersionUnknown_HighVersionBlocked, DaqPackedModeIsBlockedLocally) {
+    auto transport = std::make_unique<test::MockTransport>();
+    XcpMasterOptions options;
+    options.version_policy.probe_get_version = false;
+    XcpMaster master(std::move(transport), options);
+
+    using Cap = XcpMaster::UnsupportedCapability;
+    EXPECT_TRUE(master.IsCapabilityUnsupported(Cap::DaqPackedMode))
+        << "DAQ Packed Mode 是 V1.5 新特性且本实现未提供编码路径";
+    EXPECT_TRUE(master.IsCapabilityUnsupported(Cap::Level1OtherSubcommand));
+}
+
+/// @brief `VersionUnknown.HighVersionBlocked`：拒绝入口抛 UnsupportedFeature
+/// @details 关键区分：能力缺失必须报 `UnsupportedFeature`，**不能**报
+///          ProtocolError/Timeout——后者会被调用方误判为对端故障。
+TEST(VersionUnknown_HighVersionBlocked, ThrowIfUnsupportedRaisesUnsupported) {
+    auto transport = std::make_unique<test::MockTransport>();
+    XcpMasterOptions options;
+    options.version_policy.probe_get_version = false;
+    XcpMaster master(std::move(transport), options);
+
+    using Cap = XcpMaster::UnsupportedCapability;
+    for (const Cap cap : {Cap::DaqPackedMode, Cap::Level1OtherSubcommand,
+                          Cap::Ipv6Transport, Cap::OptionalTlSubcommand}) {
+        try {
+            master.ThrowIfUnsupported(cap);
+            FAIL() << "明确不支持的能力应抛异常（cap="
+                   << static_cast<int>(cap) << "）";
+        } catch (const XcpException& e) {
+            EXPECT_EQ(e.Category(), ErrorCategory::UnsupportedFeature)
+                << "必须报 UnsupportedFeature 而非对端故障类别";
+        }
+    }
+}
+
+/// @brief `TransportUnknown.OptionalBlocked`：四个 Optional TL Subcommand Block
+TEST(TransportUnknown_OptionalBlocked, OptionalTlSubcommandIsBlockedLocally) {
+    auto transport = std::make_unique<test::MockTransport>();
+    XcpMasterOptions options;
+    options.version_policy.probe_get_version = false;
+    XcpMaster master(std::move(transport), options);
+
+    EXPECT_TRUE(master.IsCapabilityUnsupported(
+        XcpMaster::UnsupportedCapability::OptionalTlSubcommand));
+}
+
+/// @brief `TransportUnknown.OptionalBlocked`：IPv6 归属能力缺失而非"地址笔误"
+/// @details 与 `src/udp_transport.cpp` 的 `looksLikeIpv6` 拒绝同口径：
+///          能力缺失必须可与"地址非法"区分，否则调用方会误以为是自己写错了。
+TEST(TransportUnknown_OptionalBlocked, Ipv6IsReportedAsUnsupportedNotInvalid) {
+    auto transport = std::make_unique<test::MockTransport>();
+    XcpMasterOptions options;
+    options.version_policy.probe_get_version = false;
+    XcpMaster master(std::move(transport), options);
+
+    EXPECT_TRUE(master.IsCapabilityUnsupported(
+        XcpMaster::UnsupportedCapability::Ipv6Transport));
+
+    try {
+        master.ThrowIfUnsupported(
+            XcpMaster::UnsupportedCapability::Ipv6Transport);
+        FAIL() << "IPv6 应抛 UnsupportedFeature";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::UnsupportedFeature)
+            << "IPv6 是能力缺失，不得报成 InvalidArgument（地址非法）";
+    }
+}
+
+/// @brief `VersionUnknown.CoreSession`：Minor 未确认时核心会话仍可建立
+/// @details 保守基线的**目的**是"少做"而不是"不能用"：CONNECT/DISCONNECT/
+///          GET_STATUS/SYNCH 属 Allow，Minor unknown 不得妨碍会话建立。
+TEST(VersionUnknown_CoreSession, ConservativeModeStillConnects) {
+    Rig rig;
+    // 让 GET_VERSION 不可用（规范允许的 normal return，原始 PDF 第 106 页 §7.4），
+    // 于是只剩 CONNECT 主版本证据 → confidence=MajorOnly、minor_confirmed=false
+    // → 进入 1.x-conservative。
+    rig.slave.SetError(CommandCode::GetVersion, ErrorCode::CmdUnknown);
+    rig.master->Connect();
+
+    EXPECT_TRUE(rig.master->IsConnected());
+    const ProtocolVersionSnapshot ps = rig.master->GetProtocolVersionSnapshot();
+    EXPECT_TRUE(ps.conservative) << "Minor 未确认时应进入保守能力状态";
+    EXPECT_FALSE(ps.evidence.minor_confirmed);
+    // 保守态下 effective 取支持范围下限 {1,3} 作为**能力口径**
+    // （src/version_resolver.cpp:138），这是"按保守交集执行能力"的标识，
+    // 不代表对端真的上报了 V1.3。
+    //
+    // ⚠ 已知语义张力（用户裁决 m06013：保持现状 + 文档明写）：
+    //   方案 §4.2.1 要求保守时 Minor "保持 unknown"，而实现令
+    //   effective.minor=3。二者靠 `conservative` 标志与
+    //   `confidence==MajorOnly` 区分，信息未丢失，但**调用方不得只看
+    //   effective**——必须同时检查 conservative，否则会把保守口径误读为
+    //   "对端是 V1.3"。本断言锁定当前行为，防止无声漂移。
+    EXPECT_EQ(ps.effective, (XcpProtocolVersion{1, 3}))
+        << "保守态 effective 现为下限口径；若改为'未知'表示法需同步本用例";
+    EXPECT_EQ(ps.evidence.confidence, VersionConfidence::MajorOnly)
+        << "区分保守口径与真 V1.3 的判据：置信度必须为 MajorOnly";
+    // 会话命令确实被发出（Allow 语义的可观测证据）
+    EXPECT_EQ(rig.slave.Count(CommandCode::Connect), 1)
+        << "保守状态不得阻断 CONNECT";
+}
+
+/// @brief `VersionUnknown.Memory`：保守状态下内存读走替代路径
+/// @details DoD 要求"实践替代路径"：SHORT_UPLOAD 遇 ERR_CMD_UNKNOWN 时应
+///          降级到 SET_MTA+UPLOAD，而不是整体失败。
+TEST(VersionUnknown_Memory, ConservativeModeMemoryReadUsesAlternativePath) {
+    Rig rig;
+    rig.slave.SetError(CommandCode::GetVersion, ErrorCode::CmdUnknown);
+    rig.master->Connect();
+    EXPECT_TRUE(rig.master->GetProtocolVersionSnapshot().conservative)
+        << "GET_VERSION 不可用时须进入保守能力状态";
+
+    // SHORT_UPLOAD 不可用（模拟对端未实现）→ 应自动走 SET_MTA+UPLOAD
+    // 替代路径，而不是整体失败。复用本文件既有的 MockXcpSlave 脚本，
+    // 避免手工拼响应而与真实 UPLOAD 语义（元素计数/MTA 推进）脱节。
+    const Bytes content = BytesOf({0x11, 0x22, 0x33, 0x44});
+    rig.slave.SetMemory(0x2000, content);
+    rig.slave.SetShortUploadUnsupported();
+
+    const Bytes got = rig.master->ReadMemoryBytes(0x2000, 0x00, 4);
+    EXPECT_EQ(got, content)
+        << "保守状态下内存读应走替代路径并取回正确数据";
+    EXPECT_FALSE(rig.master->GetSessionParameters().short_upload_available);
+    EXPECT_GE(rig.slave.Count(CommandCode::SetMta), 1)
+        << "替代路径必须先 SET_MTA 再 UPLOAD";
+    EXPECT_GE(rig.slave.Count(CommandCode::Upload), 1);
+}
+
+
+// =============================================================================
+// 批次 G：G.3 三版本测试（V1.3 / V1.4 / V1.5 + 越界封顶）
+//
+// 目的：证明工程支持范围 **V1.3～V1.5** 的每一个目标版本都能被正确发现、
+// 正确取到 PL/TL 两个独立值，且**越界版本一律封顶并留下可见冲突**。
+// =============================================================================
+
+/// @brief G.3：三个目标版本逐一验证——reported 与 effective 均如实取值
+/// @details 使用参数化思路但保持单用例内自校验，避免新增夹具类型。
+///          响应布局：[Reserved][PL Maj][PL Min][TL Maj][TL Min]
+TEST(XcpMasterVersion, ThreeVersionMatrixDiscoveredFaithfully) {
+    struct Case {
+        std::uint8_t pl_major;
+        std::uint8_t pl_minor;
+        XcpProtocolVersion expected;
+    };
+    // V1.3（工程支持范围下限）、V1.4（XCPlite 对手端）、V1.5（范围上限）
+    const Case cases[] = {
+        {0x01, 0x03, XcpProtocolVersion{1, 3}},
+        {0x01, 0x04, XcpProtocolVersion{1, 4}},
+        {0x01, 0x05, XcpProtocolVersion{1, 5}},
+    };
+
+    for (const Case& c : cases) {
+        Rig rig;
+        rig.slave.SetResponse(
+            CommandCode::GetVersion,
+            BytesOf({0xFF, 0x00, c.pl_major, c.pl_minor, 0x01, 0x05}));
+        rig.master->Connect();
+
+        const ProtocolVersionSnapshot ps =
+            rig.master->GetProtocolVersionSnapshot();
+        EXPECT_EQ(ps.evidence.source, VersionSource::GetVersion);
+        EXPECT_EQ(ps.evidence.confidence, VersionConfidence::RuntimeConfirmed);
+        EXPECT_FALSE(ps.conservative)
+            << "范围内版本不得被标为保守态";
+        EXPECT_FALSE(ps.evidence.capped)
+            << "范围内版本不得被标为封顶";
+        EXPECT_EQ(ps.evidence.reported, c.expected);
+        EXPECT_EQ(ps.effective, c.expected);
+
+        // TL 独立取值：本例固定 TL=1.5，不得被 PL 覆盖
+        const TransportVersionSnapshot ts =
+            rig.master->GetTransportVersionSnapshot();
+        EXPECT_EQ(ts.effective, (XcpProtocolVersion{1, 5}))
+            << "TL 必须独立于 PL 取值";
+    }
+}
+
+/// @brief G.3：低于支持下限（V1.2）时不得伪报为 V1.3
+/// @details 支持范围下限是 V1.3；对端若报 V1.2，reported 必须保留原话。
+///          这是"不伪造版本"约束在下界方向的对称验证。
+TEST(XcpMasterVersion, BelowSupportedFloorIsNotSilentlyPromoted) {
+    Rig rig;
+    rig.slave.SetResponse(CommandCode::GetVersion,
+                          BytesOf({0xFF, 0x00, 0x01, 0x02, 0x01, 0x02}));
+    rig.master->Connect();
+
+    const ProtocolVersionSnapshot ps = rig.master->GetProtocolVersionSnapshot();
+    EXPECT_EQ(ps.evidence.reported, (XcpProtocolVersion{1, 2}))
+        << "对端原话必须保留，不得改写成 V1.3";
+}
+
+/// @brief G.3：V1.5 之上（V1.6/V2.0）必须封顶到 V1.5 且冲突可见
+/// @details 上限 V1.5 是**工程决策**（规范无兼容矩阵，方案 §1.9）；
+///          因此越界必须"可用但被记录"，不能静默接受也不能硬拒绝。
+TEST(XcpMasterVersion, AboveCapIsCappedAndConflictVisibleForBoth) {
+    struct Case {
+        std::uint8_t pl_major;
+        std::uint8_t pl_minor;
+    };
+    const Case cases[] = {{0x01, 0x06}, {0x02, 0x00}};
+
+    for (const Case& c : cases) {
+        Rig rig;
+        rig.slave.SetResponse(
+            CommandCode::GetVersion,
+            BytesOf({0xFF, 0x00, c.pl_major, c.pl_minor, 0x01, 0x05}));
+        rig.master->Connect();
+
+        const ProtocolVersionSnapshot ps =
+            rig.master->GetProtocolVersionSnapshot();
+        EXPECT_EQ(ps.evidence.reported,
+                  (XcpProtocolVersion{c.pl_major, c.pl_minor}))
+            << "越界版本必须保留 reported 原话";
+        EXPECT_TRUE(ps.evidence.capped)
+            << "越界版本必须标记 capped";
+        EXPECT_EQ(ps.effective, kProtocolVersion15)
+            << "effective 必须压到工程上限 V1.5";
+        EXPECT_FALSE(rig.master->VersionConflicts().empty())
+            << "封顶必须产生可见冲突记录，不得静默";
     }
 }
 

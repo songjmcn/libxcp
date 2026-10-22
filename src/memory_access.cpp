@@ -177,11 +177,19 @@ ElementCount MemoryAccess::MaxDownloadElements() const {
     const auto max_cto = static_cast<ElementCount>(m_session_.MaxCto());
     const auto ag = static_cast<ElementCount>(
         AgToBytes(m_session_.GetAddressGranularity()));
-    if (ag == 0U || max_cto < 2U + ag) {
-        // CTO 头 [CMD][SIZE] 已占 2 字节，连一个元素都放不下
+    // CTO 布局：[CMD][SIZE][对齐字节...][data...]。
+    // 对齐字节数由 AG 决定（原始 PDF 第 142 页 Table 82："Used for alignment,
+    // only if AG >2"；"If AG = DWORD, 2 alignment bytes must be used"），
+    // AG=BYTE/WORD 时为 0 —— 容量必须把它扣掉，否则 AG=DWORD 时按旧口径
+    // 算出 (MAX_CTO-2)/AG 会令整帧超出 MAX_CTO。
+    const auto alignment = static_cast<ElementCount>(
+        DownloadAlignmentBytes(m_session_.GetAddressGranularity()));
+    const auto header = 2U + alignment;
+    if (ag == 0U || max_cto < header + ag) {
+        // CTO 头 [CMD][SIZE] + 对齐字节后，连一个元素都放不下
         return 0U;
     }
-    return (max_cto - 2U) / ag;
+    return (max_cto - header) / ag;
 }
 
 ElementCount MemoryAccess::MaxShortDownloadElements() const {
@@ -285,8 +293,9 @@ void MemoryAccess::DownloadChunked(Address address, AddressExtension extension,
         if (remaining == 0U) {
             break;
         }
-        // 推进到下一块起点（与 UploadChunked 同一 Advance 语义：
-        // byte_offset = chunk*AG，AG 只做单位换算，绝不乘进地址）
+        // 推进到下一块起点（与 UploadChunked 同一语义）：
+        // chunk 是元素数，XCP 地址按元素计数，故地址推进量为 chunk 本身；
+        // AG 只用于把元素数换算成字节数（见上一行的 offset_bytes）。
         const auto next = cursor.Advance(chunk, ag);
         if (!next) {
             LIBXCP_LOG_ERROR(

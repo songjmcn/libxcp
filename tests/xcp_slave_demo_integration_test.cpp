@@ -551,11 +551,12 @@ std::unique_ptr<XcpMaster> MakeDemoMaster(std::uint16_t port,
     config.local_host = "127.0.0.1";
     config.local_port = 0;
     config.receive_poll_interval_ms = 10;
-    return std::make_unique<XcpMaster>(
-        std::make_unique<UdpTransport>(config),
-        CommandTimeouts{std::chrono::milliseconds(300),
-                        std::chrono::milliseconds(300), 1},
-        listener);
+    XcpMasterOptions options;
+    options.timeouts = CommandTimeouts{std::chrono::milliseconds(300),
+                                       std::chrono::milliseconds(300), 1};
+    options.event_listener = listener;
+    return std::make_unique<XcpMaster>(std::make_unique<UdpTransport>(config),
+                                       options);
 }
 
 /**
@@ -1235,7 +1236,7 @@ TEST(XcpSlaveDemoIntegrationTest, GeneratedA2lFeedsLiveMeasurementSession) {
     ASSERT_NE(master, nullptr);
     session.Bind(*master);
     auto profile =
-        BuildXcpliteMeasurementRuntimeProfile(*master, event_metadata);
+        BuildMeasurementRuntimeProfile(*master, event_metadata);
     ASSERT_TRUE(profile.HasValue()) << profile.ErrorInfo().message;
     ApplyMeasurementRuntimeProfile(session, profile.Value());
     const std::string fast_name = "xcp_slave_demo::meas_fast.output";
@@ -1321,7 +1322,7 @@ TEST(XcpSlaveDemoIntegrationTest, GeneratedA2lFeedsLiveContiguousArrayDaq) {
         EXPECT_FALSE(
             tools::SymbolDaqObservationUnsupportedReason(symbol.Value(), events)
                 .empty())
-            << "Generic profile 必须继续拒绝数组";
+            << "未开启一维连续数组准入时必须拒绝数组";
     }
     auto count = database->Count();
     ASSERT_TRUE(count.HasValue());
@@ -1367,11 +1368,11 @@ TEST(XcpSlaveDemoIntegrationTest, GeneratedA2lFeedsLiveContiguousArrayDaq) {
     ASSERT_NE(master, nullptr);
     session.Bind(*master);
     auto profile =
-        BuildXcpliteMeasurementRuntimeProfile(*master, event_metadata);
+        BuildMeasurementRuntimeProfile(*master, event_metadata);
     ASSERT_TRUE(profile.HasValue()) << profile.ErrorInfo().message;
     ASSERT_TRUE(
         profile.Value().daq_entry_capabilities.supports_contiguous_1d_arrays);
-    ASSERT_GE(profile.Value().daq_entry_capabilities.max_entry_size_bytes,
+    ASSERT_GE(profile.Value().daq_entry_capabilities.max_entry_size_elements,
               sizeof(std::uint32_t) * xcp_slave_demo::kSampleCount);
     ApplyMeasurementRuntimeProfile(session, profile.Value());
     // 使用协商的 MAX_DTO/AG 与运行时 Entry 能力证明每个数组恰占一条 Entry。

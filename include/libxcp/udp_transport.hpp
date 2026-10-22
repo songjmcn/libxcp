@@ -89,9 +89,31 @@ public:
     [[nodiscard]] std::optional<DatagramCtr> LastReceiveCtr() const noexcept;
 
 private:
-    /// @brief 接收线程主体：带 SO_RCVTIMEO 轮询收包，交由 HandleDatagram 处理，
+    /// @brief 接收线程主体：select 同时等待数据 Socket 与唤醒 Socket，
+    ///        唤醒 Socket 可读或数据到达时即返回，交由 HandleDatagram 处理，
     ///        退出前回调 OnTransportClosed
     void ReceiveLoop();
+
+    /// @brief 唤醒 Socket 句柄对：用于让 Close() 立即打断阻塞中的接收线程
+    /// @details 采用"回环 UDP 自连"实现（跨平台统一）：`read_handle` 绑定到
+    ///          `127.0.0.1:0` 由 OS 分配端口，`write_handle` 连向该端口。
+    ///          Close() 向 `write_handle` 发一字节，select() 立即可读，
+    ///          接收线程无需等待轮询周期即可退出。
+    /// @note 不使用 `socketpair`（Windows 无此原语），也不回退到"先关数据
+    ///       Socket"（见 Close() 注释所述句柄复用风险）。
+    struct WakeupPair;
+
+    /// @brief 创建回环 UDP 自连唤醒对；失败返回 nullptr（调用方回退到轮询）
+    /// @return 已就绪的唤醒对，或 nullptr 表示当前平台/环境不支持唤醒
+    static std::unique_ptr<WakeupPair> CreateWakeupPair();
+
+    /// @brief 触发一次唤醒（幂等、非阻塞、线程安全）；Close() 调用
+    /// @param pair 唤醒对；为空时本函数不做任何事
+    static void SignalWakeup(WakeupPair* pair) noexcept;
+
+    /// @brief 排空唤醒 Socket 中的待读字节，避免误当作数据
+    /// @param pair 唤醒对；为空时本函数不做任何事
+    static void DrainWakeup(WakeupPair* pair) noexcept;
 
     /// @brief 处理一个收到的 Datagram：来源过滤 → 解码 Frame 序列 → 逐帧投递
     /// @param data 原始字节
@@ -124,9 +146,13 @@ private:
     IPacketListener* m_listener_{nullptr};
     /// @brief 平台 Socket 实现（pimpl，隔离 Windows/POSIX 差异）
     std::unique_ptr<SocketImpl> m_socket_;
+    /// @brief 唤醒 Socket 对（非拥有指针的 pimpl）；Open() 创建、Close() 释放
+    /// @details 为空表示唤醒不可用，此时 ReceiveLoop 退化为纯 SO_RCVTIMEO
+    ///          轮询（退出延迟为一个轮询周期），功能仍正确。
+    std::unique_ptr<WakeupPair> m_wakeup_;
     /// @brief 接收线程；仅在打开期间 joinable
     std::thread m_receive_thread_;
-    /// @brief 接收线程运行标记，Close() 置 false 后线程依 SO_RCVTIMEO 轮询退出
+    /// @brief 接收线程运行标记，Close() 置 false 后由唤醒 Socket 立即打断
     std::atomic<bool> m_running_{false};
     /// @brief 保护发送路径与发送 CTR
     mutable std::mutex m_send_mutex_;

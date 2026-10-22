@@ -11,10 +11,13 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "libxcp/command_executor.hpp"
 #include "libxcp/ixcp_transport.hpp"
 #include "libxcp/memory_access.hpp"
+#include "libxcp/protocol_version.hpp"
 #include "libxcp/session.hpp"
 #include "libxcp/xcp_error.hpp"
 
@@ -103,6 +106,60 @@ struct DaqLedgerEntry {
 };
 
 /**
+ * @brief XCP Master 构造配置聚合（批次 B1 引入）
+ *
+ * @details 批次 B1 之前，`XcpMaster` 的构造参数是逐个位置参数
+ *          （`CommandTimeouts`、`IEventListener*`、字节序、AG……）。随着版本
+ *          策略与后续批次能力的加入，位置参数会持续膨胀且难以安全演进。
+ *          本结构把它们聚合为**单一配置对象**，新增字段不再改变构造函数签名。
+ *
+ * @par 破坏性变更说明（版本 2.0.0）
+ *      批次 B1 之前构造函数是**逐个位置参数**
+ *      `XcpMaster(transport, timeouts, event_listener)`。本次改为单一
+ *      `XcpMasterOptions`，后续批次新增能力（版本策略、警告回调等）不再反复
+ *      改动签名。**旧的三参调用形式不再隐式可用**，须显式构造配置对象。
+ *
+ * @note 字节序与地址粒度**不来自本结构**：它们由对端 CONNECT 响应决定
+ *       （`Session::GetByteOrder()` 取自 COMM_MODE_BASIC bit0，
+ *       `Session::GetAddressGranularity()` 取自 CONNECT 的 AG 字段）。
+ *       本结构中的同名字段仅在调用方需要**显式覆盖**探测结果时使用，
+ *       默认值表示"遵循对端上报"。
+ */
+struct XcpMasterOptions {
+    /// @brief 命令超时配置
+    CommandTimeouts timeouts{};
+
+    /// @brief 事件监听器（可选，**非拥有**；生命周期须长于 XcpMaster）
+    IEventListener* event_listener{nullptr};
+
+    /// @brief 线路字节序**覆盖值**（`std::nullopt` 表示遵循对端 CONNECT 上报）
+    /// @details 正常场景保持 `nullopt`：规范中字节序是**对端宣告的属性**
+    ///          （CONNECT 的 COMM_MODE_BASIC bit0），Master 不应自作主张。
+    ///          仅在对端宣告有误、需强制纠正时使用。
+    std::optional<ByteOrder> byte_order;
+
+    /// @brief 地址粒度**覆盖值**（`std::nullopt` 表示遵循对端 CONNECT 上报）
+    /// @details 规范原文（原始 PDF 第 112 页 Table 42）："The address
+    ///          granularity indicates the size of an element contained at a
+    ///          single address." 它同样是 CONNECT 协商结果，正常不覆盖。
+    std::optional<AddressGranularity> address_granularity;
+
+    /// @brief 版本策略（PL/TL 先验、是否自动探测 GET_VERSION）
+    /// @details 默认全部未配置：库**不得自动猜测版本**（方案 §4.2）。
+    VersionPolicy version_policy{};
+
+    /// @brief 是否在 CONNECT 后自动调用 GET_VERSION 拉取精确版本
+    /// @details 默认 true；探测失败（对端未实现/超时）**不构成连接失败**，
+    ///          只让版本进入 `ConnectMajor` + `MajorOnly` 保守状态。
+    bool autodetect_version{true};
+
+    /// @brief 是否要求 GET_VERSION 必须成功，否则连接失败
+    /// @details 默认 **false**。置 true 只应在"确知对端支持 V1.4+ 且必须
+    ///          精确版本"的场景使用；更严的 `Require` 语义由后续批次引入。
+    bool require_get_version{false};
+};
+
+/**
  * @brief XCP Master 顶层门面
  *
  * 内部组合 Session、CommandExecutor、MemoryAccess，并持有 Transport 所有权。
@@ -113,12 +170,10 @@ public:
     /**
      * @brief 构造
      * @param transport Transport 实例（XcpMaster 接管所有权）
-     * @param timeouts 命令超时配置
-     * @param event_listener 事件监听器（可选，非拥有；生命周期须长于本对象）
+     * @param options 构造配置聚合（超时、监听器、字节序、AG、版本策略）
      */
     explicit XcpMaster(std::unique_ptr<IXcpTransport> transport,
-                       CommandTimeouts timeouts = {},
-                       IEventListener* event_listener = nullptr);
+                       XcpMasterOptions options = {});
 
     /// @brief 析构：尽力断开逻辑会话并关闭 Transport
     ~XcpMaster();
@@ -145,6 +200,23 @@ public:
 
     /// @brief 是否已连接
     [[nodiscard]] bool IsConnected() const;
+
+    /**
+     * @brief 取消当前挂起的操作（F-11）
+     * @details 线程安全，可从其他线程调用。唤醒正在等待响应的调用，使其以
+     *          `ErrorCategory::Cancelled` 返回，而**不是** `Timeout` 或
+     *          `ProtocolError`。
+     *
+     * @par 何时需要
+     *      规范恢复矩阵为 `ERR_CMD_BUSY` 规定 `wait t7 → repeat ∞ times`。
+     *      协议语义上这意味着持续等待资源，但库实现不得形成不可中断的同步
+     *      调用（方案 §4.6 第 6 条），故提供本入口供调用方中断等待。
+     *
+     * @note 取消在等待期间生效；已完成的命令不受影响。`Disconnect`、
+     *       `Transport` 关闭与析构同样会触发取消语义。下一次顶层命令开始前
+     *       取消标志自动清除。
+     */
+    void CancelPendingOperation();
 
     // ---- 内存读取 ----
 
@@ -514,13 +586,145 @@ public:
     ///        该口径不外扩为公共 API，故以 friend 授权（不改变其余可见性）。
     friend class MeasurementSession;
 
+    // ---- 版本证据（批次 B1）----
+
+    /**
+     * @brief 协议层版本快照（含来源、置信度、生效值与冲突标志）
+     * @return 不可变快照；未连接或无证据时 `evidence.source == Unknown`
+     * @details 这是调用方判断"对端到底是什么协议版本"的**唯一合法入口**。
+     *          `effective` 是能力裁决依据，`evidence.reported` 是对端原话；
+     *          二者在封顶（`capped`）或保守（`conservative`）时会不同。
+     * @note 本方法为只读查询，不触发任何命令交互。
+     */
+    [[nodiscard]] ProtocolVersionSnapshot GetProtocolVersionSnapshot() const;
+
+    /**
+     * @brief 传输层版本快照（含来源、置信度、生效值与冲突标志）
+     * @return 不可变快照；未连接或无证据时 `evidence.source == Unknown`
+     * @details 传输层与协议层是**独立维度**：传输层决定线路布局
+     *          （Tail/Alignment/Packet 边界），不得由协议层版本推导。
+     */
+    [[nodiscard]] TransportVersionSnapshot GetTransportVersionSnapshot() const;
+
+    /**
+     * @brief 主动探测对端版本（GET_VERSION）
+     * @return 探测结果分类与响应（对端未实现该 optional 命令属正常结果）
+     * @throws XcpException 仅抛真正的传输故障或恢复失败，**不抛"命令不可用"**
+     * @details 用于构造时关闭了自动探测、之后又想补测的场景。探测成功后
+     *          会重新裁决双快照；失败则保留原证据不变（**不得降级为假定版本**）。
+     */
+    CommandExecutor::GetVersionProbe ProbeVersion();
+
+    /**
+     * @brief 版本裁决产生的冲突描述列表
+     * @return 冲突文本；空表示无冲突
+     * @details 用户仲裁（m03674）：**不提供静默模式**，冲突必须始终可被
+     *          调用方观察到。典型冲突：GET_VERSION 与调用方配置不一致、
+     *          GET_VERSION 与 A2L 声明不一致、对端版本高于支持上限。
+     */
+    [[nodiscard]] std::vector<std::string> VersionConflicts() const;
+
+    // ---- 能力边界（批次 G：`1.x-conservative` 能力基线的对外表达）----
+
+    /// @brief 本库在当前会话状态下明确"不支持"的能力项
+    /// @details 对应方案 §4.2.1 冻结的 `Xcp13CoreBaseline` 能力表中
+    ///          判为 **Block** 的分组。这些能力**不是"尚未查询"**，而是本
+    ///          实现**确定不提供**：调用方据此避免发送注定失败的请求。
+    /// @note 本枚举是"能力集"的一部分：Minor 未确认（`conservative`）时，
+    ///       高版本特性一律归入 `Block`，**不得**依据对端返回的错误码反推
+    ///       版本（方案 §4.3：禁止内容探测式尝试）。
+    enum class UnsupportedCapability : std::uint8_t {
+        /// SET_DAQ_PACKED_MODE（0xC0,0x01）/ GET_DAQ_PACKED_MODE（0xC0,0x02）
+        /// —— 原始 PDF 确认为 V1.5 新特性（§4.1.10、Table 172/155 的
+        /// DAQ_LIST_PROPERTIES/DAQ_EVENT_PROPERTIES Bit4 PACKED），
+        /// 本实现未提供编码路径。
+        DaqPackedMode = 0,
+
+        /// 0xC0 族（Level-1 双字节命令码）中除 GET_VERSION（0xC0,0x00）外的
+        /// 其它子命令 —— 本实现只登记并实现了 GET_VERSION。
+        Level1OtherSubcommand = 1,
+
+        /// IPv6 传输 —— 本版本基础 Profile 只承诺 **IPv4 UDP 单播**。
+        Ipv6Transport = 2,
+
+        /// 四个 Optional TL Subcommand —— 本版本基础 Profile 不实现。
+        OptionalTlSubcommand = 3,
+    };
+
+    /// @brief 查询某项能力在本会话状态下是否**明确不支持**
+    /// @param capability 待查询的能力项
+    /// @return true 表示确定不支持（调用方应改走替代路径或放弃该功能）；
+    ///         false 表示本项**不在此黑名单内**，但**不代表已实现或已验证**
+    /// @details 返回 false 只说明"该能力未被本基线判为 Block"，调用方仍须
+    ///          依赖对端能力查询结果与既有 API 的运行时校验。
+    /// @note 与 `HasCalPagResource()` 的区别：后者反映**对端资源位**，
+    ///       本方法反映**本库能力边界**，二者互不替代。
+    [[nodiscard]] bool IsCapabilityUnsupported(
+        UnsupportedCapability capability) const;
+
+    /// @brief 若该能力明确不支持则抛 `UnsupportedFeature`，否则返回
+    /// @param capability 待断言的能力项
+    /// @throws XcpException(UnsupportedFeature) 当
+    ///         `IsCapabilityUnsupported(capability)` 为真
+    /// @details 供调用方在**发起注定失败的操作前**做前置断路，把"能力缺失"
+    ///          与"对端拒绝/超时"区分开。异常消息包含能力名与替代路径提示，
+    ///          便于日志定位。
+    /// @note 这是**本地判定**，不发送任何报文。
+    void ThrowIfUnsupported(UnsupportedCapability capability) const;
+
 private:
     void ConfigureDaqListsDynamicImpl(const std::vector<DaqListSpec>& specs,
                                       std::size_t dto_identification_bytes,
                                       bool legacy_timestamp);
 
+    /**
+     * @brief CONNECT 之后的版本裁决编排（批次 B1）
+     * @param connect 已完成的 CONNECT 响应（提供 PL/TL 主版本兜底证据）
+     *
+     * @details 流程：按 `m_options_` 决定是否探测 GET_VERSION → 收集
+     *          CONNECT 主版本、探测结果、调用方配置、A2L 声明 → 交给
+     *          `VersionResolver::Resolve` → 落盘双快照与冲突列表。
+     *
+     * @note **探测失败不抛异常**（除非 `require_get_version` 为真）：规范
+     *       明文把"未实现 optional 命令"作为 GET_VERSION 的正常返回
+     *       （原始 PDF 第 106 页 §7.4）。方案 B1 特别要求"不得以 timeout
+     *       冒充老版本"——失败只导致 `MajorOnly` 保守状态。
+     */
+    void ResolveVersionAfterConnect(const ConnectResponse& connect);
+
+    /**
+     * @brief 用一次已完成的探测结果重新裁决版本快照（不发起任何通信）
+     * @param probe 调用方已取得或已从缓存补取的 GET_VERSION 探测结果
+     * @throws XcpException `require_get_version` 为真但探测不可用时抛
+     *         `InvalidState`（语义与连接期裁决一致）
+     *
+     * @details 从 `ResolveVersionAfterConnect` 中抽出，使「连接期自动探测」
+     *          与「连接后主动补测」共用同一套裁决与冲突记录逻辑，避免两处
+     *          实现各写一遍而漂移。本方法只做本地裁决——探测动作由调用方
+     *          负责发起（见 `ProbeVersion()`）。
+     * @note 调用前必须处于已连接状态，否则 CONNECT 主版本兜底证据不可用。
+     */
+    void ApplyVersionProbe(const CommandExecutor::GetVersionProbe& probe);
+
     std::unique_ptr<IXcpTransport> m_transport_;  ///< 拥有的 Transport
     Session m_session_;                           ///< 会话状态与协商参数
+
+    /// @brief 构造配置（批次 B1）：超时、监听器、字节序/AG 覆盖、版本策略
+    /// @details 保存整个配置对象而非拆散字段，便于后续批次新增能力时
+    ///          不改动成员布局；生命周期与本对象一致。
+    XcpMasterOptions m_options_;
+
+    /// @brief 协议层版本快照（批次 B1），由 VersionResolver 裁决后写入
+    /// @details 断连时清空为默认值：版本证据是**会话态**，不得跨会话残留
+    ///          （否则重连到不同版本对端会沿用旧裁决）。
+    ProtocolVersionSnapshot m_protocol_version_;
+
+    /// @brief 传输层版本快照（批次 B1），与协议层独立裁决
+    TransportVersionSnapshot m_transport_version_;
+
+    /// @brief 版本裁决产生的冲突描述（批次 B1）
+    /// @details 只记录不阻断；调用方通过 `VersionConflicts()` 观察。
+    std::vector<std::string> m_version_conflicts_;
     std::unique_ptr<CommandExecutor>
         m_executor_;  ///< 命令执行器（同时是包监听器）
     std::unique_ptr<MemoryAccess> m_memory_access_;  ///< 内存访问
@@ -538,6 +742,28 @@ private:
      */
     bool m_daq_processor_info_queried_{false};
     std::optional<std::uint8_t> m_daq_processor_properties_;
+    /**
+     * @brief 本会话 GET_DAQ_PROCESSOR_INFO 的完整取证快照（批次 E2，F-05/O-2）
+     * @details 批次 E2 起除 DAQ_PROPERTIES 外还需消费三项：
+     *          - `min_daq`：F-05 要求可配置 List 编号区间为
+     *            `[MIN_DAQ, MAX_DAQ-1]`，实现不得再硬性要求从 0 连续编号；
+     *          - `key_byte`：O-2 要求拦下 `Address_Extension` 的规范禁止组合
+     *            （bit5-4 == `10`，原始 PDF 第 182 页 Table 142 "Not allowed"）；
+     *          - `properties` 的 bit7-6：O-2 要求 `OVERLOAD_MSB` 启用
+     *            （`01`）时限制 ODT 编号严格小于 `0x7C`（原始 PDF 第 180 页）。
+     *          `nullopt` 与 `m_daq_processor_properties_` 同义（未支持/未取证）。
+     */
+    std::optional<GetDaqProcessorInfoResponse> m_daq_processor_info_;
+
+    /**
+     * @brief 本会话 GET_DAQ_RESOLUTION_INFO 的完整取证快照（批次 E2，F-12）
+     * @details 批次 E2 起除时间戳宽度外还需消费粒度与上限：
+     *          `granularity_daq`、`max_odt_entry_size_daq` 用于 C1～C5 校验
+     *          （原始 PDF 第 14-15 页 §4.1.2）；`timestamp_mode` 的
+     *          `size_code`/`unit_code` 用于 Table 147/148 的合法性判定。
+     *          nullopt = Slave 不支持该 Optional 命令，**不校验也不猜**（B-3）。
+     */
+    std::optional<GetDaqResolutionInfoResponse> m_daq_resolution_info_;
 
     /**
      * @brief 本会话 GET_DAQ_RESOLUTION_INFO 的一次性取证缓存（批次20，G3）
@@ -566,9 +792,20 @@ private:
      */
     [[nodiscard]] std::size_t DaqTimestampBytesCached();
 
+    /**
+     * @brief Slave 是否启用了 OVERLOAD_MSB 过载指示（批次 E2，O-2）
+     * @details 判据为 GET_DAQ_PROCESSOR_INFO 响应的 `DAQ_PROPERTIES`
+     *          bit7-6 == `01`（原始 PDF 第 179 页 Table 139）。
+     *          启用后规范要求 ODT 编号 `0x00 <= N < 0x7C`
+     *          （原始 PDF 第 180 页）。
+     * @return true = 启用；未取证或未支持时返回 false——**不猜**（B-3）
+     */
+    [[nodiscard]] bool IsOverloadMsbEnabled() const;
+
     /// @brief 动态编排中途失败后的清理：整表 FREE_DAQ 尽力恢复到干净空表，
     ///        二次失败只尽力不掩盖原异常；账本/解码代际同步作废（批次20）
     void ClearDynamicTableBestEffort();
+
 };
 
 }  // namespace calmcar::xcp

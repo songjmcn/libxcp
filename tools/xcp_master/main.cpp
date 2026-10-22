@@ -95,16 +95,15 @@ using calmcar::xcp::A2lEventMetadata;
 using calmcar::xcp::Address;
 using calmcar::xcp::AddressExtension;
 using calmcar::xcp::ApplyMeasurementRuntimeProfile;
-using calmcar::xcp::BuildGenericMeasurementRuntimeProfile;
-using calmcar::xcp::BuildXcpliteMeasurementRuntimeProfile;
+using calmcar::xcp::BuildMeasurementRuntimeProfile;
 using calmcar::xcp::ByteCount;
 using calmcar::xcp::Bytes;
 using calmcar::xcp::IdentificationFieldType;
 using calmcar::xcp::MeasurementDaqCapabilities;
 using calmcar::xcp::MeasurementFrame;
 using calmcar::xcp::MeasurementPlanner;
+using calmcar::xcp::MeasurementRuntimeProfile;
 using calmcar::xcp::MeasurementSession;
-using calmcar::xcp::XcpliteMeasurementRuntimeProfile;
 using calmcar::xcp::XcpMaster;
 using calmcar::xcp::a2l::A2lBridge;
 using calmcar::xcp::a2l::CharacteristicType;
@@ -123,19 +122,17 @@ struct Options {
     std::string module;
     std::chrono::milliseconds interval{500};
     std::string mode{"poll"};
-    std::string daq_profile{"generic"};
     bool interval_explicit{false};
-    bool daq_profile_explicit{false};
 };
 
 void PrintUsage(std::ostream& out) {
     out << "Usage: xcp_master --a2l <path> --host <IPv4> --port <1..65535> "
-           "[--module <name>] [--mode poll|daq] [--interval-ms <ms>] "
-           "[--daq-profile generic|xcplite]\n"
+           "[--module <name>] [--mode poll|daq] [--interval-ms <ms>]\n"
            "       xcp_master --help\n"
            "poll: --interval-ms is the target polling cycle (default 500 ms).\n"
-           "daq: event-driven; --interval-ms is invalid; profile defaults to "
-           "generic.\n";
+           "daq: event-driven; --interval-ms is invalid. The DTO layout is "
+           "selected automatically from the slave's reported identification "
+           "field type (DAQ_KEY_BYTE); no profile option is needed.\n";
 }
 
 bool ParseUnsigned(std::string_view text, std::uint64_t& value) {
@@ -199,13 +196,6 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 return std::nullopt;
             }
             options.mode = value;
-        } else if (key == "--daq-profile") {
-            if (value != "generic" && value != "xcplite") {
-                error = "--daq-profile must be generic or xcplite";
-                return std::nullopt;
-            }
-            options.daq_profile = value;
-            options.daq_profile_explicit = true;
         } else {
             error = "unknown option: " + std::string(key);
             return std::nullopt;
@@ -214,10 +204,6 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
     if (options.mode == "daq" && options.interval_explicit) {
         error =
             "--interval-ms controls polling only and conflicts with --mode daq";
-        return std::nullopt;
-    }
-    if (options.mode == "poll" && options.daq_profile_explicit) {
-        error = "--daq-profile is valid only with --mode daq";
         return std::nullopt;
     }
     if (options.a2l_path.empty() || options.host.empty() || options.port == 0) {
@@ -599,7 +585,7 @@ public:
                                                          : "已停止";
             const auto mode_state =
                 options_.mode == "daq"
-                    ? "DAQ/" + options_.daq_profile
+                    ? "DAQ/自动布局"
                     : "POLL/目标 " + std::to_string(options_.interval.count()) +
                           " ms";
             const bool compact = current_layout_.compact;
@@ -1803,8 +1789,7 @@ private:
                  ? "；watch 按目标周期 " +
                        std::to_string(options_.interval.count()) +
                        " ms 主动读取。"
-                 : "；watch 使用事件驱动 DAQ，profile=" + options_.daq_profile +
-                       "。"));
+                 : "；watch 使用事件驱动 DAQ，DTO 布局按从站取证自动选择。"));
         Say("DAQ 只支持唯一 FIXED_EVENT_LIST 的 MEASUREMENT；运行中禁止 "
             "read/write 和修改观测集合。stop + Enter 停止。");
     }
@@ -1926,8 +1911,7 @@ private:
             for (const auto& event : events_)
                 available_events.push_back(event.channel);
             return calmcar::xcp::tools::SymbolDaqObservationUnsupportedReason(
-                symbol, available_events,
-                options_.daq_profile == "xcplite");
+                symbol, available_events, true);
         }
         if (symbol.dimensions.empty())
             return calmcar::xcp::tools::SymbolReadUnsupportedReason(symbol);
@@ -2766,38 +2750,41 @@ private:
         std::size_t timestamp_bytes = 0;
         std::size_t identification_bytes = 1;
         MeasurementDaqCapabilities daq_entry_capabilities{};
-        std::optional<XcpliteMeasurementRuntimeProfile> xcplite_profile;
-        if (options_.daq_profile == "generic") {
+        std::optional<MeasurementRuntimeProfile> runtime_profile;
+        {
+            // DTO 布局由从站上报的识别字段模式自动决定，无需预先声明厂商。
             auto profile =
-                BuildGenericMeasurementRuntimeProfile(master_, selected_events);
+                BuildMeasurementRuntimeProfile(master_, selected_events);
             if (!profile.HasValue()) {
                 const std::string& reason = profile.ErrorInfo().message;
-                std::string hint;
-                // 仅在已知的 DTO 标识/时间戳/地址扩展布局不兼容时提示
-                // XCPlite 的显式选择；不自动重试，也不发送 FREE_DAQ。
-                if (reason.find("generic profile 仅支持") !=
-                        std::string::npos ||
-                    reason.find("Slave 强制固定时间戳") != std::string::npos) {
-                    hint =
-                        "；DAQ 未启动。若已确认是 XCPlite，请重启并显式添加 "
-                        "--daq-profile xcplite";
+                // 结构化提示：附带从站上报的 DTO 标识与时间戳事实，便于定位。
+                std::string facts;
+                const auto processor = master_.QueryDaqProcessorInfo();
+                if (processor.has_value()) {
+                    facts = "；从站 DAQ_KEY_BYTE=0x" +
+                            [&processor] {
+                                constexpr char kHex[] = "0123456789ABCDEF";
+                                std::uint8_t raw = processor->key_byte.raw;
+                                std::string text;
+                                text += kHex[(raw >> 4U) & 0x0FU];
+                                text += kHex[raw & 0x0FU];
+                                return text;
+                            }() +
+                            "（识别字段模式 " +
+                            std::to_string(
+                                processor->key_byte.identification_field_type) +
+                            "，地址扩展模式 " +
+                            std::to_string(
+                                processor->key_byte.address_extension_mode) +
+                            "）";
                 }
-                Say("通用 DAQ 能力校验失败: " + reason + hint);
+                Say("DAQ 能力校验失败: " + reason + facts +
+                    "。请核对 A2L 与从站能力后再试。");
                 return;
             }
-            identification_bytes = profile.Value().identification_header_bytes;
-            daq_entry_capabilities = MeasurementDaqCapabilities{
-                false, profile.Value().daq_entry_granularity_bytes,
-                profile.Value().max_daq_entry_size_bytes};
-        } else {
-            auto profile =
-                BuildXcpliteMeasurementRuntimeProfile(master_, selected_events);
-            if (!profile.HasValue()) {
-                Say("XCPlite DAQ 能力校验失败: " + profile.ErrorInfo().message);
-                return;
-            }
-            xcplite_profile = profile.Value();
-            timestamp_bytes = 4;
+            runtime_profile = profile.Value();
+            timestamp_bytes =
+                profile.Value().timestamp_unit_ns != 0U ? 4U : 0U;
             identification_bytes = profile.Value().identification_header_bytes;
             daq_entry_capabilities = profile.Value().daq_entry_capabilities;
         }
@@ -2811,17 +2798,22 @@ private:
             Say("DAQ 本地规划失败: " + planned.ErrorInfo().message);
             return;
         }
-        if (options_.daq_profile == "generic" &&
+        // 规范约束：识别字段为绝对 ODT 号（Absolute PID）时，PID 空间有限，
+        // 只支持单一 DAQ list。判据取自已取证的识别字段模式，而非厂商名。
+        if (runtime_profile->identification_field_type ==
+                IdentificationFieldType::Absolute &&
             planned.Value().daq_lists.size() != 1U) {
-            Say("通用 Absolute-PID profile 仅支持一个 DAQ list。");
+            Say("Absolute PID 布局仅支持一个 DAQ list。");
             return;
         }
 
         Say("警告：开始 DAQ 将发送 FREE_DAQ，清除 Slave 当前全部动态 DAQ "
             "配置（不可恢复）。");
         const auto ticket = Confirm(
-            "即将 FREE_DAQ 清空 ECU 所有动态 DAQ 配置（不可恢复）；profile=" +
-            options_.daq_profile + "，观测变量 " +
+            "即将 FREE_DAQ 清空 ECU 所有动态 DAQ 配置（不可恢复）；识别字段模式 " +
+            std::to_string(static_cast<int>(
+                runtime_profile->identification_field_type)) +
+            "（头长 " + std::to_string(identification_bytes) + " 字节），观测变量 " +
             std::to_string(names.size()) +
             " 个。能力查询及布局检查已通过。继续? [Y/N]");
         if (!ticket) {
@@ -2832,14 +2824,8 @@ private:
         bool samples_pending = false;
         try {
             if (!profile_configured_) {
-                if (xcplite_profile) {
-                    ApplyMeasurementRuntimeProfile(measurement_session_,
-                                                   *xcplite_profile);
-                } else {
-                    measurement_session_.SetEnvelopeMode(
-                        IdentificationFieldType::Absolute, 1);
-                    measurement_session_.SetTimestampEnabled(false);
-                }
+                ApplyMeasurementRuntimeProfile(measurement_session_,
+                                               *runtime_profile);
                 profile_configured_ = true;
             }
             measurement_session_.Clear();
@@ -3191,10 +3177,47 @@ int main(int argc, char** argv) {
     calmcar::xcp::UdpTransportConfig config;
     config.remote_host = options->host;
     config.remote_port = options->port;
+    // T-05：PACKET_ALIGNMENT 自动贯通。
+    // A2L 的 IF_DATA XCP 以 UDP 传输声明了 PACKET_ALIGNMENT_x（8/16/32 bit）
+    // 时按声明设置；**未声明则保持 8-bit 并明确告知依据**，而不是让用户
+    // 误以为对齐来自 A2L（方案 §1.9A.4：无证据不得假定对齐）。
+    // 注意 a2lbridge 的 packet_alignment 字段为位宽，0 表示未知。
+    {
+        const auto* xcp_info = bridge->XcpInfo();
+        bool aligned_from_a2l = false;
+        if (xcp_info != nullptr && !xcp_info->ambiguous) {
+            for (const auto& endpoint : xcp_info->transports) {
+                if (endpoint.packet_alignment == 0U) continue;
+                const auto parsed = calmcar::xcp::ParsePacketAlignment(
+                    endpoint.packet_alignment);
+                if (parsed == calmcar::xcp::PacketAlignment::Unknown) continue;
+                if (aligned_from_a2l && parsed != config.packet_alignment) {
+                    // 同一 IF_DATA 内多个传输声明冲突：不静默覆盖
+                    std::cerr << "A2L PACKET_ALIGNMENT 声明冲突，"
+                                 "拒绝自动建链。\n";
+                    return 1;
+                }
+                config.packet_alignment = parsed;
+                aligned_from_a2l = true;
+            }
+        }
+        if (aligned_from_a2l) {
+            std::cout << "PACKET_ALIGNMENT 取自 A2L: "
+                      << static_cast<int>(calmcar::xcp::AlignmentBytes(
+                             config.packet_alignment))
+                      << " 字节\n";
+        } else {
+            std::cout << "A2L 未声明 PACKET_ALIGNMENT，使用默认 8-bit 对齐；"
+                         "如对端使用 16/32-bit 请在 A2L 中声明。\n";
+        }
+    }
     try {
         auto transport =
             std::make_unique<calmcar::xcp::UdpTransport>(std::move(config));
-        XcpMaster master(std::move(transport), {}, &measurement_session);
+        // 注意：外层已有名为 options 的 CLI 参数指针，此处变量名须避让
+        calmcar::xcp::XcpMasterOptions master_options;
+        master_options.event_listener = &measurement_session;
+        XcpMaster master(std::move(transport), master_options);
         master.Connect();
         measurement_session.Bind(master);
         std::cout << "XCP on UDP 已连接: " << options->host << ':'

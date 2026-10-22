@@ -140,8 +140,10 @@ std::unique_ptr<calmcar::xcp::XcpMaster> MakeMaster(const Options& opt) {
     timeouts.command_timeout = opt.commandTimeout;
     timeouts.synch_timeout = opt.commandTimeout;
     timeouts.max_retries = 1;
+    calmcar::xcp::XcpMasterOptions master_options;
+    master_options.timeouts = timeouts;
     return std::make_unique<calmcar::xcp::XcpMaster>(
-        std::make_unique<calmcar::xcp::UdpTransport>(cfg), timeouts);
+        std::make_unique<calmcar::xcp::UdpTransport>(cfg), master_options);
 }
 
 /// @brief 等待 demo 达到可 CONNECT 状态；成功返回已连接的 master，超时返回 nullptr。

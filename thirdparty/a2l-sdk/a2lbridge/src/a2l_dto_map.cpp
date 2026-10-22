@@ -419,9 +419,15 @@ bool ConvertRecordLayoutInfo(const liba2l::SymbolDto& dto,
 void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
                       std::vector<TransportEndpoint>* transports) noexcept {
     if (layer != nullptr) {
-        // protocol_version 是 uint16 major<<8|minor；IF_DATA 段版本首版记
-        // 0x0100
-        layer->version = 0x0100;
+        // protocol_version 是 uint16 major<<8|minor，直接取解析结果。
+        // 历史上此处曾硬编码 0x0100，导致任何 A2L 都被报成 V1.0：上游
+        // liba2l 已正确解析 PROTOCOL_LAYER/VERSION（语法层
+        // xcpdataparser.y -> ProtocolLayer::GetVersion -> IfDataXcpDto），
+        // 桥接层丢弃该值属于实现错误（V-04）。
+        // A2L 未标注该字段时 dto.protocol_version 为 0：保持 0 即可，
+        // 0x0000 会被 XcpProtocolVersion::IsValid() 判为「无证据」，
+        // 而不是伪造出一个 V1.0。
+        layer->version = dto.protocol_version;
         layer->max_cto = dto.max_cto;
         layer->max_dto = dto.max_dto;
         layer->byte_order = ConvertByteOrder(dto.byte_order);

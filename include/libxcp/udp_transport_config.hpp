@@ -56,6 +56,20 @@ struct UdpTransportConfig {
      *          对 Slave 连接绑定规则的复刻；设为 false 时仅匹配 remote_host。
      */
     bool strict_remote_port = true;
+
+    /**
+     * @brief PACKET_ALIGNMENT（TL V1.5 §4.3.2.2）：XCP Packet 起始地址对齐
+     * @details 默认 `PacketAlignment::Bit8`（等价于不填充 Tail），与 XCP 1.1
+     *          Part 3 的"无 Tail"行为一致，因此不改变既有调用方行为。
+     *
+     *          需要 16/32-bit 对齐时，由 A2L 的 `PACKET_ALIGNMENT_16/32`
+     *          （经 A2L 桥接层的 `IfDataXcpTransport.packet_alignment`）或
+     *          调用方显式设置；**不得由传输层自行推断**。
+     *
+     * @note `PacketAlignment::Unknown` 会让 `Open()` 直接失败：既无 A2L 证据
+     *       也无显式配置时，无法确定报文布局（方案 §1.9A.4）。
+     */
+    PacketAlignment packet_alignment = PacketAlignment::Bit8;
 };
 
 }  // namespace calmcar::xcp

@@ -19,12 +19,29 @@ namespace {
 /// @brief UPLOAD / SHORT_UPLOAD 的元素数字段为单字节，有效取值 1..255
 constexpr ElementCount kMaxElementsPerField = 0xFFU;
 
+/// @brief Level-1 命令族前缀（原始 PDF 第 106 页 §7.4：以 0xC0 起始的双字节码）
+constexpr std::uint8_t kLevel1CommandPrefix = 0xC0U;
+
+/// @brief GET_VERSION 的 Level-1 子命令码（原始 PDF 第 114 页 Table 44）
+constexpr std::uint8_t kGetVersionSubCommand = 0x00U;
+
 }  // namespace
 
-CommandCodec::CommandCodec(ByteOrder byte_order) noexcept
-    : m_byte_order_(byte_order) {}
+CommandCodec::CommandCodec(ByteOrder byte_order,
+                           AddressGranularity ag) noexcept
+    : m_byte_order_(byte_order), m_ag_(ag) {}
 
 ByteOrder CommandCodec::GetByteOrder() const noexcept { return m_byte_order_; }
+
+AddressGranularity CommandCodec::GetAddressGranularity() const noexcept {
+    return m_ag_;
+}
+
+std::size_t CommandCodec::DownloadAlignmentBytes() const noexcept {
+    // 规则本体在 protocol_types.hpp 的 DownloadAlignmentBytes(ag)，
+    // 与 MemoryAccess 的容量计算共用同一定义，避免两处口径不一致。
+    return calmcar::xcp::DownloadAlignmentBytes(m_ag_);
+}
 
 void CommandCodec::WriteU16(Bytes& buf, std::uint16_t val) const {
     if (m_byte_order_ == ByteOrder::Intel) {
@@ -72,6 +89,16 @@ Bytes CommandCodec::EncodeGetStatus() const {
     cto.reserve(2);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::GetStatus));
     cto.push_back(0x00U);  // reserved
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetVersion() const {
+    // 原始 PDF 第 114 页 Table 44：Level-1 双字节命令码 [0xC0][0x00]。
+    // 第二字节是子命令码，非参数——不得写入长度或保留字节。
+    Bytes cto;
+    cto.reserve(2);
+    cto.push_back(kLevel1CommandPrefix);
+    cto.push_back(kGetVersionSubCommand);
     return cto;
 }
 
@@ -366,8 +393,12 @@ Bytes CommandCodec::EncodeAllocOdtEntry(std::uint16_t daq_list,
 
 Bytes CommandCodec::EncodeDownload(ElementCount number_of_elements,
                                    BytesView data) const {
-    // DOWNLOAD: [F0][size][data...]（xcp.h:578-582）；size 是**元素数**
-    // （以 AG 为单位），与 Session Byte Order 无关
+    // DOWNLOAD: [F0][size][pad...][data...]（xcp.h:578-582）；size 是**元素数**
+    // （以 AG 为单位），与 Session Byte Order 无关。
+    // ASAM XCP V1.5.0 原始 PDF 第 142 页 Table 82：对齐字节 "only if AG >2"，
+    // 首元素位置 AG=1 时为 2、AG>1 时为 AG；"If AG = DWORD, 2 alignment bytes
+    // must be used"。故 AG=DWord 时在 [F0][size] 之后插 2 字节对齐（填 0），
+    // 使数据段落在 4 字节边界。AG=1(Byte)/2(Word) 时行为与修正前逐字节一致。
     if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
         LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
@@ -378,10 +409,13 @@ Bytes CommandCodec::EncodeDownload(ElementCount number_of_elements,
         LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument("DOWNLOAD 数据段为空");
     }
+    const std::size_t alignment = DownloadAlignmentBytes();
     Bytes cto;
-    cto.reserve(2 + data.size());
+    cto.reserve(2 + alignment + data.size());
     cto.push_back(static_cast<std::uint8_t>(CommandCode::Download));
     cto.push_back(static_cast<std::uint8_t>(number_of_elements));
+    // 对齐字节取值不受规范约束（原文只称 "Used for alignment"），统一填 0
+    cto.insert(cto.end(), alignment, 0x00U);
     cto.insert(cto.end(), data.begin(), data.end());
     return cto;
 }

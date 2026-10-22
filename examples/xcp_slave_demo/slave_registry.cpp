@@ -240,8 +240,11 @@ namespace {
  * ObserveSlaveProtocolState() 轮询判定，避免两套机制互相抵消。
  * @param mode CONNECT 命令的 mode 字节（0 表示 normal）。
  * @return 始终返回 true，保持默认的"连接总是被接受"语义。
+ * @note 该参数是 XCPlite 回调的固定签名要求，不能删除或改名；它仅在日志
+ *       语句中被消费，而日志关闭时 `LIBXCP_LOG_INFO` 展开为空操作、不求值
+ *       参数，故标注 `[[maybe_unused]]` 而非删除参数。
  */
-bool OnSlaveConnectCallback(std::uint8_t mode) {
+bool OnSlaveConnectCallback([[maybe_unused]] std::uint8_t mode) {
     LIBXCP_LOG_INFO("从站协议事件：收到 CONNECT 请求，mode={}，已接受连接",
                     static_cast<unsigned>(mode));
     return true;

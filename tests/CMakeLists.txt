@@ -52,6 +52,7 @@ add_executable(libxcp_tests
         session_test.cpp
         udp_header_codec_test.cpp
         udp_transport_test.cpp
+        link_budget_test.cpp
         udp_test_slave_test.cpp
         memory_access_test.cpp
         recovery_test.cpp
@@ -66,7 +67,8 @@ add_executable(libxcp_tests
         measurement_session_test.cpp
         daq_timestamp_test.cpp
         measurement_session_hardening_test.cpp
-        logging_test.cpp)
+        logging_test.cpp
+        version_resolver_test.cpp)
 
 target_link_libraries(libxcp_tests PRIVATE
         libxcp::libxcp
@@ -192,7 +194,10 @@ set_tests_properties(A2lSmoke PROPERTIES FIXTURES_REQUIRED A2lGolden)
 # ----------------------------------------------------------------------------
 add_executable(A2lGolden a2l_golden_test.cpp)
 target_compile_features(A2lGolden PRIVATE cxx_std_20)
-target_link_libraries(A2lGolden PRIVATE libxcp::a2lbridge libxcp_test_main)
+target_link_libraries(A2lGolden PRIVATE libxcp::a2lbridge libxcp_test_main
+        # T-05：需要 libxcp 的 PacketAlignment 强类型与 XcpFrameBytes()，
+        # 用以断言 A2L PACKET_ALIGNMENT 贯通到本侧 Tail 公式
+        libxcp::libxcp)
 target_compile_definitions(A2lGolden PRIVATE
         A2L_GOLDEN_DIR="${A2L_GOLDEN_DIR}"
         A2L_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/a2l"
@@ -290,11 +295,14 @@ if(LIBXCP_BUILD_TOOLS)
   add_test(NAME XcpMasterToolRejectsPollingIntervalInDaq
            COMMAND xcp_master --a2l ignored.a2l --host 127.0.0.1 --port 5555
                    --mode daq --interval-ms 500)
-  add_test(NAME XcpMasterToolRejectsDaqProfileInPoll
+  # DTO 布局改为按取证自动选择后，--daq-profile 已被移除；
+  # 该选项现应作为未知参数被拒绝（不再存在厂商 profile 开关）。
+  add_test(NAME XcpMasterToolRejectsRemovedDaqProfileOption
            COMMAND xcp_master --a2l ignored.a2l --host 127.0.0.1 --port 5555
                    --daq-profile xcplite)
   set_tests_properties(XcpMasterToolRejectsPollingIntervalInDaq
-                       XcpMasterToolRejectsDaqProfileInPoll PROPERTIES WILL_FAIL TRUE)
+                       XcpMasterToolRejectsRemovedDaqProfileOption
+                       PROPERTIES WILL_FAIL TRUE)
 
   add_executable(XcpMasterSymbolPolicyTest
           xcp_master_symbol_policy_test.cpp

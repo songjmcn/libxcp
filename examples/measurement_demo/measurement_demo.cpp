@@ -14,7 +14,7 @@
 //      （多事件 Slave 如 cpp_demo 一机多通道同样适用），取不到时回退
 //      --event 命名事件（默认 "mainloop"）的 EVENT 段通道；
 //   4) MeasurementSession：先构造（作 IEventListener）→ Bind → Connect →
-//      SetEnvelopeMode(RelativeByte,4)+SetTimestampFirstOdtOnly(true)+
+//      SetEnvelopeMode(RelativeWordAligned,4)+SetTimestampFirstOdtOnly(true)+
 //      SetTimestampUnit(1)（XCPlite 实然取证值，生产环境应改从
 //      GET_DAQ_PROCESSOR_INFO / GET_DAQ_RESOLUTION_INFO / A2L EVENT 取证）→
 //      Add → Prepare → Start（回调收 MeasurementFrame）；
@@ -527,8 +527,11 @@ std::unique_ptr<XcpMaster> MakeMaster(const Options& opt,
     timeouts.command_timeout = opt.commandTimeout;
     timeouts.synch_timeout = opt.commandTimeout;
     timeouts.max_retries = 1;
+    XcpMasterOptions options;
+    options.timeouts = timeouts;
+    options.event_listener = listener;
     return std::make_unique<XcpMaster>(std::make_unique<UdpTransport>(cfg),
-                                       timeouts, listener);
+                                       options);
 }
 
 /// @brief 等待 Slave 达到可 CONNECT 状态；超时返回 nullptr。
@@ -991,9 +994,6 @@ int main(int argc, char** argv) {
     auto Qualified = [&](std::string_view symbol) {
         return projectPrefix + std::string(symbol);
     };
-    auto ShortName = [&](std::string_view qualified) {
-        return qualified.substr(projectPrefix.size());
-    };
 
     std::error_code ec;
     fs::create_directories(opt.runDir, ec);
@@ -1229,7 +1229,7 @@ int main(int argc, char** argv) {
         // 由适配层查询 GET_DAQ_PROCESSOR_INFO / GET_DAQ_RESOLUTION_INFO /
         // GET_DAQ_EVENT_INFO，并与上传 A2L EVENT 元数据逐通道交叉校验。
         const auto profile =
-            BuildXcpliteMeasurementRuntimeProfile(*master, bound_events);
+            BuildMeasurementRuntimeProfile(*master, bound_events);
         if (!profile.HasValue()) {
             std::printf("[env] Slave profile 取证失败：%s\n",
                         profile.ErrorInfo().message.c_str());

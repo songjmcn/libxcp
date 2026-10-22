@@ -16,6 +16,7 @@
 #include <variant>
 
 #include "libxcp/protocol_types.hpp"
+#include "libxcp/protocol_version.hpp"
 #include "libxcp/xcp_error.hpp"
 
 namespace calmcar::xcp {
@@ -179,15 +180,122 @@ struct ReadDaqResponse {
 };
 
 /**
- * @brief GET_ID 响应解析结果（批次 21 21-2；XCPlite 实然布局 xcp.h:521-525）
- * @details CRM：MODE=b1（0x00=走 UPLOAD、0x01=响应内含数据）、
- *          LENGTH=DWORD@b4..7、DATA=b8..。规范 §7.5.1.6 的 LENGTH 为 WORD
- *          且偏移不同——实然优先。res_data 已剥 0xFF，索引全体 -1。
+ * @brief GET_VERSION 响应解析结果（批次 B1）
+ *
+ * @details 布局依据（原始 PDF 第 114 页 Table 45「GET_VERSION response
+ *          structure」，逐字）：
+ * @verbatim
+ *          Position Type Description
+ *          0        BYTE Packet ID = 0xFF
+ *          1        BYTE Reserved
+ *          2        BYTE Major version of protocol layer
+ *          3        BYTE Minor version of protocol layer
+ *          4        BYTE Major version of currently active transport layer
+ *          5        BYTE Minor version of currently active transport layer
+ * @endverbatim
+ *          **全部为单字节字段，字节序无影响**；`res_data` 已剥离首字节
+ *          `0xFF`，故索引全体 −1：`reserved@0`、`major_pl@1`、`minor_pl@2`、
+ *          `major_tl@3`、`minor_tl@4`，共 **5 字节**。
+ *
+ * @par 字段顺序
+ *      **Protocol 在前（1/2），Transport 在后（3/4）**。二者必须写入两个
+ *      独立快照，**禁止**用一方推导另一方（方案 §4 第 3 条）。
+ *
+ * @note `position 1` 是 **Reserved**，**不是长度字段**，也不是子命令回显。
+ *       本命令响应**不含任何长度字段**（对照 GET_ID 的 Table 60 有 DWORD
+ *       Length）。历史上曾有注释声称「GET_VERSION 的 LENGTH 为 WORD」，
+ *       属臆造，已由 §2A 更正。
+ */
+struct GetVersionResponse {
+    /// @brief Reserved 字节（原始 PDF 第 114 页 Table 45 position 1）
+    /// @details 规范未规定其取值语义。保留原值供诊断，**不参与裁决**。
+    std::uint8_t reserved{0};
+
+    /// @brief 协议层主版本（Table 45 position 2）
+    std::uint8_t protocol_major{0};
+
+    /// @brief 协议层次版本（Table 45 position 3）
+    std::uint8_t protocol_minor{0};
+
+    /// @brief 当前活动传输层主版本（Table 45 position 4）
+    std::uint8_t transport_major{0};
+
+    /// @brief 当前活动传输层次版本（Table 45 position 5）
+    std::uint8_t transport_minor{0};
+
+    /// @brief 协议层版本视图
+    [[nodiscard]] XcpProtocolVersion ProtocolVersion() const noexcept {
+        return XcpProtocolVersion{protocol_major, protocol_minor};
+    }
+
+    /// @brief 传输层版本视图
+    [[nodiscard]] XcpProtocolVersion TransportVersion() const noexcept {
+        return XcpProtocolVersion{transport_major, transport_minor};
+    }
+};
+
+/**
+ * @brief GET_ID 响应解析结果（F-03a/F-03b）
+ *
+ * @details 布局依据（原始 PDF 第 123 页 Table 60「GET ID positive response
+ *          structure」，逐字）：
+ * @verbatim
+ *          Position     Type    Description
+ *          0            BYTE    Packet ID: 0xFF
+ *          1            BYTE    Mode
+ *          2            WORD    Reserved
+ *          4            DWORD   Length [BYTE]
+ *          8            BYTE 1  first byte of Identification (if mode = 1)
+ *          8+Length-1   BYTE n  nth byte of identification
+ * @endverbatim
+ *          `res_data` 已剥离首字节 `0xFF`，故索引全体 -1：
+ *          `mode@0`、`reserved@1..2`（WORD）、`length@3..6`（DWORD）、
+ *          `data@7..`。
+ *
+ * @warning 本结构此前的 Doxygen 曾声称「规范 §7.5.1.6 的 LENGTH 为 WORD 且
+ *          偏移不同——实然优先」，该说法**与官方规范冲突且不成立**：规范
+ *          Table 60 明确 LENGTH 为 **DWORD@4**，与实现一致（无任何偏离）。
+ *          该错误注释已实际导致规范审计报告做出错误的「固化 XCPlite 方言」
+ *          高风险判断，故一并修正（F-03a）。另需注意 GET_VERSION 的 Table 45
+ *          为固定 6 字节、**根本不含 LENGTH 字段**，故「LENGTH 为 WORD」的
+ *          说法既不适用于 GET_ID 也不适用于 GET_VERSION，属臆造。
  */
 struct GetIdResponse {
-    std::uint8_t transfer_mode{0};  ///< 传输模式（b1 原码）
-    std::uint32_t length{0};        ///< LENGTH：标识数据/文件的字节长
-    Bytes identification_data;  ///< MODE=0x01 时的响应内数据（MODE=0 为空）
+    /// @brief 原始 Mode 字节（保留供诊断与日志）
+    /// @details Table 61 规定 bit 7..2 为保留位（x）、bit 1 为
+    ///          COMPRESSED_ENCRYPTED、bit 0 为 TRANSFER_MODE。保留原始字节
+    ///          以便上层在被要求时完整回显 Slave 的应答，不做有损改写。
+    std::uint8_t raw_mode{0};
+
+    /// @brief 传输模式（`Mode` 的 **bit 0**）：1=标识符内联于响应剩余字节；
+    ///        0=Slave 设置 MTA，Master 用 UPLOAD 读取
+    /// @details 按 Table 61 的位掩码 `Mode & 0x01` 提取，**不与 bit 1 混淆**。
+    std::uint8_t transfer_mode{0};
+
+    /// @brief 压缩/加密标志（`Mode` 的 **bit 1**）
+    /// @details Table 61：COMPRESSED_ENCRYPTED 仅对 identification type 4
+    ///          （ASAM-MC2 file to upload）合法。置位时数据经压缩/加密，
+    ///          须由外部算法解压解密——**本库未实现该能力**，调用方必须把
+    ///          该情形当作 `UnsupportedFeature` 处理，不得把密文当作 A2L 文本。
+    bool compressed_encrypted{false};
+
+    /// @brief Mode 字节中除 bit 0/bit 1 外的保留位是否为 0（Table 61 的 bit 7..2）
+    /// @details 规范将 bit 7..2 标为 `x`（保留）。非零时按畸形响应处理，以
+    ///          避免把未来协议的扩展位静默当作当前语义。
+    bool reserved_bits_clear{true};
+
+    /// @brief LENGTH：标识数据/文件的字节长（`Length [BYTE]`）
+    /// @details Table 60 下方原文：`Length` 指定标识符的字节数；若为 0 表示
+    ///          所请求的标识类型不可用。另有约束 `Length mod AG = 0`（F-03c）。
+    std::uint32_t length{0};
+
+    /// @brief LENGTH 是否满足 `Length mod AG = 0`（F-03c）
+    /// @details 由解析器按当前会话 AG 判定；不满足时上层须按畸形响应拒绝，
+    ///          不得进入 A2L 解析或后续 UPLOAD 编排。
+    bool length_aligned_to_ag{true};
+
+    /// @brief MODE 的 TRANSFER_MODE=1 时的响应内数据（TRANSFER_MODE=0 为空）
+    Bytes identification_data;
 };
 
 /// @brief 解析后的 Packet 联合类型
@@ -205,11 +313,19 @@ public:
     /**
      * @brief 构造解析器
      * @param byte_order Session 字节序
+     * @param ag Session 地址粒度（AG）
+     * @details AG 参与长度类判据：GET_ID 的 `Length mod AG = 0`
+     *          （原始 PDF 第 123 页 Table 60，F-03c）必须按会话实际 AG 判定，
+     *          不能假定 BYTE。
      */
-    explicit ResponseParser(ByteOrder byte_order) noexcept;
+    explicit ResponseParser(ByteOrder byte_order,
+                            AddressGranularity ag = AddressGranularity::Byte) noexcept;
 
     /// @brief 当前使用的字节序
     [[nodiscard]] ByteOrder GetByteOrder() const noexcept;
+
+    /// @brief 当前使用的地址粒度（AG）
+    [[nodiscard]] AddressGranularity GetAddressGranularity() const noexcept;
 
     /**
      * @brief 解析一个完整的 XCP Packet
@@ -244,6 +360,18 @@ public:
      */
     [[nodiscard]] std::optional<GetCommModeInfoResponse>
     ParseGetCommModeInfoResponse(BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_VERSION 响应（批次 B1）
+     * @param res_data RES 后的数据（剥离 0xFF 后**长度必须 >= 5**）
+     * @return 解析结果；长度不足返回 std::nullopt
+     *
+     * @details 布局见 `GetVersionResponse` 的 Doxygen（原始 PDF 第 114 页
+     *          Table 45）。本方法不做版本合法性判断（如是否在支持范围内），
+     *          只负责忠实解码——版本裁决由版本解析器负责。
+     */
+    [[nodiscard]] std::optional<GetVersionResponse> ParseGetVersionResponse(
+        BytesView res_data) const;
 
     /**
      * @brief 解析 GET_SEED 响应（Seed&Key，批次 7）
@@ -371,7 +499,12 @@ public:
 
 private:
     /// @brief CONNECT 协商出的 Session 字节序，决定多字节字段的读取方向
-    ByteOrder m_byte_order_;
+    ByteOrder m_byte_order_;  ///< 会话字节序（Intel/Motorola）
+
+    /// @brief 会话地址粒度（AG）
+    /// @details 用于按 AG 判定长度类规范约束（如 GET_ID 的
+    ///          `Length mod AG = 0`）。CONNECT 协商后由执行器重建解析器。
+    AddressGranularity m_ag_;
 
     /// @brief 按 Session 字节序读取 16 位字段
     /// @param data 响应数据

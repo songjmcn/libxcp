@@ -119,7 +119,8 @@ public:
     /**
      * @brief 设定 DTO 识别字段模式（运行时取证用；须在 Prepare 前调用）
      * @param type 识别字段模式（默认 RelativeWord）
-     * @param id_field_bytes 识别字段头长（默认 2；Absolute=1，RelativeByte=4）
+     * @param id_field_bytes 识别字段头长（默认 3；按规范 Figure 51/52/53：
+     *        Absolute=1，RelativeByte=2，RelativeWord=3，RelativeWordAligned=4）
      * @details 信封布局只能来自会话取证，绝不猜测（B-16）。worker 解码时
      *          按此模式 + 取证到的时间戳宽度切分识别字段（时间戳段不计入
      *          id_field_bytes，由解码器按 timestamp_size_bits 单独消费）。
@@ -190,7 +191,8 @@ private:
     std::uint32_t m_plan_generation_{0};   ///< Prepare 时记录的代际
     IdentificationFieldType m_id_field_type_{
         IdentificationFieldType::RelativeWord};  ///< 识别字段模式（取证可改）
-    std::size_t m_id_field_bytes_{2};            ///< 识别字段头长（不含时间戳）
+    std::size_t m_id_field_bytes_{3};  ///< 识别字段头长（不含时间戳）；
+                                       ///< RelativeWord=3（Figure 52）
     std::uint64_t m_timestamp_unit_ns_{
         0};  ///< tick→纳秒（0=未知不猜，R13；SetTimestampUnit 取证注入）
     bool m_timestamp_first_odt_only_{

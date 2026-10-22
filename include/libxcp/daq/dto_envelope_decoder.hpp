@@ -32,21 +32,25 @@ namespace calmcar::xcp {
  * // env.identity.daq_list / odt 定位到账本；env.payload 是净荷段
  * @endcode
  *
- * 解析语义（对照 XCPlite 实然 + XCP 1.3.0 docs L2452… 区域）：
- *  - Absolute：byte0 = 绝对 ODT 号（PID），净荷自 byte1；
- *  - RelativeByte：byte0 = 相对 ODT 号，byte1 = DAQ 扩展字节，净荷自 byte2；
- *  - RelativeWord / RelativeWordAligned：低字节 DAQ 号、高字节相对 ODT（Intel），
- *    净荷自 byte2；Aligned 模式要求帧长相对扩展表 4 字节对齐。
+ * 解析语义（原始 PDF 第 95-99 页 Figure 50-57 为准）：
+ *  - Absolute：识别字段 = PID（绝对 ODT 号），净荷自 byte1；
+ *  - RelativeByte：识别字段 = PID（相对 ODT）+ DAQ(BYTE)，净荷自 byte2；
+ *  - RelativeWord：识别字段 = PID（相对 ODT）+ DAQ(WORD)，净荷自 byte3；
+ *  - RelativeWordAligned：识别字段 = PID（相对 ODT）+ FILL + DAQ(WORD)，
+ *    净荷自 byte4；FILL 用于对齐，**取值不受规范约束**。
  *
  * 身份换算：
  *  - 相对模式把（相对 ODT + DtoFrameLayout::first_odt）还原为绝对 ODT 号存入
  *    identity.odt；Absolute 模式 byte0 即绝对 ODT 号。
- *  - identity.daq_list：Relative* 模式取自扩展字节/低字节；Absolute 模式由调用方
+ *  - identity.daq_list：Relative* 模式取自 DAQ 字段；Absolute 模式由调用方
  *    （运行态哪条 DAQ List 在跑）在路由阶段补充，本解码器置 0。
  *
  * 可选尾段（按 DtoFrameLayout 使能位）：
- *  - counter_enabled：识别字段后紧跟 1 字节 DTO 计数器；
- *  - timestamp_enabled：再紧跟 timestamp_size_bits/8 字节原始时间戳（小端）；
+ *  - counter_enabled：1 字节 DTO 计数器。**位置随模式而异**：
+ *    `RelativeWordAligned` 下 CTR **取代识别字段内的 FILL 字节**（原始 PDF
+ *    第 97-98 页 Figure 56），故不额外占字节；其余模式下位于识别字段**之后**。
+ *  - timestamp_enabled：再紧跟 timestamp_size_bits/8 字节原始时间戳，
+ *    按会话字节序解码；
  *  - pid_off：禁止（B-7），抛 XcpException(MalformedPacket)。
  *
  * 任何字段越界/不足 → 抛 XcpException(MalformedPacket)；不允许部分解释。

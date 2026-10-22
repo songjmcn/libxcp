@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
             return 3;
         }
         const calmcar::xcp::Bytes key{0xC1U, 0x5EU};
-        (void)executor.ExecuteUnlock(2U, key);
+        (void)executor.ExecuteUnlock(2U, key, true);
 
         // 通过异步 DTO 检查 64 字节摘要上限和“不伪造命令上下文”。
         calmcar::xcp::Bytes dto_packet(70U, 0xAAU);

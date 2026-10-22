@@ -136,6 +136,17 @@ public:
     [[nodiscard]] bool DaqSimulationEnabled() const;
 
     /**
+     * @brief 设置本测试 Slave 使用的 PACKET_ALIGNMENT（TL V1.5 §4.3.2.2）
+     * @param alignment 对齐位宽；默认 `PacketAlignment::Bit8`
+     * @details 设为 16/32 后，本 Slave 的**收发两侧**都会按该对齐插入/跳过
+     *          Tail FILL 字节，用于验证 Master 侧对齐编解码是否与对端一致。
+     *          必须在 `Start()` 之前设置。
+     * @note `PacketAlignment::Unknown` 会被视为非法配置：测试 Slave 不做
+     *       "猜测对齐"的容错，以便暴露 Master 侧的静默假定。
+     */
+    void SetPacketAlignment(PacketAlignment alignment);
+
+    /**
      * @brief 把某个 DAQ List 标记为 PREDEFINED（WRITE_DAQ 必须被拒）
      * @param daq_list DAQ List 号
      * @param predefined true = Slave 侧拒写该列表（ERR_WRITE_PROTECTED，
@@ -335,6 +346,10 @@ private:
     Address m_mta_{0};           ///< 当前 MTA 的 32 位地址部分
     AddressExtension m_mta_extension_{0};  ///< 当前 MTA 的地址扩展部分
     DatagramCtr m_send_ctr_{0};            ///< 下一个 Slave→Master Frame 的 CTR
+    /// @brief 本测试 Slave 使用的 PACKET_ALIGNMENT（T-08 端到端验证用）
+    /// @details 默认 Bit8，保持既有用例语义不变；设为 16/32 后收发都会
+    ///          真实插入/跳过 Tail FILL 字节。
+    PacketAlignment m_alignment_{PacketAlignment::Bit8};
     std::size_t m_command_count_{0};       ///< 已处理的 XCP 命令总数
     FaultInjection m_fault_;               ///< 当前故障注入配置
     std::size_t m_response_count_{0};  ///< 已生成的响应计数（故障注入定位用）

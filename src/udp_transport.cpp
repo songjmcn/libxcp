@@ -29,6 +29,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -128,6 +129,23 @@ bool parseIpv4(const std::string& text, in_addr* out) {
 }
 
 /**
+ * @brief 判断文本是否为 IPv6 字面量
+ * @param text 主机文本（不含端口）
+ * @return 是 IPv6 字面量返回 true
+ *
+ * @details 用于 T-06 能力边界：本库当前**只承诺 IPv4 UDP 单播**
+ *          （方案 §1.9A.3 第 4 项）。IPv6 必须被**显式识别并拒绝**，
+ *          而不是让 `inet_pton(AF_INET, ...)` 静默失败后给出一个笼统的
+ *          "地址非法"——后者会让调用方误以为是笔误而非能力缺失。
+ *
+ *          判据：含 ':' 即视为 IPv6 字面量（IPv4 点分十进制不含冒号；
+ *          主机名也走 IPv4 解析路径）。
+ */
+bool looksLikeIpv6(const std::string& text) {
+    return text.find(':') != std::string::npos;
+}
+
+/**
  * @brief 模 65536 的前向距离：从 base 前进多少步到达 value
  * @return 0..65535；value == base 时为 0
  */
@@ -162,6 +180,142 @@ struct UdpTransport::SocketImpl {
     bool bound{false};                    ///< 是否已成功绑定
     sockaddr_in remote{};                 ///< Open() 时解析并缓存的远端端点
 };
+
+// ---------------------------------------------------------------------------
+// WakeupPair：回环 UDP 自连唤醒对
+// ---------------------------------------------------------------------------
+
+/// @brief Close() 立即打断阻塞接收所用的唤醒 Socket 对
+/// @details 为什么用"回环 UDP 自连"而不是别的方案：
+///          - `socketpair()` 是 POSIX 专有，Windows 无对应原语；
+///          - Windows 的 `WSAEventSelect` 需要与 POSIX 分叉出两套等待逻辑，
+///            回归面翻倍；
+///          - 回环 UDP 在三个目标平台上语义一致，且与既有 UDP Socket 代码
+///            共用同一套错误处理辅助函数。
+///          为什么**不**回退到"Close() 先关数据 Socket"：见 Close() 内注释，
+///          那样会让句柄被 OS 回收并可能被本进程新建 Socket 复用，导致接收
+///          线程的迟到回调命中复用句柄，造成跨会话串扰。
+struct UdpTransport::WakeupPair {
+#if defined(_WIN32)
+    WinsockSession winsock;  ///< RAII 引用 WSAStartup/WSACleanup
+#endif
+    SocketHandle read_handle{kInvalidSocket};   ///< 本端（绑定后等待可读）
+    SocketHandle write_handle{kInvalidSocket};  ///< 对端（用于写入唤醒字节）
+    sockaddr_in read_addr{};                    ///< read_handle 绑定的实际地址
+};
+
+std::unique_ptr<UdpTransport::WakeupPair> UdpTransport::CreateWakeupPair() {
+    auto pair = std::make_unique<WakeupPair>();
+    // 1. 读端：绑定到回环地址的临时端口，供 select 监听与写入触发
+    pair->read_handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (pair->read_handle == kInvalidSocket) {
+        LIBXCP_LOG_WARNING("UDP wakeup socket create failed: {}",
+                           lastSocketError());
+        return nullptr;
+    }
+    sockaddr_in local{};
+    local.sin_family = AF_INET;
+    local.sin_port = htons(0);  // 由 OS 分配临时端口
+    ::inet_pton(AF_INET, "127.0.0.1", &local.sin_addr);
+    if (::bind(pair->read_handle, reinterpret_cast<sockaddr*>(&local),
+               sizeof(local)) != 0) {
+        LIBXCP_LOG_WARNING("UDP wakeup bind failed: {}", lastSocketError());
+        closeSocket(pair->read_handle);
+        pair->read_handle = kInvalidSocket;
+        return nullptr;
+    }
+    // 取回实际绑定的端口，写端需要连向它
+    socklen_t addr_len = sizeof(local);
+    if (::getsockname(pair->read_handle, reinterpret_cast<sockaddr*>(&local),
+                      &addr_len) != 0) {
+        LIBXCP_LOG_WARNING("UDP wakeup getsockname failed: {}",
+                           lastSocketError());
+        closeSocket(pair->read_handle);
+        pair->read_handle = kInvalidSocket;
+        return nullptr;
+    }
+    pair->read_addr = local;
+
+    // 3. 读端设为非阻塞：DrainWakeup 需要循环读到空（可能累积多次唤醒），
+    //    若保持阻塞会在最后一次 recv 上挂住。
+#if defined(_WIN32)
+    u_long non_blocking = 1;
+    if (::ioctlsocket(pair->read_handle, FIONBIO, &non_blocking) != 0) {
+        LIBXCP_LOG_WARNING("UDP wakeup set nonblocking failed: {}",
+                           lastSocketError());
+        closeSocket(pair->read_handle);
+        pair->read_handle = kInvalidSocket;
+        return nullptr;
+    }
+#else
+    const int flags = ::fcntl(pair->read_handle, F_GETFL, 0);
+    if (flags < 0 ||
+        ::fcntl(pair->read_handle, F_SETFL, flags | O_NONBLOCK) != 0) {
+        LIBXCP_LOG_WARNING("UDP wakeup set nonblocking failed: {}",
+                           lastSocketError());
+        closeSocket(pair->read_handle);
+        pair->read_handle = kInvalidSocket;
+        return nullptr;
+    }
+#endif
+
+    // 4. 写端：连向读端，之后可直接 send 唤醒字节
+    pair->write_handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (pair->write_handle == kInvalidSocket) {
+        LIBXCP_LOG_WARNING("UDP wakeup writer create failed: {}",
+                           lastSocketError());
+        closeSocket(pair->read_handle);
+        pair->read_handle = kInvalidSocket;
+        return nullptr;
+    }
+    if (::connect(pair->write_handle, reinterpret_cast<sockaddr*>(&local),
+                  sizeof(local)) != 0) {
+        LIBXCP_LOG_WARNING("UDP wakeup connect failed: {}", lastSocketError());
+        closeSocket(pair->write_handle);
+        closeSocket(pair->read_handle);
+        pair->write_handle = kInvalidSocket;
+        pair->read_handle = kInvalidSocket;
+        return nullptr;
+    }
+    return pair;
+}
+
+void UdpTransport::SignalWakeup(WakeupPair* pair) noexcept {
+    if (pair == nullptr || pair->write_handle == kInvalidSocket) {
+        return;
+    }
+    // 唤醒字节内容无意义，仅用于让读端变为可读；失败也不影响正确性
+    // （ReceiveLoop 仍有 SO_RCVTIMEO 轮询兜底），故显式忽略返回值。
+    const char token = '\0';
+#if defined(_WIN32)
+    (void)::send(pair->write_handle, &token, 1, 0);
+#else
+    (void)::send(pair->write_handle, &token, 1, MSG_NOSIGNAL);
+#endif
+}
+
+void UdpTransport::DrainWakeup(WakeupPair* pair) noexcept {
+    if (pair == nullptr || pair->read_handle == kInvalidSocket) {
+        return;
+    }
+    // 可能存在多次唤醒写入，循环读到空为止（读端已设为非阻塞）
+    char buffer[64];
+    for (;;) {
+#if defined(_WIN32)
+        const int received =
+            ::recv(pair->read_handle, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            break;
+        }
+#else
+        const ssize_t received =
+            ::recv(pair->read_handle, buffer, sizeof(buffer), 0);
+        if (received <= 0) {
+            break;
+        }
+#endif
+    }
+}
 
 // ---------------------------------------------------------------------------
 // 构造 / 析构
@@ -215,6 +369,30 @@ void UdpTransport::Open(IPacketListener& listener) {
             "UDP open rejected because receive poll interval is zero");
         throw detail::MakeInvalidArgument(
             "receive_poll_interval_ms 必须大于 0");
+    }
+    // PACKET_ALIGNMENT 必须已知：无 A2L 证据也无显式配置时，报文布局
+    // （是否含 Tail、含几字节）无法确定，静默按 8-bit 处理会与对端不兼容
+    if (m_config_.packet_alignment == PacketAlignment::Unknown) {
+        LIBXCP_LOG_ERROR("UDP open rejected because packet alignment unknown");
+        throw detail::MakeInvalidArgument(
+            "UdpTransportConfig::packet_alignment 不能为 Unknown："
+            "需要 A2L 的 PACKET_ALIGNMENT 或调用方显式指定 8/16/32");
+    }
+    // T-06 能力边界：本库只承诺 IPv4 UDP 单播；IPv6 显式报 Unsupported，
+    // 不得退化为"地址非法"这类无法区分笔误与能力缺失的报错
+    if (looksLikeIpv6(m_config_.remote_host)) {
+        LIBXCP_LOG_ERROR("UDP open rejected: IPv6 remote unsupported host={}",
+                         m_config_.remote_host);
+        throw detail::MakeUnsupportedFeature(
+            "IPv6 UDP 传输尚未实现（本版本基础 Profile 仅承诺 IPv4 UDP "
+            "单播）：remote_host=" + m_config_.remote_host);
+    }
+    if (looksLikeIpv6(m_config_.local_host)) {
+        LIBXCP_LOG_ERROR("UDP open rejected: IPv6 local unsupported host={}",
+                         m_config_.local_host);
+        throw detail::MakeUnsupportedFeature(
+            "IPv6 UDP 传输尚未实现（本版本基础 Profile 仅承诺 IPv4 UDP "
+            "单播）：local_host=" + m_config_.local_host);
     }
 
     auto impl = std::make_unique<SocketImpl>();
@@ -318,6 +496,16 @@ void UdpTransport::Open(IPacketListener& listener) {
     }
 
     m_running_.store(true, std::memory_order_release);
+    // 创建唤醒对：使 Close() 能立即打断阻塞中的接收线程，而不必等满一个
+    // 轮询周期。创建失败不致命——ReceiveLoop 会用 SO_RCVTIMEO 轮询兜底，
+    // 退出延迟退化为一个轮询周期（即修复前的既有行为）。
+    m_wakeup_ = CreateWakeupPair();
+    if (m_wakeup_ == nullptr) {
+        LIBXCP_LOG_WARNING(
+            "UDP wakeup pair unavailable; Close() latency falls back to "
+            "receive_poll_interval_ms={}ms",
+            m_config_.receive_poll_interval_ms);
+    }
     try {
         m_receive_thread_ = std::thread([this] { ReceiveLoop(); });
     } catch (const std::system_error& e) {
@@ -337,8 +525,12 @@ void UdpTransport::Close() {
     // 1. 通知接收线程退出
     m_running_.store(false, std::memory_order_release);
 
-    // 2. 等待接收线程结束（其退出前负责回调 OnTransportClosed）。
-    //    唤醒依赖 Open() 设置的 SO_RCVTIMEO 轮询，因此不再需要先关 Socket；
+    // 2. 立即唤醒阻塞在 select/recvfrom 的接收线程，使其无需等满一个轮询
+    //    周期即可观察到 m_running_==false。
+    SignalWakeup(m_wakeup_.get());
+
+    // 3. 等待接收线程结束（其退出前负责回调 OnTransportClosed）。
+    //    唤醒失效时仍有 SO_RCVTIMEO 轮询兜底，因此不再需要先关 Socket；
     //    反过来，若在 join 之前关闭 Socket，其句柄号会被 OS
     //    立即回收并可能分配给 进程中其他新建的
     //    Socket，而接收线程此刻仍可能在处理入站包并回调监听器，
@@ -347,10 +539,22 @@ void UdpTransport::Close() {
         m_receive_thread_.join();
     }
 
-    // 3. 线程已停，此处关闭 Socket 不再存在竞态
+    // 4. 线程已停，此处关闭 Socket 不再存在竞态
     if (m_socket_ && m_socket_->handle != kInvalidSocket) {
         closeSocket(m_socket_->handle);
         m_socket_->handle = kInvalidSocket;
+    }
+    // 5. 释放唤醒对（读端/写端均在此关闭）
+    if (m_wakeup_ != nullptr) {
+        if (m_wakeup_->read_handle != kInvalidSocket) {
+            closeSocket(m_wakeup_->read_handle);
+            m_wakeup_->read_handle = kInvalidSocket;
+        }
+        if (m_wakeup_->write_handle != kInvalidSocket) {
+            closeSocket(m_wakeup_->write_handle);
+            m_wakeup_->write_handle = kInvalidSocket;
+        }
+        m_wakeup_.reset();
     }
 
     m_socket_.reset();
@@ -388,7 +592,10 @@ void UdpTransport::Send(BytesView packet) {
 
     UdpFrame frame;
     try {
-        frame = EncodeUdpFrame(packet, ctr);
+        // 按会话协商到的 PACKET_ALIGNMENT 编码：Tail 长度由 LEN 与
+        // alignment 推出，使后继 XCP Packet 满足对齐（TL V1.5 §4.3.2.2）
+        frame = EncodeUdpFrameAligned(packet, ctr,
+                                      m_config_.packet_alignment);
     } catch (...) {
         LIBXCP_LOG_ERROR("UDP frame encoding failed ctr={} xcp_bytes={}", ctr,
                          packet.size());
@@ -451,6 +658,71 @@ void UdpTransport::ReceiveLoop() {
     std::string close_reason = "Transport 正常关闭";
 
     while (m_running_.load(std::memory_order_acquire)) {
+        // ---- 用 select 同时等待数据 Socket 与唤醒 Socket ----
+        // 唤醒 Socket 可读即表示 Close() 已请求退出，可立即返回；
+        // 数据 Socket 可读则进入 recvfrom 取包。
+        // 超时仍用 receive_poll_interval_ms 作为**兜底轮询**：万一唤醒字节
+        // 丢失（极端资源耗尽下 send 失败），退出延迟仍有一个明确上界。
+        fd_set read_set;
+        FD_ZERO(&read_set);
+        const SocketHandle data_handle =
+            (m_socket_ ? m_socket_->handle : kInvalidSocket);
+        if (data_handle != kInvalidSocket) {
+            FD_SET(data_handle, &read_set);
+        }
+        const SocketHandle wake_handle =
+            (m_wakeup_ ? m_wakeup_->read_handle : kInvalidSocket);
+        if (wake_handle != kInvalidSocket) {
+            FD_SET(wake_handle, &read_set);
+        }
+        if (data_handle == kInvalidSocket && wake_handle == kInvalidSocket) {
+            break;  // 无可用句柄，无从等待
+        }
+
+        timeval wait{};
+        wait.tv_sec =
+            static_cast<long>(m_config_.receive_poll_interval_ms / 1000U);
+        wait.tv_usec = static_cast<long>(
+            (m_config_.receive_poll_interval_ms % 1000U) * 1000U);
+#if defined(_WIN32)
+        const int ready = ::select(0, &read_set, nullptr, nullptr, &wait);
+#else
+        const int ready =
+            ::select(FD_SETSIZE, &read_set, nullptr, nullptr, &wait);
+#endif
+        if (ready < 0) {
+            if (isInterruptedError()) {
+                break;
+            }
+            if (!m_running_.load(std::memory_order_acquire)) {
+                break;  // Close() 触发，正常退出
+            }
+            // 其它 select 错误（含超时以外的瞬态失败）：警告后继续
+            const auto error = lastSocketError();
+            if (listener != nullptr) {
+                listener->OnTransportWarning("select 失败: " + error);
+            }
+            continue;
+        }
+        // ready == 0 表示兜底轮询超时，回到 while 重新检查关闭标记
+        if (ready == 0) {
+            continue;
+        }
+
+        // 唤醒 Socket 可读：排空并检查关闭标记
+        if (wake_handle != kInvalidSocket && FD_ISSET(wake_handle, &read_set)) {
+            DrainWakeup(m_wakeup_.get());
+            if (!m_running_.load(std::memory_order_acquire)) {
+                break;  // Close() 触发，正常退出
+            }
+            // 非关闭场景的意外唤醒：继续等待（不视为错误）
+            continue;
+        }
+        if (!FD_ISSET(data_handle, &read_set)) {
+            continue;  // 无数据可读（理论上不可达），回到等待
+        }
+
+        // ---- 数据 Socket 可读：取出一个 Datagram ----
         sockaddr_in src{};
         socklen_t src_len = sizeof(src);
         const int received =
@@ -552,7 +824,9 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
     }
 
     const BytesView view{data, size};
-    auto frames = DecodeUdpDatagram(view);
+    // 按会话协商到的 PACKET_ALIGNMENT 解码，跳过每 Frame 尾部的 FILL
+    auto frames =
+        DecodeUdpDatagramAligned(view, m_config_.packet_alignment);
     if (!frames) {
         // 原子性策略：任一 Frame 非法则整个 Datagram 不交付（§8.1 第 7 条）
         if (listener != nullptr) {

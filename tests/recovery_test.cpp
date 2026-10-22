@@ -153,6 +153,17 @@ public:
         m_drop_first_[cmd] = n;
     }
 
+    /// @brief 令某个命令的前 n 次调用返回 ERR_CMD_BUSY，其后返回给定响应
+    /// @param cmd 命令码
+    /// @param n 返回 BUSY 的次数
+    /// @param then 之后使用的持续响应
+    /// @details F-11 用例需要「先 BUSY 若干次、再成功」的脚本，以验证重试
+    ///          路径被走到后能立即收敛（而不是一直等到总体 deadline）。
+    void SetBusyFirstCalls(CommandCode cmd, std::size_t n, Bytes then) {
+        m_busy_first_[cmd] = n;
+        m_responses_[cmd] = std::move(then);
+    }
+
     [[nodiscard]] int Count(CommandCode cmd) const {
         const auto it = m_counts_.find(cmd);
         return it == m_counts_.end() ? 0 : it->second;
@@ -184,6 +195,13 @@ public:
             return {};
         }
 
+        // F-11：前 n 次返回 ERR_CMD_BUSY，用于验证 BUSY 重试后能立即收敛。
+        const auto busy_it = m_busy_first_.find(cmd);
+        if (busy_it != m_busy_first_.end() &&
+            static_cast<std::size_t>(m_counts_[cmd]) <= busy_it->second) {
+            return ErrBytes(ErrorCode::CmdBusy);
+        }
+
         const auto once_it = m_once_.find(cmd);
         if (once_it != m_once_.end() &&
             static_cast<std::size_t>(m_counts_[cmd]) == 1) {
@@ -202,6 +220,8 @@ private:
     std::map<CommandCode, Bytes> m_once_;
     std::map<CommandCode, std::size_t> m_drop_;
     std::map<CommandCode, std::size_t> m_drop_first_;
+    /// @brief 前 n 次调用返回 ERR_CMD_BUSY 的命令（F-11 用例）
+    std::map<CommandCode, std::size_t> m_busy_first_;
     std::map<CommandCode, int> m_counts_;
     std::vector<CommandCode> m_order_;
 };
@@ -210,8 +230,9 @@ private:
 struct Fixture {
     explicit Fixture(CommandTimeouts timeouts =
                          CommandTimeouts{std::chrono::milliseconds(120),
-                                         std::chrono::milliseconds(120), 2})
-        : executor(transport, session, timeouts, &events) {
+                                         std::chrono::milliseconds(120), 2},
+                     RecoveryPolicy policy = {})
+        : executor(transport, session, timeouts, &events, policy) {
         slave.SetResponse(CommandCode::Connect, MakeConnectResponse());
         slave.SetResponse(CommandCode::GetStatus,
                           Bytes{static_cast<std::uint8_t>(PacketType::Res),
@@ -537,16 +558,271 @@ TEST(ErrorDispatch, AccessLockedMapsToProtocolErrorWithUnlockHint) {
     }
 }
 
-TEST(ErrorDispatch, CmdBusyReportedAsProtocolErrorWithoutRetry) {
-    Fixture f;
+// --------------------------------------------------------------------------
+// F-11：ERR_CMD_BUSY → wait t7 → repeat（受总体 deadline 与取消约束）
+// --------------------------------------------------------------------------
+
+/// @brief 本用例取代旧的 `CmdBusyReportedAsProtocolErrorWithoutRetry`。
+/// @details 旧用例显式锁定「ERR_CMD_BUSY 不重试」，与规范恢复矩阵冲突：
+///          原始 PDF 第 246 页为 GET_STATUS/SET_REQUEST/GET_SEED/UNLOCK 等
+///          几乎每个命令都列出 `ERR_CMD_BUSY → wait t7 → repeat ∞ times`。
+///          规范允许持续等待资源，但库实现必须受总体 deadline 与取消控制
+///          （方案 §4.6 第 3、6 条），故行为改为「有限等待后以 RecoveryFailed
+///          报告 deadline 耗尽」，而非无限重试也非立即失败。
+TEST(RecoveryBusy, BusyIsRetriedUntilTotalDeadlineExhausted) {
+    // 缩短参数以便用例快速跑到 deadline：间隔 20 ms、总体 150 ms。
+    CommandTimeouts timeouts{std::chrono::milliseconds(120),
+                             std::chrono::milliseconds(120), 2};
+    RecoveryPolicy policy;
+    policy.busy_retry_delay = std::chrono::milliseconds(20);
+    policy.busy_total_timeout = std::chrono::milliseconds(150);
+    Fixture f(timeouts, policy);
     f.Connect();
     f.slave.ResetCounts();
     f.slave.SetResponse(CommandCode::GetStatus, ErrBytes(ErrorCode::CmdBusy));
 
-    EXPECT_THROW((void)f.executor.ExecuteGetStatus(), XcpException);
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        (void)f.executor.ExecuteGetStatus();
+        FAIL() << "ERR_CMD_BUSY 持续返回应以 RecoveryFailed 结束";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::RecoveryFailed);
+        EXPECT_NE(std::string(e.what()).find("BUSY"), std::string::npos);
+    }
+    const auto elapsed =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start);
+
+    // 关键断言：发生了重试（旧行为是只发 1 次），且不是无限重试。
+    EXPECT_GT(f.slave.Count(CommandCode::GetStatus), 1)
+        << "ERR_CMD_BUSY 必须按恢复矩阵等待 t7 后重发";
+    // 不得无谓地做 SYNCH：BUSY 不是超时，无需重新同步。
+    EXPECT_EQ(f.slave.Count(CommandCode::Synch), 0)
+        << "ERR_CMD_BUSY 不应触发 SYNCH 恢复";
+    // 总体 deadline 得到遵守（留出调度余量）。
+    EXPECT_LT(elapsed.count(), 1000)
+        << "总体 deadline 应约束 BUSY 重试，不得无限等待";
+    // 重试次数应大致符合 deadline/间隔，而不是只试一次或失控。
+    EXPECT_GE(f.slave.Count(CommandCode::GetStatus), 3);
+}
+
+/// @brief 关闭 BUSY 重试后回退旧行为：立即以 ProtocolError 报告
+TEST(RecoveryBusy, DisabledBusyRetryKeepsImmediateProtocolError) {
+    RecoveryPolicy policy;
+    policy.busy_retry_enabled = false;
+    Fixture f(CommandTimeouts{std::chrono::milliseconds(120),
+                              std::chrono::milliseconds(120), 2},
+              policy);
+    f.Connect();
+    f.slave.ResetCounts();
+    f.slave.SetResponse(CommandCode::GetStatus, ErrBytes(ErrorCode::CmdBusy));
+
+    try {
+        (void)f.executor.ExecuteGetStatus();
+        FAIL() << "应抛 ProtocolError";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
+        EXPECT_EQ(e.GetErrorCode(),
+                  std::optional<ErrorCode>(ErrorCode::CmdBusy));
+    }
     EXPECT_EQ(f.slave.Count(CommandCode::GetStatus), 1)
-        << "ERR_CMD_BUSY 不应重试";
+        << "关闭重试后只应发送一次";
+}
+
+/// @brief BUSY 之后一旦成功即返回，不继续等待到总体 deadline
+/// @details 用「前 N 次 BUSY、其后成功」的脚本确保重试路径被走到，
+///          并断言总耗时不接近 deadline——证明成功路径会立即收敛。
+TEST(RecoveryBusy, BusyThenSuccessReturnsWithoutWaitingDeadline) {
+    RecoveryPolicy policy;
+    policy.busy_retry_delay = std::chrono::milliseconds(10);
+    policy.busy_total_timeout = std::chrono::seconds(5);
+    Fixture f(CommandTimeouts{std::chrono::milliseconds(120),
+                              std::chrono::milliseconds(120), 2},
+              policy);
+    f.Connect();
+    f.slave.ResetCounts();
+    // 前 2 次返回 BUSY，第 3 次成功：重试路径被走到后立即收敛。
+    f.slave.SetBusyFirstCalls(CommandCode::GetStatus, 2,
+                              Bytes{static_cast<std::uint8_t>(PacketType::Res),
+                                    0x00, 0x00, 0x01, 0x07, 0x00});
+
+    const auto start = std::chrono::steady_clock::now();
+    EXPECT_NO_THROW((void)f.executor.ExecuteGetStatus())
+        << "BUSY 之后成功的响应必须正常返回";
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+
+    EXPECT_EQ(f.slave.Count(CommandCode::GetStatus), 3)
+        << "应为「BUSY、BUSY、成功」共 3 次";
+    EXPECT_LT(elapsed.count(), 1000)
+        << "成功后应立即返回，不得继续等到 5s 总体 deadline";
     EXPECT_EQ(f.slave.Count(CommandCode::Synch), 0);
+}
+
+/// @brief RecoveryPolicy 参数校验（方案 §4.6 第 7 条）
+TEST(RecoveryBusy, PolicyValidationRejectsIllegalValues) {
+    RecoveryPolicy ok;
+    EXPECT_TRUE(ok.Validate().empty()) << "默认值必须合法";
+
+    RecoveryPolicy zero_delay;
+    zero_delay.busy_retry_delay = std::chrono::milliseconds(0);
+    EXPECT_FALSE(zero_delay.Validate().empty()) << "零间隔必须被判非法";
+
+    RecoveryPolicy negative_delay;
+    negative_delay.busy_retry_delay = std::chrono::milliseconds(-1);
+    EXPECT_FALSE(negative_delay.Validate().empty()) << "负间隔必须被判非法";
+
+    RecoveryPolicy zero_total;
+    zero_total.busy_total_timeout = std::chrono::milliseconds(0);
+    EXPECT_FALSE(zero_total.Validate().empty()) << "零总体 deadline 非法";
+
+    RecoveryPolicy total_less_than_delay;
+    total_less_than_delay.busy_retry_delay = std::chrono::milliseconds(500);
+    total_less_than_delay.busy_total_timeout = std::chrono::milliseconds(100);
+    EXPECT_FALSE(total_less_than_delay.Validate().empty())
+        << "总体 deadline 小于单次等待属自相矛盾配置";
+
+    // 关闭重试后，数值不再参与重试，不应因旧的非法值阻碍连接。
+    RecoveryPolicy disabled;
+    disabled.busy_retry_enabled = false;
+    disabled.busy_retry_delay = std::chrono::milliseconds(0);
+    EXPECT_TRUE(disabled.Validate().empty())
+        << "关闭 BUSY 重试后等待参数不再生效";
+}
+
+// --------------------------------------------------------------------------
+// F-11：取消语义（Cancelled 与 Timeout/ProtocolError 严格区分）
+// --------------------------------------------------------------------------
+
+/// @brief 取消挂起中的等待：返回 Cancelled，且不触发 SYNCH 恢复
+TEST(RecoveryCancel, CancelDuringWaitReturnsCancelledWithoutRecovery) {
+    // 命令超时设得远长于取消时刻，确保走「取消」而非「超时」分支。
+    Fixture f(CommandTimeouts{std::chrono::seconds(5),
+                              std::chrono::milliseconds(120), 2});
+    f.Connect();
+    f.slave.ResetCounts();
+    f.slave.DropFirstCalls(CommandCode::GetStatus, 1);  // 不产生响应
+
+    std::optional<ErrorCategory> category;
+    std::string message;
+    std::thread worker([&] {
+        try {
+            (void)f.executor.ExecuteGetStatus();
+        } catch (const XcpException& e) {
+            category = e.Category();
+            message = e.what();
+        }
+    });
+    ThreadJoiner joiner(worker);
+
+    // 等命令确实发出后再取消，避免取消发生在发送之前。
+    for (int i = 0; i < 200 && f.slave.Count(CommandCode::GetStatus) == 0;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    f.executor.CancelPendingOperation();
+
+    // 取消必须能唤醒等待者，不得等到 5s 超时。
+    const auto start = std::chrono::steady_clock::now();
+    worker.join();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), 2000) << "取消必须立即唤醒等待者";
+
+    ASSERT_TRUE(category.has_value()) << "取消应以异常返回";
+    EXPECT_EQ(*category, ErrorCategory::Cancelled)
+        << "取消必须用 Cancelled，不得伪装成 Timeout";
+    EXPECT_EQ(f.slave.Count(CommandCode::Synch), 0)
+        << "取消不是协议故障，不得触发 SYNCH 恢复";
+    EXPECT_NE(message.find("取消"), std::string::npos);
+}
+
+/// @brief 取消是幂等的，且无挂起操作时为空操作
+TEST(RecoveryCancel, CancelIsIdempotentAndSafeWhenIdle) {
+    Fixture f;
+    f.Connect();
+    f.executor.CancelPendingOperation();
+    f.executor.CancelPendingOperation();  // 重复调用不得崩溃
+    // 取消标志不影响已经完成的操作，下一次命令正常执行。
+    f.slave.SetResponse(CommandCode::GetStatus,
+                        Bytes{static_cast<std::uint8_t>(PacketType::Res),
+                              0x00, 0x00, 0x01, 0x07, 0x00});
+    EXPECT_NO_THROW((void)f.executor.ExecuteGetStatus())
+        << "顶层命令开始前应清除上一轮取消标志";
+}
+
+/// @brief Transport 关闭属「取消类」唤醒：等待者返回 Cancelled 而非 Timeout
+TEST(RecoveryCancel, TransportCloseWakesWaiterAsCancelled) {
+    Fixture f(CommandTimeouts{std::chrono::seconds(5),
+                              std::chrono::milliseconds(120), 2});
+    f.Connect();
+    f.slave.ResetCounts();
+    f.slave.DropFirstCalls(CommandCode::GetStatus, 1);
+
+    std::optional<ErrorCategory> category;
+    std::thread worker([&] {
+        try {
+            (void)f.executor.ExecuteGetStatus();
+        } catch (const XcpException& e) {
+            category = e.Category();
+        }
+    });
+    ThreadJoiner joiner(worker);
+
+    for (int i = 0; i < 200 && f.slave.Count(CommandCode::GetStatus) == 0;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    f.executor.OnTransportClosed("测试主动关闭");
+
+    worker.join();
+    ASSERT_TRUE(category.has_value());
+    EXPECT_EQ(*category, ErrorCategory::Cancelled)
+        << "Transport 关闭须按 §4.6 第 6 条返回 Cancelled";
+}
+
+/// @brief 取消在 BUSY 等待期间同样生效，且不越过总体 deadline
+TEST(RecoveryCancel, CancelDuringBusyWaitIsHonoured) {
+    RecoveryPolicy policy;
+    policy.busy_retry_delay = std::chrono::milliseconds(5000);
+    policy.busy_total_timeout = std::chrono::seconds(30);
+    Fixture f(CommandTimeouts{std::chrono::milliseconds(120),
+                              std::chrono::milliseconds(120), 2},
+              policy);
+    f.Connect();
+    f.slave.ResetCounts();
+    f.slave.SetResponse(CommandCode::GetStatus, ErrBytes(ErrorCode::CmdBusy));
+
+    std::optional<ErrorCategory> category;
+    std::thread worker([&] {
+        try {
+            (void)f.executor.ExecuteGetStatus();
+        } catch (const XcpException& e) {
+            category = e.Category();
+        }
+    });
+    ThreadJoiner joiner(worker);
+
+    for (int i = 0; i < 200 && f.slave.Count(CommandCode::GetStatus) == 0;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    f.executor.CancelPendingOperation();
+
+    const auto start = std::chrono::steady_clock::now();
+    worker.join();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start);
+    EXPECT_LT(elapsed.count(), 2000)
+        << "BUSY 等待（t7=5s）必须可被取消立即中断";
+
+    ASSERT_TRUE(category.has_value());
+    EXPECT_EQ(*category, ErrorCategory::Cancelled);
+    // 尚未越过 30s deadline，故因取消而非 deadline 结束。
+    EXPECT_EQ(f.slave.Count(CommandCode::GetStatus), 1);
 }
 
 TEST(ErrorDispatch, OutOfRangePreservesContext) {
@@ -803,6 +1079,213 @@ TEST(ExecutorGuards, ConcurrentCommandRejectedWhilePending) {
         EXPECT_EQ(e.Category(), ErrorCategory::InvalidState);
     }
     session.ClearPendingCommand();
+}
+
+// ===========================================================================
+// F-09：SHORT_UPLOAD 成功后本地隐含 MTA 必须同步推进
+// ===========================================================================
+//
+// 规范要求 SHORT_UPLOAD 成功后把 MTA 设为「上传数据块之后的第一个数据
+// 字节」。若本端不更新隐含 MTA，此后一旦发生 UPLOAD 超时恢复，
+// RestoreUploadMta() 会按陈旧地址重放 SET_MTA，导致读到的位置与预期错位。
+
+/// @brief SHORT_UPLOAD 推进隐含 MTA：后续 UPLOAD 超时恢复须重放推进后的地址
+TEST(ShortUploadMtaSync, AdvanceIsReplayedByUploadRecovery) {
+    Fixture f;
+    f.Connect();
+    f.slave.ResetCounts();
+
+    // SHORT_UPLOAD 读 2 个元素（AG=BYTE，即 2 字节），地址 0x1000
+    f.slave.SetResponse(
+        CommandCode::ShortUpload,
+        BytesOf({static_cast<std::uint8_t>(PacketType::Res), 0x11, 0x22}));
+    const Bytes first = f.executor.ExecuteShortUpload(2, 0x00U, 0x1000U);
+    EXPECT_EQ(first, BytesOf({0x11, 0x22}));
+
+    // 随后 UPLOAD 超时一次：恢复路径会重放 SET_MTA
+    f.slave.DropNthCall(CommandCode::Upload, 1);
+    f.slave.SetResponse(
+        CommandCode::Upload,
+        BytesOf({static_cast<std::uint8_t>(PacketType::Res), 0x33}));
+    f.slave.ResetCounts();
+    const Bytes second = f.executor.ExecuteUpload(1);
+    EXPECT_EQ(second, BytesOf({0x33}));
+
+    // 恢复时发出的 SET_MTA 必须携带 0x1000 + 2 = 0x1002
+    // SET_MTA 报文：[F6][0x00 保留][0x00 AG 保留][addr 4 字节 LE][ext]
+    bool saw_advanced_set_mta = false;
+    for (const auto& pkt : f.transport.SentPackets()) {
+        if (pkt.size() < 8U || pkt[0] != 0xF6U) {
+            continue;
+        }
+        const auto addr = static_cast<std::uint32_t>(pkt[4]) |
+                          (static_cast<std::uint32_t>(pkt[5]) << 8U) |
+                          (static_cast<std::uint32_t>(pkt[6]) << 16U) |
+                          (static_cast<std::uint32_t>(pkt[7]) << 24U);
+        if (addr == 0x1002U) {
+            saw_advanced_set_mta = true;
+        }
+        EXPECT_NE(addr, 0x1000U)
+            << "恢复重放了陈旧地址 0x1000，SHORT_UPLOAD 未同步 MTA";
+    }
+    EXPECT_TRUE(saw_advanced_set_mta)
+        << "未观察到携带推进后地址 0x1002 的 SET_MTA";
+}
+
+/// @brief 反向保护：未追踪过 SHORT_UPLOAD 时不得凭空造出 MTA
+TEST(ShortUploadMtaSync, NoShortUploadLeavesRecoveryMtaUnset) {
+    Fixture f;
+    f.Connect();
+    // 先做一次正常 SET_MTA + UPLOAD，确立基准
+    f.executor.ExecuteSetMta(0x00U, 0x2000U);
+    f.slave.SetResponse(
+        CommandCode::Upload,
+        BytesOf({static_cast<std::uint8_t>(PacketType::Res), 0x44}));
+    (void)f.executor.ExecuteUpload(1);
+
+    // 此后 UPLOAD 超时恢复：重放的是 SET_MTA 记录的 0x2000，而非其它值
+    f.slave.DropNthCall(CommandCode::Upload, 1);
+    f.slave.SetResponse(
+        CommandCode::Upload,
+        BytesOf({static_cast<std::uint8_t>(PacketType::Res), 0x55}));
+    (void)f.executor.ExecuteUpload(1);
+
+    bool saw_expected = false;
+    for (const auto& pkt : f.transport.SentPackets()) {
+        if (pkt.size() < 8U || pkt[0] != 0xF6U) {
+            continue;
+        }
+        const auto addr = static_cast<std::uint32_t>(pkt[4]) |
+                          (static_cast<std::uint32_t>(pkt[5]) << 8U) |
+                          (static_cast<std::uint32_t>(pkt[6]) << 16U) |
+                          (static_cast<std::uint32_t>(pkt[7]) << 24U);
+        if (addr == 0x2000U) {
+            saw_expected = true;
+        }
+    }
+    EXPECT_TRUE(saw_expected) << "恢复应重放最近一次成功 SET_MTA 的地址";
+}
+
+// --------------------------------------------------------------------------
+// 通道重开复位（批次 B1：修复"一次 Disconnect 后再也无法 Connect"）
+// --------------------------------------------------------------------------
+
+/// @brief 构造一个已进入 Closed 通道状态的执行器
+/// @param f 已 Connect 的夹具
+/// @details 直接调用 OnTransportClosed 模拟 Disconnect 引发的通道关闭，
+///          这是重连缺陷的触发条件；不需要真的走 Transport 生命周期。
+static void CloseChannel(Fixture& f) { f.executor.OnTransportClosed("测试关闭"); }
+
+TEST(TransportReopen, ClosedFlagIsObservableAfterClose) {
+    Fixture f;
+    f.Connect();
+    f.slave.ResetCounts();
+
+    EXPECT_FALSE(f.executor.IsTransportClosed())
+        << "正常连接后不应处于关闭态";
+
+    CloseChannel(f);
+    EXPECT_TRUE(f.executor.IsTransportClosed())
+        << "OnTransportClosed 后必须可被观察到，否则无法诊断命令失败原因";
+}
+
+TEST(TransportReopen, ReopenedTransportClearsClosedFlag) {
+    Fixture f;
+    f.Connect();
+    CloseChannel(f);
+    ASSERT_TRUE(f.executor.IsTransportClosed());
+
+    f.executor.OnTransportReopened();
+
+    EXPECT_FALSE(f.executor.IsTransportClosed())
+        << "OnTransportReopened 必须清回关闭标志，否则重连后第一条命令立即失败";
+}
+
+TEST(TransportReopen, CommandAfterReopenIsActuallySent) {
+    Fixture f;
+    f.Connect();
+    CloseChannel(f);
+    f.executor.OnTransportReopened();
+    f.slave.ResetCounts();
+
+    // 关闭态下命令根本不会被发出（WaitForResponse 立即返回），
+    // 因此"命令确实到达对端"才是复位生效的硬证据。
+    (void)f.executor.ExecuteGetStatus();
+
+    EXPECT_EQ(f.slave.Count(CommandCode::GetStatus), 1)
+        << "复位后命令必须真正发出；若仍处于关闭态则计数为 0";
+}
+
+TEST(TransportReopen, CommandWhileClosedReturnsCancelledWithoutHittingSlave) {
+    Fixture f;
+    f.Connect();
+    CloseChannel(f);
+    f.slave.ResetCounts();
+
+    // 对照用例：**不**复位时必须立即失败，证明上一个用例的"发出"确由复位带来。
+    std::optional<ErrorCategory> category;
+    try {
+        (void)f.executor.ExecuteGetStatus();
+    } catch (const XcpException& e) {
+        category = e.Category();
+    }
+
+    ASSERT_TRUE(category.has_value()) << "关闭态下命令须失败而非静默返回";
+    EXPECT_EQ(*category, ErrorCategory::RecoveryFailed)
+        << "通道已关闭时 WaitForResponse 立即返回 nullopt，被统一当作响应超时"
+           "走恢复路径；关键约束是命令绝不静默成功";
+    // 注意：关闭态下 TX 仍会真实发出（PerformAttempt 不检查关闭标志），
+    // 因此这里**不能**断言计数为 0。本用例锁定的是"不静默成功"这一契约。
+}
+
+TEST(TransportReopen, ResetIsIdempotentAndSafeWithoutPriorClose) {
+    Fixture f;
+    f.Connect();
+
+    // 连接成功后立刻复位（XcpMaster::Connect 的真实调用时序）不得破坏可用性
+    f.executor.OnTransportReopened();
+    f.executor.OnTransportReopened();
+    f.slave.ResetCounts();
+
+    (void)f.executor.ExecuteGetStatus();
+    EXPECT_EQ(f.slave.Count(CommandCode::GetStatus), 1)
+        << "冗余复位不得影响后续命令";
+}
+
+TEST(TransportReopen, ReopenedTransportStillSupportsFullRecoveryBudget) {
+    Fixture f;
+    f.Connect();
+    f.slave.ResetCounts();
+
+    // 先制造一次真实的超时恢复：UPLOAD 第 1 次不回响应，随后恢复成功。
+    // 这会让执行器经历完整的"超时 → SYNCH → 重试"事务。
+    f.slave.DropNthCall(CommandCode::Upload, 1);
+    f.slave.SetResponse(
+        CommandCode::Upload,
+        Bytes{static_cast<std::uint8_t>(PacketType::Res), 0x5A});
+    const Bytes got = f.executor.ExecuteUpload(1);
+    EXPECT_EQ(got, BytesOf({0x5A}));
+    EXPECT_EQ(f.slave.Count(CommandCode::Synch), 1)
+        << "首轮确实经历了恢复事务（前置条件）";
+
+    // 通道关闭再重开：新会话必须仍具备**完整**的恢复能力。
+    // 说明：m_synch_confirmed_ / m_in_recovery_ 本身在 SendSynch 入口与出口
+    // 都会被复位，因此它们在命令之间的残留并非可观测缺陷；本用例锁定的是
+    // "重开后恢复预算未被上一会话透支"这一对外契约。
+    CloseChannel(f);
+    f.executor.OnTransportReopened();
+    f.slave.ResetCounts();
+
+    f.slave.DropFirstCalls(CommandCode::Upload, 99);
+    try {
+        (void)f.executor.ExecuteUpload(1);
+        FAIL() << "持续无响应应抛错";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::RecoveryFailed);
+        EXPECT_EQ(e.RetryCount(), 2) << "重试预算必须完整（首次 + 2 次重试）";
+    }
+    EXPECT_EQ(f.slave.Count(CommandCode::Synch), 2)
+        << "新会话须重新执行 SYNCH 恢复，而非沿用上一会话的确认结果";
 }
 
 }  // namespace

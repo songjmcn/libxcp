@@ -199,10 +199,16 @@ std::string_view SessionStateName(SessionState state) noexcept {
 
 std::optional<XcpAddress40> XcpAddress40::Advance(
     ElementCount elements, AddressGranularity ag) const noexcept {
-    // 先做乘法溢出检查（ElementCount * AG 字节数），再检查地址回绕
-    const auto bytes = static_cast<std::uint64_t>(elements) *
-                       static_cast<std::uint64_t>(AgToBytes(ag));
-    const auto sum = static_cast<std::uint64_t>(address) + bytes;
+    // 地址按元素计数。AG 是"单个地址所含元素的尺寸"，规范原文见 XCP V1.5.0
+    // 原始 PDF 第 112 页："The address granularity indicates the size of an
+    // element contained at a single address. It is needed if the master has
+    // to do address calculation."；第 113 页 Table 43 佐证：WORD 下
+    // Address n = Byte 00、Address n+1 = Byte 02，地址每 +1 前进一个元素。
+    // 因此前进 n 个元素即 address + n；AG 只用于字节长度换算，不参与地址推进。
+    // 修正前误按 elements * AgToBytes(ag) 推进，AG>1 时会多进 AG 倍。
+    static_cast<void>(ag);
+    const auto sum = static_cast<std::uint64_t>(address) +
+                     static_cast<std::uint64_t>(elements);
     if (sum > 0xFFFFFFFFULL) {
         return std::nullopt;
     }

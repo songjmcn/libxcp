@@ -4,6 +4,8 @@
  */
 
 #include "libxcp/xcp_master.hpp"
+
+#include "libxcp/version_resolver.hpp"
 #include "libxcp/log.hpp"
 
 #include <algorithm>
@@ -27,8 +29,9 @@ constexpr ResourceMask kValidUnlockResources =
     static_cast<ResourceMask>(Resource::Pgm);
 
 /// @brief TIMESTAMP_MODE 低 3 位位宽码 → 字节数（批次20，G3）
-/// @details docs §7.5.4.10：Timestamp Size ∈ {0,1,2,4} 字节；其余码值为
-///          未定义组合——返回 0（不计入），**不猜**（B-3）。
+/// @details 原始 PDF 第 185 页 Table 147：Timestamp Size ∈ {0,1,2,4} 字节；
+///          `011` 被规范明文标为 **Not allowed**，其余码值为未定义组合——
+///          一律返回 0（不计入），**不猜**（B-3）。
 ///          XCPlite TIMESTAMP_MODE=0x0C → size_code=4、fixed=bit3 ✓。
 constexpr std::size_t TimestampModeSizeBytes(std::uint8_t size_code) noexcept {
     switch (size_code) {
@@ -41,6 +44,40 @@ constexpr std::size_t TimestampModeSizeBytes(std::uint8_t size_code) noexcept {
         default:
             return 0U;
     }
+}
+
+/// @brief TIMESTAMP_MODE 的低 3 位是否为**规范允许**的位宽码（E2/F-12）
+/// @details 原始 PDF 第 185 页 Table 147：合法码为 `000`(无时间戳)、
+///          `001`(1B)、`010`(2B)、`100`(4B)；**`011` 被明文标为
+///          "Not allowed"**，`101`/`110`/`111` 未列出（保留）。
+///          `000` 合法但表示"无时间戳"，不是时间戳宽度。
+/// @param size_code TIMESTAMP_MODE 的 bit2-0
+/// @return true = 该码在规范码表中
+[[nodiscard]] constexpr bool IsAllowedTimestampSizeCode(
+    std::uint8_t size_code) noexcept {
+    return size_code == 0U || size_code == 1U || size_code == 2U ||
+           size_code == 4U;
+}
+
+/// @brief TIMESTAMP_MODE 的高 4 位是否为**规范允许**的时间单位码（E2/F-12）
+/// @details 原始 PDF 第 186 页 Table 148 列出 `0000`～`1100` 共 13 个单位；
+///          **`1101`～`1111` 未列出，属保留值**，须按非法处理。
+/// @param unit_code TIMESTAMP_MODE 的 bit7-4
+/// @return true = 该码在规范码表中
+[[nodiscard]] constexpr bool IsAllowedTimestampUnitCode(
+    std::uint8_t unit_code) noexcept {
+    return unit_code <= 0x0CU;
+}
+
+/// @brief GRANULARITY_ODT_ENTRY_SIZE_x 的规范允许取值集合（E2/F-12）
+/// @details 原始 PDF 第 15 页 §4.1.2 原文："The possible values for
+///          GRANULARITY_ODT_ENTRY_SIZE_x are **{1,2,4,8}**."
+/// @param granularity_bytes 粒度字节数（响应原值）
+/// @return true = 取值合法
+[[nodiscard]] constexpr bool IsAllowedGranularity(
+    std::uint8_t granularity_bytes) noexcept {
+    return granularity_bytes == 1U || granularity_bytes == 2U ||
+           granularity_bytes == 4U || granularity_bytes == 8U;
 }
 
 /// @brief DaqListSpec 入参预检（批次20 从静态通路抽出，STATIC/DYNAMIC 共用；
@@ -114,18 +151,236 @@ void ValidateDaqListAgainstMaxDto(const DaqListSpec& spec,
     }
 }
 
+/// @brief ODT Entry 的粒度与对齐前置校验（E2/F-12 C1～C5）
+/// @details 规范依据为**原始 PDF 第 14-15 页 §4.1.2**，原文逐字：
+///          - "GRANULARITY_ODT_ENTRY_SIZE_x must not be smaller than AG."
+///            `GRANULARITY_ODT_ENTRY_SIZE_x[BYTE] >= AG[BYTE]`
+///          - "The possible values for GRANULARITY_ODT_ENTRY_SIZE_x are
+///            **{1,2,4,8}**."；"The possible values for ADDRESS_GRANULARITY
+///            are **{1,2,4}**."
+///          - `GRANULARITY_ODT_ENTRY_SIZE_x[BYTE] mod AG[BYTE] = 0`
+///          - 地址：`Address[AG] mod (GRANULARITY_x[BYTE] / AG[BYTE]) = 0`
+///          - 长度：`SizeOf(...)[AG] mod (GRANULARITY_x[BYTE] / AG[BYTE]) = 0`
+///          - 上限：`SizeOf(...)[AG] <= MAX_ODT_ENTRY_SIZE_x[AG]`
+///
+///          **单位纪律（与 F-01 同族）**：`Address`、`Size`、
+///          `MAX_ODT_ENTRY_SIZE_x` 三者在规范中**均以 AG 为单位**，而
+///          `GRANULARITY_x` 是**字节数**。因此必须先验证
+///          `GRANULARITY >= AG && GRANULARITY mod AG == 0`，再计算
+///          `ratio = GRANULARITY / AG`；**禁止先做整数除法再取模**，
+///          否则 `GRANULARITY < AG` 时会出现除零/模零。
+///
+/// @param spec 待校验的 List 配置（Address/Size 均为 AG 单位）
+/// @param granularity_bytes Slave 声明的 GRANULARITY_ODT_ENTRY_SIZE_x（字节）
+/// @param max_odt_entry_size Slave 声明的 MAX_ODT_ENTRY_SIZE_x（**AG 单位**）
+/// @param ag_bytes 当前会话的地址粒度（字节）
+/// @throws XcpException InvalidArgument —— 任一判据不满足
+void ValidateOdtEntryGranularity(const DaqListSpec& spec,
+                                 std::uint8_t granularity_bytes,
+                                 std::uint8_t max_odt_entry_size,
+                                 std::size_t ag_bytes) {
+    // C1：粒度取值必须落在规范集合 {1,2,4,8}
+    if (!IsAllowedGranularity(granularity_bytes)) {
+        throw detail::MakeInvalidArgument(
+            "Slave 声明的 GRANULARITY_ODT_ENTRY_SIZE 非法：" +
+            std::to_string(granularity_bytes) +
+            " 字节；规范（PDF 第 15 页 §4.1.2）只允许 {1,2,4,8}");
+    }
+    // C2：粒度必须能被当前 AG 表示（GRANULARITY >= AG 且整除）
+    if (granularity_bytes < ag_bytes || granularity_bytes % ag_bytes != 0U) {
+        throw detail::MakeInvalidArgument(
+            "GRANULARITY_ODT_ENTRY_SIZE(" +
+            std::to_string(granularity_bytes) +
+            " 字节) 无法由当前 AG(" + std::to_string(ag_bytes) +
+            " 字节) 表示：规范要求 GRANULARITY >= AG 且 GRANULARITY mod AG "
+            "== 0（PDF 第 15 页 §4.1.2）");
+    }
+    // C2 成立后 ratio 必为正，后续取模安全
+    const std::size_t ratio =
+        static_cast<std::size_t>(granularity_bytes) / ag_bytes;
+    for (std::size_t odt_index = 0; odt_index < spec.odts.size();
+         ++odt_index) {
+        for (std::size_t entry_index = 0;
+             entry_index < spec.odts[odt_index].entries.size();
+             ++entry_index) {
+            const auto& e = spec.odts[odt_index].entries[entry_index];
+            // C3：Entry 地址按 AG 换算后须对齐粒度
+            if (static_cast<std::size_t>(e.address) % ratio != 0U) {
+                throw detail::MakeInvalidArgument(
+                    "DAQ List " + std::to_string(spec.daq_list) + " ODT " +
+                    std::to_string(odt_index) + " Entry " +
+                    std::to_string(entry_index) + " 地址未对齐：地址(AG 单位)=" +
+                    std::to_string(e.address) + "，粒度比=" +
+                    std::to_string(ratio) +
+                    "；规范要求 Address[AG] mod (GRANULARITY / AG) == 0"
+                    "（PDF 第 15 页 §4.1.2）");
+            }
+            // C4：Entry 长度（AG 单位）须对齐粒度
+            if (static_cast<std::size_t>(e.size) % ratio != 0U) {
+                throw detail::MakeInvalidArgument(
+                    "DAQ List " + std::to_string(spec.daq_list) + " ODT " +
+                    std::to_string(odt_index) + " Entry " +
+                    std::to_string(entry_index) + " 长度未对齐：Size(AG 单位)=" +
+                    std::to_string(e.size) + "，粒度比=" +
+                    std::to_string(ratio) +
+                    "；规范要求 Size[AG] mod (GRANULARITY / AG) == 0"
+                    "（PDF 第 15 页 §4.1.2）");
+            }
+            // C5：Entry 长度不得超 MAX_ODT_ENTRY_SIZE_x（同样以 AG 为单位）
+            if (e.size > max_odt_entry_size) {
+                throw detail::MakeInvalidArgument(
+                    "DAQ List " + std::to_string(spec.daq_list) + " ODT " +
+                    std::to_string(odt_index) + " Entry " +
+                    std::to_string(entry_index) + " 超出 MAX_ODT_ENTRY_SIZE：" +
+                    "Size(AG 单位)=" + std::to_string(e.size) + " > 上限=" +
+                    std::to_string(max_odt_entry_size) +
+                    "（PDF 第 15 页 §4.1.2）");
+            }
+        }
+    }
+}
+
+/// @brief DAQ_KEY_BYTE 的静态合法性校验（E2/O-2，配置前本地拒绝）
+/// @details 两条规范依据（**原始 PDF 第 182 页**）：
+///          - **Table 142 Address extension bit mask coding**：bit4-5 组合
+///            `10` 被明文标为 **"Not allowed"**（合法值仅 `00`/`01`/`11`）；
+///          - **Table 143 Identification field type**：bit6-7 用满 `00`～`11`
+///            四值，本身无非法组合。
+///          因此本函数只需拦下 bit4-5 == `10`。
+/// @param key_byte GET_DAQ_PROCESSOR_INFO 的 DAQ_KEY_BYTE 拆解结果
+/// @throws XcpException InvalidArgument —— 地址扩展位为规范禁止的组合
+void ValidateDaqKeyByte(const DaqKeyByte& key_byte) {
+    // RawDaqKeyByteAddressExtensionMode 的原始位值：bit5-4 == 2 即 `10`
+    if (key_byte.address_extension_mode == 2U) {
+        throw detail::MakeInvalidArgument(
+            "Slave 声明的 DAQ_KEY_BYTE 地址扩展位为 2(bit5-4 = 10)，"
+            "该组合被规范明文禁止（原始 PDF 第 182 页 Table 142 "
+            "\"Not allowed\"）；合法值为 0/1/3");
+    }
+}
+
+/// @brief OVERLOAD_MSB 启用时的 ODT 编号上限校验（E2/O-2）
+/// @details 规范依据（**原始 PDF 第 180 页**原文逐字）：
+///          "When the MSB of the PID is used, the maximum number of
+///           (absolute or relative) ODT numbers is limited and has to be in
+///           the range `0x00 <= ODT_NUMBER(DAQ with overrun_msb) < 0x7C`"
+///          触发条件为 DAQ_PROPERTIES 的 bit7-6 == `01`
+///          （Table 139：`01` = overload indication in MSB of PID）。
+/// @param spec 待校验的 List 配置（ODT 号即其在 odts 中的 0 基下标）
+/// @param overload_msb true = Slave 使用 PID 的 MSB 指示过载
+/// @throws XcpException InvalidArgument —— ODT 编号达到或超过 0x7C
+void ValidateOdtNumberAgainstOverloadMsb(const DaqListSpec& spec,
+                                         bool overload_msb) {
+    if (!overload_msb) {
+        return;
+    }
+    // ODT 编号为 0 基下标；上限为**严格小于** 0x7C
+    constexpr std::size_t kOverloadMsbOdtLimit = 0x7CU;
+    if (spec.odts.size() > kOverloadMsbOdtLimit) {
+        throw detail::MakeInvalidArgument(
+            "DAQ List " + std::to_string(spec.daq_list) + " 有 " +
+            std::to_string(spec.odts.size()) +
+            " 个 ODT，超过 OVERLOAD_MSB 模式的上限：规范要求 ODT_NUMBER "
+            "严格小于 0x7C(124)（原始 PDF 第 180 页）");
+    }
+    // 显式逐条核对（下标即 ODT 号），避免只靠总数判断
+    for (std::size_t i = 0; i < spec.odts.size(); ++i) {
+        if (i >= kOverloadMsbOdtLimit) {
+            throw detail::MakeInvalidArgument(
+                "DAQ List " + std::to_string(spec.daq_list) + " 的 ODT 号 " +
+                std::to_string(i) +
+                " 超过 OVERLOAD_MSB 模式上限（须严格小于 0x7C）；原始 PDF "
+                "第 180 页");
+        }
+    }
+}
+
 }  // namespace
 
 XcpMaster::XcpMaster(std::unique_ptr<IXcpTransport> transport,
-                     CommandTimeouts timeouts, IEventListener* event_listener)
-    : m_transport_(std::move(transport)) {
+                     XcpMasterOptions options)
+    : m_transport_(std::move(transport)), m_options_(std::move(options)) {
     if (!m_transport_) {
         throw detail::MakeInvalidArgument(
             "XcpMaster 需要非空的 IXcpTransport 实例");
     }
-    m_executor_ = std::make_unique<CommandExecutor>(*m_transport_, m_session_,
-                                                    timeouts, event_listener);
+    // 版本策略自检：把"配置本身自相矛盾"这类问题在构造期暴露，
+    // 而不是等到 Connect 之后以模糊的探测失败呈现给调用方。
+    const std::string policy_error = m_options_.version_policy.Validate();
+    if (!policy_error.empty()) {
+        throw detail::MakeInvalidArgument(policy_error);
+    }
+    m_executor_ = std::make_unique<CommandExecutor>(
+        *m_transport_, m_session_, m_options_.timeouts,
+        m_options_.event_listener);
     m_memory_access_ = std::make_unique<MemoryAccess>(*m_executor_, m_session_);
+}
+
+ProtocolVersionSnapshot XcpMaster::GetProtocolVersionSnapshot() const {
+    return m_protocol_version_;
+}
+
+TransportVersionSnapshot XcpMaster::GetTransportVersionSnapshot() const {
+    return m_transport_version_;
+}
+
+std::vector<std::string> XcpMaster::VersionConflicts() const {
+    return m_version_conflicts_;
+}
+
+bool XcpMaster::IsCapabilityUnsupported(
+    UnsupportedCapability capability) const {
+    // 批次 G：本版本只承诺 IPv4 UDP 单播 Profile，且 0xC0 族只实现了
+    // GET_VERSION。以下四项是**确定不提供**的能力，不随会话状态变化——
+    // 它们是本库的静态能力边界，而非"依赖对端查询结果"的动态能力。
+    //
+    // 特别说明 DaqPackedMode：原始 PDF 确认 SET/GET_DAQ_PACKED_MODE
+    // （0xC0,0x01 / 0xC0,0x02）是 V1.5 新特性，且本实现连命令码都未登记
+    // （见 include/libxcp/protocol_types.hpp 的 CommandCode 注释：按
+    // "只登记已实现的码"纪律）。因此这里判 Block 是**如实反映现状**，
+    // 而不是新增限制。
+    switch (capability) {
+        case UnsupportedCapability::DaqPackedMode:
+        case UnsupportedCapability::Level1OtherSubcommand:
+        case UnsupportedCapability::Ipv6Transport:
+        case UnsupportedCapability::OptionalTlSubcommand:
+            return true;
+    }
+    // 枚举全覆盖，理论上不可达；保留以便新增能力项时编译器能提示
+    return true;
+}
+
+void XcpMaster::ThrowIfUnsupported(UnsupportedCapability capability) const {
+    if (!IsCapabilityUnsupported(capability)) {
+        return;
+    }
+    // 异常消息给出能力名 + 替代路径，避免调用方只看到"不支持"而无从下手
+    std::string name;
+    std::string hint;
+    switch (capability) {
+        case UnsupportedCapability::DaqPackedMode:
+            name = "DAQ Packed Mode（SET/GET_DAQ_PACKED_MODE）";
+            hint = "该能力为 V1.5 新特性且本实现未提供；请使用既有"
+                   " SET_DAQ_LIST_MODE + WRITE_DAQ 的非 Packed 路径";
+            break;
+        case UnsupportedCapability::Level1OtherSubcommand:
+            name = "Level-1 命令族子命令";
+            hint = "本实现只提供 GET_VERSION（0xC0,0x00）；其余 0xC0 族"
+                   "子命令未实现，禁止内容探测式尝试";
+            break;
+        case UnsupportedCapability::Ipv6Transport:
+            name = "IPv6 传输";
+            hint = "本版本基础 Profile 只承诺 IPv4 UDP 单播；"
+                   "请使用 IPv4 地址";
+            break;
+        case UnsupportedCapability::OptionalTlSubcommand:
+            name = "Optional TL Subcommand";
+            hint = "本版本基础 Profile 不实现这四个传输层子命令";
+            break;
+    }
+    LIBXCP_LOG_ERROR("capability unsupported: {}", name);
+    throw detail::MakeUnsupportedFeature(
+        "本库明确不支持该能力：" + name + "。" + hint);
 }
 
 XcpMaster::~XcpMaster() {
@@ -169,9 +424,21 @@ void XcpMaster::Connect() {
     m_daq_timestamp_bytes_.reset();
     m_pag_processor_info_queried_ = false;
     m_pag_processor_info_.reset();
+    // 批次 B1：版本证据是**会话态**，新会话必须清零。否则从 V1.5 对端切到
+    // V1.3 对端时会沿用旧裁决，造成"能力超出对端实际支持"的静默越界。
+    m_protocol_version_ = ProtocolVersionSnapshot{};
+    m_transport_version_ = TransportVersionSnapshot{};
+    m_version_conflicts_.clear();
 
     // Transport.Open 的监听器即 CommandExecutor；Open 之后接收线程立即开始回调
     m_transport_->Open(m_executor_->AsListener());
+    // 批次 B1：复位执行器的**通道级**关闭状态。Disconnect 会 Close Transport，
+    // 从而由 OnTransportClosed() 把 m_transport_closed_ 置位；若 Open 之后不
+    // 清回，重连后第一条命令会在 WaitForResponse 里立刻看到"通道已关闭"而
+    // 提前返回，CONNECT 超时、恢复又因会话处于 Connecting 而抛 InvalidState
+    // ——即"一次 Disconnect 后再也无法 Connect"。该复位必须紧跟 Open，
+    // 不能依赖调用方自觉。
+    m_executor_->OnTransportReopened();
 
     auto cleanup_on_failure = [this] {
         // CONNECT、参数校验或 GET_STATUS 失败时清除部分状态并关闭通道（计划
@@ -198,6 +465,11 @@ void XcpMaster::Connect() {
         // GET_STATUS 为 Mandatory，失败即视为连接失败
         (void)m_executor_->ExecuteGetStatus();
         LIBXCP_LOG_INFO("XCP Connect: mandatory GET_STATUS confirmed");
+
+        // 批次 B1：版本裁决。顺序上放在 GET_STATUS 之后、PAG 探测之前——
+        // GET_STATUS 是 Mandatory 且不依赖版本，先完成它可以让"对端根本
+        // 不可用"这类问题优先暴露，而不是被版本探测的错误掩盖。
+        ResolveVersionAfterConnect(connect);
 
         // 变量标定批次：CONNECT 协商出 CAL/PAG 资源时探测 Paging 子系统
         // （GET_PAG_PROCESSOR_INFO，Optional）。Slave 不支持（nullopt）或
@@ -231,11 +503,129 @@ void XcpMaster::Connect() {
     }
 }
 
+CommandExecutor::GetVersionProbe XcpMaster::ProbeVersion() {
+    // 探测不改变会话状态：即使失败也只是"版本未确认"，连接照旧可用。
+    const CommandExecutor::GetVersionProbe probe =
+        m_executor_->ExecuteGetVersion();
+    // 探测成功必须真正**生效**：否则调用方拿到 Available 却在快照里
+    // 仍看到"未确认"，接口语义自相矛盾（构造期关了自动探测的场景尤其
+    // 依赖这条路径补测）。失败则保持原证据不变——不得降级为假定版本。
+    if (probe.IsAvailable()) {
+        ApplyVersionProbe(probe);
+    }
+    return probe;
+}
+
+void XcpMaster::ResolveVersionAfterConnect(const ConnectResponse& connect) {
+    // 参数保留在签名里以自文档化"本裁决发生在 CONNECT 之后、且依赖其响应"，
+    // 实际读取走 `Session::Parameters()`（会话已由 EstablishConnection 落盘，
+    // 单一数据源可避免两处取值不一致）。显式标注避免 unused 警告。
+    static_cast<void>(connect);
+
+    // 探测条件：配置允许 + 配置的探测开关。注意 GET_VERSION 是 optional
+    // 命令，对端不认识时必须能优雅降级。
+    const bool should_probe = m_options_.autodetect_version &&
+                              m_options_.version_policy.probe_get_version &&
+                              m_options_.version_policy
+                                  .allow_version_probe_roundtrip;
+
+    CommandExecutor::GetVersionProbe probe;
+    if (should_probe) {
+        probe = m_executor_->ExecuteGetVersion();
+        if (probe.IsAvailable()) {
+            // 关日志时 LIBXCP_LOG_INFO 不求值参数，故变量随开关一同声明，
+            // 避免 -Wunused-variable（仓库既有约定，见 session.cpp:166）。
+#if LIBXCP_ENABLE_LOG
+            const GetVersionResponse& vr = *probe.response;
+            LIBXCP_LOG_INFO(
+                "XCP GET_VERSION resolved: protocol={}.{} transport={}.{}",
+                static_cast<unsigned>(vr.protocol_major),
+                static_cast<unsigned>(vr.protocol_minor),
+                static_cast<unsigned>(vr.transport_major),
+                static_cast<unsigned>(vr.transport_minor));
+#endif
+        } else {
+            // 关键日志：明确区分"未确认"与"就是老版本"，避免运维把超时
+            // 误读成对端版本低（方案 B1 硬要求）。
+            LIBXCP_LOG_INFO(
+                "XCP GET_VERSION unavailable (outcome={}); version remains "
+                "unconfirmed at connect-major level",
+                static_cast<int>(probe.outcome));
+        }
+    } else {
+        // 未探测：显式说明原因，便于诊断"为什么版本只有主版本"
+        LIBXCP_LOG_INFO(
+            "XCP GET_VERSION probe skipped by configuration; version stays "
+            "at connect-major level");
+    }
+
+    ApplyVersionProbe(probe);
+}
+
+void XcpMaster::ApplyVersionProbe(
+    const CommandExecutor::GetVersionProbe& probe) {
+    VersionResolver::Inputs inputs;
+    // CONNECT 只给出主版本字节（原始 PDF 第 12 页 §3.1.1），作为最低一档证据。
+    // 注意：这里不能从快照反推，必须直接取会话参数——快照本身正是待裁决对象。
+    // 未连接时 `Parameters().connect` 为默认值（版本字节 0），裁决器会把
+    // 主版本 0 视为"无证据"而不是"版本 0.0"，因此不会伪造版本。
+    const SessionParameters params = m_session_.Parameters();
+    inputs.connect_protocol_major = params.connect.protocol_layer_version;
+    inputs.connect_transport_major = params.connect.transport_layer_version;
+    inputs.policy = m_options_.version_policy;
+    inputs.probe = probe;
+
+    const VersionResolver::Result result = VersionResolver::Resolve(inputs);
+
+    if (m_options_.require_get_version && !result.get_version_available) {
+        // 调用方显式要求精确版本却拿不到：这是配置与现实的冲突，必须失败。
+        // 放在裁决之后抛错，以便日志先记录完整裁决上下文。
+        // 用 InvalidState：这是"本地配置要求与对端现实不符"，不是收到坏包，
+        // 因此不适合 MalformedPacket/ProtocolError（那两个语义是"对端违规"）。
+        throw detail::MakeInvalidState(
+            "require_get_version 为真但 GET_VERSION 不可用（对端可能未实现该 "
+            "optional 命令或响应超时）；版本保持未确认");
+    }
+
+    m_protocol_version_ = result.protocol;
+    m_transport_version_ = result.transport;
+    m_version_conflicts_ = result.conflicts;
+
+    // 冲突与封顶一律显式告警，不做静默处理（m03674 裁定）
+#if LIBXCP_ENABLE_LOG
+    for (const std::string& conflict : m_version_conflicts_) {
+        LIBXCP_LOG_WARNING("XCP version conflict: {}", conflict);
+    }
+#endif
+    if (result.protocol.conservative) {
+        LIBXCP_LOG_INFO(
+            "XCP protocol version running in 1.x-conservative mode: minor "
+            "unconfirmed, capability decisions use V1.3 intersection");
+    }
+    if (result.transport.conservative) {
+        LIBXCP_LOG_INFO(
+            "XCP transport version running in conservative mode: minor "
+            "unconfirmed, layout decisions use the lowest supported level");
+    }
+}
+
+void XcpMaster::CancelPendingOperation() {
+    // 直接转发给执行器：取消是执行器层的等待状态问题，XcpMaster 不持有
+    // 额外状态。无挂起操作时为空操作（幂等）。
+    if (m_executor_) {
+        m_executor_->CancelPendingOperation();
+    }
+}
+
 void XcpMaster::Disconnect() {
     // 未连接：本地幂等，仅确保通道关闭
     if (m_session_.State() == SessionState::Disconnected) {
         LIBXCP_LOG_INFO(
             "XCP Disconnect: already disconnected; closing transport");
+        // 幂等路径同样作废版本证据：会话已不在，快照不得继续声称精确版本
+        m_protocol_version_ = ProtocolVersionSnapshot{};
+        m_transport_version_ = TransportVersionSnapshot{};
+        m_version_conflicts_.clear();
         m_transport_->Close();
         return;
     }
@@ -275,6 +665,15 @@ void XcpMaster::Disconnect() {
         }
     }
 
+    // 批次 B1：版本证据是**会话态**，会话结束即作废。
+    // 若不在此清零，`GetProtocolVersionSnapshot()` 在断连后会继续报告上一次
+    // 会话的 `GetVersion` 精确版本——调用方会据此对一个"已无会话"的连接
+    // 做出能力判断，属于静默越界。Connect() 起始处另有一次清零用于兜底
+    // （覆盖"从未 Disconnect 过、直接重连"的路径），两处共同保证不残留。
+    m_protocol_version_ = ProtocolVersionSnapshot{};
+    m_transport_version_ = TransportVersionSnapshot{};
+    m_version_conflicts_.clear();
+
     if (failure) {
         LIBXCP_LOG_ERROR(
             "XCP Disconnect completed cleanup with reported failure");
@@ -313,8 +712,15 @@ void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
         m_daq_processor_info_queried_ = true;
         const auto processor = m_executor_->ExecuteGetDaqProcessorInfo();
         if (processor.has_value()) {
+            // 批次 E2：保留完整快照（F-05 需 MIN_DAQ、O-2 需 KEY_BYTE）
+            m_daq_processor_info_ = processor;
             m_daq_processor_properties_ = processor->properties;
         }
+    }
+    // O-2：地址扩展位为规范禁止组合（bit5-4 = 10）时立即拒绝。
+    // 放在缓存块外，确保任何时候只要有取证快照都会被校验（不只首次查询）。
+    if (m_daq_processor_info_.has_value()) {
+        ValidateDaqKeyByte(m_daq_processor_info_->key_byte);
     }
     if (m_daq_processor_properties_.has_value() &&
         HasDaqProcessorProperty(
@@ -330,11 +736,26 @@ void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
     // GET_DAQ_RESOLUTION_INFO 声明的时间戳宽度计入信封预检；未声明按 0 计
     // ——不猜（B-3），对不声明时间戳的 Slave 行为与旧口径完全一致。
     std::size_t header_bytes = 1U + (spec.dto_counter ? 1U : 0U);
+    // 批次 E2/F-12：无论是否启用时间戳都先完成一次 GET_DAQ_RESOLUTION_INFO
+    // 取证——C1～C5 的粒度与上限判据依赖该响应，若只在 spec.timestamp 时取证
+    // 则无时间戳配置会完全绕过 F-12 校验（本批次修复的正是这类漏检）。
+    const std::size_t timestamp_bytes = DaqTimestampBytesCached();
     if (spec.timestamp) {
-        header_bytes += DaqTimestampBytesCached();
+        header_bytes += timestamp_bytes;
     }
     ValidateDaqListAgainstMaxDto(spec, header_bytes, ag_bytes,
                                  m_session_.MaxDto());
+    // 批次 E2/F-12：ODT Entry 粒度与对齐前置校验（C1～C5）。
+    // 仅当 Slave 经 GET_DAQ_RESOLUTION_INFO 声明了粒度时才校验——不猜（B-3），
+    // 对不声明该 Optional 命令的 Slave 行为与旧口径完全一致。
+    if (m_daq_resolution_info_.has_value() &&
+        m_daq_resolution_info_->granularity_daq != 0U) {
+        ValidateOdtEntryGranularity(spec, m_daq_resolution_info_->granularity_daq,
+                                    m_daq_resolution_info_->max_odt_entry_size_daq,
+                                    ag_bytes);
+    }
+    // 批次 E2/O-2：OVERLOAD_MSB 启用时 ODT 编号须严格小于 0x7C
+    ValidateOdtNumberAgainstOverloadMsb(spec, IsOverloadMsbEnabled());
 
     // 仅记录编排元信息，不输出 Entry 的地址或数据。
     LIBXCP_LOG_INFO("DAQ static configure started list={} odts={}",
@@ -479,14 +900,45 @@ std::size_t XcpMaster::DaqTimestampBytesCached() {
         m_daq_resolution_info_queried_ = true;
         const auto resolution = m_executor_->ExecuteGetDaqResolutionInfo();
         if (resolution.has_value()) {
+            // 批次 E2：保留完整快照（F-12 需粒度与 MAX_ODT_ENTRY_SIZE）
+            m_daq_resolution_info_ = resolution;
             const std::size_t bytes =
                 TimestampModeSizeBytes(resolution->timestamp_mode.size_code);
             if (bytes > 0U) {
                 m_daq_timestamp_bytes_ = static_cast<std::uint8_t>(bytes);
             }
+            // 批次 E2/F-12：TIMESTAMP_MODE 的码表合法性（Table 147/148）。
+            // `011` 被规范明文标为 Not allowed；Unit 的 `1101`～`1111` 为保留值。
+            if (!IsAllowedTimestampSizeCode(
+                    resolution->timestamp_mode.size_code)) {
+                throw detail::MakeInvalidArgument(
+                    "Slave 声明的 TIMESTAMP_MODE 位宽码为 " +
+                    std::to_string(
+                        resolution->timestamp_mode.size_code) +
+                    "，该组合被规范禁止（原始 PDF 第 185 页 Table 147："
+                    "`011` = Not allowed；合法值 0/1/2/4 字节）");
+            }
+            if (!IsAllowedTimestampUnitCode(
+                    resolution->timestamp_mode.unit_code)) {
+                throw detail::MakeInvalidArgument(
+                    "Slave 声明的 TIMESTAMP_MODE 时间单位码为 " +
+                    std::to_string(resolution->timestamp_mode.unit_code) +
+                    "，属规范保留值（原始 PDF 第 186 页 Table 148 仅列出 "
+                    "0000～1100）");
+            }
         }
     }
     return m_daq_timestamp_bytes_.value_or(0U);
+}
+
+bool XcpMaster::IsOverloadMsbEnabled() const {
+    // O-2：DAQ_PROPERTIES 的 bit7-6 == `01` 表示过载指示使用 PID 的 MSB
+    // （原始 PDF 第 179 页 Table 139）。未取证时返回 false——不猜（B-3）。
+    if (!m_daq_processor_properties_.has_value()) {
+        return false;
+    }
+    const std::uint8_t props = *m_daq_processor_properties_;
+    return ((props & 0xC0U) >> 6) == 0x01U;
 }
 
 void XcpMaster::ClearDynamicTableBestEffort() {
@@ -544,26 +996,51 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
             "ALLOC_DAQ 的 n 超出 WORD 上限 65535: " +
             std::to_string(specs.size()));
     }
-    for (std::size_t i = 0; i < specs.size(); ++i) {
-        if (specs[i].daq_list != static_cast<std::uint16_t>(i)) {
-            throw detail::MakeInvalidArgument(
-                "ALLOC_DAQ 按分配顺序从 0 编号（MIN_DAQ=0，Slave 侧 daq_count "
-                "自增）：specs[" +
-                std::to_string(i) + "] 的 daq_list 必须等于其下标 " +
-                std::to_string(i) + "，实际为 " +
-                std::to_string(specs[i].daq_list));
-        }
-        PreflightDaqListSpec(specs[i]);
-    }
-
     // ---- 2) 能力门：动态整表只放行正向声明 DYNAMIC 的 Slave（B-16 不猜；
     //         XCPlite PROPERTIES=0x11 实证，D9/G1）----
+    // 注：取证先于编号校验——F-05 需要 MIN_DAQ 才能判定合法编号区间。
     if (!m_daq_processor_info_queried_) {
         m_daq_processor_info_queried_ = true;
         const auto processor = m_executor_->ExecuteGetDaqProcessorInfo();
         if (processor.has_value()) {
+            // 批次 E2：保留完整快照（F-05 需 MIN_DAQ、O-2 需 KEY_BYTE）
+            m_daq_processor_info_ = processor;
             m_daq_processor_properties_ = processor->properties;
         }
+    }
+    // O-2：地址扩展位为规范禁止组合（bit5-4 = 10）时立即拒绝。
+    // 放在缓存块外，确保任何时候只要有取证快照都会被校验（不只首次查询）。
+    if (m_daq_processor_info_.has_value()) {
+        ValidateDaqKeyByte(m_daq_processor_info_->key_byte);
+    }
+    // F-05 修复（批次 E2）：不再假定了 MIN_DAQ==0、编号必从 0 起。
+    // 规范原文（原始 PDF 第 180 页）：
+    //   "MIN_DAQ is the number of predefined DAQ lists. For predefined DAQ
+    //    lists, DAQ_LIST_NUMBER is in the range [0,1,..MIN_DAQ-1].
+    //    MAX_DAQ-MIN_DAQ is the number of configurable DAQ lists. For
+    //    configurable DAQ lists, DAQ_LIST_NUMBER is in the range
+    //    [MIN_DAQ,MIN_DAQ+1,..MAX_DAQ-1]. If DAQ_CONFIG_TYPE = dynamic,
+    //    MAX_DAQ equals MIN_DAQ+DAQ_COUNT."
+    // MIN_DAQ 未取证时按 0 保守处理——不猜（B-3），与旧行为一致。
+    const std::uint16_t min_daq =
+        m_daq_processor_info_.has_value()
+            ? static_cast<std::uint16_t>(m_daq_processor_info_->min_daq)
+            : 0U;
+    for (std::size_t i = 0; i < specs.size(); ++i) {
+        // 规范约束：可配置列表编号须为 [MIN_DAQ, MIN_DAQ + n - 1]
+        // （动态模式下 MAX_DAQ == MIN_DAQ + DAQ_COUNT，故上限由本次分配数决定）
+        const std::uint16_t expected =
+            static_cast<std::uint16_t>(min_daq + i);
+        if (specs[i].daq_list != expected) {
+            throw detail::MakeInvalidArgument(
+                "ALLOC_DAQ 的列表编号须为连续的 [MIN_DAQ, MIN_DAQ+n-1]："
+                "specs[" +
+                std::to_string(i) + "] 的 daq_list 应为 " +
+                std::to_string(expected) + "（MIN_DAQ=" +
+                std::to_string(min_daq) + "），实际为 " +
+                std::to_string(specs[i].daq_list));
+        }
+        PreflightDaqListSpec(specs[i]);
     }
     if (!m_daq_processor_properties_.has_value() ||
         !HasDaqProcessorProperty(
@@ -590,6 +1067,16 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
             (spec.timestamp || legacy_timestamp ? cached_timestamp_bytes : 0U);
         ValidateDaqListAgainstMaxDto(spec, header_bytes, ag_bytes,
                                      m_session_.MaxDto());
+        // 批次 E2/F-12：ODT Entry 粒度与对齐前置校验（C1～C5）。
+        // 仅当 Slave 声明了粒度才校验——不猜（B-3）。
+        if (m_daq_resolution_info_.has_value() &&
+            m_daq_resolution_info_->granularity_daq != 0U) {
+            ValidateOdtEntryGranularity(
+                spec, m_daq_resolution_info_->granularity_daq,
+                m_daq_resolution_info_->max_odt_entry_size_daq, ag_bytes);
+        }
+        // 批次 E2/O-2：OVERLOAD_MSB 启用时 ODT 编号须严格小于 0x7C
+        ValidateOdtNumberAgainstOverloadMsb(spec, IsOverloadMsbEnabled());
     }
 
     LIBXCP_LOG_INFO("DAQ dynamic configure started lists={} dto_id_bytes={}",
@@ -710,10 +1197,39 @@ Bytes XcpMaster::FetchA2lViaUpload() {
             "FetchA2lViaUpload 需要先 Connect Slave");
     }
     const GetIdResponse id = m_executor_->ExecuteGetId(0x04U);
+    // F-03b：Table 61 的 Mode 是位域——bit 1 = COMPRESSED_ENCRYPTED、
+    // bit 0 = TRANSFER_MODE。必须先拒绝「压缩/加密」这一正交标志：库未实现
+    // 外部解压/解密算法，若只判 transfer_mode 而放行，Mode=0x02/0x03 会被
+    // 当作普通 UPLOAD 通路，把密文当 A2L 文本交给解析器。
+    if (id.compressed_encrypted) {
+        throw detail::MakeUnsupportedFeature(
+            "GET_ID(IDT=4) 置位 COMPRESSED_ENCRYPTED（Mode bit1，raw=" +
+            std::to_string(id.raw_mode) +
+            "）：标识数据经压缩/加密，本库未实现外部解压解密算法，拒绝按未"
+            "处理的原始 A2L 处理");
+    }
+    // 保留位（bit 7..2）非零：规范标为 x，属未知扩展，不得静默按当前语义处理。
+    if (!id.reserved_bits_clear) {
+        throw detail::MakeMalformedPacket(
+            "GET_ID(IDT=4) 响应 Mode 保留位非零（raw=" +
+            std::to_string(id.raw_mode) +
+            "）；按原始 PDF 第 124 页 Table 61，bit 7..2 为保留位");
+    }
     if (id.transfer_mode != 0x00U) {
         throw detail::MakeUnsupportedFeature(
             "GET_ID(IDT=4) 返回 MODE=" + std::to_string(id.transfer_mode) +
             "（非 0），非 UPLOAD 文件通路，本批不编排");
+    }
+    // F-03c：Table 60 下方原文「The following rule applies: Length mod AG = 0」。
+    // 长度不满足 AG 整倍时不得继续编排——后续 UPLOAD 的元素数换算
+    // （Number of Data Elements UPLOAD [AG] = Length / AG，Table 61 原文）
+    // 会因整除截断而少读尾部字节，且 Slave 本身违反规范。
+    if (!id.length_aligned_to_ag) {
+        throw detail::MakeMalformedPacket(
+            "GET_ID(IDT=4) 上报长度 " + std::to_string(id.length) +
+            " 不满足 Length mod AG = 0（AG=" +
+            std::to_string(AgToBytes(m_session_.GetAddressGranularity())) +
+            " 字节）；按原始 PDF 第 123 页 Table 60 属违规响应");
     }
     if (id.length == 0U) {
         throw detail::MakeUnsupportedFeature(
@@ -808,70 +1324,101 @@ UnlockResult XcpMaster::Unlock(Resource resource,
     const auto max_segment =
         static_cast<std::size_t>(m_session_.MaxCto()) - kSeedKeyHeaderBytes;
 
-    // ---- 2) GET_SEED 首段，获得 Seed 总长度 ----
-    const GetSeedResponse first =
-        m_executor_->ExecuteGetSeed(resource, SeedMode::First);
-    if (first.length == 0U) {
-        // Length=0：资源未保护，无需 UNLOCK（规范 §7.5.1.8），
-        // 不调用回调、不发送 UNLOCK
-        return UnlockResult{true, std::nullopt};
-    }
+    // ---- 2) 分段 Seed&Key 事务（含 GET_SEED 与 UNLOCK 两段）----
+    // F-10：整个事务放进重试循环。执行器在分段超时后会按事务语义复位
+    // （GET_SEED 段：清状态 + SYNCH；UNLOCK 段：直接报告结果未知），
+    // 本层只能从 GET_SEED(Mode=0) 完整重启，绝不重放中途的续段。
+    constexpr int kMaxUnlockSequenceRestarts = 1;
+    for (int sequence_restart = 0;; ++sequence_restart) {
+        try {
+            // ---- 2a) GET_SEED 首段，获得 Seed 总长度 ----
+            const GetSeedResponse first =
+                m_executor_->ExecuteGetSeed(resource, SeedMode::First);
+            if (first.length == 0U) {
+                // Length=0：资源未保护，无需 UNLOCK（规范 §7.5.1.8），
+                // 不调用回调、不发送 UNLOCK
+                m_executor_->ResetSeedKeyTransaction();
+                return UnlockResult{true, std::nullopt};
+            }
 
-    // ---- 3) 分段收集 Seed（Remainder 帧）----
-    Bytes seed(first.seed.begin(), first.seed.end());
-    if (seed.empty()) {
-        throw detail::MakeMalformedPacket("GET_SEED 声明 Length " +
-                                          std::to_string(first.length) +
-                                          " 但首段 Seed 为空");
-    }
-    if (seed.size() > first.length) {
-        throw detail::MakeMalformedPacket(
-            "GET_SEED 首段 Seed 字节数 " + std::to_string(seed.size()) +
-            " 超过声明总长度 " + std::to_string(first.length));
-    }
-    while (seed.size() < first.length) {
-        const GetSeedResponse part =
-            m_executor_->ExecuteGetSeed(resource, SeedMode::Remainder);
-        if (part.seed.empty()) {
-            // 空续段无法推进进度，终止以防死循环
-            throw detail::MakeMalformedPacket(
-                "GET_SEED 续段返回空 Seed，无法收满声明总长度 " +
-                std::to_string(first.length));
+            // ---- 2b) 分段收集 Seed（Remainder 帧）----
+            Bytes seed(first.seed.begin(), first.seed.end());
+            if (seed.empty()) {
+                throw detail::MakeMalformedPacket(
+                    "GET_SEED 声明 Length " + std::to_string(first.length) +
+                    " 但首段 Seed 为空");
+            }
+            if (seed.size() > first.length) {
+                throw detail::MakeMalformedPacket(
+                    "GET_SEED 首段 Seed 字节数 " + std::to_string(seed.size()) +
+                    " 超过声明总长度 " + std::to_string(first.length));
+            }
+            while (seed.size() < first.length) {
+                const GetSeedResponse part =
+                    m_executor_->ExecuteGetSeed(resource, SeedMode::Remainder);
+                if (part.seed.empty()) {
+                    // 空续段无法推进进度，终止以防死循环
+                    throw detail::MakeMalformedPacket(
+                        "GET_SEED 续段返回空 Seed，无法收满声明总长度 " +
+                        std::to_string(first.length));
+                }
+                if (seed.size() + part.seed.size() > first.length) {
+                    throw detail::MakeMalformedPacket(
+                        "GET_SEED 续段累计字节数超过声明总长度 " +
+                        std::to_string(first.length));
+                }
+                seed.insert(seed.end(), part.seed.begin(), part.seed.end());
+            }
+
+            // ---- 2c) 调用方算法计算 Key（异常原样传播）----
+            Bytes key = calculator(resource, BytesView{seed});
+            if (key.empty()) {
+                throw detail::MakeInvalidArgument(
+                    "SeedKeyCalculator 返回空 Key，无法执行 UNLOCK");
+            }
+            if (key.size() > kMaxKeyLength) {
+                throw detail::MakeInvalidArgument(
+                    "SeedKeyCalculator 返回的 Key 长度 " +
+                    std::to_string(key.size()) + " 字节超过 Length 字段上限 255");
+            }
+
+            // ---- 2d) 分段发送 UNLOCK：首帧 Length=总长，后续帧=剩余 ----
+            std::size_t offset = 0;
+            UnlockResponse last{};
+            do {
+                const std::size_t remaining = key.size() - offset;
+                const std::size_t segment = std::min(remaining, max_segment);
+                const auto length_field = static_cast<std::uint8_t>(
+                    offset == 0U ? key.size() : remaining);
+                const bool is_final = (offset + segment) >= key.size();
+                last = m_executor_->ExecuteUnlock(
+                    length_field, BytesView{key}.subspan(offset, segment),
+                    is_final);
+                offset += segment;
+            } while (offset < key.size());
+
+            // 事务完成：清除分段状态，避免影响后续 Seed&Key 调用
+            m_executor_->ResetSeedKeyTransaction();
+            return UnlockResult{false, last.resource_protection};
+        } catch (const XcpException& e) {
+            // 仅 GET_SEED 段超时可安全地从 Mode=0 完整重启一次（执行器已
+            // 证据：Slave 侧 Seed 序列未完成，重发 Mode=0 即可复位）。
+            // UNLOCK 段与末段的失败结果未知，一律上交调用方，绝不重放。
+            const bool is_get_seed_timeout =
+                e.Category() == ErrorCategory::RecoveryFailed &&
+                e.GetCommandCode() == CommandCode::GetSeed;
+            if (!is_get_seed_timeout ||
+                sequence_restart >= kMaxUnlockSequenceRestarts) {
+                m_executor_->ResetSeedKeyTransaction();
+                throw;
+            }
+            LIBXCP_LOG_WARNING(
+                "XCP seed&key transaction restarting from GET_SEED(Mode=0) "
+                "restart={}",
+                sequence_restart + 1);
+            // 回到 2a：重新从 GET_SEED(Mode=0) 收满 Seed 并重算 Key
         }
-        if (seed.size() + part.seed.size() > first.length) {
-            throw detail::MakeMalformedPacket(
-                "GET_SEED 续段累计字节数超过声明总长度 " +
-                std::to_string(first.length));
-        }
-        seed.insert(seed.end(), part.seed.begin(), part.seed.end());
     }
-
-    // ---- 4) 调用方算法计算 Key（异常原样传播）----
-    Bytes key = calculator(resource, BytesView{seed});
-    if (key.empty()) {
-        throw detail::MakeInvalidArgument(
-            "SeedKeyCalculator 返回空 Key，无法执行 UNLOCK");
-    }
-    if (key.size() > kMaxKeyLength) {
-        throw detail::MakeInvalidArgument("SeedKeyCalculator 返回的 Key 长度 " +
-                                          std::to_string(key.size()) +
-                                          " 字节超过 Length 字段上限 255");
-    }
-
-    // ---- 5) 分段发送 UNLOCK：首帧 Length=Key 总长，后续帧=剩余长度 ----
-    std::size_t offset = 0;
-    UnlockResponse last{};
-    do {
-        const std::size_t remaining = key.size() - offset;
-        const std::size_t segment = std::min(remaining, max_segment);
-        const auto length_field =
-            static_cast<std::uint8_t>(offset == 0U ? key.size() : remaining);
-        last = m_executor_->ExecuteUnlock(
-            length_field, BytesView{key}.subspan(offset, segment));
-        offset += segment;
-    } while (offset < key.size());
-
-    return UnlockResult{false, last.resource_protection};
 }
 
 // ---------------------------------------------------------------------------

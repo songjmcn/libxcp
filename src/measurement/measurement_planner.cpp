@@ -73,7 +73,7 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
         }
         if (info.is_array &&
             (m_daq_capabilities_.entry_granularity_bytes == 0U ||
-             m_daq_capabilities_.max_entry_size_bytes == 0U)) {
+             m_daq_capabilities_.max_entry_size_elements == 0U)) {
             return detail::MakeMeasurementError<MeasurementPlan>(
                 MeasurementErrorCode::DaqConfigurationError,
                 "数组 Entry 缺少已验证的粒度或最大长度",
@@ -89,15 +89,35 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
                 name);
         }
         const std::size_t byte_width = element_size * element_count;
-        if (m_daq_capabilities_.max_entry_size_bytes != 0U &&
-            byte_width > m_daq_capabilities_.max_entry_size_bytes) {
+        // E2/F-12 单位修正：MAX_ODT_ENTRY_SIZE_x 的单位是 **AG**，不是字节。
+        // 规范（原始 PDF 第 15 页 §4.1.2）：
+        //   "The MAX_ODT_ENTRY_SIZE_x parameters indicate the upper limits for
+        //    the size of the element described by an ODT entry in
+        //    ADDRESS_GRANULARITY."
+        //   SizeOf(element described by ODT entry)[AG] <= MAX_ODT_ENTRY_SIZE_x[AG]
+        // 因此此处必须先把字节宽度换算为 AG 元素数再比对。AG=1（BYTE）时
+        // 换算为恒等，与修正前行为逐位一致。
+        if (byte_width % m_ag_bytes_ != 0U) {
             return detail::MakeMeasurementError<MeasurementPlan>(
-                MeasurementErrorCode::DaqConfigurationError,
-                "测量 '" + name + "' 单 Entry 需 " +
-                    std::to_string(byte_width) + " 字节，超过 Slave 最大值 " +
-                    std::to_string(m_daq_capabilities_.max_entry_size_bytes),
+                MeasurementErrorCode::InvalidLayout,
+                "测量 '" + name + "' 实占 " + std::to_string(byte_width) +
+                    " 字节无法按 AG(" + std::to_string(m_ag_bytes_) +
+                    " 字节) 换算为整数元素数，不能与 MAX_ODT_ENTRY_SIZE 比较",
                 name);
         }
+        const std::size_t element_width_ag = byte_width / m_ag_bytes_;
+        if (m_daq_capabilities_.max_entry_size_elements != 0U &&
+            element_width_ag > m_daq_capabilities_.max_entry_size_elements) {
+            return detail::MakeMeasurementError<MeasurementPlan>(
+                MeasurementErrorCode::DaqConfigurationError,
+                "测量 '" + name + "' 单 Entry 占 " +
+                    std::to_string(element_width_ag) + " 个 AG 元素，超过 Slave " +
+                    "声明的 MAX_ODT_ENTRY_SIZE " +
+                    std::to_string(m_daq_capabilities_.max_entry_size_elements),
+                name);
+        }
+        // 粒度判据按规范同样是 AG 单位换算后再取模：
+        //   SizeOf(...)[AG] mod (GRANULARITY_x[BYTE] / AG[BYTE]) = 0
         if (m_daq_capabilities_.entry_granularity_bytes != 0U &&
             byte_width % m_daq_capabilities_.entry_granularity_bytes != 0U) {
             return detail::MakeMeasurementError<MeasurementPlan>(

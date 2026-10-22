@@ -23,8 +23,15 @@
 namespace calmcar::xcp {
 namespace {
 
-/// @brief 模拟 ECU 内存：按地址存字节
-using MemoryImage = std::map<Address, std::uint8_t>;
+/// @brief 模拟 ECU 内存：按**地址**存元素，每个地址存 AG 个字节
+///
+/// @note 依据原始 PDF 第 112 页 Table 42「The address granularity indicates
+///       the size of an element contained at a single address」与第 113 页
+///       Table 43（WORD 下 Address n = Byte 00 Byte 01、Address n+1 =
+///       Byte 02 Byte 03）：XCP 地址以**元素**计数，一个地址承载 AG 字节。
+///       修正前该镜像把地址当字节偏移（每地址 1 字节），与主站对地址语义
+///       的理解不一致，导致 AG>1 的用例在错误假设下「一起错、于是通过」。
+using MemoryImage = std::map<Address, Bytes>;
 
 /// @brief 组装 CONNECT 响应报文（RES 前缀 + 7 字节负载）
 Bytes ConnectResponseBytes(AddressGranularity ag, ByteOrder order,
@@ -110,12 +117,6 @@ public:
           m_max_cto_(max_cto),
           m_max_dto_(max_dto) {}
 
-    void SetMemory(Address address, const Bytes& data) {
-        for (std::size_t i = 0; i < data.size(); ++i) {
-            m_memory_[address + static_cast<Address>(i)] = data[i];
-        }
-    }
-
     /// @brief 令 SHORT_UPLOAD 始终返回 ERR_CMD_UNKNOWN
     void RejectShortUpload() { m_reject_short_upload_ = true; }
 
@@ -127,14 +128,72 @@ public:
         m_write_protected_ = protected_write;
     }
 
-    /// @brief 读回模拟内存（验证写回真的落进了 Slave 内存）
-    [[nodiscard]] Bytes Peek(Address address, std::size_t bytes) const {
-        Bytes out;
-        for (std::size_t i = 0; i < bytes; ++i) {
-            const auto it = m_memory_.find(address + static_cast<Address>(i));
-            out.push_back(it == m_memory_.end() ? 0x00U : it->second);
+    /// @brief 判断本 mock 当前的地址粒度字节数
+    [[nodiscard]] std::size_t AgBytes() const {
+        return AgToBytes(m_ag_);
+    }
+
+    /// @brief 按元素装载模拟内存（自动使用本 mock 的 AG 作为元素尺寸）
+    /// @param address 起始**元素**地址
+    /// @param data 数据字节；长度必须是 AG 的整数倍
+    /// @note 第 k 个元素位于地址 address + k，承载 AG 字节
+    ///       （原始 PDF 第 112 页 Table 42、第 113 页 Table 43）
+    void SetMemoryElements(Address address, const Bytes& data) {
+        const auto ag_bytes = AgBytes();
+        if (ag_bytes == 0U) {
+            return;
         }
+        const auto count = data.size() / ag_bytes;
+        for (std::size_t k = 0; k < count; ++k) {
+            Bytes element(data.begin() + k * ag_bytes,
+                          data.begin() + (k + 1) * ag_bytes);
+            m_memory_[address + static_cast<Address>(k)] = std::move(element);
+        }
+    }
+
+    /// @brief 按元素装载模拟内存（显式指定元素尺寸）
+    /// @param address 起始**元素**地址
+    /// @param data 数据字节
+    /// @param ag_bytes 每元素的字节数
+    void SetMemoryElements(Address address, const Bytes& data,
+                           std::size_t ag_bytes) {
+        if (ag_bytes == 0U) {
+            return;
+        }
+        const auto count = data.size() / ag_bytes;
+        for (std::size_t k = 0; k < count; ++k) {
+            Bytes element(data.begin() + k * ag_bytes,
+                          data.begin() + (k + 1) * ag_bytes);
+            m_memory_[address + static_cast<Address>(k)] = std::move(element);
+        }
+    }
+
+    /// @brief 读回模拟内存（用于校验写回真的落进了 Slave 内存）
+    /// @param address 起始**元素**地址
+    /// @param bytes 自起始元素地址起的字节数
+    /// @return 按元素顺序拼接的字节
+    [[nodiscard]] Bytes Peek(Address address, std::size_t bytes) const {
+        const auto ag_bytes = AgBytes();
+        if (ag_bytes == 0U) {
+            return {};
+        }
+        Bytes out;
+        const auto elements = (bytes + ag_bytes - 1U) / ag_bytes;
+        for (std::size_t k = 0; k < elements; ++k) {
+            const auto it = m_memory_.find(address + static_cast<Address>(k));
+            if (it == m_memory_.end()) {
+                out.insert(out.end(), ag_bytes, 0x00U);
+                continue;
+            }
+            out.insert(out.end(), it->second.begin(), it->second.end());
+        }
+        out.resize(bytes);
         return out;
+    }
+
+    /// @brief 按字节视图装载（地址按字节推进，仅用于 AG=BYTE 的旧式用例）
+    void SetMemory(Address address, const Bytes& data) {
+        SetMemoryElements(address, data, AgBytes());
     }
 
     /// @brief 令第 n 次 UPLOAD（1 起）不响应（模拟超时）
@@ -209,9 +268,11 @@ private:
             return Err(ErrorCode::CmdSyntax);
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
+        // 容量以字节计：elements * AG 不得超过 MAX_CTO
+        // （UPLOAD 的 RES 为 [FF][data...]，不含元素计数字节，故 -1）
+        const auto ag_bytes = AgToBytes(m_ag_);
         if (elements == 0U ||
-            elements + 1U >
-                static_cast<ElementCount>(m_max_cto_ / AgToBytes(m_ag_))) {
+            static_cast<std::size_t>(elements) * ag_bytes + 1U > m_max_cto_) {
             return Err(ErrorCode::OutOfRange);
         }
         auto data = read(m_mta_, elements);
@@ -221,7 +282,10 @@ private:
         // UPLOAD 的 RES 为 [FF][data...]，不含元素计数字节
         Bytes res{static_cast<std::uint8_t>(PacketType::Res)};
         res.insert(res.end(), data->begin(), data->end());
-        m_mta_ += static_cast<Address>(elements) * AgToBytes(m_ag_);
+        // MTA 按元素数前移：XCP 地址以元素为单位（原始 PDF 第 113 页
+        // Table 43：WORD 下 Address n+1 = Byte 02，地址 +1 即前进 1 个元素），
+        // 故推进量为 elements 本身，AG 不得乘入地址。
+        m_mta_ += static_cast<Address>(elements);
         return res;
     }
 
@@ -233,8 +297,10 @@ private:
             return Err(ErrorCode::CmdSyntax);
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
-        if (elements == 0U || elements > static_cast<ElementCount>(
-                                             m_max_cto_ / AgToBytes(m_ag_))) {
+        // 容量以字节计：elements * AG 不得超过 MAX_CTO
+        const auto ag_bytes = AgToBytes(m_ag_);
+        if (elements == 0U ||
+            static_cast<std::size_t>(elements) * ag_bytes > m_max_cto_) {
             return Err(ErrorCode::OutOfRange);
         }
         const Address address = ParseShortUploadAddress(packet, m_order_);
@@ -245,20 +311,33 @@ private:
         // SHORT_UPLOAD 的 RES 同样为 [FF][data...]
         Bytes res{static_cast<std::uint8_t>(PacketType::Res)};
         res.insert(res.end(), data->begin(), data->end());
-        m_mta_ = address + static_cast<Address>(elements) * AgToBytes(m_ag_);
+        // 同 handleUpload：地址按元素计数，AG 不参与地址推进
+        m_mta_ = address + static_cast<Address>(elements);
         return res;
     }
 
+    /// @brief 自元素地址读取若干元素
+    /// @param address 起始元素地址
+    /// @param elements 要读取的元素个数
+    /// @return 共 elements * AG 字节；任一元素首字节未映射则返回 nullopt
+    ///
+    /// @note 地址以**元素**为单位（原始 PDF 第 113 页 Table 43：WORD 下
+    ///       Address n = Byte 00、Address n+1 = Byte 02），第 k 个元素位于
+    ///       address + k*AG。修正前误按 elements * AgToBytes(ag) 连续步进
+    ///       地址，并把 AG 乘进地址推进，与主站「一起错」，导致 AG>1 用例
+    ///       全部虚假通过。
     std::optional<Bytes> read(Address address, ElementCount elements) {
         Bytes out;
-        const auto count =
-            static_cast<std::size_t>(elements) * AgToBytes(m_ag_);
-        for (std::size_t i = 0; i < count; ++i) {
-            const auto it = m_memory_.find(address + static_cast<Address>(i));
+        const auto ag_bytes = AgBytes();
+        const auto count = static_cast<std::size_t>(elements);
+        out.reserve(count * ag_bytes);
+        // 地址以元素计数：第 k 个元素位于 address + k，承载 AG 字节
+        for (std::size_t k = 0; k < count; ++k) {
+            const auto it = m_memory_.find(address + static_cast<Address>(k));
             if (it == m_memory_.end()) {
                 return std::nullopt;
             }
-            out.push_back(it->second);
+            out.insert(out.end(), it->second.begin(), it->second.end());
         }
         return out;
     }
@@ -273,16 +352,27 @@ private:
             return Err(ErrorCode::CmdSyntax);
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
-        const auto want = static_cast<std::size_t>(elements) * AgToBytes(m_ag_);
-        if (elements == 0U || want + 2U > packet.size() ||
-            want + 2U > m_max_cto_) {
+        // AG>2（即 DWORD）时 [F0][SIZE] 之后有 2 字节对齐
+        // （原始 PDF 第 142 页 Table 82："only if AG >2"；
+        //   "If AG = DWORD, 2 alignment bytes must be used"）
+        const auto alignment = static_cast<std::size_t>(
+            DownloadAlignmentBytes(m_ag_));
+        const auto header = 2U + alignment;
+        const auto ag_bytes = AgToBytes(m_ag_);
+        // 净荷长度 = 元素数 * AG
+        const auto want = static_cast<std::size_t>(elements) * ag_bytes;
+        if (elements == 0U || header + want > packet.size() ||
+            header + want > m_max_cto_) {
             // 元素数与净荷长度必须自洽，且整帧不得超 MAX_CTO
             return Err(ErrorCode::CmdSyntax);
         }
-        for (std::size_t i = 0; i < want; ++i) {
-            m_memory_[m_mta_ + static_cast<Address>(i)] = packet[2 + i];
+        for (std::size_t k = 0; k < static_cast<std::size_t>(elements); ++k) {
+            Bytes element(packet.begin() + header + k * ag_bytes,
+                          packet.begin() + header + (k + 1) * ag_bytes);
+            m_memory_[m_mta_ + static_cast<Address>(k)] = std::move(element);
         }
-        m_mta_ += static_cast<Address>(want);
+        // 地址按元素计数，推进量为元素数（AG 不参与地址推进）
+        m_mta_ += static_cast<Address>(elements);
         return Bytes{static_cast<std::uint8_t>(PacketType::Res)};
     }
 
@@ -297,14 +387,19 @@ private:
             return Err(ErrorCode::CmdSyntax);
         }
         const auto elements = static_cast<ElementCount>(packet[1]);
-        const auto want = static_cast<std::size_t>(elements) * AgToBytes(m_ag_);
+        // 净荷长度 = 元素数 * AG；SHORT_DOWNLOAD 头固定 8 字节，
+        // 数据天然按 AG 对齐，不额外插对齐字节
+        const auto ag_bytes = AgToBytes(m_ag_);
+        const auto want = static_cast<std::size_t>(elements) * ag_bytes;
         if (elements == 0U || want + 8U > packet.size() ||
             want + 8U > m_max_cto_) {
             return Err(ErrorCode::CmdSyntax);
         }
         const Address address = ParseShortUploadAddress(packet, m_order_);
-        for (std::size_t i = 0; i < want; ++i) {
-            m_memory_[address + static_cast<Address>(i)] = packet[8 + i];
+        for (std::size_t k = 0; k < static_cast<std::size_t>(elements); ++k) {
+            Bytes element(packet.begin() + 8 + k * ag_bytes,
+                          packet.begin() + 8 + (k + 1) * ag_bytes);
+            m_memory_[address + static_cast<Address>(k)] = std::move(element);
         }
         return Bytes{static_cast<std::uint8_t>(PacketType::Res)};
     }
@@ -435,6 +530,9 @@ TEST_P(MemoryAccessAgTest, ChunkingSplitsAtUploadLimit) {
 
     // 造一块比单块上限大得多的数据，强制多块 UPLOAD
     const ElementCount total = c.upload_max * 3 + 1;
+    // 元素地址以元素为单位计数（原始 PDF 第 113 页 Table 43），
+    // 故 total 个元素落在 total 个连续地址上；
+    // 本 mock 每地址存 ag_bytes 字节，总字节数 = total * AG
     const auto total_bytes = static_cast<std::size_t>(total) * ag_bytes;
     Bytes content;
     content.reserve(total_bytes);
@@ -444,7 +542,7 @@ TEST_P(MemoryAccessAgTest, ChunkingSplitsAtUploadLimit) {
 
     Harness h(c.ag, ByteOrder::Intel, c.max_cto,
               static_cast<std::uint16_t>(c.max_cto * 4U));
-    h.slave.SetMemory(0x4000, content);
+    h.slave.SetMemoryElements(0x4000, content, ag_bytes);
 
     MemoryAccess access(h.executor, h.session);
     const Bytes got = access.UploadChunked(0x4000, 0x00, total);
@@ -465,7 +563,7 @@ TEST_P(MemoryAccessAgTest, SingleShortUploadWithinLimit) {
 
     Harness h(c.ag, ByteOrder::Intel, c.max_cto,
               static_cast<std::uint16_t>(c.max_cto * 4U));
-    h.slave.SetMemory(0x8000, content);
+    h.slave.SetMemoryElements(0x8000, content, ag_bytes);
 
     MemoryAccess access(h.executor, h.session);
     const Bytes got = access.ReadElements(0x8000, 0x00, c.short_upload_max);
@@ -483,7 +581,7 @@ TEST_P(MemoryAccessAgTest, BeyondShortUploadLimitFallsBackToChunked) {
 
     Harness h(c.ag, ByteOrder::Intel, c.max_cto,
               static_cast<std::uint16_t>(c.max_cto * 4U));
-    h.slave.SetMemory(0x9000, content);
+    h.slave.SetMemoryElements(0x9000, content, ag_bytes);
 
     MemoryAccess access(h.executor, h.session);
     const Bytes got = access.ReadElements(0x9000, 0x00, total);
@@ -505,7 +603,7 @@ TEST_P(MemoryAccessAgTest, AddressAdvancesByAgBytes) {
 
     Harness h(c.ag, ByteOrder::Intel, c.max_cto,
               static_cast<std::uint16_t>(c.max_cto * 4U));
-    h.slave.SetMemory(0xC000, content);
+    h.slave.SetMemoryElements(0xC000, content, ag_bytes);
 
     MemoryAccess access(h.executor, h.session);
     const Bytes got = access.UploadChunked(0xC000, 0x00, total);

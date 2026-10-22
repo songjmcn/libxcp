@@ -232,7 +232,8 @@ std::unique_ptr<XcpMaster> MakeProfileMaster(RuntimeProfileSlave& slave) {
     auto transport = std::make_unique<test::MockTransport>();
     transport->SetResponse(
         [&slave](BytesView packet) { return slave(packet); });
-    auto master = std::make_unique<XcpMaster>(std::move(transport));
+    auto master =
+        std::make_unique<XcpMaster>(std::move(transport), XcpMasterOptions{});
     master->Connect();
     return master;
 }
@@ -488,7 +489,7 @@ TEST(A2lMeasurementDatabase, ToPhysicalErrorCodesMapToCoreCodes) {
     }
 }
 
-TEST(GenericMeasurementRuntimeProfile,
+TEST(MeasurementRuntimeProfile,
      AcceptsOnlyAbsoluteTimestampFreeProfile) {
     RuntimeProfileSlave slave;
     slave.key_byte = 0x00U;
@@ -498,35 +499,38 @@ TEST(GenericMeasurementRuntimeProfile,
         {"event0", "event0", 0U, 5U, 2U, 1U, 0xFFU},
     }};
 
-    const auto profile = BuildGenericMeasurementRuntimeProfile(*master, events);
+    const auto profile = BuildMeasurementRuntimeProfile(*master, events);
     ASSERT_TRUE(profile.HasValue()) << profile.ErrorInfo().message;
     EXPECT_EQ(profile.Value().identification_field_type,
               IdentificationFieldType::Absolute);
     EXPECT_EQ(profile.Value().identification_header_bytes, 1U);
     EXPECT_EQ(profile.Value().daq_entry_granularity_bytes, 1U);
-    EXPECT_EQ(profile.Value().max_daq_entry_size_bytes, 8U);
+    EXPECT_EQ(profile.Value().max_daq_entry_size_elements, 8U);
     EXPECT_EQ(slave.queried_events, (std::vector<std::uint16_t>{0U}));
 }
 
-TEST(GenericMeasurementRuntimeProfile, RejectsUnverifiedModesAndEvents) {
+TEST(MeasurementRuntimeProfile, RejectsUnverifiedModesAndEvents) {
     const std::array<A2lEventMetadata, 1> event{{
         {"event0", "event0", 0U, 5U, 2U, 1U, 0xFFU},
     }};
     {
         RuntimeProfileSlave slave;
-        slave.key_byte = 0x10U;  // ODT address-extension mode is not verified.
+        slave.key_byte = 0x10U;  // 地址扩展模式为 ODT，本库仅支持 FREE(0)。
         slave.timestamp_mode = 0x00U;
         auto master = MakeProfileMaster(slave);
         EXPECT_FALSE(
-            BuildGenericMeasurementRuntimeProfile(*master, event).HasValue());
+            BuildMeasurementRuntimeProfile(*master, event).HasValue());
     }
     {
         RuntimeProfileSlave slave;
         slave.key_byte = 0x00U;
-        slave.timestamp_mode = 0x0CU;  // fixed timestamps cannot be disabled.
+        slave.timestamp_mode = 0x0CU;  // 固定 32-bit 时间戳：C1 后受支持
         auto master = MakeProfileMaster(slave);
-        EXPECT_FALSE(
-            BuildGenericMeasurementRuntimeProfile(*master, event).HasValue());
+        auto profile = BuildMeasurementRuntimeProfile(*master, event);
+        ASSERT_TRUE(profile.HasValue()) << profile.ErrorInfo().message;
+        // 固定时间戳按 XCPlite 厂商约定换算，并如实记录采用了该约定。
+        EXPECT_TRUE(profile.Value().used_xcplite_timestamp_unit_convention);
+        EXPECT_GT(profile.Value().timestamp_unit_ns, 0U);
     }
     {
         RuntimeProfileSlave slave;
@@ -536,12 +540,12 @@ TEST(GenericMeasurementRuntimeProfile, RejectsUnverifiedModesAndEvents) {
         auto no_daq_event = event;
         no_daq_event[0].max_daq_list = 0U;
         EXPECT_FALSE(
-            BuildGenericMeasurementRuntimeProfile(*master, no_daq_event)
+            BuildMeasurementRuntimeProfile(*master, no_daq_event)
                 .HasValue());
     }
 }
 
-TEST(XcpliteMeasurementRuntimeProfile,
+TEST(MeasurementRuntimeProfile,
      CrossChecksLiveProfileAndAllBoundEvents) {
     RuntimeProfileSlave slave;
     auto master = MakeProfileMaster(slave);
@@ -550,10 +554,10 @@ TEST(XcpliteMeasurementRuntimeProfile,
         {"event4", "event4", 4U, 5U, 2U, 1U, 0xFFU},
     }};
 
-    const auto profile = BuildXcpliteMeasurementRuntimeProfile(*master, events);
+    const auto profile = BuildMeasurementRuntimeProfile(*master, events);
     ASSERT_TRUE(profile.HasValue()) << profile.ErrorInfo().message;
     EXPECT_EQ(profile.Value().identification_field_type,
-              IdentificationFieldType::RelativeByte);
+              IdentificationFieldType::RelativeWordAligned);
     EXPECT_EQ(profile.Value().identification_header_bytes, 4U);
     EXPECT_EQ(profile.Value().timestamp_unit_ns, 3U);
     EXPECT_TRUE(profile.Value().timestamp_first_odt_only);
@@ -561,7 +565,7 @@ TEST(XcpliteMeasurementRuntimeProfile,
                     .supports_contiguous_1d_arrays);
     EXPECT_EQ(profile.Value().daq_entry_capabilities.entry_granularity_bytes,
               1U);
-    EXPECT_EQ(profile.Value().daq_entry_capabilities.max_entry_size_bytes, 8U);
+    EXPECT_EQ(profile.Value().daq_entry_capabilities.max_entry_size_elements, 8U);
     EXPECT_EQ(slave.queried_events, (std::vector<std::uint16_t>{0U, 4U}));
 
     FakeA2l db;
@@ -571,7 +575,7 @@ TEST(XcpliteMeasurementRuntimeProfile,
     EXPECT_NO_THROW(ApplyMeasurementRuntimeProfile(session, profile.Value()));
 }
 
-TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownEntryLimitsBeforeEvents) {
+TEST(MeasurementRuntimeProfile, RejectsUnknownEntryLimitsBeforeEvents) {
     const std::array<A2lEventMetadata, 1> event{{
         {"event", "event", 0U, 5U, 2U, 1U, 0xFFU},
     }};
@@ -583,7 +587,7 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownEntryLimitsBeforeEvents) {
         slave.daq_granularity = granularity;
         slave.max_daq_entry_size = max_entry;
         auto master = MakeProfileMaster(slave);
-        const auto profile = BuildXcpliteMeasurementRuntimeProfile(*master, event);
+        const auto profile = BuildMeasurementRuntimeProfile(*master, event);
         EXPECT_FALSE(profile.HasValue());
         EXPECT_TRUE(slave.queried_events.empty());
     }
@@ -598,7 +602,7 @@ TEST(DaqRuntimeProfiles, RejectsProtectedDaqBeforeConfiguration) {
         slave.resource_protection = static_cast<std::uint8_t>(Resource::Daq);
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildGenericMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_NE(result.ErrorInfo().message.find("不发送 FREE_DAQ"),
                   std::string::npos);
@@ -608,44 +612,54 @@ TEST(DaqRuntimeProfiles, RejectsProtectedDaqBeforeConfiguration) {
         slave.resource_protection = static_cast<std::uint8_t>(Resource::Daq);
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_NE(result.ErrorInfo().message.find("不发送 FREE_DAQ"),
                   std::string::npos);
     }
 }
 
-TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
+TEST(MeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
     const std::array<A2lEventMetadata, 1> event{{
         {"event", "event", 0U, 5U, 2U, 1U, 0xFFU},
     }};
     {
         RuntimeProfileSlave slave;
         slave.key_byte =
-            0x80U;  // RelativeWord, not the XCPlite RelativeByte profile.
+            0x80U;  // wire code 2 = RelativeWord：C1 后按规范自动支持
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
+        ASSERT_TRUE(result.HasValue()) << result.ErrorInfo().message;
+        EXPECT_EQ(result.Value().identification_field_type,
+                  IdentificationFieldType::RelativeWord);
+        // 头长按规范 Figure 52 由模式唯一决定为 3 字节。
+        EXPECT_EQ(result.Value().identification_header_bytes, 3U);
+    }
+    {
+        RuntimeProfileSlave slave;
+        slave.daq_properties = 0x10U;  // 仅 kTimestamp，未声明 DYNAMIC
+        auto master = MakeProfileMaster(slave);
+        const auto result =
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_EQ(result.ErrorInfo().code,
                   MeasurementErrorCode::DaqConfigurationError);
     }
     {
         RuntimeProfileSlave slave;
-        slave.daq_properties = 0x01U;  // No dynamic/timestamp properties.
+        slave.daq_properties = 0x01U;  // 仅 DYNAMIC：C1 后不再要求 kTimestamp
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
-        ASSERT_FALSE(result.HasValue());
-        EXPECT_EQ(result.ErrorInfo().code,
-                  MeasurementErrorCode::DaqConfigurationError);
+            BuildMeasurementRuntimeProfile(*master, event);
+        ASSERT_TRUE(result.HasValue()) << result.ErrorInfo().message;
     }
     {
         RuntimeProfileSlave slave;
         slave.timestamp_mode = 0x7CU;  // Unknown XCPlite unit code 7.
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_EQ(result.ErrorInfo().code,
                   MeasurementErrorCode::DaqConfigurationError);
@@ -655,7 +669,7 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
         slave.event_cycle = 6U;
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_EQ(result.ErrorInfo().symbol, "event");
     }
@@ -664,7 +678,7 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
         slave.event_supported = false;
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_EQ(result.ErrorInfo().symbol, "event");
     }
@@ -673,7 +687,7 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
         slave.connect_mode_basic = 0xC1U;  // Motorola byte order.
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_NE(result.ErrorInfo().message.find("Intel 字节序"),
                   std::string::npos);
@@ -683,7 +697,7 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
         slave.event_max_daq_lists = 0U;
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_EQ(result.ErrorInfo().symbol, "event");
     }
@@ -695,7 +709,7 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
             {"event", "event", 4U, 5U, 2U, 1U, 0xFFU},
         }};
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, out_of_range);
+            BuildMeasurementRuntimeProfile(*master, out_of_range);
         ASSERT_FALSE(result.HasValue());
         EXPECT_EQ(result.ErrorInfo().symbol, "event");
     }
@@ -710,7 +724,7 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
             {"second", "second", 1U, 5U, 2U, 1U, 0xFFU},
         }};
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, events);
+            BuildMeasurementRuntimeProfile(*master, events);
         ASSERT_TRUE(result.HasValue()) << result.ErrorInfo().message;
         EXPECT_EQ(slave.queried_events, (std::vector<std::uint16_t>{0U, 1U}));
     }
@@ -719,20 +733,20 @@ TEST(XcpliteMeasurementRuntimeProfile, RejectsUnknownOrMismatchedFacts) {
         slave.min_daq = 1U;
         auto master = MakeProfileMaster(slave);
         const auto result =
-            BuildXcpliteMeasurementRuntimeProfile(*master, event);
+            BuildMeasurementRuntimeProfile(*master, event);
         ASSERT_FALSE(result.HasValue());
         EXPECT_NE(result.ErrorInfo().message.find("从 0 开始"),
                   std::string::npos);
     }
 }
 
-TEST(XcpliteMeasurementRuntimeProfile,
+TEST(MeasurementRuntimeProfile,
      RejectsEmptyEventEvidenceAndInvalidTimestamp) {
     RuntimeProfileSlave slave;
     auto master = MakeProfileMaster(slave);
     const std::span<const A2lEventMetadata> no_events;
     const auto empty =
-        BuildXcpliteMeasurementRuntimeProfile(*master, no_events);
+        BuildMeasurementRuntimeProfile(*master, no_events);
     ASSERT_FALSE(empty.HasValue());
     EXPECT_EQ(empty.ErrorInfo().code,
               MeasurementErrorCode::DaqConfigurationError);
@@ -745,14 +759,19 @@ TEST(XcpliteMeasurementRuntimeProfile,
         zero_ticks.timestamp_ticks = 0U;
         auto zero_tick_master = MakeProfileMaster(zero_ticks);
         const auto zero_tick =
-            BuildXcpliteMeasurementRuntimeProfile(*zero_tick_master, event);
+            BuildMeasurementRuntimeProfile(*zero_tick_master, event);
         ASSERT_FALSE(zero_tick.HasValue());
     }
 
-    slave.timestamp_mode = 0x04U;  // 32-bit field, but not fixed.
+    slave.timestamp_mode = 0x04U;  // 32-bit 字段但非固定模式。
     const auto not_fixed =
-        BuildXcpliteMeasurementRuntimeProfile(*master, event);
-    ASSERT_FALSE(not_fixed.HasValue());
+        BuildMeasurementRuntimeProfile(*master, event);
+    // C1 后非固定时间戳不再拒绝：时间戳单位未知（0），
+    // 由上层显式注入，绝不猜测（帧时间戳标记为 invalid）。
+    ASSERT_TRUE(not_fixed.HasValue()) << not_fixed.ErrorInfo().message;
+    EXPECT_EQ(not_fixed.Value().timestamp_unit_ns, 0U);
+    EXPECT_FALSE(
+        not_fixed.Value().used_xcplite_timestamp_unit_convention);
 }
 
 }  // namespace

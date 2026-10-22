@@ -1,5 +1,9 @@
 # ============================================================================
-# libxcp —— XCP 1.3.0 最小协议核心 + XCP on UDP/IP Transport
+# libxcp —— XCP 协议主站核心（V1.3–V1.5）+ XCP on UDP/IP Transport
+#
+# 版本 2.0.0（破坏性变更，批次 B1）：
+#   * XcpMaster 构造函数由位置参数改为单一 XcpMasterOptions 聚合
+#   * 新增版本发现能力（GET_VERSION）与 PL/TL 双版本快照接口
 #
 # 依据设计文档：code-plan/XCP_1.3.0_详细设计_类接口与头文件.md
 # 语言标准：C++20；目标平台：Windows / Linux / macOS
@@ -20,8 +24,8 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(libxcp
-        VERSION 1.3.0
-        DESCRIPTION "XCP 1.3.0 minimal protocol core with UDP/IP transport"
+        VERSION 2.0.0
+        DESCRIPTION "XCP protocol master core (V1.3-V1.5) with UDP/IP transport"
         LANGUAGES CXX)
 
 # ----------------------------------------------------------------------------
@@ -143,12 +147,15 @@ add_library(libxcp::libxcp ALIAS libxcp)
 
 target_sources(libxcp PRIVATE
         src/protocol_types.cpp
+        src/protocol_version.cpp
+        src/version_resolver.cpp
         src/xcp_error.cpp
         src/command_codec.cpp
         src/response_parser.cpp
         src/session.cpp
         src/udp_header_codec.cpp
         src/udp_transport.cpp
+        src/link_budget.cpp
         src/command_executor.cpp
         src/memory_access.cpp
         src/xcp_master.cpp

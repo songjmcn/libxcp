@@ -30,7 +30,11 @@ struct TransportEndpoint {
     enum class Kind : std::uint8_t { UdpIp, TcpIp, Can, Sxi, Usb, Flx };
 
     Kind kind = Kind::UdpIp;         ///< IF_DATA XCP 段声明的传输层
-    std::uint16_t version = 0x0100;  ///< IF_DATA XCP 段版本号
+    /// @brief IF_DATA XCP 段版本号
+    /// @details 默认 0 表示「A2L 未声明」：上游 IfDataXcpDto 没有与
+    ///          PROTOCOL_LAYER 版本分开的段版本字段，桥接层无处可取，
+    ///          故不再用 0x0100 冒充 V1.0（V-04 同类问题）。
+    std::uint16_t version = 0;
     std::string remote_host;         ///< IPv4/IPv6 字符串；CAN 时为通道名
     std::uint16_t remote_port = 0;   ///< 远端端口
     std::string local_host;          ///< A2L 描述时填入，否则由调用方决定
@@ -48,8 +52,11 @@ struct TransportEndpoint {
  *          t1..t7 是 Master 超时配置，不参与运行时比对（B-16）。
  */
 struct ProtocolLayerInfo {
-    std::uint16_t version =
-        0x0100;  ///< PROTOCOL_LAYER VERSION（major<<8|minor）
+    /// @brief PROTOCOL_LAYER VERSION（major<<8|minor）
+    /// @details 默认 0 表示「A2L 未标注」：0x0000 会被
+    ///          XcpProtocolVersion::IsValid() 判为无证据。此前默认 0x0100
+    ///          会把未标注该字段的文件伪装成 V1.0（V-04）。
+    std::uint16_t version = 0;
     std::uint16_t timeout_ms[7] =
         {};                     ///< t1..t7，索引 0 = t1（A2L 未给出时为 0）
     std::uint8_t max_cto = 0;   ///< MAX_CTO
