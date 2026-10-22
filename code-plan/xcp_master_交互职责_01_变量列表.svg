@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="920" viewBox="0 0 1440 920"><title>A / 变量列表：选择、加入观测、进入标定</title>
+<g font-family="SFMono-Regular, Menlo, Consolas, monospace">
+<rect x="0" y="0" width="1440" height="920" rx="5" fill="#0b1220" stroke="none"/>
+<text x="36" y="44" fill="#f3f7fc" font-size="26">A / 变量列表：选择、加入观测、进入标定</text>
+<text x="36" y="76" fill="#93a5ba" font-size="15">设计效果图 · 非运行截图 · 示例值及写入资格均为虚构</text>
+<rect x="24" y="100" width="1392" height="776" rx="5" fill="#111c2d" stroke="#33475f"/>
+<text x="44" y="132" fill="#6ee7df" font-size="19">XCP MASTER   UDP 127.0.0.1:5555   |   cpp_demo_V201.a2l</text>
+<text x="44" y="164" fill="#b9cadb" font-size="18">已连接  |  已停止  |  观测集合 2 项  |  选择和加入集合均不读取 ECU</text>
+<rect x="36" y="182" width="1368" height="36" rx="5" fill="#1e3048" stroke="none"/>
+<text x="48" y="207" fill="#6ee7df" font-size="18">[ 变量预览 ]       命令结果       日志</text>
+<text x="48" y="246" fill="#b9cadb" font-size="18">搜索: loop_                         范围: 全部变量 / 观测集合</text>
+<text x="48" y="290" fill="#93a5ba" font-size="16">展开  集合   变量名                                  类型 / 形态                    能力</text>
+<rect x="42" y="309" width="1350" height="39" rx="5" fill="#234b60" stroke="#6ee7df"/>
+<text x="50" y="336" fill="#dce5ef" font-size="17">▸     [✓]    cpp_demo::loop_histogram</text>
+<text x="768" y="336" fill="#dce5ef" font-size="17">ULONG / 数组[128]</text>
+<text x="1100" y="336" fill="#a6d4c8" font-size="16">POLL可观测 · 数组只读</text>
+<text x="50" y="385" fill="#dce5ef" font-size="17">▸     [✓]    cpp_demo::loop_cycletime</text>
+<text x="768" y="385" fill="#dce5ef" font-size="17">A_UINT64 / 标量</text>
+<text x="1100" y="385" fill="#a6d4c8" font-size="16">可观测 · 只读</text>
+<text x="50" y="434" fill="#dce5ef" font-size="17">▸     [ ]    cpp_demo::counter</text>
+<text x="768" y="434" fill="#dce5ef" font-size="17">UWORD / 标量</text>
+<text x="1100" y="434" fill="#a6d4c8" font-size="16">可观测 · 只读</text>
+<text x="50" y="483" fill="#dce5ef" font-size="17">▸     [ ]    demo::calibration_gain</text>
+<text x="768" y="483" fill="#dce5ef" font-size="17">FLOAT64_IEEE / VALUE</text>
+<text x="1100" y="483" fill="#a6d4c8" font-size="16">可观测 · 可申请标定</text>
+<rect x="48" y="560" width="1344" height="175" rx="5" fill="#17283b" stroke="none"/>
+<text x="68" y="592" fill="#6ee7df" font-size="19">当前选择：cpp_demo::loop_histogram</text>
+<text x="68" y="628" fill="#dce5ef" font-size="18">Enter 原位展开；数组全部索引可滚动访问。尚未运行，当前不读取数据。</text>
+<text x="68" y="664" fill="#dce5ef" font-size="17">Ctrl+A / ⌘A 切换观测成员    Ctrl+S / ⌘S 进入标定    F3 查看只读元数据</text>
+<text x="68" y="703" fill="#f2cb75" font-size="17">集合管理 ≠ 启动采样；使用 watch 启动，stop 停止。</text>
+<rect x="36" y="786" width="1368" height="36" rx="5" fill="#1e3048" stroke="none"/>
+<text x="48" y="811" fill="#dce5ef" font-size="18">命令 &gt; watch</text>
+<text x="48" y="852" fill="#6ee7df" font-size="16">Enter 展开   F6 成员切换   F4 标定   F3 详情   F5 停止   F2 切换视图</text>
+<text x="36" y="904" fill="#93a5ba" font-size="16">焦点在输入框时不抢占全选；macOS Command 组合键需终端映射，F6/F4 为备用入口。</text>
+</g></svg>

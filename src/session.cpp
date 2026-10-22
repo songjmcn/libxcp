@@ -9,6 +9,8 @@
 
 #include "libxcp/session.hpp"
 
+#include "libxcp/log.hpp"
+
 #include <algorithm>
 #include <string>
 
@@ -17,6 +19,7 @@ namespace calmcar::xcp {
 void Session::ValidateConnectParams(const ConnectResponse& resp) const {
     // MAX_CTO 范围校验
     if (resp.max_cto < kMaxCtoMinimum) {
+        LIBXCP_LOG_ERROR("Session rejected invalid CONNECT parameters");
         throw detail::MakeInvalidArgument(
             "CONNECT 返回的 MAX_CTO 小于协议下限 0x08: " +
             std::to_string(resp.max_cto));
@@ -24,6 +27,7 @@ void Session::ValidateConnectParams(const ConnectResponse& resp) const {
 
     // MAX_DTO 范围校验
     if (resp.max_dto < kMaxDtoMinimum) {
+        LIBXCP_LOG_ERROR("Session rejected invalid CONNECT parameters");
         throw detail::MakeInvalidArgument(
             "CONNECT 返回的 MAX_DTO 小于协议下限 0x0008: " +
             std::to_string(resp.max_dto));
@@ -32,12 +36,14 @@ void Session::ValidateConnectParams(const ConnectResponse& resp) const {
     // AG 整除校验：MAX_CTO mod AG == 0
     const auto ag_bytes = AgToBytes(resp.address_granularity);
     if (ag_bytes == 0U || (resp.max_cto % ag_bytes) != 0U) {
+        LIBXCP_LOG_ERROR("Session rejected invalid CONNECT parameters");
         throw detail::MakeInvalidArgument(
             "MAX_CTO 不能被 Address Granularity 整除: MAX_CTO=" +
             std::to_string(resp.max_cto) + ", AG=" + std::to_string(ag_bytes));
     }
     // AG 整除校验：MAX_DTO mod AG == 0
     if ((resp.max_dto % ag_bytes) != 0U) {
+        LIBXCP_LOG_ERROR("Session rejected invalid CONNECT parameters");
         throw detail::MakeInvalidArgument(
             "MAX_DTO 不能被 Address Granularity 整除: MAX_DTO=" +
             std::to_string(resp.max_dto) + ", AG=" + std::to_string(ag_bytes));
@@ -68,12 +74,15 @@ void Session::BeginConnecting() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
     // 仅允许从 Disconnected 发起连接；Failed 必须先 reset()
     if (m_state_ != SessionState::Disconnected) {
+        LIBXCP_LOG_ERROR("Session rejected invalid state transition");
         throw detail::MakeInvalidState(std::string("当前状态不允许发起连接: ") +
                                        std::string(SessionStateName(m_state_)));
     }
     m_state_ = SessionState::Connecting;
     m_pending_command_.reset();
     m_fail_reason_.clear();
+    // 状态变更与日志在同一临界区内，避免并发迁移后记录错误的顺序。
+    LIBXCP_LOG_INFO("Session state Disconnected -> Connecting; pending=none");
 }
 
 void Session::EstablishConnection(const ConnectResponse& connect_response) {
@@ -81,6 +90,7 @@ void Session::EstablishConnection(const ConnectResponse& connect_response) {
     {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         if (m_state_ != SessionState::Connecting) {
+            LIBXCP_LOG_ERROR("Session rejected invalid state transition");
             throw detail::MakeInvalidState(
                 std::string("CONNECT 响应到达时不在 Connecting 状态: ") +
                 std::string(SessionStateName(m_state_)));
@@ -98,16 +108,22 @@ void Session::EstablishConnection(const ConnectResponse& connect_response) {
         m_state_ = SessionState::Connected;
         m_pending_command_.reset();
         m_fail_reason_.clear();
+        LIBXCP_LOG_INFO(
+            "Session state Connecting -> Connected; max_cto={} max_dto={} "
+            "daq_generation=0 pending=none",
+            connect_response.max_cto, connect_response.max_dto);
     }
 }
 
 void Session::BeginDisconnecting() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
     if (m_state_ != SessionState::Connected) {
+        LIBXCP_LOG_ERROR("Session rejected invalid state transition");
         throw detail::MakeInvalidState(std::string("当前状态不允许断开: ") +
                                        std::string(SessionStateName(m_state_)));
     }
     m_state_ = SessionState::Disconnecting;
+    LIBXCP_LOG_INFO("Session state Connected -> Disconnecting");
 }
 
 void Session::CompleteDisconnection() {
@@ -121,26 +137,35 @@ void Session::CompleteDisconnection() {
     m_pag_processor_info_.reset();  // 变量标定批次：PAG 缓存一并作废
     m_pending_command_.reset();
     m_state_ = SessionState::Disconnected;
+    LIBXCP_LOG_INFO(
+        "Session state Disconnecting -> Disconnected; daq_generation=0 "
+        "running_lists=0 pending=none");
 }
 
 void Session::BeginRecovery() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
     if (m_state_ != SessionState::Connected) {
+        LIBXCP_LOG_ERROR("Session rejected invalid state transition");
         throw detail::MakeInvalidState(std::string("当前状态不允许进入恢复: ") +
                                        std::string(SessionStateName(m_state_)));
     }
     m_state_ = SessionState::Recovering;
+    LIBXCP_LOG_INFO("Session state Connected -> Recovering");
 }
 
 void Session::CompleteRecovery() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
     if (m_state_ == SessionState::Recovering) {
         m_state_ = SessionState::Connected;
+        LIBXCP_LOG_INFO("Session state Recovering -> Connected");
     }
 }
 
 void Session::Fail(std::string_view reason) {
     const std::lock_guard<std::mutex> lock(m_mutex_);
+#if LIBXCP_ENABLE_LOG
+    const auto previous = m_state_;
+#endif
     m_state_ = SessionState::Failed;
     m_fail_reason_ = std::string(reason);
     m_params_ = SessionParameters{};
@@ -149,10 +174,18 @@ void Session::Fail(std::string_view reason) {
     m_daq_generation_ = 0U;
     m_pag_processor_info_.reset();  // 变量标定批次：PAG 缓存一并作废
     m_pending_command_.reset();
+    // 只记录状态和资源清理结果，不输出可能包含敏感内容的 reason。
+    LIBXCP_LOG_ERROR(
+        "Session state {} -> Failed; daq_generation=0 running_lists=0 "
+        "pending=none",
+        SessionStateName(previous));
 }
 
 void Session::Reset() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
+#if LIBXCP_ENABLE_LOG
+    const auto previous = m_state_;
+#endif
     m_state_ = SessionState::Disconnected;
     m_params_ = SessionParameters{};
     m_daq_running_lists_.clear();
@@ -160,11 +193,16 @@ void Session::Reset() {
     m_pag_processor_info_.reset();  // 变量标定批次：PAG 缓存一并作废
     m_pending_command_.reset();
     m_fail_reason_.clear();
+    LIBXCP_LOG_INFO(
+        "Session state {} -> Disconnected (reset); daq_generation=0 "
+        "running_lists=0 pending=none",
+        SessionStateName(previous));
 }
 
 void Session::MarkCommandSent(CommandCode cmd) {
     const std::lock_guard<std::mutex> lock(m_mutex_);
     if (m_pending_command_.has_value()) {
+        LIBXCP_LOG_ERROR("Session rejected invalid state transition");
         throw detail::MakeInvalidState(
             "已有待响应的命令，Standard Communication Model 只允许一条 "
             "Outstanding Command");
@@ -172,14 +210,22 @@ void Session::MarkCommandSent(CommandCode cmd) {
     // Failed / Disconnected 状态下不得发送业务命令
     if (m_state_ == SessionState::Failed ||
         m_state_ == SessionState::Disconnected) {
+        LIBXCP_LOG_ERROR("Session rejected invalid state transition");
         throw detail::MakeInvalidState(std::string("当前状态不允许发送命令: ") +
                                        std::string(SessionStateName(m_state_)));
     }
     m_pending_command_ = cmd;
+    LIBXCP_LOG_INFO("Session pending none -> {} state={}",
+                    static_cast<unsigned int>(cmd), SessionStateName(m_state_));
 }
 
 void Session::ClearPendingCommand() {
     const std::lock_guard<std::mutex> lock(m_mutex_);
+    if (m_pending_command_) {
+        LIBXCP_LOG_INFO("Session pending {} -> none state={}",
+                        static_cast<unsigned int>(*m_pending_command_),
+                        SessionStateName(m_state_));
+    }
     m_pending_command_.reset();
 }
 

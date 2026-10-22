@@ -52,8 +52,12 @@ namespace liba2l {
 //               元素类型/换算引用/边界；SDK 不做任何递归或地址推导）；
 //               StructInfoDto +matrix_dim（16-B：INSTANCE 的 MATRIX_DIM 原值，
 //               结构体数组实例逐元素展开的前提）。
+// v7：SymbolDto 增逐 MEASUREMENT 的 fixed/default/available 事件号列表。
+// v8：TYPEDEF_MEASUREMENT 事实 DTO 增 CHARACTERISTIC/固定轴语义；
+//     StructInfoDto 增 INSTANCE REF_MEMORY_SEGMENT；IDoc 增 MEMORY_SEGMENT
+//     页快照。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 6u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 8u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -100,6 +104,16 @@ enum class CharacteristicTypeDto : std::int32_t {
     kCube5 = 6,   ///< CUBE_5
     kValBlk = 7,  ///< VAL_BLK
     kAscii = 8,   ///< ASCII
+};
+
+/** TYPEDEF_CHARACTERISTIC 轴描述类型。 */
+enum class AxisTypeDto : std::int32_t {
+    kCurveAxis = 0,  ///< CURVE_AXIS
+    kComAxis = 1,    ///< COM_AXIS
+    kFixAxis = 2,    ///< FIX_AXIS
+    kResAxis = 3,    ///< RES_AXIS
+    kStdAxis = 4,    ///< STD_AXIS
+    kUnknown = 5,    ///< 未知或缺失
 };
 
 /** ASAM 基本数据类型（A2lDataType 的显式宽度映射，B-3）。 */
@@ -243,6 +257,33 @@ struct ConversionDto {
 };
 
 /**
+ * @brief TYPEDEF_CHARACTERISTIC 的一个轴描述快照。
+ * @details 轴容量与固定轴定义分别保留；调用方仅可在可证明的轴型/记录布局上
+ *          开放索引访问，不得用缺失或冲突字段推导曲线长度。
+ */
+struct TypedefAxisDescrDto {
+    AxisTypeDto axis_type = AxisTypeDto::kUnknown;  ///< AXIS_DESCR 类型
+    std::string input_quantity;                     ///< INPUT_QUANTITY 原文
+    std::string compu_method_name;                  ///< COMPU_METHOD_REF 名
+    ConversionDto conversion;                       ///< 轴换算快照
+    std::string phys_unit;                          ///< PHYS_UNIT 原文
+    AsamDataTypeDto data_type = AsamDataTypeDto::kUnknown;  ///< 轴存储数据类型
+    std::uint8_t element_size_bytes = 0;    ///< 轴存储元素宽度；未知时为0
+    std::uint64_t max_axis_points = 0;      ///< MAX_AXIS_POINTS
+    bool have_limit = false;                ///< 是否声明轴值限值
+    double lower_limit = 0.0;               ///< 轴下限
+    double upper_limit = 0.0;               ///< 轴上限
+    std::string axis_pts_ref;               ///< AXIS_PTS_REF（可空）
+    std::string curve_axis_ref;             ///< CURVE_AXIS_REF（可空）
+    std::uint8_t deposit = 0;               ///< DEPOSIT 原始码
+    bool has_fix_axis_par_dist = false;     ///< 是否声明 FIX_AXIS_PAR_DIST
+    double fix_axis_offset = 0.0;           ///< 固定轴起始偏移
+    double fix_axis_distance = 0.0;         ///< 固定轴等间距
+    std::uint64_t fix_axis_points = 0;      ///< FIX_AXIS_PAR_DIST 点数
+    std::vector<double> fixed_axis_values;  ///< FIX_AXIS_PAR_LIST 原值
+};
+
+/**
  * @brief 符号完整快照（B-13 键 module::symbol；B-1 地址三件套；B-3 类型宽度）。
  *
  * xcp_address 为 ECU_ADDRESS 原值（未经任何换算，B-1）。
@@ -278,6 +319,12 @@ struct SymbolDto {
     std::string record_layout_name;
     /// @brief RECORD_LAYOUT 归一化类别（批次13，B-4/B-12；判定见枚举注释）
     RecordLayoutKindDto record_layout_kind = RecordLayoutKindDto::kNotProvided;
+    /// @brief DAQ_EVENT fixed event 号列表（逐 MEASUREMENT 原始顺序透传）
+    std::vector<std::uint16_t> daq_event_fixed;
+    /// @brief DAQ_EVENT default event 号列表（逐 MEASUREMENT 原始顺序透传）
+    std::vector<std::uint16_t> daq_event_default;
+    /// @brief DAQ_EVENT available event 号列表（逐 MEASUREMENT 原始顺序透传）
+    std::vector<std::uint16_t> daq_event_available;
 };
 
 /**
@@ -459,9 +506,10 @@ struct StructInfoDto {
     ///          code-plan/A2L_集成_R4_遗留修复计划_批次15.md §1 L5）。
     ///          TYPEDEF_STRUCTURE 无地址，本字段对它恒 0。
     std::uint8_t address_extension = 0;
-    std::uint8_t address_type = 0;  ///< A2lAddressType 原始码
-    std::uint8_t layout = 0;        ///< A2lLayout 原始码
-    bool read_write = false;        ///< INSTANCE 的 READ_WRITE 声明
+    std::string ref_memory_segment;  ///< REF_MEMORY_SEGMENT（可空）
+    std::uint8_t address_type = 0;   ///< A2lAddressType 原始码
+    std::uint8_t layout = 0;         ///< A2lLayout 原始码
+    bool read_write = false;         ///< INSTANCE 的 READ_WRITE 声明
     /// @brief INSTANCE 的 MATRIX_DIM 原值（批次18，STRUCTLEAF 16-B；v6 起有值）
     /// @details 上游 A2lObject::MatrixDim() 对 INSTANCE 同样生效
     ///          （src/a2lparser.y:871 的实例属性规则显式接收 MATRIX_DIM）。
@@ -470,20 +518,18 @@ struct StructInfoDto {
     ///          （INDEX_MAP 暂不解析，与标量成员数组同一口径）。
     ///          TYPEDEF_STRUCTURE 无本属性，对它恒空。
     std::vector<std::uint64_t> matrix_dim;
+    /// @brief INSTANCE IF_DATA XCP DAQ_EVENT 中原始
+    /// FIXED_EVENT_LIST；结构定义恒空
+    std::vector<std::uint16_t> daq_event_fixed;
     std::vector<StructMemberDto> members;  ///< 成员元数据（不展开）
 };
 
 /**
  * @brief TYPEDEF_MEASUREMENT 事实快照（批次18，STRUCTLEAF 16-A）。
- * @details 只保存上游声明本身可证的事实（类型/换算/边界/维度等）；
+ * @details 只保存 TYPEDEF_MEASUREMENT 声明本身可证的类型/换算/边界/维度等事实；
  *          conversion 内嵌快照与 SymbolDto 同一口径（BuildConversion 复用），
  *          **不**推导成员地址、**不**递归结构体 —— 叶子展开归桥接层
  *          StructureLayoutResolver（批次16 §2 职责划分）。
- *          18-A′ 起，TYPEDEF_CHARACTERISTIC 也复用本 DTO 并入同一标量事实
- *          注册表（CalSeg 校准段成员只写 typedef characteristic，不并入则
- *          永远解不出叶子）：其中和类型相关的可证事实按同一 B-3/B-4 口径
- *          导出，data_type/element_size 的宽度由 Deposit 指向的 RECORD_LAYOUT
- *          FNC_VALUES 证明；不可证时为 kUnknown/0，交 resolver 拒绝。
  */
 struct TypedefMeasurementDto {
     std::string name;         ///< TYPEDEF_MEASUREMENT 名（如 M_word_field）
@@ -508,6 +554,69 @@ struct TypedefMeasurementDto {
     std::uint8_t address_type = 0;          ///< A2lAddressType 原始码
     std::uint8_t layout = 0;                ///< A2lLayout 原始码
     bool read_write = false;                ///< READ_WRITE 声明
+};
+
+/**
+ * @brief TYPEDEF_CHARACTERISTIC 的类型事实快照。
+ * @details 不含实例地址或实例写权限；实例级 READ_WRITE 与内存页权限必须在桥接
+ *          和运行时单独核验。固定轴/记录布局不可证时保留原始未知状态，由消费方拒绝。
+ */
+struct TypedefCharacteristicDto {
+    std::string name;         ///< TYPEDEF_CHARACTERISTIC 名
+    std::string description;  ///< 描述文本（可空）
+    std::string module_name;  ///< 所属 MODULE
+    CharacteristicTypeDto characteristic_type = CharacteristicTypeDto::kNone;
+    AsamDataTypeDto data_type =
+        AsamDataTypeDto::kUnknown;        ///< FNC_VALUES元素类型
+    std::uint8_t element_size_bytes = 0;  ///< 单元素宽度；不可证时为0
+    std::string compu_method_name;        ///< COMPU_METHOD引用名
+    ConversionDto conversion;             ///< COMPU_METHOD快照
+    std::string phys_unit;                ///< PHYS_UNIT原文
+    ByteOrderDto byte_order = ByteOrderDto::kUnknown;  ///< BYTE_ORDER原始含义
+    std::vector<std::uint64_t> matrix_dim;             ///< MATRIX_DIM原值
+    bool have_limit = false;                           ///< 是否声明LIMITS
+    double lower_limit = 0.0;                          ///< 下限
+    double upper_limit = 0.0;                          ///< 上限
+    std::uint64_t bit_mask = 0;                        ///< BIT_MASK原值
+    std::string record_layout_name;  ///< DEPOSIT引用的RECORD_LAYOUT名
+    RecordLayoutKindDto record_layout_kind = RecordLayoutKindDto::kNotProvided;
+    std::vector<TypedefAxisDescrDto> axis_descriptions;  ///< AXIS_DESCR快照
+};
+
+/// @brief A2L XCP PAGE 的写访问属性；显式映射上游WriteAccessType。
+enum class XcpPageWriteAccessDto : std::uint8_t {
+    kNotAllowed,
+    kWithoutEcuOnly,
+    kWithEcuOnly,
+    kDontCare,
+    kUnknown,
+};
+
+/** @brief MEMORY_SEGMENT 中一个 XCP PAGE 的静态权限声明。 */
+struct MemoryPageDto {
+    std::uint8_t number = 0;                ///< PAGE number
+    std::uint8_t ecu_access_type = 0;       ///< a2llib EcuAccessType原始码
+    std::uint8_t xcp_read_access_type = 0;  ///< a2llib ReadAccessType原始码
+    XcpPageWriteAccessDto xcp_write_access_type =
+        XcpPageWriteAccessDto::kUnknown;       ///< XCP写访问属性（显式映射）
+    std::optional<std::uint8_t> init_segment;  ///< INIT_SEGMENT（可空）
+};
+
+/**
+ * @brief MEMORY_SEGMENT 地址范围和 XCP PAG 静态声明。
+ * @details `has_xcp_segment=false` 时不得推导 segment/page 号或写权限。
+ */
+struct MemorySegmentDto {
+    std::string name;              ///< MEMORY_SEGMENT 名
+    std::string description;       ///< 描述文本（可空）
+    std::string module_name;       ///< 所属 MODULE
+    std::uint64_t address = 0;     ///< MEMORY_SEGMENT 起始地址
+    std::uint64_t size = 0;        ///< MEMORY_SEGMENT 字节长度
+    bool has_xcp_segment = false;  ///< 是否成功解析有效的 IF_DATA XCP SEGMENT
+    std::uint8_t segment_number = 0;     ///< XCP SEGMENT number
+    std::uint8_t number_of_pages = 0;    ///< XCP SEGMENT number_of_pages
+    std::uint8_t address_extension = 0;  ///< XCP SEGMENT address_extension
+    std::vector<MemoryPageDto> pages;    ///< 静态 PAGE 权限列表
 };
 
 // ----------------------------------------------------------------------------
@@ -661,14 +770,35 @@ public:
         std::vector<StructInfoDto>* out) const noexcept = 0;
 
     /**
-     * @brief 列出全部 TYPEDEF_MEASUREMENT 事实快照（批次18，STRUCTLEAF 16-A）。
-     * @param out 输出向量（DLL 侧先 clear 再填充）。
-     * @details 只导出上游声明可证的事实（见 TypedefMeasurementDto 注释）；
-     *          成员叶子展开与寻址归桥接层。排序稳定：按 (MODULE, 名) 升序。
+     * @brief 列出全部 TYPEDEF_MEASUREMENT 类型事实。
+     * @param out 输出向量（DLL 侧先清空再填充）。
+     * @details 成员叶子展开与寻址归桥接层；排序稳定：按 (MODULE, 名) 升序。
      * @return kOk（无该块时输出空向量）/ kNotInitialized / kBadArgument。
      */
     virtual ErrorCode ListTypedefMeasurements(
         std::vector<TypedefMeasurementDto>* out) const noexcept = 0;
+
+    /**
+     * @brief 列出全部 TYPEDEF_CHARACTERISTIC 类型事实（VALUE/CURVE等）。
+     * @param out 输出向量（DLL 侧先清空再填充）。
+     * @details 仅包含类型/布局/轴等 typedef 事实，不包含实例地址、实例
+     *          READ_WRITE 或运行时页状态；不可证的宽度/轴事实保留 Unknown/0。
+     *          排序稳定：按 (MODULE, 名) 升序。
+     * @return kOk（无声明时输出空向量）/ kNotInitialized / kBadArgument。
+     */
+    virtual ErrorCode ListTypedefCharacteristics(
+        std::vector<TypedefCharacteristicDto>* out) const noexcept = 0;
+
+    /**
+     * @brief 列出 MEMORY_SEGMENT 地址范围及 XCP SEGMENT/PAGE 静态声明。
+     * @param out 输出向量（DLL 侧先清空再填充）。
+     * @details 无效或缺失的 XCP 子块仍可返回地址范围，但
+     *          `has_xcp_segment=false`；消费方不得推测segment号或页权限。
+     *          排序稳定：按 (MODULE, 名) 升序。
+     * @return kOk（无段时输出空向量）/ kNotInitialized / kBadArgument。
+     */
+    virtual ErrorCode ListMemorySegments(
+        std::vector<MemorySegmentDto>* out) const noexcept = 0;
 
     /**
      * @brief 按 COMPU_METHOD 名取转换快照（含 TAB_* 引用的 COMPU_TAB）。

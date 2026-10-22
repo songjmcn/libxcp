@@ -89,6 +89,27 @@ struct A2lBridge::Impl {
                                              "枚举 TYPEDEF_MEASUREMENT 失败");
             return false;
         }
+        std::vector<liba2l::TypedefCharacteristicDto> typedef_characteristics;
+        const liba2l::ErrorCode tc_rc =
+            doc->ListTypedefCharacteristics(&typedef_characteristics);
+        if (tc_rc != liba2l::ErrorCode::kOk) {
+            last_error = detail::MapSdkError(
+                tc_rc, Phase::Load, "枚举 TYPEDEF_CHARACTERISTIC 失败");
+            return false;
+        }
+        std::vector<liba2l::MemorySegmentDto> memory_segment_dtos;
+        const liba2l::ErrorCode ms_rc =
+            doc->ListMemorySegments(&memory_segment_dtos);
+        if (ms_rc != liba2l::ErrorCode::kOk) {
+            last_error = detail::MapSdkError(ms_rc, Phase::Load,
+                                             "枚举 MEMORY_SEGMENT 失败");
+            return false;
+        }
+        std::vector<MemorySegmentInfo> memory_segments;
+        memory_segments.reserve(memory_segment_dtos.size());
+        for (const liba2l::MemorySegmentDto& dto : memory_segment_dtos) {
+            memory_segments.push_back(detail::ConvertMemorySegment(dto));
+        }
         std::vector<liba2l::StructInfoDto> struct_typedefs;
         std::vector<liba2l::StructInfoDto> instances;
         for (const liba2l::StructInfoDto& s : structs) {
@@ -99,7 +120,8 @@ struct A2lBridge::Impl {
             }
         }
         const detail::StructureLayoutResult layout =
-            detail::BuildStructureLeaves(struct_typedefs, instances, typedefs);
+            detail::BuildStructureLeaves(struct_typedefs, instances, typedefs,
+                                         typedef_characteristics);
         // 批次13（R3 接线）：SDK 给出了 RECORD_LAYOUT 类别的 CHARACTERISTIC
         // 才进判定器表；无类别的符号不进（"无信息"≠"不可执行"）。
         std::unordered_map<std::string, RecordLayoutInfo> record_layouts;
@@ -113,7 +135,8 @@ struct A2lBridge::Impl {
         }
         database = detail::MakeDatabase(
             std::move(symbols), std::move(structs), std::move(record_layouts),
-            std::move(layout.leaves), std::move(layout.warnings));
+            std::move(layout.leaves), std::move(layout.warnings),
+            std::move(memory_segments));
 
         Result<IfDataXcpInfo> xcp =
             detail::BuildIfDataXcp(*doc, require_if_data);

@@ -8,6 +8,8 @@
 
 #include "libxcp/command_codec.hpp"
 
+#include "libxcp/log.hpp"
+
 #include <string>
 
 namespace calmcar::xcp {
@@ -17,12 +19,29 @@ namespace {
 /// @brief UPLOAD / SHORT_UPLOAD 的元素数字段为单字节，有效取值 1..255
 constexpr ElementCount kMaxElementsPerField = 0xFFU;
 
+/// @brief Level-1 命令族前缀（原始 PDF 第 106 页 §7.4：以 0xC0 起始的双字节码）
+constexpr std::uint8_t kLevel1CommandPrefix = 0xC0U;
+
+/// @brief GET_VERSION 的 Level-1 子命令码（原始 PDF 第 114 页 Table 44）
+constexpr std::uint8_t kGetVersionSubCommand = 0x00U;
+
 }  // namespace
 
-CommandCodec::CommandCodec(ByteOrder byte_order) noexcept
-    : m_byte_order_(byte_order) {}
+CommandCodec::CommandCodec(ByteOrder byte_order,
+                           AddressGranularity ag) noexcept
+    : m_byte_order_(byte_order), m_ag_(ag) {}
 
 ByteOrder CommandCodec::GetByteOrder() const noexcept { return m_byte_order_; }
+
+AddressGranularity CommandCodec::GetAddressGranularity() const noexcept {
+    return m_ag_;
+}
+
+std::size_t CommandCodec::DownloadAlignmentBytes() const noexcept {
+    // 规则本体在 protocol_types.hpp 的 DownloadAlignmentBytes(ag)，
+    // 与 MemoryAccess 的容量计算共用同一定义，避免两处口径不一致。
+    return calmcar::xcp::DownloadAlignmentBytes(m_ag_);
+}
 
 void CommandCodec::WriteU16(Bytes& buf, std::uint16_t val) const {
     if (m_byte_order_ == ByteOrder::Intel) {
@@ -73,6 +92,16 @@ Bytes CommandCodec::EncodeGetStatus() const {
     return cto;
 }
 
+Bytes CommandCodec::EncodeGetVersion() const {
+    // 原始 PDF 第 114 页 Table 44：Level-1 双字节命令码 [0xC0][0x00]。
+    // 第二字节是子命令码，非参数——不得写入长度或保留字节。
+    Bytes cto;
+    cto.reserve(2);
+    cto.push_back(kLevel1CommandPrefix);
+    cto.push_back(kGetVersionSubCommand);
+    return cto;
+}
+
 Bytes CommandCodec::EncodeSynch() const {
     Bytes cto;
     cto.reserve(2);
@@ -110,6 +139,7 @@ Bytes CommandCodec::EncodeSetMta(AddressExtension extension,
 
 Bytes CommandCodec::EncodeUpload(ElementCount number_of_elements) const {
     if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "UPLOAD NumberOfElements 超出单字节字段范围 1..255: " +
             std::to_string(number_of_elements));
@@ -126,6 +156,7 @@ Bytes CommandCodec::EncodeShortUpload(ElementCount number_of_elements,
                                       AddressExtension extension,
                                       Address address) const {
     if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "SHORT_UPLOAD NumberOfElements 超出单字节字段范围 1..255: " +
             std::to_string(number_of_elements));
@@ -166,6 +197,7 @@ Bytes CommandCodec::EncodeUnlock(std::uint8_t length_field,
                                  BytesView key_segment) const {
     // 长度字段声明的剩余 Key 量不可能小于本帧携带量（首帧=总长，后续帧=剩余）
     if (static_cast<std::size_t>(length_field) < key_segment.size()) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "UNLOCK Length 字段 " + std::to_string(length_field) +
             " 小于本帧 Key 字节数 " + std::to_string(key_segment.size()));
@@ -209,6 +241,7 @@ Bytes CommandCodec::EncodeWriteDaq(std::uint8_t bit_offset, std::uint8_t size,
     // WRITE_DAQ: [E1][bit_offset][size][extension][addr(DWORD)]
     // （xcp.h:696-701）；size 以 AG 为单位，0 = 无效条目（docs L2161-2166）
     if (size == 0U) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "WRITE_DAQ Size 字段不得为 0（以 AG 为单位的元素数）");
     }
@@ -360,20 +393,29 @@ Bytes CommandCodec::EncodeAllocOdtEntry(std::uint16_t daq_list,
 
 Bytes CommandCodec::EncodeDownload(ElementCount number_of_elements,
                                    BytesView data) const {
-    // DOWNLOAD: [F0][size][data...]（xcp.h:578-582）；size 是**元素数**
-    // （以 AG 为单位），与 Session Byte Order 无关
+    // DOWNLOAD: [F0][size][pad...][data...]（xcp.h:578-582）；size 是**元素数**
+    // （以 AG 为单位），与 Session Byte Order 无关。
+    // ASAM XCP V1.5.0 原始 PDF 第 142 页 Table 82：对齐字节 "only if AG >2"，
+    // 首元素位置 AG=1 时为 2、AG>1 时为 AG；"If AG = DWORD, 2 alignment bytes
+    // must be used"。故 AG=DWord 时在 [F0][size] 之后插 2 字节对齐（填 0），
+    // 使数据段落在 4 字节边界。AG=1(Byte)/2(Word) 时行为与修正前逐字节一致。
     if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "DOWNLOAD NumberOfElements 超出单字节字段范围 1..255: " +
             std::to_string(number_of_elements));
     }
     if (data.empty()) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument("DOWNLOAD 数据段为空");
     }
+    const std::size_t alignment = DownloadAlignmentBytes();
     Bytes cto;
-    cto.reserve(2 + data.size());
+    cto.reserve(2 + alignment + data.size());
     cto.push_back(static_cast<std::uint8_t>(CommandCode::Download));
     cto.push_back(static_cast<std::uint8_t>(number_of_elements));
+    // 对齐字节取值不受规范约束（原文只称 "Used for alignment"），统一填 0
+    cto.insert(cto.end(), alignment, 0x00U);
     cto.insert(cto.end(), data.begin(), data.end());
     return cto;
 }
@@ -384,11 +426,13 @@ Bytes CommandCodec::EncodeShortDownload(ElementCount number_of_elements,
     // SHORT_DOWNLOAD: [ED][size][reserved][extension][addr(DWORD)][data...]
     // （xcp.h:597-602）——固定头 8 字节，MAX_CTO=8 时无处放数据（docs L2026）
     if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "SHORT_DOWNLOAD NumberOfElements 超出单字节字段范围 1..255: " +
             std::to_string(number_of_elements));
     }
     if (data.empty()) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument("SHORT_DOWNLOAD 数据段为空");
     }
     Bytes cto;
@@ -402,17 +446,16 @@ Bytes CommandCodec::EncodeShortDownload(ElementCount number_of_elements,
     return cto;
 }
 
-Bytes CommandCodec::EncodeModifyBits(std::uint8_t shift,
-                                     std::uint16_t and_mask,
+Bytes CommandCodec::EncodeModifyBits(std::uint8_t shift, std::uint16_t and_mask,
                                      std::uint16_t xor_mask) const {
     // MODIFY_BITS: [EC][shift][AND Mask(WORD)][XOR Mask(WORD)]
     // （xcp.h CRO_MODIFY_BITS_LEN=6：SHIFT=CRO_BYTE(1)、AND=CRO_WORD(2)、
     //  XOR=CRO_WORD(3)→字节4..5）；Shift 有效范围 0..16（docs §7.5.2.5，
     // 超出 Slave 回 ERR_OUT_OF_RANGE，本地预检直接拒绝）
     if (shift > kModifyBitsMaxShift) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
-            "MODIFY_BITS Shift Value 超出范围 0..16: " +
-            std::to_string(shift));
+            "MODIFY_BITS Shift Value 超出范围 0..16: " + std::to_string(shift));
     }
     Bytes cto;
     cto.reserve(6);
@@ -423,13 +466,13 @@ Bytes CommandCodec::EncodeModifyBits(std::uint8_t shift,
     return cto;
 }
 
-Bytes CommandCodec::EncodeSetCalPage(CalPageModeBit mode,
-                                     std::uint8_t segment,
+Bytes CommandCodec::EncodeSetCalPage(CalPageModeBit mode, std::uint8_t segment,
                                      std::uint8_t page) const {
     // SET_CAL_PAGE: [EB][mode][segment][page]（xcp.h CRO_SET_CAL_PAGE_LEN=4）
     // mode 至少含 ECU/XCP 之一才有意义；仅 ALL 或全零组合 Slave 无法执行，
     // 本地预检拒绝（ERR_MODE_NOT_VALID 的语义前置到调用方）
     if (!HasCalPageMode(mode, CalPageModeBit::kEcu | CalPageModeBit::kXcp)) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "SET_CAL_PAGE Mode 必须包含 ECU(0x01) 或 XCP(0x02) 位: 0x" +
             std::to_string(static_cast<unsigned>(mode)));
@@ -450,6 +493,7 @@ Bytes CommandCodec::EncodeGetCalPage(CalPageAccessMode access_mode,
     // ERR_MODE_NOT_VALID（docs §7.5.3.2），本地预检拒绝
     if (access_mode != CalPageAccessMode::Ecu &&
         access_mode != CalPageAccessMode::Xcp) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "GET_CAL_PAGE Access Mode 仅允许 0x01(ECU)/0x02(XCP): 0x" +
             std::to_string(static_cast<unsigned>(access_mode)));
@@ -481,11 +525,12 @@ Bytes CommandCodec::EncodeGetSegmentInfo(SegmentInfoMode mode,
     const auto mode_raw = static_cast<std::uint8_t>(mode);
     const auto info_raw = static_cast<std::uint8_t>(info);
     if (mode_raw > 2U) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
-            "GET_SEGMENT_INFO Mode 仅允许 0/1/2: " +
-            std::to_string(mode_raw));
+            "GET_SEGMENT_INFO Mode 仅允许 0/1/2: " + std::to_string(mode_raw));
     }
     if (info_raw > 2U) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
         throw detail::MakeInvalidArgument(
             "GET_SEGMENT_INFO SegmentInfo 仅允许 0/1/2: " +
             std::to_string(info_raw));

@@ -3,8 +3,8 @@
  * @brief 测量子系统的结果封装类型（v0.4，A2L-free）。
  *
  * 依 AGENTS.md I8 与架构文档 §18：测量层**自持**一套与 A2L `a2l_result.hpp`
- * 风格一致的 `MeasurementResult<T>`，但核心不依赖 A2L 类型、不 `#include` 任何
- * `libxcp/a2l/*`。对应测量子系统代码增长计划 §4.4 的测量错误分类。
+ * 风格一致的 `MeasurementResult<T>`，但核心不依赖 A2L 类型，也不包含 A2L 目录下的头文件。
+ * 对应测量子系统代码增长计划 §4.4 的测量错误分类。
  */
 
 #ifndef CALMCAR_XCP_MEASUREMENT_MEASUREMENT_RESULT_HPP_

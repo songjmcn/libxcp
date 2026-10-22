@@ -7,9 +7,10 @@
  * IMeasurementDatabase::ToPhysical 换算 → MeasurementFrame 回调。
  *
  * 兼容性说明：本实现的构造形态（MeasurementSession(IMeasurementDatabase&)
- * + Bind(XcpMaster&)）是计划 §5.5 字面签名 `(XcpMaster&, IMeasurementDatabase&)`
- * 的偏差——因为 XcpMaster 的事件监听器仅在构造时固定，session 必须先构造并以
- * &session 作为 master 监听器，master 引用随后 Bind。详见 v0.5 记录"偏差说明"。
+ * + Bind(XcpMaster&)）是计划 §5.5 字面签名 `(XcpMaster&,
+ * IMeasurementDatabase&)` 的偏差——因为 XcpMaster
+ * 的事件监听器仅在构造时固定，session 必须先构造并以 &session 作为 master
+ * 监听器，master 引用随后 Bind。详见 v0.5 记录"偏差说明"。
  */
 
 #include "libxcp/measurement/measurement_session.hpp"
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -31,6 +33,7 @@
 #include <vector>
 
 #include "libxcp/daq/daq_timestamp.hpp"
+#include "libxcp/log.hpp"
 #include "libxcp/daq/dto_payload_decoder.hpp"
 #include "libxcp/daq/dto_envelope_decoder.hpp"
 #include "libxcp/measurement/measurement_planner.hpp"
@@ -92,21 +95,21 @@ void MeasurementSession::SetEnvelopeMode(IdentificationFieldType type,
     if (!m_routes_.empty()) {
         ThrowState("MeasurementSession::SetEnvelopeMode 须在 Prepare 前调用");
     }
-    std::size_t minimum_bytes = 0U;
+    // 识别字段最小长度按规范 Figure 51/52/53 逐模式校验（N-02）：
+    //   Absolute=1、RelativeByte=2、RelativeWord=3、RelativeWordAligned=4。
+    // 长度统一取自 IdentificationFieldMinimumBytes，避免各处硬编码漂移。
+    // 未知枚举值先拒（解码器同样会拒，此处提前给出更明确的失败点）。
     switch (type) {
         case IdentificationFieldType::Absolute:
-            minimum_bytes = 1U;
-            break;
         case IdentificationFieldType::RelativeByte:
-            minimum_bytes = 4U;
-            break;
         case IdentificationFieldType::RelativeWord:
         case IdentificationFieldType::RelativeWordAligned:
-            minimum_bytes = 2U;
             break;
         default:
             ThrowInvalid("MeasurementSession::SetEnvelopeMode 未知识别字段模式");
     }
+    const std::size_t minimum_bytes =
+        IdentificationFieldMinimumBytes(type);
     if (id_field_bytes < minimum_bytes) {
         ThrowInvalid("MeasurementSession::SetEnvelopeMode 识别字段长度不足");
     }
@@ -123,6 +126,16 @@ void MeasurementSession::SetTimestampUnit(std::uint64_t unit_ns) {
     m_timestamp_unit_ns_ = unit_ns;
 }
 
+void MeasurementSession::SetTimestampEnabled(bool enabled) {
+    if (!m_routes_.empty()) {
+        ThrowState("MeasurementSession::SetTimestampEnabled 须在 Prepare 前调用");
+    }
+    if (Running()) {
+        ThrowState("MeasurementSession::SetTimestampEnabled 运行中禁止");
+    }
+    m_timestamp_enabled_ = enabled;
+}
+
 void MeasurementSession::SetTimestampFirstOdtOnly(bool first_only) {
     // v0.9：部分 Slave（XCPlite D13）只在事件首 ODT 帧附时间戳段。
     // 开关式取证注入（默认关=每帧带），运行中禁改（与 SetTimestampUnit 同律）。
@@ -130,6 +143,19 @@ void MeasurementSession::SetTimestampFirstOdtOnly(bool first_only) {
         ThrowState("MeasurementSession::SetTimestampFirstOdtOnly 运行中禁止");
     }
     m_timestamp_first_odt_only_ = first_only;
+}
+
+void MeasurementSession::SetDaqEntryCapabilities(
+    MeasurementDaqCapabilities capabilities) {
+    if (m_prepared_ || Running()) {
+        ThrowState("MeasurementSession::SetDaqEntryCapabilities 须在 Prepare 前调用");
+    }
+    if (capabilities.supports_contiguous_1d_arrays &&
+        (capabilities.entry_granularity_bytes == 0U ||
+         capabilities.max_entry_size_elements == 0U)) {
+        ThrowInvalid("数组准入缺少已验证的 DAQ Entry 粒度或最大长度");
+    }
+    m_daq_entry_capabilities_ = capabilities;
 }
 
 void MeasurementSession::Bind(XcpMaster& master) {
@@ -177,7 +203,9 @@ void MeasurementSession::Prepare() {
     m_max_dto_ = params.connect.max_dto;
     m_ag_bytes_ = static_cast<std::size_t>(params.connect.address_granularity);
     m_byte_order_ = params.connect.byte_order;
-    m_timestamp_bytes_ = master.DaqTimestampBytesCached();
+    m_timestamp_bytes_ = m_timestamp_enabled_
+                             ? master.DaqTimestampBytesCached()
+                             : 0U;
 
     std::vector<std::string> names;
     {
@@ -188,7 +216,8 @@ void MeasurementSession::Prepare() {
     // 规划 + 下发（一个整体：失败不留半份账，ConfigureDaqListsDynamic 自回滚）
     MeasurementPlanner planner(m_database_, m_max_dto_,
                                params.connect.address_granularity,
-                               m_timestamp_bytes_);
+                               m_timestamp_bytes_, m_id_field_bytes_,
+                               m_daq_entry_capabilities_);
     const MeasurementResult<MeasurementPlan> plan = planner.Build(names);
     if (!plan.HasValue()) {
         // v0.6 硬化：按错误码映射异常类别上抛（不再统一 InvalidArgument）
@@ -196,7 +225,12 @@ void MeasurementSession::Prepare() {
         throw XcpException(CategoryOf(err.code), err.message);
     }
 
-    master.ConfigureDaqListsDynamic(plan.Value().daq_lists);
+    if (m_id_field_type_ == IdentificationFieldType::Absolute &&
+        (plan.Value().daq_lists.size() != 1U ||
+         plan.Value().daq_lists.front().daq_list != 0U)) {
+        ThrowInvalid("Absolute PID DTO 当前仅支持单个 DAQ List（DAQ_LIST 0）");
+    }
+    master.ConfigureDaqListsDynamic(plan.Value().daq_lists, m_id_field_bytes_);
 
     // 建成路由视图：按 (daq_list, odt) 分组的切片规格
     m_routes_.clear();
@@ -218,10 +252,17 @@ void MeasurementSession::Prepare() {
             odts.push_back(OdtView{r.odt, {}});
             it = std::prev(odts.end());
         }
-        it->slices.push_back(OdtSlice{r.name, r.payload_offset, r.size, false});
+        it->slices.push_back(OdtSlice{r.name,
+                                      r.payload_offset,
+                                      r.size,
+                                      false,
+                                      r.is_array,
+                                      r.element_count,
+                                      r.element_size_bytes});
     }
 
     m_plan_generation_ = master.DaqConfigGeneration();
+    m_prepared_ = true;
 }
 
 void MeasurementSession::Start(MeasurementCallback callback) {
@@ -245,10 +286,36 @@ void MeasurementSession::Start(MeasurementCallback callback) {
         m_running_ = true;
     }
 
-    m_master_->StartDaqSync();
+    try {
+        if (m_id_field_type_ == IdentificationFieldType::Absolute) {
+            m_first_pid_ = m_master_->StartDaqList(0U);
+            if (static_cast<std::size_t>(m_first_pid_) +
+                    m_routes_.front().second.size() > 256U) {
+                throw XcpException(
+                    ErrorCategory::UnsupportedFeature,
+                    "FIRST_PID 加 ODT 范围超出 PID 字节，拒绝解码");
+            }
+        } else {
+            m_master_->StartDaqSync();
+        }
 
-    m_worker_ = std::make_unique<std::thread>(&MeasurementSession::WorkerLoop,
-                                               this);
+        m_worker_ = std::make_unique<std::thread>(
+            &MeasurementSession::WorkerLoop, this);
+    } catch (...) {
+        try {
+            m_master_->StopDaq();
+        } catch (...) {
+            // 保留首个启动异常；断开连接仍会收尾残余 Slave 状态。
+        }
+        {
+            std::lock_guard<std::mutex> lock(m_run_mutex_);
+            m_running_ = false;
+            m_stop_requested_ = false;
+            m_queue_.clear();
+            m_callback_ = nullptr;
+        }
+        throw;
+    }
 }
 
 void MeasurementSession::Stop() {
@@ -314,7 +381,9 @@ void MeasurementSession::WorkerLoop() {
     // 绝不能把时间戳再计入（否则重复扣字节，帧被误判过短）。
     DtoFrameLayout layout;
     layout.identification_field_type = m_id_field_type_;
-    layout.first_odt = 0;
+    layout.first_odt = m_id_field_type_ == IdentificationFieldType::Absolute
+                           ? m_first_pid_
+                           : 0U;
     layout.counter_enabled = false;
     layout.timestamp_enabled = m_timestamp_bytes_ > 0;
     layout.timestamp_size_bits =
@@ -361,6 +430,7 @@ void MeasurementSession::WorkerLoop() {
         try {
             envelope = decoder.Decode(BytesView{frame}, layout);
         } catch (const XcpException&) {
+            LIBXCP_LOG_WARNING("DTO envelope decode failed; frame dropped");
             m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
             continue;
         }
@@ -434,15 +504,72 @@ void MeasurementSession::WorkerLoop() {
             sample.raw = ds.raw;
             sample.valid = ds.valid;
             sample.timestamp = frame_out.timestamp;
-            if (ds.valid) {
-                const MeasurementResult<MeasurementValue> conv =
-                    m_database_.ToPhysical(ds.name, BytesView{ds.raw});
-                if (conv.HasValue()) {
-                    sample.value = conv.Value();
-                } else {
+            const auto route_it = std::find_if(
+                view->slices.begin(), view->slices.end(),
+                [&](const OdtSlice& slice) { return slice.name == ds.name; });
+            if (route_it == view->slices.end()) {
+                sample.valid = false;
+                sample.error = "DTO 切片缺少已规划路由";
+            } else {
+                sample.is_array = route_it->is_array;
+                if (!ds.valid) {
+                    sample.error = "DTO 原始切片解码失败";
+                } else if (!route_it->is_array) {
+                    const MeasurementResult<MeasurementValue> conv =
+                        m_database_.ToPhysical(ds.name, BytesView{ds.raw});
+                    if (conv.HasValue()) {
+                        sample.value = conv.Value();
+                    } else {
+                        sample.valid = false;
+                        sample.error = conv.ErrorInfo().message;
+                    }
+                } else if (route_it->element_count == 0U ||
+                           route_it->element_size_bytes == 0U ||
+                           route_it->element_count >
+                               std::numeric_limits<std::size_t>::max() /
+                                   route_it->element_size_bytes ||
+                           ds.raw.size() !=
+                               static_cast<std::size_t>(route_it->element_count) *
+                                   route_it->element_size_bytes) {
                     sample.valid = false;
-                    m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
+                    sample.error = "DTO 数组字节数与已规划元素布局不匹配";
+                } else {
+                    std::vector<MeasurementValue> elements;
+                    elements.reserve(route_it->element_count);
+                    for (std::uint64_t index = 0;
+                         index < route_it->element_count; ++index) {
+                        const std::size_t byte_offset =
+                            static_cast<std::size_t>(index) *
+                            route_it->element_size_bytes;
+                        const BytesView element_raw{
+                            ds.raw.data() + byte_offset,
+                            route_it->element_size_bytes};
+                        const MeasurementResult<MeasurementValue> converted =
+                            m_database_.ToPhysicalElement(ds.name, index,
+                                                          element_raw);
+                        if (!converted.HasValue()) {
+                            sample.valid = false;
+                            sample.error = converted.ErrorInfo().message;
+                            elements.clear();
+                            break;
+                        }
+                        elements.push_back(converted.Value());
+                    }
+                    if (sample.valid &&
+                        elements.size() == route_it->element_count) {
+                        sample.elements = std::move(elements);
+                    } else {
+                        sample.valid = false;
+                        if (sample.error.empty()) {
+                            sample.error = "数组元素换算未生成完整样本";
+                        }
+                    }
                 }
+            }
+            // 截断 DTO 切片维持原有降级语义：仍回调无效样本，但只对完整切片的
+            // 换算/数组布局失败递增解码错误计数（畸形整帧在上层单独计数）。
+            if (!sample.valid && ds.valid) {
+                m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
             }
             frame_out.samples.push_back(std::move(sample));
         }

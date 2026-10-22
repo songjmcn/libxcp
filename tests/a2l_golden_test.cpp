@@ -28,6 +28,9 @@
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/a2l/a2l_types.hpp"
 #include "libxcp/a2l/ia2l_database.hpp"
+// T-05：A2L PACKET_ALIGNMENT 贯通到 libxcp 强类型与本侧 Tail 公式
+#include "libxcp/link_budget.hpp"
+#include "libxcp/protocol_types.hpp"
 
 #ifndef A2L_GOLDEN_DIR
 #error "A2L_GOLDEN_DIR 缺失（tests/CMakeLists.txt 注入）"
@@ -265,6 +268,38 @@ TEST_F(A2lGoldenTest, RequireIfDataXcpControlsMissingIfData) {
     ASSERT_NE(b->Database(), nullptr);
     // 原 11 个符号 + 4 个独立 LINEAR 系数用例。
     EXPECT_EQ(b->Database()->Count().Value(), 15u);
+}
+
+TEST_F(A2lGoldenTest, MeasurementDaqEventListsArePreservedPerSymbol) {
+    LoadOptions options;
+    options.require_if_data_xcp = false;
+    auto b = LoadOk(Data("measurement_daq_event.a2l"), options);
+    ASSERT_NE(b, nullptr);
+    ASSERT_NE(b->Database(), nullptr);
+
+    const auto event0 = b->Database()->Find("EVENT0");
+    ASSERT_TRUE(event0.HasValue()) << event0.ErrorInfo().message;
+    EXPECT_EQ(event0.Value().daq_event_default,
+              (std::vector<std::uint16_t>{0}));
+
+    const auto fixed = b->Database()->Find("FIXED_MULTI");
+    ASSERT_TRUE(fixed.HasValue()) << fixed.ErrorInfo().message;
+    EXPECT_EQ(fixed.Value().daq_event_fixed,
+              (std::vector<std::uint16_t>{1, 2}));
+
+    const auto defaults = b->Database()->Find("DEFAULT_ONLY");
+    ASSERT_TRUE(defaults.HasValue()) << defaults.ErrorInfo().message;
+    EXPECT_EQ(defaults.Value().daq_event_default,
+              (std::vector<std::uint16_t>{3}));
+    EXPECT_TRUE(defaults.Value().daq_event_fixed.empty());
+
+    const auto plus = b->Database()->Find("PLUS_PREF");
+    ASSERT_TRUE(plus.HasValue()) << plus.ErrorInfo().message;
+    EXPECT_EQ(plus.Value().daq_event_fixed, (std::vector<std::uint16_t>{5, 6}));
+
+    const auto plain = b->Database()->Find("PLAIN_FALLBACK");
+    ASSERT_TRUE(plain.HasValue()) << plain.ErrorInfo().message;
+    EXPECT_EQ(plain.Value().daq_event_fixed, (std::vector<std::uint16_t>{7}));
 }
 
 TEST_F(A2lGoldenTest, MalformedButLegalVariantsParse) {
@@ -752,6 +787,45 @@ TEST_F(A2lGoldenTest, UdpEndpointAndProtocolLayer) {
     EXPECT_EQ(mx->transports[0].sub_commands[1], 0xFC);
 }
 
+TEST_F(A2lGoldenTest, PacketAlignmentFlowsIntoLibxcpType) {
+    // T-05：A2L 的 PACKET_ALIGNMENT -> libxcp 强类型 PacketAlignment 的贯通。
+    // 上游 a2lbridge 已把原码（0/1/2）换算成**位宽**（8/16/32），
+    // libxcp 侧用 ParsePacketAlignment() 收强类型。
+    //
+    // golden_basic：未声明 PACKET_ALIGNMENT -> 上游默认位宽 8
+    auto basic = LoadOk(Golden("golden_basic.a2l"));
+    ASSERT_NE(basic, nullptr);
+    const IfDataXcpInfo* bi = basic->XcpInfo();
+    ASSERT_NE(bi, nullptr);
+    ASSERT_EQ(bi->transports.size(), 1u);
+    EXPECT_EQ(calmcar::xcp::ParsePacketAlignment(
+                  bi->transports[0].packet_alignment),
+              calmcar::xcp::PacketAlignment::Bit8);
+    EXPECT_EQ(calmcar::xcp::AlignmentBytes(calmcar::xcp::ParsePacketAlignment(
+                  bi->transports[0].packet_alignment)),
+              1U);
+
+    // golden_mask：声明 PACKET_ALIGNMENT_32 -> 位宽 32 -> Bit32 -> 4 字节
+    auto mask = LoadOk(Golden("golden_mask.a2l"));
+    ASSERT_NE(mask, nullptr);
+    const IfDataXcpInfo* mi = mask->XcpInfo();
+    ASSERT_NE(mi, nullptr);
+    ASSERT_EQ(mi->transports.size(), 1u);
+    EXPECT_EQ(calmcar::xcp::ParsePacketAlignment(
+                  mi->transports[0].packet_alignment),
+              calmcar::xcp::PacketAlignment::Bit32);
+    EXPECT_EQ(calmcar::xcp::AlignmentBytes(calmcar::xcp::ParsePacketAlignment(
+                  mi->transports[0].packet_alignment)),
+              4U);
+
+    // 贯通后的对齐必须真的影响 Tail 计算（不是只存了个枚举）
+    // 32-bit 下 packet 17 字节 -> 无 tail 帧长 21 -> 补 3 到 24
+    EXPECT_EQ(calmcar::xcp::XcpFrameBytes(17, calmcar::xcp::PacketAlignment::Bit32),
+              24U);
+    EXPECT_EQ(calmcar::xcp::XcpFrameBytes(17, calmcar::xcp::PacketAlignment::Bit8),
+              21U);
+}
+
 TEST_F(A2lGoldenTest, EventChannelSnapshot) {
     // 批次10 事件通道透传 + EVENT_FIXED 反查（golden_mask: event#1 ↔ list#2）
     auto b = LoadOk(Golden("golden_mask.a2l"));
@@ -1145,6 +1219,7 @@ TEST_F(A2lGoldenTest, StructLeafRealCorpusFourForms) {
         std::uint8_t esz;      ///< 期望元素宽（B-3 可证值）
         std::uint8_t rw;       ///< 期望读写位（随 INSTANCE 声明，见下注）
         std::uint64_t extent;  ///< 数组成员元素数（0 = 标量叶子无 dims）
+        bool characteristic = false;  ///< TYPEDEF_CHARACTERISTIC叶子
     };
     static constexpr LeafExpect kLeaves[] = {
         // 形态 1：结构标量成员
@@ -1173,14 +1248,26 @@ TEST_F(A2lGoldenTest, StructLeafRealCorpusFourForms) {
         // 关键词，
         // CalSeg 实例走分段相对寻址故缺省只读——物理可写性由批次17 裸地址
         // 写通路实证，A2L 元数据层不伪造读写位）
-        {"kDefaultCalParams.cal_factor", 0x80010000, 0, 2, 0, 0},
-        {"kDefaultCalParams.cal_offset", 0x80010004, 0, 4, 0, 0},
+        // 与本用例的分工：这里是对上游输出的忠实快照（回归基线），职责是
+        // 记录 XCPlite 的实际行为，故 rw 保持 0 不动；examples/xcp_slave_demo
+        // 作为交付给主站的示例，会主动补齐该缺失位（段相对寻址物理可写，
+        // xcplite.c 的 XcpWriteMta 为 XcpAddrIsSeg 开了专门分支）。两者目的
+        // 不同，差异在此显式记录，详见
+        // examples/xcp_slave_demo/main.cpp 的 PatchCalibrationInstanceWriteAccess。
+        {"kDefaultCalParams.cal_factor", 0x80010000, 0, 2, 0, 0, true},
+        {"kDefaultCalParams.cal_offset", 0x80010004, 0, 4, 0, 0, true},
     };
     for (const auto& e : kLeaves) {
         const std::string key = std::string("xcp_test_slave::") + e.path;
         auto r = db->Find(key);
         ASSERT_TRUE(r.HasValue()) << key << ": " << r.ErrorInfo().message;
-        EXPECT_EQ(r.Value().kind, SymbolKind::Measurement) << key;
+        EXPECT_EQ(r.Value().kind, e.characteristic ? SymbolKind::Characteristic
+                                                   : SymbolKind::Measurement)
+            << key;
+        if (e.characteristic) {
+            EXPECT_EQ(r.Value().characteristic_type, CharacteristicType::Value)
+                << key;
+        }
         EXPECT_EQ(r.Value().xcp_address, e.addr) << key;
         EXPECT_EQ(static_cast<unsigned>(r.Value().address_extension),
                   static_cast<unsigned>(e.ext))
@@ -1236,6 +1323,95 @@ TEST_F(A2lGoldenTest, StructLeafRealCorpusFourForms) {
     EXPECT_EQ(bad.ErrorInfo().phase, Phase::Conversion);
     EXPECT_NE(bad.ErrorInfo().message.find("只读"), std::string::npos)
         << bad.ErrorInfo().message;
+}
+
+TEST_F(A2lGoldenTest, CppDemoV201TypedInstancesAndMemoryPages) {
+    auto bridge = LoadOk(Data("cpp_demo_V201_corrected.a2l"));
+    ASSERT_NE(bridge, nullptr);
+    const IA2lDatabase* db = bridge->Database();
+    ASSERT_NE(db, nullptr);
+    EXPECT_TRUE(bridge->ListLoadWarnings().empty());
+
+    const std::string counter_key = "cpp_demo::kParameters.counter_max";
+    auto counter = db->Find(counter_key);
+    ASSERT_TRUE(counter.HasValue()) << counter.ErrorInfo().message;
+    EXPECT_EQ(counter.Value().kind, SymbolKind::Characteristic);
+    EXPECT_EQ(counter.Value().characteristic_type, CharacteristicType::Value);
+    EXPECT_TRUE(counter.Value().read_write);
+    ASSERT_TRUE(counter.Value().memory_segment.has_value());
+    EXPECT_EQ(counter.Value().memory_segment->name, "kParameters");
+    EXPECT_EQ(counter.Value().memory_segment->segment_number, 1u);
+    ASSERT_EQ(counter.Value().memory_segment->pages.size(), 2u);
+    EXPECT_EQ(counter.Value().memory_segment->pages[0].number, 0u);
+    EXPECT_EQ(counter.Value().memory_segment->pages[0].xcp_write_access,
+              XcpPageWriteAccess::DontCare);
+    EXPECT_EQ(counter.Value().memory_segment->pages[1].number, 1u);
+    EXPECT_EQ(counter.Value().memory_segment->pages[1].xcp_write_access,
+              XcpPageWriteAccess::NotAllowed);
+
+    const std::string curve_key = "cpp_demo::SigGen1.lookup.values";
+    auto curve = db->Find(curve_key);
+    ASSERT_TRUE(curve.HasValue()) << curve.ErrorInfo().message;
+    EXPECT_EQ(curve.Value().kind, SymbolKind::Characteristic);
+    EXPECT_EQ(curve.Value().characteristic_type, CharacteristicType::Curve);
+    EXPECT_EQ(curve.Value().xcp_address, 0x80020020u);
+    EXPECT_EQ(curve.Value().element_size_bytes, 4u);
+    ASSERT_EQ(curve.Value().dimensions.size(), 1u);
+    EXPECT_EQ(curve.Value().dimensions[0].extent, 11u);
+    EXPECT_EQ(curve.Value().dimensions[0].byte_stride, 4u);
+    ASSERT_TRUE(curve.Value().fixed_curve_axis.has_value());
+    EXPECT_DOUBLE_EQ(curve.Value().fixed_curve_axis->offset, 0.0);
+    EXPECT_DOUBLE_EQ(curve.Value().fixed_curve_axis->distance, 1.0);
+    EXPECT_EQ(curve.Value().fixed_curve_axis->point_count, 11u);
+    ASSERT_TRUE(curve.Value().memory_segment.has_value());
+    EXPECT_EQ(curve.Value().memory_segment->segment_number, 2u);
+    auto curve_size = db->ByteSizeOf(curve_key);
+    ASSERT_TRUE(curve_size.HasValue()) << curve_size.ErrorInfo().message;
+    EXPECT_EQ(curve_size.Value(), 44u);
+
+    // F32 little-endian raw 1.5 可按固定轴CURVE点索引解码并单点往返。
+    const Bytes raw_float{0x00, 0x00, 0xC0, 0x3F};
+    auto decoded = db->ToPhysicalElement(curve_key, 7, BytesView(raw_float));
+    ASSERT_TRUE(decoded.HasValue()) << decoded.ErrorInfo().message;
+    ASSERT_TRUE(std::holds_alternative<double>(decoded.Value()))
+        << "PhysicalValue variant index=" << decoded.Value().index();
+    EXPECT_DOUBLE_EQ(std::get<double>(decoded.Value()), 1.5);
+    auto encoded = db->FromPhysicalElement(curve_key, 7, PhysicalValue{0.5});
+    ASSERT_TRUE(encoded.HasValue()) << encoded.ErrorInfo().message;
+    EXPECT_EQ(encoded.Value().size(), 4u);
+    auto round_trip =
+        db->ToPhysicalElement(curve_key, 7, BytesView(encoded.Value()));
+    ASSERT_TRUE(round_trip.HasValue()) << round_trip.ErrorInfo().message;
+    EXPECT_DOUBLE_EQ(std::get<double>(round_trip.Value()), 0.5);
+    auto invalid_curve_index =
+        db->ToPhysicalElement(curve_key, 11, BytesView(raw_float));
+    ASSERT_FALSE(invalid_curve_index.HasValue());
+    EXPECT_EQ(invalid_curve_index.ErrorInfo().code, ErrorCode::BadArgument);
+    auto whole_curve_write = db->FromPhysical(curve_key, PhysicalValue{0.5});
+    ASSERT_FALSE(whole_curve_write.HasValue());
+    EXPECT_EQ(whole_curve_write.ErrorInfo().code,
+              ErrorCode::UnsupportedOperation);
+
+    // MEASUREMENT数组只开放元素读取；整体写入及标定写入API均拒绝。
+    const std::string histogram_key = "cpp_demo::loop_histogram";
+    auto histogram = db->Find(histogram_key);
+    ASSERT_TRUE(histogram.HasValue()) << histogram.ErrorInfo().message;
+    EXPECT_EQ(histogram.Value().kind, SymbolKind::Measurement);
+    ASSERT_EQ(histogram.Value().dimensions.size(), 1u);
+    EXPECT_EQ(histogram.Value().dimensions[0].extent, 128u);
+    auto histogram_size = db->ByteSizeOf(histogram_key);
+    ASSERT_TRUE(histogram_size.HasValue())
+        << histogram_size.ErrorInfo().message;
+    EXPECT_EQ(histogram_size.Value(), 512u);
+    const Bytes raw_count{42, 0, 0, 0};
+    auto count =
+        db->ToPhysicalElement(histogram_key, 127, BytesView(raw_count));
+    ASSERT_TRUE(count.HasValue()) << count.ErrorInfo().message;
+    EXPECT_EQ(std::get<std::int64_t>(count.Value()), 42);
+    auto array_write = db->FromPhysicalElement(
+        histogram_key, 0, PhysicalValue{std::uint64_t{42}});
+    ASSERT_FALSE(array_write.HasValue());
+    EXPECT_EQ(array_write.ErrorInfo().code, ErrorCode::UnsupportedOperation);
 }
 
 TEST_F(A2lGoldenTest, StructLeafBrokenCorpusWarnsEveryRejection) {
@@ -1333,12 +1509,15 @@ TEST_F(A2lGoldenTest, StructLeafBrokenCorpusWarnsEveryRejection) {
 namespace {
 
 /// @brief 按 envelope 规则组装测试帧（独立重算 header 字节数，B-7 字节规则）
+/// @details 识别字段长度与 a2lbridge::EnvelopeExtraBytes 同源，按原始 PDF
+///          第 95-96 页 Figure 51/52/53 计算：Absolute=PID、RelativeByte=+1、
+///          RelativeWord=+2、RelativeWordAligned=+3（含 FILL）。
+///          CTR 仅 RelativeWordAligned 时取代 FILL，不额外占字节。
 Bytes MakeEnvelope(const DtoFrameLayout& f, std::uint8_t pid,
                    const Bytes& payload) {
     Bytes b;
     b.push_back(pid);
     std::size_t extra = 0;
-    if (f.counter_enabled) extra += 1;
     if (f.timestamp_enabled) extra += (f.timestamp_size_bits + 7) / 8;
     if (f.first_odt) extra += 1;
     switch (f.identification_field_type) {
@@ -1348,13 +1527,80 @@ Bytes MakeEnvelope(const DtoFrameLayout& f, std::uint8_t pid,
             extra += 1;
             break;
         case DaqInfo::IdFieldType::RelativeWord:
-        case DaqInfo::IdFieldType::RelativeWordAligned:
             extra += 2;
             break;
+        case DaqInfo::IdFieldType::RelativeWordAligned:
+            extra += 3;
+            break;
+    }
+    if (f.counter_enabled &&
+        f.identification_field_type != DaqInfo::IdFieldType::RelativeWordAligned) {
+        extra += 1;
     }
     b.insert(b.end(), extra, 0xEE);  // 填充字节（Decode 只按长度校验）
     b.insert(b.end(), payload.begin(), payload.end());
     return b;
+}
+
+// ============================================================================
+// V-04 回归：A2L 声明的 PROTOCOL_LAYER VERSION 必须透传，不得被桥接层改写
+// ============================================================================
+// 背景：`a2l_dto_map.cpp` 中 `layer->version` 曾硬编码为 0x0100，导致任何 A2L
+// 都被报告成 V1.0。上游 liba2l 早已正确解析该字段（语法层 xcpdataparser.y ->
+// ProtocolLayer::GetVersion -> IfDataXcpDto::protocol_version），桥接层把它丢弃
+// 属于实现错误。
+//
+// 之所以此前无测试发现：`golden_basic.a2l` 恰好也声明 0x100，与硬编码值
+// **巧合一致**；而 VersionResolver 的 A2L 用例是直接注入 inputs，根本不过
+// 桥接层。本组用例专门把「文件里的声明」与「桥接层的输出」对账，堵住该漏洞。
+
+/// @brief 真实 A2L 文件声明的 0x104（V1.4）必须原样透出
+TEST_F(A2lGoldenTest, V04A2lDeclaredVersionIsNotRewritten) {
+    auto b = LoadOk(Data("cpp_demo_V201_corrected.a2l"));
+    ASSERT_NE(b, nullptr);
+    const IfDataXcpInfo* xcp = b->XcpInfo();
+    ASSERT_NE(xcp, nullptr);
+    // 该文件 /begin PROTOCOL_LAYER 首字段声明 0x104（V1.4）。
+    // 硬编码时代这里会得到 0x0100——测试会失败，正是本用例的价值。
+    EXPECT_EQ(xcp->protocol_layer.version, 0x0104)
+        << "A2L 声明的 V1.4 被改写；V-04 回归（应透传 dto.protocol_version）";
+}
+
+/// @brief 合成 A2L：非 V1.x 的声明同样必须透传（防止再次写死）
+TEST_F(A2lGoldenTest, V04SyntheticNonV1VersionIsPropagated) {
+    const std::filesystem::path dir =
+        std::filesystem::temp_directory_path() / "libxcp_v04";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    const std::filesystem::path path = dir / "v04_declared.a2l";
+    // 声明 0x201（V2.1）：与 0x0100 差异显著，任何写死都会暴露。
+    {
+        std::ofstream out(path);
+        out << "ASAP2_VERSION 1 61\n"
+               "/begin PROJECT P \"\"\n"
+               "/begin MODULE M \"\"\n"
+               "/begin IF_DATA XCP\n"
+               "/begin PROTOCOL_LAYER\n"
+               " 0x201 1000 2000 0 0 0 0 0 248 1024 "
+               "BYTE_ORDER_MSB_LAST ADDRESS_GRANULARITY_BYTE\n"
+               "/end PROTOCOL_LAYER\n"
+               "/end IF_DATA\n"
+               "/end MODULE\n"
+               "/end PROJECT\n";
+    }
+    auto r = A2lBridge::Load(path.string());
+    if (!r.HasValue()) {
+        std::error_code rm;
+        std::filesystem::remove(path, rm);
+        GTEST_SKIP() << "最小 IF_DATA 样本解析失败（需完整 MODULE 结构）："
+                     << r.ErrorInfo().message;
+    }
+    const IfDataXcpInfo* xcp = r.Value()->XcpInfo();
+    ASSERT_NE(xcp, nullptr);
+    EXPECT_EQ(xcp->protocol_layer.version, 0x0201)
+        << "A2L 声明的 V2.1 被改写；V-04 回归";
+    std::error_code rm;
+    std::filesystem::remove(path, rm);
 }
 
 }  // namespace

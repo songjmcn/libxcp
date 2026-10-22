@@ -26,11 +26,85 @@ namespace calmcar::xcp {
  * 运行时真值（docs L1445）。核心自持此枚举，不依赖 A2L 侧的对应概念。
  */
 enum class IdentificationFieldType : std::uint8_t {
-    Absolute,            ///< 绝对 ODT 号：byte0 = 绝对 ODT 号
-    RelativeByte,        ///< byte0 = 相对 ODT 号 + byte1 = DAQ 扩展字节
-    RelativeWord,        ///< WORD 识别：低字节 DAQ 号，高字节相对 ODT（Intel）
-    RelativeWordAligned, ///< WORD 识别且 4 字节对齐（扩展表按 DWORD 对齐）
+    Absolute,            ///< 绝对 ODT 号：识别字段 = PID（1 字节）
+    RelativeByte,        ///< PID + DAQ(BYTE)：2 字节，无 FILL
+    RelativeWord,        ///< PID + DAQ(WORD)：3 字节，无 FILL
+    RelativeWordAligned, ///< PID + FILL + DAQ(WORD)：4 字节（FILL 用于对齐）
 };
+
+/**
+ * @brief 由 DAQ_KEY_BYTE 的 identification 位域换算识别字段模式
+ *
+ * 依据原始 PDF 第 96 页 Figure 51/52/53 与第 181-183 页 Table 143：
+ *  wire code `00` → Absolute；`01` → RelativeByte；`10` → RelativeWord；
+ *  `11` → RelativeWordAligned。
+ *
+ * @param key_byte_identification_field_type DAQ_KEY_BYTE 的 bit6-7 原值
+ * @return 对应模式；取值超出 0..3 时返回 nullopt（不由本函数抛异常，
+ *         便于调用方区分「Slave 申报非法」与「解析失败」）
+ *
+ * @warning 调用方**必须**使用本函数，不得自行按位比较或猜测模式——
+ *          F-08 的缺陷正是「解析了 key byte 却没有映射消费」。
+ */
+[[nodiscard]] constexpr std::optional<IdentificationFieldType>
+IdentificationFieldTypeFromKeyByte(
+    std::uint8_t key_byte_identification_field_type) noexcept {
+    switch (key_byte_identification_field_type) {
+        case 0U:
+            return IdentificationFieldType::Absolute;
+        case 1U:
+            return IdentificationFieldType::RelativeByte;
+        case 2U:
+            return IdentificationFieldType::RelativeWord;
+        case 3U:
+            return IdentificationFieldType::RelativeWordAligned;
+        default:
+            return std::nullopt;
+    }
+}
+
+/**
+ * @brief 识别字段的**最小**字节数（不含时间戳、不含计数器）
+ *
+ * 依据原始 PDF 第 95-96 页 Figure 51/52/53：
+ *  - Absolute：1（仅 PID）
+ *  - RelativeByte：2（PID + DAQ(BYTE)）
+ *  - RelativeWord：3（PID + DAQ(WORD)）
+ *  - RelativeWordAligned：4（PID + FILL + DAQ(WORD)）
+ *
+ * @note 计数器（CTR）**不属于**本长度：对 `RelativeWordAligned`，CTR 会
+ *       **取代 FILL 字节**（原始 PDF 第 97-98 页 Figure 56），故头长不变；
+ *       其余模式下 CTR 位于识别字段**之后**，由解码器单独消费。
+ */
+[[nodiscard]] constexpr std::size_t IdentificationFieldMinimumBytes(
+    IdentificationFieldType type) noexcept {
+    switch (type) {
+        case IdentificationFieldType::Absolute:
+            return 1U;
+        case IdentificationFieldType::RelativeByte:
+            return 2U;
+        case IdentificationFieldType::RelativeWord:
+            return 3U;
+        case IdentificationFieldType::RelativeWordAligned:
+            return 4U;
+    }
+    return 1U;
+}
+
+/**
+ * @brief 该模式的 CTR 是否合并进识别字段（取代 FILL 字节）
+ *
+ * 依据原始 PDF 第 97-98 页：仅 `(WORD, aligned)` 采用该做法，目的是
+ * 「keep the alignment without introducing additional fill bytes」。
+ *
+ * @param type 识别字段模式
+ * @return true 表示 CTR 占用识别字段内的 FILL 槽位，解码器不得在其后
+ *         再消费计数器字节
+ */
+[[nodiscard]] constexpr bool IdentificationFieldMergesCounter(
+    IdentificationFieldType type) noexcept {
+    return type == IdentificationFieldType::RelativeWordAligned;
+}
 
 /**
  * @brief 运行时信封布局（校验描述后续字节如何切分）

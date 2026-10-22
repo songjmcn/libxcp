@@ -171,9 +171,10 @@ protected:
         cfg.local_host = "127.0.0.1";
         cfg.local_port = 0;
         cfg.receive_poll_interval_ms = 20;
+        calmcar::xcp::XcpMasterOptions options;
+        options.event_listener = &dto_listener_;
         master_ = std::make_unique<calmcar::xcp::XcpMaster>(
-            std::make_unique<calmcar::xcp::UdpTransport>(cfg),
-            calmcar::xcp::CommandTimeouts{}, &dto_listener_);
+            std::make_unique<calmcar::xcp::UdpTransport>(cfg), options);
         master_->Connect();
     }
 

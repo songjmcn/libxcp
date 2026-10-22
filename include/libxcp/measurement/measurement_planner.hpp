@@ -31,7 +31,10 @@ struct MeasurementRoute {
     std::uint16_t daq_list{0};    ///< DAQ List 号
     std::uint8_t odt{0};          ///< ODT 号（0 基）
     std::size_t payload_offset{0};  ///< 净荷内字节偏移
-    std::size_t size{0};          ///< 实占字节数
+    std::size_t size{0};            ///< 实占字节数
+    bool is_array{false};           ///< 是否为一条完整数组 Entry
+    std::uint8_t element_count{1};  ///< 数组元素数（标量固定为 1）
+    std::uint8_t element_size_bytes{0};  ///< 单元素实占字节数
 };
 
 /**
@@ -63,11 +66,13 @@ public:
      * @param max_dto  会话 MAX_DTO（来自 `GetSessionParameters().max_dto`）
      * @param address_granularity 会话 AG（来自 `GetSessionParameters()`）
      * @param timestamp_bytes `DaqTimestampBytesCached()` 缓存（0=无/未知，不猜）
+     * @param daq_capabilities 已核验的 Entry 粒度/长度与数组准入；默认拒绝数组
      */
-    explicit MeasurementPlanner(const IMeasurementDatabase& database,
-                                std::uint16_t max_dto,
-                                AddressGranularity address_granularity,
-                                std::size_t timestamp_bytes = 0);
+    explicit MeasurementPlanner(
+        const IMeasurementDatabase& database, std::uint16_t max_dto,
+        AddressGranularity address_granularity, std::size_t timestamp_bytes = 0,
+        std::size_t identification_bytes = 1,
+        MeasurementDaqCapabilities daq_capabilities = {});
     ~MeasurementPlanner();
 
     MeasurementPlanner(const MeasurementPlanner&) = delete;
@@ -82,6 +87,8 @@ private:
     std::uint16_t m_max_dto_{0};              ///< 会话 MAX_DTO
     std::size_t m_ag_bytes_{1};               ///< AG 字节数（AgToBytes）
     std::size_t m_timestamp_bytes_{0};        ///< 信封时间戳头字节（0=无）
+    std::size_t m_identification_bytes_{1};  ///< 识别字段头宽
+    MeasurementDaqCapabilities m_daq_capabilities_{};  ///< 已核验的 Entry 限制
 };
 
 }  // namespace calmcar::xcp

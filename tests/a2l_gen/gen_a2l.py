@@ -592,7 +592,8 @@ def main():
         text = "\r\n".join(build_a2l(spec)) + "\r\n"
         # 非纯 ASCII spec（含中文描述）必须 UTF-8；纯 ASCII 也统一 UTF-8（ASCII 兼容）
         a2l_path = out_dir / f"{stem}.a2l"
-        a2l_path.write_text(text, encoding="utf-8", newline="")
+        with a2l_path.open("w", encoding="utf-8", newline="") as output:
+            output.write(text)
         written.append(a2l_path)
         # 基本样本附带期望值（供人核对；C++ 侧以常量固化同一组值）
         if stem == "golden_basic":
@@ -604,7 +605,8 @@ def main():
             for name, fn in (("lf", variant_lf), ("ws", variant_ws),
                              ("bom", variant_bom)):
                 vp = out_dir / f"golden_basic_{name}.a2l"
-                vp.write_text(fn(text), encoding="utf-8", newline="")
+                with vp.open("w", encoding="utf-8", newline="") as output:
+                    output.write(fn(text))
                 written.append(vp)
 
     for p in written:

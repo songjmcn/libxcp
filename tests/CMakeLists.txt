@@ -32,6 +32,17 @@ FetchContent_Declare(
         GIT_SHALLOW TRUE)
 
 FetchContent_MakeAvailable(googletest)
+# GTest上游将FetchContent头文件标记为SYSTEM；AppleClang因此可能优先
+# 命中/usr/local/include中的旧安装版，造成头文件与本次构建archive ABI不一致。
+# 取消其SYSTEM分类，让本地Fetched头先于编译器默认系统目录搜索。
+set_property(TARGET gtest PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "")
+set_property(TARGET gtest_main PROPERTY INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "")
+
+# 使用项目自有 main 管理测试进程级日志；测试发现模式不初始化 glog。
+add_library(libxcp_test_main STATIC test_main.cpp)
+target_compile_features(libxcp_test_main PRIVATE cxx_std_20)
+target_link_libraries(libxcp_test_main PUBLIC GTest::gtest)
+libxcp_configure_program_logging(libxcp_test_main)
 
 add_executable(libxcp_tests
         protocol_types_test.cpp
@@ -41,6 +52,7 @@ add_executable(libxcp_tests
         session_test.cpp
         udp_header_codec_test.cpp
         udp_transport_test.cpp
+        link_budget_test.cpp
         udp_test_slave_test.cpp
         memory_access_test.cpp
         recovery_test.cpp
@@ -54,12 +66,14 @@ add_executable(libxcp_tests
         measurement_planner_test.cpp
         measurement_session_test.cpp
         daq_timestamp_test.cpp
-        measurement_session_hardening_test.cpp)
+        measurement_session_hardening_test.cpp
+        logging_test.cpp
+        version_resolver_test.cpp)
 
 target_link_libraries(libxcp_tests PRIVATE
         libxcp::libxcp
         GTest::gtest
-        GTest::gtest_main)
+        libxcp_test_main)
 
 # 测试设施头文件目录（mock_transport.hpp 等），仅 tests 内部可见
 target_include_directories(libxcp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -99,7 +113,7 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
           libxcp::libxcp
           libxcp::a2lbridge libxcp_measurement_adapter
           GTest::gtest
-          GTest::gtest_main)
+          libxcp_test_main)
   # 夹具与共享类型头的搜索路径（tests/ 与 tests/xcp_test_slave/）
   target_include_directories(XcpliteIntegration PRIVATE
           ${CMAKE_CURRENT_SOURCE_DIR})
@@ -115,6 +129,24 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
           COMMAND ${CMAKE_COMMAND} -E copy_if_different
                   "$<TARGET_FILE:liba2l::liba2l>"
                   "$<TARGET_FILE_DIR:XcpliteIntegration>")
+
+  # examples 子目录在 tests 之后配置；这里登记源文件与延迟求值的目标路径，
+  # 由 examples/xcp_slave_demo/CMakeLists.txt 在目标创建后补充构建依赖。
+  if(LIBXCP_BUILD_EXAMPLES)
+    target_sources(XcpliteIntegration PRIVATE
+            xcp_slave_demo_model_test.cpp
+            xcp_slave_demo_integration_test.cpp
+            "${PROJECT_SOURCE_DIR}/examples/xcp_slave_demo/slave_model.cpp")
+    target_include_directories(XcpliteIntegration PRIVATE
+            "${PROJECT_SOURCE_DIR}/examples/xcp_slave_demo")
+    target_compile_definitions(XcpliteIntegration PRIVATE
+            XCP_SLAVE_DEMO_EXECUTABLE="$<TARGET_FILE:xcp_slave_demo>"
+            XCP_THIRDPARTY_DIR="${PROJECT_SOURCE_DIR}/thirdparty")
+  endif()
+
+  # 该目标包含从站日志布点的黑盒用例（xcp_slave_demo_integration_test.cpp
+  # 的 ServiceEmitsPeriodicHeartbeatLog），需要与示例一致的 0/1 开关。
+  libxcp_configure_program_logging(XcpliteIntegration)
 
   gtest_discover_tests(XcpliteIntegration DISCOVERY_TIMEOUT 120)
 endif()
@@ -143,6 +175,7 @@ add_executable(A2lSmoke a2l_smoke_test.cpp)
 target_compile_features(A2lSmoke PRIVATE cxx_std_20)
 # 经桥接层消费（libxcp::a2lbridge PUBLIC 传播 liba2l 导入目标的头与链接库）
 target_link_libraries(A2lSmoke PRIVATE libxcp::a2lbridge)
+libxcp_configure_program_logging(A2lSmoke)
 target_compile_definitions(A2lSmoke PRIVATE A2L_GOLDEN_PATH="${A2L_GOLDEN_FILE}")
 if(MSVC)
   target_compile_options(A2lSmoke PRIVATE /utf-8)
@@ -161,7 +194,10 @@ set_tests_properties(A2lSmoke PROPERTIES FIXTURES_REQUIRED A2lGolden)
 # ----------------------------------------------------------------------------
 add_executable(A2lGolden a2l_golden_test.cpp)
 target_compile_features(A2lGolden PRIVATE cxx_std_20)
-target_link_libraries(A2lGolden PRIVATE libxcp::a2lbridge GTest::gtest_main)
+target_link_libraries(A2lGolden PRIVATE libxcp::a2lbridge libxcp_test_main
+        # T-05：需要 libxcp 的 PacketAlignment 强类型与 XcpFrameBytes()，
+        # 用以断言 A2L PACKET_ALIGNMENT 贯通到本侧 Tail 公式
+        libxcp::libxcp)
 target_compile_definitions(A2lGolden PRIVATE
         A2L_GOLDEN_DIR="${A2L_GOLDEN_DIR}"
         A2L_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data/a2l"
@@ -188,7 +224,7 @@ set_tests_properties(A2lGolden PROPERTIES FIXTURES_REQUIRED A2lGolden
 add_executable(A2lE2E a2l_e2e_test.cpp udp_test_slave.cpp)
 target_compile_features(A2lE2E PRIVATE cxx_std_20)
 target_link_libraries(A2lE2E PRIVATE
-        libxcp::libxcp libxcp::a2lbridge GTest::gtest_main)
+        libxcp::libxcp libxcp::a2lbridge libxcp_test_main)
 target_compile_definitions(A2lE2E PRIVATE
         A2L_GOLDEN_DIR="${A2L_GOLDEN_DIR}")
 target_include_directories(A2lE2E PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
@@ -212,7 +248,7 @@ target_compile_features(MeasurementAdapterTest PRIVATE cxx_std_20)
 target_link_libraries(MeasurementAdapterTest PRIVATE
         libxcp_measurement_adapter
         GTest::gtest
-        GTest::gtest_main)
+        libxcp_test_main)
 target_include_directories(MeasurementAdapterTest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR})
 if(MSVC)
@@ -250,3 +286,79 @@ add_test(NAME A2lIsolation
                  "-DA2L_BRIDGE_DIR=${CMAKE_SOURCE_DIR}/thirdparty/a2l-sdk/a2lbridge"
                  "-DLIBXCP_ROOT_DIR=${CMAKE_SOURCE_DIR}"
                  -P "${CMAKE_CURRENT_SOURCE_DIR}/a2l_isolation_check.cmake")
+
+# XCP Master CLI tool smoke tests (requires LIBXCP_BUILD_TOOLS=ON).
+if(LIBXCP_BUILD_TOOLS)
+  add_test(NAME XcpMasterToolHelp COMMAND xcp_master --help)
+  add_test(NAME XcpMasterToolRejectsMissingArgs COMMAND xcp_master)
+  set_tests_properties(XcpMasterToolRejectsMissingArgs PROPERTIES WILL_FAIL TRUE)
+  add_test(NAME XcpMasterToolRejectsPollingIntervalInDaq
+           COMMAND xcp_master --a2l ignored.a2l --host 127.0.0.1 --port 5555
+                   --mode daq --interval-ms 500)
+  # DTO 布局改为按取证自动选择后，--daq-profile 已被移除；
+  # 该选项现应作为未知参数被拒绝（不再存在厂商 profile 开关）。
+  add_test(NAME XcpMasterToolRejectsRemovedDaqProfileOption
+           COMMAND xcp_master --a2l ignored.a2l --host 127.0.0.1 --port 5555
+                   --daq-profile xcplite)
+  set_tests_properties(XcpMasterToolRejectsPollingIntervalInDaq
+                       XcpMasterToolRejectsRemovedDaqProfileOption
+                       PROPERTIES WILL_FAIL TRUE)
+
+  add_executable(XcpMasterSymbolPolicyTest
+          xcp_master_symbol_policy_test.cpp
+          xcp_master_calibration_policy_test.cpp
+          xcp_master_tui_model_test.cpp
+          xcp_master_symbol_display_test.cpp)
+  target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
+  target_include_directories(XcpMasterSymbolPolicyTest PRIVATE
+          ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(XcpMasterSymbolPolicyTest PRIVATE
+          libxcp::a2lbridge GTest::gtest libxcp_test_main Threads::Threads)
+  if(MSVC)
+    target_compile_options(XcpMasterSymbolPolicyTest PRIVATE /utf-8)
+  endif()
+  gtest_discover_tests(XcpMasterSymbolPolicyTest DISCOVERY_TIMEOUT 60)
+endif()
+
+# Boost.Locale-backed A2L log timestamp compatibility test.
+add_executable(A2lLogTimestampTest a2l_log_timestamp_test.cpp)
+target_compile_features(A2lLogTimestampTest PRIVATE cxx_std_20)
+target_include_directories(A2lLogTimestampTest PRIVATE
+        ${PROJECT_SOURCE_DIR}/thirdparty/a2l-sdk/src)
+target_link_libraries(A2lLogTimestampTest PRIVATE
+        a2l Boost::locale GTest::gtest libxcp_test_main)
+gtest_discover_tests(A2lLogTimestampTest DISCOVERY_TIMEOUT 60)
+
+if(LIBXCP_ENABLE_LOG)
+  # 独立探针用于黑盒检查日志文件、标准流隔离、不可写目录与 discovery。
+  add_executable(libxcp_logging_probe logging_probe.cpp)
+  target_compile_features(libxcp_logging_probe PRIVATE cxx_std_20)
+  target_link_libraries(libxcp_logging_probe PRIVATE libxcp::libxcp)
+  libxcp_configure_program_logging(libxcp_logging_probe)
+
+  set(LIBXCP_LOG_TEST_ROOT "${CMAKE_CURRENT_BINARY_DIR}/log-behavior")
+  add_test(NAME LibxcpLogFileOutput
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=file-output"
+                   "-DPROBE_EXE=$<TARGET_FILE:libxcp_logging_probe>"
+                   "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
+  add_test(NAME LibxcpLogControlRecovery
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=control-recovery"
+                   "-DTEST_EXE=$<TARGET_FILE:libxcp_tests>"
+                   "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
+  add_test(NAME LibxcpLogUnwritableDirectory
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=unwritable"
+                   "-DPROBE_EXE=$<TARGET_FILE:libxcp_logging_probe>"
+                   "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
+  add_test(NAME LibxcpLogDiscoveryNoDirectory
+           COMMAND ${CMAKE_COMMAND}
+                   "-DMODE=discovery"
+                   "-DTEST_EXE=$<TARGET_FILE:libxcp_tests>"
+                   "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
+endif()

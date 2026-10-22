@@ -8,15 +8,16 @@
  * 帧结构（识别字段头长 = DtoFrameLayout::header_bytes，调用方按会话取证构造）：
  *   [识别字段 | counter? | timestamp?] | payload
  *   - Absolute：byte0 = 绝对 ODT 号；header_bytes=1。
- *   - RelativeByte（XCPlite 实然）：[relODT][0xAA][DAQ16 LE]，header_bytes=4；
- *     相对 ODT 复原 + DAQ16 取 == 账本 daq_list。
- *   - RelativeWord：低字节 DAQ 号、高字节相对 ODT（Intel 文档口径）；
- *     header_bytes=2。
- *   - RelativeWordAligned：WORD 但扩展表按 4 字节 DWORD 对齐（header_bytes=4，
- *     payload 起点天然对 4）。
+ *   - RelativeByte：[PID(relODT)][DAQ(BYTE)]；header_bytes=2。
+ *   - RelativeWord：[PID(relODT)][DAQ(WORD)]；header_bytes=3。
+ *   - RelativeWordAligned：[PID(relODT)][FILL][DAQ(WORD)]；header_bytes=4。
+ *     FILL 取值由规范留白，**不参与判定**。
+ *   以上布局依据原始 PDF 第 95-96 页 Figure 50-53；相对 ODT 恒在 PID（byte0），
+ *   DAQ 字段在其后。
  *
- * counter_enabled：识别字段后紧跟 1 字节 DTO 计数器。
- * timestamp_enabled：再紧跟 timestamp_size_bits/8 字节原始时间戳（小端）。
+ * counter_enabled：DTO 计数器。`RelativeWordAligned` 时 CTR **取代 FILL 字节**
+ *   （原始 PDF 第 97-98 页 Figure 56），不额外占长度；其余模式紧跟识别字段之后。
+ * timestamp_enabled：再紧跟 timestamp_size_bits/8 字节原始时间戳，按会话字节序。
  * pid_off：禁止（B-7）→ MalformedPacket。
  *
  * 任何越界/不足 → MalformedPacket，不允许部分解释。
@@ -34,9 +35,6 @@ namespace calmcar::xcp {
 
 namespace {
 
-/// @brief XCPlite 相对枚举 0xAA 标志（识别字段分隔标记，见 RelativeByte 注释）
-constexpr std::uint8_t kXcpliteRelativeMarker = 0xAAU;
-
 /// @brief 抛 MalformedPacket（短帧/pid_off/识别字段非法），message 仅展示
 [[noreturn]] void ThrowMalformed(std::string msg) {
     throw detail::MakeMalformedPacket(std::move(msg));
@@ -49,11 +47,22 @@ constexpr std::uint8_t kXcpliteRelativeMarker = 0xAAU;
         std::to_string(bits) + " 非法（须为 8/16/32/64 整字节）");
 }
 
-/// @brief 小端读 [0,8) 字节 → uint64（Intel；raw 段永远按小端，符合会话取证）
-std::uint64_t ReadLe(BytesView view, std::size_t offset, std::size_t n) {
+/// @brief 按会话字节序读 [0,8) 字节 → uint64
+/// @param order 会话字节序；Motorola 为高字节在前（F-07）
+/// @param view 帧缓冲
+/// @param offset 起始偏移
+/// @param n 字节数
+std::uint64_t ReadOrdered(BytesView view, std::size_t offset, std::size_t n,
+                          ByteOrder order) {
     std::uint64_t v = 0;
-    for (std::size_t i = 0; i < n; ++i) {
-        v |= static_cast<std::uint64_t>(view[offset + i]) << (8U * i);
+    if (order == ByteOrder::Intel) {
+        for (std::size_t i = 0; i < n; ++i) {
+            v |= static_cast<std::uint64_t>(view[offset + i]) << (8U * i);
+        }
+    } else {
+        for (std::size_t i = 0; i < n; ++i) {
+            v = (v << 8U) | static_cast<std::uint64_t>(view[offset + i]);
+        }
     }
     return v;
 }
@@ -70,42 +79,64 @@ DtoEnvelope DtoEnvelopeDecoder::Decode(BytesView dto,
         ThrowMalformed("pid_off DTO 无识别字段，无法解码信封");
     }
 
-    // header_bytes 即识别字段头长；帧至少要有完整识别字段。
+    // header_bytes 即识别字段头长（不含时间戳）；帧至少要有完整识别字段。
     const std::size_t field = frame_layout.header_bytes;
     if (dto.size() < field) {
         ThrowMalformed("DTO 帧短于识别字段头");
     }
 
+    // 识别字段内 CTR 的字节偏移（仅 RelativeWordAligned 有意义，= FILL 槽位）。
+    std::optional<std::size_t> merged_counter_offset;
+
     DtoIdentity identity;
     switch (frame_layout.identification_field_type) {
         case IdentificationFieldType::Absolute: {
-            // byte0 = 绝对 ODT 号；daq_list 由调用方（运行态哪条在跑）路由补充。
-            identity.odt = dto[0];
+            // 识别字段仅 PID；first_odt 为 START 返回的 FIRST_PID，
+            // 映射成当前单 List 内的相对 ODT 编号。first_odt=0 保持旧纯解码语义。
+            if (dto[0] < frame_layout.first_odt) {
+                ThrowMalformed("Absolute PID 小于 FIRST_PID");
+            }
+            identity.odt = static_cast<std::uint8_t>(
+                dto[0] - frame_layout.first_odt);
             identity.daq_list = 0;
             break;
         }
         case IdentificationFieldType::RelativeByte: {
-            // XCPlite：[relODT][0xAA][DAQ16 LE]，header_bytes=4。
-            if (field < 4U) {
-                ThrowMalformed("RelativeByte 识别字段不足 4 字节");
-            }
-            if (dto[1] != kXcpliteRelativeMarker) {
-                ThrowMalformed("RelativeByte 识别字段缺少 0xAA 标志");
+            // Figure 51：PID（相对 ODT）+ DAQ(BYTE)，共 2 字节。
+            if (field < 2U) {
+                ThrowMalformed("RelativeByte 识别字段不足 2 字节");
             }
             identity.odt =
                 static_cast<std::uint8_t>(frame_layout.first_odt + dto[0]);
-            identity.daq_list = static_cast<std::uint16_t>(ReadLe(dto, 2, 2));
+            identity.daq_list = dto[1];
             break;
         }
-        case IdentificationFieldType::RelativeWord:
-        case IdentificationFieldType::RelativeWordAligned: {
-            // WORD：低字节 DAQ 号、高字节相对 ODT（Intel 文档口径）。
-            if (field < 2U) {
-                ThrowMalformed("RelativeWord 识别字段不足 2 字节");
+        case IdentificationFieldType::RelativeWord: {
+            // Figure 52：PID（相对 ODT）+ DAQ(WORD)，共 3 字节。
+            if (field < 3U) {
+                ThrowMalformed("RelativeWord 识别字段不足 3 字节");
             }
             identity.odt =
-                static_cast<std::uint8_t>(frame_layout.first_odt + dto[1]);
-            identity.daq_list = dto[0];
+                static_cast<std::uint8_t>(frame_layout.first_odt + dto[0]);
+            identity.daq_list = static_cast<std::uint16_t>(
+                ReadOrdered(dto, 1, 2, m_byte_order_));
+            break;
+        }
+        case IdentificationFieldType::RelativeWordAligned: {
+            // Figure 53：PID（相对 ODT）+ FILL + DAQ(WORD)，共 4 字节。
+            // FILL 用于对齐，规范不约束其取值（"an extra FILL byte"），
+            // 故此处**不得**校验任何固定标志值。
+            if (field < 4U) {
+                ThrowMalformed("RelativeWordAligned 识别字段不足 4 字节");
+            }
+            identity.odt =
+                static_cast<std::uint8_t>(frame_layout.first_odt + dto[0]);
+            identity.daq_list = static_cast<std::uint16_t>(
+                ReadOrdered(dto, 2, 2, m_byte_order_));
+            // Figure 56：CTR 取代 FILL 字节（偏移 1），不额外占用帧长。
+            if (frame_layout.counter_enabled) {
+                merged_counter_offset = 1U;
+            }
             break;
         }
         default:
@@ -114,9 +145,13 @@ DtoEnvelope DtoEnvelopeDecoder::Decode(BytesView dto,
 
     std::size_t off = field;  // 当前指到 counter/timestamp 段起点
 
-    // counter：使能时紧跟 1 字节。
+    // counter：
+    //  - RelativeWordAligned：CTR 已在识别字段内（取代 FILL），此处不消费字节；
+    //  - 其余模式：使能时紧跟识别字段之后，占 1 字节。
     std::optional<std::uint8_t> counter;
-    if (frame_layout.counter_enabled) {
+    if (merged_counter_offset.has_value()) {
+        counter = dto[*merged_counter_offset];
+    } else if (frame_layout.counter_enabled) {
         if (off + 1 > dto.size()) {
             ThrowMalformed("DTO 计数器越界");
         }
@@ -143,7 +178,8 @@ DtoEnvelope DtoEnvelopeDecoder::Decode(BytesView dto,
         if (off + ts_bytes > dto.size()) {
             ThrowMalformed("DTO 原始时间戳越界");
         }
-        raw_timestamp = ReadLe(dto, off, ts_bytes);
+        // F-07：按会话字节序解码，不再固定小端。
+        raw_timestamp = ReadOrdered(dto, off, ts_bytes, m_byte_order_);
         off += ts_bytes;
     }
 

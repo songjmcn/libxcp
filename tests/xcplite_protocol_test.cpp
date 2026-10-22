@@ -305,5 +305,98 @@ TEST_F(XcpliteProtocolTest, ReadOutOfRangeAddressIsRejected) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 批次 B1：版本发现（真实 XCPlite 对端）
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief XCPlite 真实对端的版本发现结果必须被如实记录
+ *
+ * @details 依据原始 PDF（ASAM MCD-1 XCP V1.5.0）：
+ *          - CONNECT 正响应只返回 PL/TL 版本的**最高有效字节**（Table 38，
+ *            第 110 页；§3.1.1 第 12 页明确 "most significant byte only"）；
+ *          - XCPlite 的 `XCP_PROTOCOL_LAYER_VERSION` 为 0x0104
+ *            （`thirdparty/xcplite/src/xcp_cfg.h:29`），故 CONNECT 报出的
+ *            PL 主版本应为 1；
+ *          - GET_VERSION（命令码 0xC0）能提供精确的 Major/Minor。
+ *
+ *          本用例锁定两条不可违反的契约：
+ *          1. 禁止伪造精确版本——Minor 未经 GET_VERSION 确认时必须表达为
+ *             MajorOnly，绝不能凭空写 0 冒充"1.0"；
+ *          2. 报告的版本不得高于 EffectiveVersion（封顶语义）。
+ */
+TEST_F(XcpliteProtocolTest, RealSlaveVersionIsReportedHonestly) {
+    auto master = MakeConnectedMaster();
+
+    const ProtocolVersionSnapshot pl = master->GetProtocolVersionSnapshot();
+    const TransportVersionSnapshot tl = master->GetTransportVersionSnapshot();
+
+    // XCPlite 报 PL 主版本 1（0x0104 >> 8）；这是对端事实，不是本端推断
+    EXPECT_EQ(pl.evidence.reported.major, 1U)
+        << "XCPlite 的 XCP_PROTOCOL_LAYER_VERSION 为 0x0104，主版本应为 1";
+    EXPECT_EQ(tl.evidence.reported.major, 1U)
+        << "TL 版本与 PL 同源，XCPlite 亦为 1.x";
+
+    // XCPlite **确实实现**了 GET_VERSION，且构造默认在 CONNECT 后自动探测，
+    // 因此建链完成时版本已被运行时确认——这是对端能力的事实，不是本端伪造。
+    EXPECT_EQ(pl.evidence.source, VersionSource::GetVersion)
+        << "XCPlite 支持 GET_VERSION，自动探测后来源应为 GetVersion；"
+           "若为 ConnectMajor 说明自动探测未生效";
+    EXPECT_TRUE(pl.evidence.minor_confirmed)
+        << "GET_VERSION 提供了 Minor，应被确认";
+    EXPECT_EQ(pl.evidence.confidence, VersionConfidence::RuntimeConfirmed);
+    EXPECT_FALSE(pl.conservative)
+        << "精确版本已知，不应处于 1.x-conservative 保守态";
+
+    // 精确版本必须与 CONNECT 的粗粒度主版本**不矛盾**
+    EXPECT_LE(pl.effective.major, kProtocolVersion15.major)
+        << "生效版本不得高于支持上限";
+    EXPECT_FALSE(pl.evidence.capped) << "XCPlite 的 1.x 不应触发封顶";
+
+    // 版本证据必须可追溯，便于调用方判断可信度
+    EXPECT_TRUE(pl.evidence.IsAvailable())
+        << "已建链的对端必须给出可用的版本证据";
+}
+
+/**
+ * @brief 真实对端上显式 GET_VERSION 必须给出精确的 Major.Minor
+ *
+ * @details 这是"探测确实生效"的端到端证据：仅实现探测但忘记把结果写回快照
+ *          （本轮修复的缺陷 1）会让本用例失败。
+ *          规范依据：`thirdparty/xcplite/src/xcp_cfg.h:29` 定义
+ *          `XCP_PROTOCOL_LAYER_VERSION 0x0104`，按原始 PDF 第 12 页 §3.1.1
+ *          的 16 位语义（高字节 Major、低字节 Minor）解析应得 1.4。
+ */
+TEST_F(XcpliteProtocolTest, ExplicitProbeYieldsExactVersionFromRealSlave) {
+    auto master = MakeConnectedMaster();
+
+    const auto probe = master->ProbeVersion();
+    ASSERT_EQ(probe.outcome, CommandExecutor::GetVersionOutcome::Available)
+        << "XCPlite 实现了 GET_VERSION；不可用说明探测路径本身有问题";
+    ASSERT_TRUE(probe.response.has_value());
+
+    const auto after = master->GetProtocolVersionSnapshot();
+    EXPECT_EQ(after.evidence.source, VersionSource::GetVersion)
+        << "探测成功后证据来源必须为 GET_VERSION";
+    EXPECT_TRUE(after.evidence.minor_confirmed);
+    EXPECT_EQ(after.evidence.confidence, VersionConfidence::RuntimeConfirmed);
+    EXPECT_EQ(after.evidence.reported.major, 1U);
+    EXPECT_EQ(after.evidence.reported.minor, 4U)
+        << "XCPlite 的 PL 版本为 0x0104，精确解析应得到 1.4";
+    EXPECT_EQ(after.effective.minor, 4U);
+    EXPECT_FALSE(after.conservative);
+
+    // 响应对象与快照必须一致——防止"解析正确但写回错误"
+    EXPECT_EQ(probe.response->ProtocolVersion().major,
+              after.evidence.reported.major);
+    EXPECT_EQ(probe.response->ProtocolVersion().minor,
+              after.evidence.reported.minor);
+
+    // 传输层版本独立存在，不得由协议层推导（方案 §4 第 3 条）
+    const auto tl = master->GetTransportVersionSnapshot();
+    EXPECT_TRUE(tl.evidence.IsAvailable())
+        << "GET_VERSION 同时提供 TL 版本，传输层证据也须可用";
+}
+
 }  // namespace
 }  // namespace calmcar::xcp

@@ -279,6 +279,9 @@ SymbolInfo ConvertSymbol(const liba2l::SymbolDto& dto) {
         info.lower_limit = dto.lower_limit;
         info.upper_limit = dto.upper_limit;
     }
+    info.daq_event_fixed = dto.daq_event_fixed;
+    info.daq_event_default = dto.daq_event_default;
+    info.daq_event_available = dto.daq_event_available;
     return info;
 }
 
@@ -313,6 +316,70 @@ SymbolInfo ConvertStructure(const liba2l::StructInfoDto& dto) {
     // 会让分段地址上的实例静默指错内存）。TYPEDEF 无地址，该值本就是 0。
     info.address_extension = dto.address_extension;
     info.read_write = false;  // B-12：结构体读写一律拒绝，不随声明放行
+    return info;
+}
+
+SymbolInfo ConvertTypedefCharacteristic(
+    const liba2l::TypedefCharacteristicDto& dto) {
+    SymbolInfo info;
+    info.module_name = dto.module_name;
+    info.name = dto.name;
+    info.description = dto.description;
+    info.kind = SymbolKind::Characteristic;
+    info.characteristic_type = ConvertCharType(dto.characteristic_type);
+    info.data_type = ConvertDataType(dto.data_type);
+    info.element_size_bytes = ElementSizeOf(info.data_type);
+    info.byte_order = ConvertByteOrder(dto.byte_order);
+    info.conversion = ConvertConversion(dto.conversion);
+    if (!dto.phys_unit.empty()) {
+        info.conversion.unit = dto.phys_unit;
+    }
+    if (dto.have_limit) {
+        info.have_limit = true;
+        info.lower_limit = dto.lower_limit;
+        info.upper_limit = dto.upper_limit;
+    }
+    // TYPEDEF自身没有实例地址和实例READ_WRITE；调用方必须从INSTANCE继承。
+    info.read_write = false;
+    return info;
+}
+
+MemorySegmentInfo ConvertMemorySegment(const liba2l::MemorySegmentDto& dto) {
+    MemorySegmentInfo info;
+    info.module_name = dto.module_name;
+    info.name = dto.name;
+    info.address = dto.address;
+    info.size = dto.size;
+    info.address_extension = dto.address_extension;
+    info.segment_number = dto.segment_number;
+    info.page_count = dto.number_of_pages;
+    info.has_xcp_segment = dto.has_xcp_segment;
+    info.pages.reserve(dto.pages.size());
+    for (const liba2l::MemoryPageDto& page : dto.pages) {
+        MemoryPageInfo converted;
+        converted.number = page.number;
+        converted.ecu_access = page.ecu_access_type;
+        converted.xcp_read_access = page.xcp_read_access_type;
+        switch (page.xcp_write_access_type) {
+            case liba2l::XcpPageWriteAccessDto::kNotAllowed:
+                converted.xcp_write_access = XcpPageWriteAccess::NotAllowed;
+                break;
+            case liba2l::XcpPageWriteAccessDto::kWithoutEcuOnly:
+                converted.xcp_write_access = XcpPageWriteAccess::WithoutEcuOnly;
+                break;
+            case liba2l::XcpPageWriteAccessDto::kWithEcuOnly:
+                converted.xcp_write_access = XcpPageWriteAccess::WithEcuOnly;
+                break;
+            case liba2l::XcpPageWriteAccessDto::kDontCare:
+                converted.xcp_write_access = XcpPageWriteAccess::DontCare;
+                break;
+            case liba2l::XcpPageWriteAccessDto::kUnknown:
+            default:
+                converted.xcp_write_access = XcpPageWriteAccess::Unknown;
+                break;
+        }
+        info.pages.push_back(converted);
+    }
     return info;
 }
 
@@ -352,9 +419,15 @@ bool ConvertRecordLayoutInfo(const liba2l::SymbolDto& dto,
 void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
                       std::vector<TransportEndpoint>* transports) noexcept {
     if (layer != nullptr) {
-        // protocol_version 是 uint16 major<<8|minor；IF_DATA 段版本首版记
-        // 0x0100
-        layer->version = 0x0100;
+        // protocol_version 是 uint16 major<<8|minor，直接取解析结果。
+        // 历史上此处曾硬编码 0x0100，导致任何 A2L 都被报成 V1.0：上游
+        // liba2l 已正确解析 PROTOCOL_LAYER/VERSION（语法层
+        // xcpdataparser.y -> ProtocolLayer::GetVersion -> IfDataXcpDto），
+        // 桥接层丢弃该值属于实现错误（V-04）。
+        // A2L 未标注该字段时 dto.protocol_version 为 0：保持 0 即可，
+        // 0x0000 会被 XcpProtocolVersion::IsValid() 判为「无证据」，
+        // 而不是伪造出一个 V1.0。
+        layer->version = dto.protocol_version;
         layer->max_cto = dto.max_cto;
         layer->max_dto = dto.max_dto;
         layer->byte_order = ConvertByteOrder(dto.byte_order);

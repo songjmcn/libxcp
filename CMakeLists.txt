@@ -1,5 +1,9 @@
 # ============================================================================
-# libxcp —— XCP 1.3.0 最小协议核心 + XCP on UDP/IP Transport
+# libxcp —— XCP 协议主站核心（V1.3–V1.5）+ XCP on UDP/IP Transport
+#
+# 版本 2.0.0（破坏性变更，批次 B1）：
+#   * XcpMaster 构造函数由位置参数改为单一 XcpMasterOptions 聚合
+#   * 新增版本发现能力（GET_VERSION）与 PL/TL 双版本快照接口
 #
 # 依据设计文档：code-plan/XCP_1.3.0_详细设计_类接口与头文件.md
 # 语言标准：C++20；目标平台：Windows / Linux / macOS
@@ -20,14 +24,15 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(libxcp
-        VERSION 1.3.0
-        DESCRIPTION "XCP 1.3.0 minimal protocol core with UDP/IP transport"
+        VERSION 2.0.0
+        DESCRIPTION "XCP protocol master core (V1.3-V1.5) with UDP/IP transport"
         LANGUAGES CXX)
 
 # ----------------------------------------------------------------------------
 # 全局构建选项
 # ----------------------------------------------------------------------------
 option(LIBXCP_BUILD_TESTS "构建 libxcp 单元测试与集成测试" ON)
+option(LIBXCP_ENABLE_LOG "启用 libxcp 日志（默认 glog 后端）" OFF)
 
 # ----------------------------------------------------------------------------
 # MSVC 工具链定位
@@ -62,6 +67,69 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# 日志开启时才要求 C++20 std::format 并解析/获取 glog；关闭时不触碰后端依赖。
+if(LIBXCP_ENABLE_LOG)
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles([[
+    #include <format>
+    int main() {
+      const auto formatted = std::format("value={} hex={:02x}", 42, 42);
+      return formatted.empty();
+    }
+  ]] LIBXCP_HAS_CXX20_STD_FORMAT)
+  if(NOT LIBXCP_HAS_CXX20_STD_FORMAT)
+    message(FATAL_ERROR
+      "LIBXCP_ENABLE_LOG=ON 需要支持 C++20 <format> 的编译器与标准库；"
+      "请更换工具链或关闭 LIBXCP_ENABLE_LOG。")
+  endif()
+
+  if(NOT TARGET glog::glog)
+    # 程序日志生命周期依赖 IsGoogleLoggingInitialized，旧版 glog 不满足此接口。
+    find_package(glog 0.7.1 CONFIG QUIET)
+  endif()
+  if(NOT TARGET glog::glog)
+    include(FetchContent)
+    # 在函数作用域为按需构建的 glog 关闭可选测试/依赖，避免改写父工程缓存。
+    function(libxcp_fetch_glog)
+      set(BUILD_SHARED_LIBS OFF)
+      set(BUILD_TESTING OFF)
+      set(WITH_GFLAGS OFF)
+      set(WITH_GTEST OFF)
+      set(WITH_UNWIND OFF)
+      set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+      FetchContent_Declare(
+        glog
+        URL https://github.com/google/glog/archive/v0.7.1.zip
+        URL_HASH SHA256=c17d85c03ad9630006ef32c7be7c65656aba2e7e2fbfc82226b7e680c771fc88
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+      FetchContent_MakeAvailable(glog)
+    endfunction()
+    libxcp_fetch_glog()
+  endif()
+  if(NOT TARGET glog::glog)
+    message(FATAL_ERROR
+      "LIBXCP_ENABLE_LOG=ON 但未能提供 glog::glog；请安装 glog 0.7.1+ CONFIG 包、"
+      "设置 FETCHCONTENT_SOURCE_DIR_GLOG，或关闭 LIBXCP_ENABLE_LOG。")
+  endif()
+
+  # 复用父工程预建 target 时也校验版本，不能绕过 IsGoogleLoggingInitialized 要求。
+  if(DEFINED glog_VERSION AND NOT glog_VERSION STREQUAL "")
+    set(LIBXCP_GLOG_VERSION "${glog_VERSION}")
+  else()
+    get_target_property(LIBXCP_GLOG_VERSION glog::glog VERSION)
+  endif()
+  if(NOT LIBXCP_GLOG_VERSION OR LIBXCP_GLOG_VERSION STREQUAL "LIBXCP_GLOG_VERSION-NOTFOUND")
+    message(FATAL_ERROR
+      "LIBXCP_ENABLE_LOG=ON 但无法确认 glog 版本；请使用 glog 0.7.1+ CONFIG 包"
+      "或固定版本 FetchContent 源码。")
+  elseif(LIBXCP_GLOG_VERSION VERSION_LESS 0.7.1)
+    message(FATAL_ERROR
+      "LIBXCP_ENABLE_LOG=ON 需要 glog 0.7.1+，当前检测到 ${LIBXCP_GLOG_VERSION}。")
+  endif()
+  unset(LIBXCP_GLOG_VERSION)
+
+endif()
+
 if(MSVC)
   # 将源文件字符集声明为 UTF-8，避免中文注释在非英文 Windows 控制台下解析异常
   add_compile_options(/utf-8 /W4)
@@ -79,12 +147,15 @@ add_library(libxcp::libxcp ALIAS libxcp)
 
 target_sources(libxcp PRIVATE
         src/protocol_types.cpp
+        src/protocol_version.cpp
+        src/version_resolver.cpp
         src/xcp_error.cpp
         src/command_codec.cpp
         src/response_parser.cpp
         src/session.cpp
         src/udp_header_codec.cpp
         src/udp_transport.cpp
+        src/link_budget.cpp
         src/command_executor.cpp
         src/memory_access.cpp
         src/xcp_master.cpp
@@ -98,11 +169,17 @@ target_include_directories(libxcp
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_definitions(libxcp PUBLIC
+        LIBXCP_ENABLE_LOG=$<BOOL:${LIBXCP_ENABLE_LOG}>)
 
 # 协议核心仅依赖线程库（Session/Executor 内部同步）；
 # UdpTransport 使用平台 Socket，Windows 需显式链接 ws2_32。
 find_package(Threads REQUIRED)
 target_link_libraries(libxcp PUBLIC Threads::Threads)
+if(LIBXCP_ENABLE_LOG)
+  # log.hpp 是安装的公共头文件；静态库消费者也必须获得 glog 链接依赖。
+  target_link_libraries(libxcp PUBLIC glog::glog)
+endif()
 
 if(WIN32)
   target_link_libraries(libxcp PUBLIC ws2_32)
@@ -111,6 +188,35 @@ endif()
 set_target_properties(libxcp PROPERTIES
         OUTPUT_NAME xcp
         POSITION_INDEPENDENT_CODE ON)
+
+if(LIBXCP_ENABLE_LOG)
+  # 自有程序入口的内部初始化辅助代码，不作为 libxcp 公共接口或安装目标。
+  add_library(libxcp_program_logging STATIC src/program_logging.cpp)
+  target_compile_features(libxcp_program_logging PUBLIC cxx_std_20)
+  target_compile_definitions(libxcp_program_logging PUBLIC LIBXCP_ENABLE_LOG=1)
+  target_include_directories(libxcp_program_logging PUBLIC
+          ${PROJECT_SOURCE_DIR}/include
+          ${PROJECT_SOURCE_DIR}/src)
+  target_link_libraries(libxcp_program_logging PUBLIC glog::glog)
+  set_target_properties(libxcp_program_logging PROPERTIES
+          POSITION_INDEPENDENT_CODE ON)
+endif()
+
+# 所有自有工具/示例/测试入口均显式获得 0/1 开关；ON 时共享内部文件日志初始化器。
+function(libxcp_configure_program_logging target)
+  if(NOT TARGET ${target})
+    message(FATAL_ERROR "libxcp_configure_program_logging: 未知 target '${target}'")
+  endif()
+  if(LIBXCP_ENABLE_LOG)
+    target_link_libraries(${target} PRIVATE libxcp_program_logging)
+  else()
+    target_compile_definitions(${target} PRIVATE LIBXCP_ENABLE_LOG=0)
+  endif()
+  # log.hpp 为公共头。不链接 libxcp 核心或 libxcp_program_logging 的目标
+  # （如纯 XCPlite 的 xcp_slave_demo）必须显式获得 include 搜索路径，
+  # 否则关闭日志时 #include "libxcp/log.hpp" 会编译失败。
+  target_include_directories(${target} PRIVATE ${PROJECT_SOURCE_DIR}/include)
+endfunction()
 
 # ----------------------------------------------------------------------------
 # 安装规则
@@ -208,6 +314,9 @@ target_link_libraries(libxcp_measurement_adapter PUBLIC
 option(LIBXCP_BUILD_EXAMPLES
        "Build the standalone example programs under examples/"
        OFF)
+option(LIBXCP_BUILD_TOOLS
+       "Build standalone libxcp tools under tools/"
+       OFF)
 
 # ----------------------------------------------------------------------------
 # XCPlite 协议调试集成（code-plan/XCPlite_Slave_协议调试集成计划.md）
@@ -242,6 +351,14 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
   set(XCPLITE_BUILD_BPF_DEMO OFF)
   set(XCPLITE_INSTALL OFF)
   add_subdirectory(thirdparty/XCPlite)
+endif()
+
+# ----------------------------------------------------------------------------
+# 独立工具（LIBXCP_BUILD_TOOLS 不联动 EXAMPLES / XCPlite）
+# 工具目标先定义，测试可在两门同时开启时对其做 CLI 冒烟验证。
+# ----------------------------------------------------------------------------
+if(LIBXCP_BUILD_TOOLS)
+  add_subdirectory(tools)
 endif()
 
 # ----------------------------------------------------------------------------

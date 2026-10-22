@@ -132,6 +132,25 @@ CharacteristicTypeDto MapCharType(a2l::A2lCharacteristicType t) {
     }
 }
 
+/** AXIS_DESCR 类型 → SDK DTO。 */
+AxisTypeDto MapAxisType(a2l::A2lAxisType type) {
+    switch (type) {
+        case a2l::A2lAxisType::CURVE_AXIS:
+            return AxisTypeDto::kCurveAxis;
+        case a2l::A2lAxisType::COM_AXIS:
+            return AxisTypeDto::kComAxis;
+        case a2l::A2lAxisType::FIX_AXIS:
+            return AxisTypeDto::kFixAxis;
+        case a2l::A2lAxisType::RES_AXIS:
+            return AxisTypeDto::kResAxis;
+        case a2l::A2lAxisType::STD_AXIS:
+            return AxisTypeDto::kStdAxis;
+        case a2l::A2lAxisType::UNKNOWN:
+        default:
+            return AxisTypeDto::kUnknown;
+    }
+}
+
 /** 字节序 → DTO（混合字内/字间序明确报 kUnknown，不做近似）。 */
 ByteOrderDto MapByteOrder(a2l::A2lByteOrder t) {
     switch (t) {
@@ -582,7 +601,8 @@ ConversionDto BuildConversion(const a2l::CompuMethod* cm,
     out.unit = cm->RefUnit();
 
     // 标准 COEFFS_LINEAR 依次为 factor（C）和 additive offset（O）。
-    // 非标准 COEFFS fallback 保留既有 offset/factor 解释；本批不重定义其方言语义。
+    // 非标准 COEFFS fallback 保留既有 offset/factor
+    // 解释；本批不重定义其方言语义。
     if (out.kind == ConversionKindDto::kLinear) {
         const auto& lin = cm->CoeffsLinear();
         const auto& co = cm->Coeffs();
@@ -688,6 +708,25 @@ SymbolDto BuildMeasurementSymbol(const a2l::Measurement& m,
     s.compu_method_name = m.Conversion();
     s.conversion =
         BuildConversion(module.GetCompuMethod(m.Conversion()), module);
+    // MEASUREMENT 自身的有效 XCPplus IF_DATA 优先；无效/缺失时回退 plain XCP。
+    const a2l::xcp::XcpDataBlock* plus = m.GetXcpPlusDataBlock();
+    const a2l::xcp::XcpDataBlock* plain = m.GetXcpDataBlock();
+    const a2l::xcp::XcpDataBlock* block = plus != nullptr && plus->IsOk() ? plus
+                                          : plain != nullptr && plain->IsOk()
+                                              ? plain
+                                              : nullptr;
+    if (block != nullptr) {
+        const a2l::xcp::DaqEvent* event =
+            block->GetCommonParameters().GetDaqEvent();
+        if (event != nullptr) {
+            const auto& fixed = event->GetFixedEventList();
+            const auto& defaults = event->GetDefaultEventList();
+            const auto& available = event->GetAvailableEventList();
+            s.daq_event_fixed.assign(fixed.begin(), fixed.end());
+            s.daq_event_default.assign(defaults.begin(), defaults.end());
+            s.daq_event_available.assign(available.begin(), available.end());
+        }
+    }
     return s;
 }
 
@@ -853,6 +892,7 @@ StructInfoDto BuildInstanceInfo(const a2l::Instance& in,
     // 这里不放大也不报错（保持"原值口径"，越界由 XCP 侧命令编码阶段拒绝）
     d.address_extension =
         static_cast<std::uint8_t>(in.EcuAddressExtension() & 0xFF);
+    d.ref_memory_segment = in.RefMemorySegment();
     d.address_type = static_cast<std::uint8_t>(in.AddressType());
     d.layout = static_cast<std::uint8_t>(in.Layout());
     d.read_write = in.ReadWrite();
@@ -860,6 +900,20 @@ StructInfoDto BuildInstanceInfo(const a2l::Instance& in,
     // 显式接收：src/a2lparser.y:871）。丢失它会让结构体数组实例只剩第 0 个
     // 元素可寻址；逐元素展开与越界门归桥接层 StructureLayoutResolver。
     d.matrix_dim.assign(in.MatrixDim().begin(), in.MatrixDim().end());
+    // 与普通 MEASUREMENT 一致：仅从有效的 XCPplus/plain XCP IF_DATA
+    // 透传固定 DAQ 事件；不能把 DEFAULT/AVAILABLE 当作固定事件。
+    const a2l::xcp::XcpDataBlock* plus = in.GetXcpPlusDataBlock();
+    const a2l::xcp::XcpDataBlock* plain = in.GetXcpDataBlock();
+    const a2l::xcp::XcpDataBlock* block = plus != nullptr && plus->IsOk() ? plus
+                                          : plain != nullptr && plain->IsOk()
+                                              ? plain
+                                              : nullptr;
+    if (block != nullptr) {
+        if (const auto* event = block->GetCommonParameters().GetDaqEvent()) {
+            const auto& fixed = event->GetFixedEventList();
+            d.daq_event_fixed.assign(fixed.begin(), fixed.end());
+        }
+    }
     return d;
 }
 
@@ -900,47 +954,33 @@ TypedefMeasurementDto BuildTypedefMeasurementDto(const a2l::Measurement& m,
 }
 
 /**
- * @brief 采集一个 TYPEDEF_CHARACTERISTIC 的**标量类型事实**（批次18 增补
- * 18-A′）。
- *
- * 背景：XCPlite 对手端的校准段（CalSeg）结构成员引用的类型只写成
- * TYPEDEF_CHARACTERISTIC（如 `C_cal_factor "..." VALUE U16 0 NO_COMPU_METHOD
- * 0 65535`），上游规则把 DATATYPE token 存入 `Deposit()`（a2lparser.y:1307，
- * 语义即 RECORD_LAYOUT 名）。成员能否展开为可寻址叶子，取决于该 RECORD_LAYOUT
- * 能否**证明**元素类型——与 BuildCharacteristicSymbol 的 B-4 最小推导同一口径：
- * 纯标量连续版式（kPlainScalar）+ FNC_VALUES 起始位置 0 或 1（1 起始为
- * ASAP2/CANape 生态书写习惯，XCPlite 对手端实测如此）+ ADDRESS_TYPE=DIRECT +
- * 已知 DATA_TYPE。不可证一律 kUnknown/宽度 0，交由桥接层按 B-3 拒绝并告警。
- *
- * @param c      上游 typedef 特性对象。
- * @param module 所属模块。
- * @return 标量类型事实 DTO（复用 TypedefMeasurementDto 形态：结构成员解析
- *         只消费标量类型事实，不消费地址/锁存语义）。
+ * @brief 采集 TYPEDEF_CHARACTERISTIC 类型、版式与轴的原始事实。
+ * @param c 上游 typedef characteristic。
+ * @param module 所属 MODULE。
+ * @return 事实 DTO；类型宽度仅由可证明的 FNC_VALUES RECORD_LAYOUT 导出。
  */
-TypedefMeasurementDto BuildTypedefCharacteristicDto(
+TypedefCharacteristicDto BuildTypedefCharacteristicDto(
     const a2l::Characteristic& c, const a2l::Module& module) {
-    TypedefMeasurementDto d;
+    TypedefCharacteristicDto d;
     d.name = c.Name();
     d.description = c.Description();
     d.module_name = module.Name();
+    d.characteristic_type = MapCharType(c.Type());
     d.data_type = AsamDataTypeDto::kUnknown;
-    d.element_size_bytes = 0;
-    // 仅 VALUE（单标量）版式可作为结构成员类型；VAL_BLK/CURVE/MAP/ASCII 等
-    // 在 TYPEDEF_CHARACTERISTIC 引用语境下不给出可证标量宽度 → 保持未知。
-    if (c.Type() == a2l::A2lCharacteristicType::VALUE) {
-        if (const a2l::RecordLayout* rl = module.GetRecordLayout(c.Deposit());
-            rl != nullptr) {
-            const a2l::A2lFncValue& fnc = rl->FncValues();
-            const bool fnc_at_record_start =
-                fnc.Position == 0 || fnc.Position == 1;
-            if (fnc.DataType != a2l::A2lDataType::UNKNOWN &&
-                fnc_at_record_start &&
-                fnc.AddressType == a2l::A2lAddressType::DIRECT &&
-                ClassifyRecordLayout(*rl) ==
-                    RecordLayoutKindDto::kPlainScalar) {
-                d.data_type = MapDataType(fnc.DataType);
-                d.element_size_bytes = TypeWidthBytes(d.data_type);
-            }
+    d.record_layout_name = c.Deposit();
+    d.record_layout_kind = RecordLayoutKindDto::kNotProvided;
+    if (const a2l::RecordLayout* rl = module.GetRecordLayout(c.Deposit());
+        rl != nullptr) {
+        d.record_layout_kind = ClassifyRecordLayout(*rl);
+        const a2l::A2lFncValue& fnc = rl->FncValues();
+        const bool fnc_at_record_start = fnc.Position == 0 || fnc.Position == 1;
+        if ((c.Type() == a2l::A2lCharacteristicType::VALUE ||
+             c.Type() == a2l::A2lCharacteristicType::CURVE) &&
+            fnc.DataType != a2l::A2lDataType::UNKNOWN && fnc_at_record_start &&
+            fnc.AddressType == a2l::A2lAddressType::DIRECT &&
+            d.record_layout_kind == RecordLayoutKindDto::kPlainScalar) {
+            d.data_type = MapDataType(fnc.DataType);
+            d.element_size_bytes = TypeWidthBytes(d.data_type);
         }
     }
     d.compu_method_name = c.Conversion();
@@ -953,8 +993,33 @@ TypedefMeasurementDto BuildTypedefCharacteristicDto(
     d.lower_limit = c.LowerLimit();
     d.upper_limit = c.UpperLimit();
     d.bit_mask = c.BitMask();
-    // typedef 特性无独立读写属性位；校准语义默认可写（真实读写门在实例层）
-    d.read_write = true;
+
+    for (const auto& axis_ptr : c.AxisDescriptions()) {
+        TypedefAxisDescrDto axis_dto;
+        if (axis_ptr != nullptr) {
+            const a2l::AxisDescr& axis = *axis_ptr;
+            axis_dto.axis_type = MapAxisType(axis.AxisType());
+            axis_dto.input_quantity = axis.InputQuantity();
+            axis_dto.compu_method_name = axis.Conversion();
+            axis_dto.conversion = BuildConversion(
+                module.GetCompuMethod(axis.Conversion()), module);
+            axis_dto.phys_unit = axis.PhysUnit();
+            axis_dto.max_axis_points = axis.MaxAxisPoints();
+            axis_dto.lower_limit = axis.LowerLimit();
+            axis_dto.upper_limit = axis.UpperLimit();
+            axis_dto.axis_pts_ref = axis.AxisPtsRef();
+            axis_dto.curve_axis_ref = axis.CurveAxisRef();
+            axis_dto.deposit = static_cast<std::uint8_t>(axis.Deposit());
+            const a2l::A2lFixAxisParDist& fixed_dist = axis.FixAxisParDist();
+            axis_dto.has_fix_axis_par_dist = fixed_dist.NoAxisPoints != 0;
+            axis_dto.fix_axis_offset = fixed_dist.Offset;
+            axis_dto.fix_axis_distance = fixed_dist.Distance;
+            axis_dto.fix_axis_points = fixed_dist.NoAxisPoints;
+            axis_dto.fixed_axis_values.assign(axis.FixAxisParList().begin(),
+                                              axis.FixAxisParList().end());
+        }
+        d.axis_descriptions.push_back(std::move(axis_dto));
+    }
     return d;
 }
 
@@ -1061,6 +1126,71 @@ const a2l::xcp::XcpDataBlock* FindXcpBlock(const a2l::Module& m,
         }
     }
     return nullptr;
+}
+
+/**
+ * @brief 显式映射上游XCP PAGE写权限枚举。
+ * @param access 上游A2L解析结果。
+ * @return 对应DTO枚举；未知值保守返回kUnknown。
+ */
+XcpPageWriteAccessDto MapPageWriteAccess(
+    a2l::xcp::WriteAccessType access) noexcept {
+    switch (access) {
+        case a2l::xcp::WriteAccessType::XCP_WRITE_ACCESS_NOT_ALLOWED:
+            return XcpPageWriteAccessDto::kNotAllowed;
+        case a2l::xcp::WriteAccessType::XCP_WRITE_ACCESS_WITHOUT_ECU_ONLY:
+            return XcpPageWriteAccessDto::kWithoutEcuOnly;
+        case a2l::xcp::WriteAccessType::XCP_WRITE_ACCESS_WITH_ECU_ONLY:
+            return XcpPageWriteAccessDto::kWithEcuOnly;
+        case a2l::xcp::WriteAccessType::XCP_WRITE_ACCESS_DONT_CARE:
+            return XcpPageWriteAccessDto::kDontCare;
+    }
+    return XcpPageWriteAccessDto::kUnknown;
+}
+
+/**
+ * @brief 导出 MEMORY_SEGMENT 地址范围及其可解析的 XCP SEGMENT/PAGE 声明。
+ * @param segment 上游 MEMORY_SEGMENT。
+ * @param module 所属 MODULE。
+ * @return 不推导缺失的 XCP 信息；无效子块只保留地址范围。
+ */
+MemorySegmentDto BuildMemorySegmentDto(const a2l::A2lMemorySegment& segment,
+                                       const a2l::Module& module) {
+    MemorySegmentDto dto;
+    dto.name = segment.Name;
+    dto.description = segment.Description;
+    dto.module_name = module.Name();
+    dto.address = segment.Address;
+    dto.size = segment.Size;
+
+    const a2l::xcp::XcpDataBlock* block = segment.GetXcpDataBlock();
+    if (block == nullptr || !block->IsOk()) {
+        return dto;
+    }
+    const a2l::xcp::Segment* xcp_segment =
+        block->GetCommonParameters().GetSegment();
+    if (xcp_segment == nullptr) {
+        return dto;
+    }
+
+    dto.has_xcp_segment = true;
+    dto.segment_number = xcp_segment->GetNumber();
+    dto.number_of_pages = xcp_segment->GetNumberOfPages();
+    dto.address_extension = xcp_segment->GetAddressExtension();
+    dto.pages.reserve(xcp_segment->GetPages().size());
+    for (const a2l::xcp::Page& page : xcp_segment->GetPages()) {
+        MemoryPageDto page_dto;
+        page_dto.number = page.GetNumber();
+        page_dto.ecu_access_type =
+            static_cast<std::uint8_t>(page.GetEcuAccessType());
+        page_dto.xcp_read_access_type =
+            static_cast<std::uint8_t>(page.GetReadAccessType());
+        page_dto.xcp_write_access_type =
+            MapPageWriteAccess(page.GetWriteAccessType());
+        page_dto.init_segment = page.GetInitSegment();
+        dto.pages.push_back(std::move(page_dto));
+    }
+    return dto;
 }
 
 /** @brief 追加一条 XCP vs XCPplus 参数差异（值相同则不记录）。 */
@@ -1459,8 +1589,44 @@ public:
             return ErrorCode::kNotInitialized;
         }
         try {
-            // BuildSnapshots 已按 (MODULE, 名) 升序，此处仅拷贝
+            // BuildSnapshots 已按 (MODULE, 名) 升序，此处仅拷贝。
             *out = typedef_measurements_;
+            return ErrorCode::kOk;
+        } catch (...) {
+            out->clear();
+            return ErrorCode::kInternal;
+        }
+    }
+
+    /** @copydoc IDoc::ListTypedefCharacteristics */
+    ErrorCode ListTypedefCharacteristics(
+        std::vector<TypedefCharacteristicDto>* out) const noexcept override {
+        if (out == nullptr) {
+            return ErrorCode::kBadArgument;
+        }
+        if (!loaded_) {
+            return ErrorCode::kNotInitialized;
+        }
+        try {
+            *out = typedef_characteristics_;
+            return ErrorCode::kOk;
+        } catch (...) {
+            out->clear();
+            return ErrorCode::kInternal;
+        }
+    }
+
+    /** @copydoc IDoc::ListMemorySegments */
+    ErrorCode ListMemorySegments(
+        std::vector<MemorySegmentDto>* out) const noexcept override {
+        if (out == nullptr) {
+            return ErrorCode::kBadArgument;
+        }
+        if (!loaded_) {
+            return ErrorCode::kNotInitialized;
+        }
+        try {
+            *out = memory_segments_;
             return ErrorCode::kOk;
         } catch (...) {
             out->clear();
@@ -1502,6 +1668,8 @@ private:
         typedef_structs_.clear();
         instances_.clear();
         typedef_measurements_.clear();
+        typedef_characteristics_.clear();
+        memory_segments_.clear();
         daq_lists_.clear();
         conversions_.clear();
         if_data_xcp_ = {};
@@ -1602,6 +1770,13 @@ private:
                     instances_.push_back(BuildInstanceInfo(*in, module));
                 }
             }
+            // MEMORY_SEGMENT 的静态地址范围与 XCP PAG
+            // 声明，供bridge做唯一地址归属及权限门。
+            for (const a2l::A2lMemorySegment& segment :
+                 module.ModPar().MemorySegmentList) {
+                memory_segments_.push_back(
+                    BuildMemorySegmentDto(segment, module));
+            }
             // TYPEDEF_MEASUREMENT 事实（批次18，STRUCTLEAF 16-A）：
             // 结构体成员（如 XCPlite 的 M_word_field）引用的标量类型定义；
             // 只存上游事实，叶子展开归桥接层 resolver。
@@ -1611,16 +1786,11 @@ private:
                         BuildTypedefMeasurementDto(*tm, module));
                 }
             }
-            // 18-A′：CalSeg 通路——XCPlite 校准段的结构成员只写
-            // TYPEDEF_CHARACTERISTIC（C_cal_factor/C_cal_offset），若不并入
-            // 标量事实注册表，kDefaultCalParams 将永远解不出叶子（真实语料
-            // 探针实测恰 2 条 InvalidLayout）。元素宽仍按 B-4 可证口径
-            // （Deposit → RECORD_LAYOUT FNC_VALUES），不可证即宽度 0 由
-            // resolver 按 B-3 拒绝。重名纪律：先 TYPEDEF_MEASUREMENT 后
-            // TYPEDEF_CHARACTERISTIC，配 stable_sort 保证同键时前者胜出。
+            // TYPEDEF_CHARACTERISTIC 独立快照保留 VALUE/CURVE
+            // 类型语义及轴信息。
             for (const auto& [name, tc] : module.TypedefCharacteristics()) {
                 if (tc) {
-                    typedef_measurements_.push_back(
+                    typedef_characteristics_.push_back(
                         BuildTypedefCharacteristicDto(*tc, module));
                 }
             }
@@ -1665,17 +1835,20 @@ private:
         std::sort(typedef_structs_.begin(), typedef_structs_.end(),
                   by_module_then_name);
         std::sort(instances_.begin(), instances_.end(), by_module_then_name);
-        // TYPEDEF_MEASUREMENT 快照按 (MODULE, 名) 升序（ListTypedefMeasurements
-        // 的输出稳定性，B-20）。stable：同键的 TYPEDEF_MEASUREMENT 先于
-        // TYPEDEF_CHARACTERISTIC 插入，排序后保持该相对序 → 桥接层注册表
-        // first-wins 下"同名 typedef 测量优先"成为确定性行为。
-        std::stable_sort(
-            typedef_measurements_.begin(), typedef_measurements_.end(),
-            [](const TypedefMeasurementDto& a, const TypedefMeasurementDto& b) {
-                if (a.module_name != b.module_name)
-                    return a.module_name < b.module_name;
-                return a.name < b.name;
-            });
+        // typedef 与 MEMORY_SEGMENT 快照按 (MODULE, 名) 稳定排序。
+        const auto by_typed_module_then_name = [](const auto& a,
+                                                  const auto& b) {
+            if (a.module_name != b.module_name) {
+                return a.module_name < b.module_name;
+            }
+            return a.name < b.name;
+        };
+        std::sort(typedef_measurements_.begin(), typedef_measurements_.end(),
+                  by_typed_module_then_name);
+        std::sort(typedef_characteristics_.begin(),
+                  typedef_characteristics_.end(), by_typed_module_then_name);
+        std::sort(memory_segments_.begin(), memory_segments_.end(),
+                  by_typed_module_then_name);
     }
 
     /**
@@ -1832,9 +2005,12 @@ private:
     std::vector<StructInfoDto> typedef_structs_;
     /** INSTANCE 元数据快照（批次13，B-12；Load 后不可变）。 */
     std::vector<StructInfoDto> instances_;
-    /** TYPEDEF_MEASUREMENT 事实快照（批次18，STRUCTLEAF 16-A；Load 后不可变）。
-     */
+    /** TYPEDEF_MEASUREMENT 事实快照（Load 后不可变）。 */
     std::vector<TypedefMeasurementDto> typedef_measurements_;
+    /** TYPEDEF_CHARACTERISTIC 类型/轴事实快照（Load 后不可变）。 */
+    std::vector<TypedefCharacteristicDto> typedef_characteristics_;
+    /** MEMORY_SEGMENT 地址范围及 XCP PAGE 静态声明快照。 */
+    std::vector<MemorySegmentDto> memory_segments_;
     /** DAQ_LIST 快照。 */
     std::vector<DaqListDto> daq_lists_;
     /** COMPU_METHOD 名 → 转换快照。 */

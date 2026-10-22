@@ -18,6 +18,7 @@
 #include "libxcp/a2l/ia2l_database.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -64,19 +65,59 @@ MeasurementResult<T> ToCoreError(const a2l::Error& err) {
         MapErrorCode(err.code), err.message, err.symbol.empty() ? std::string{} : err.symbol);
 }
 
-/// @brief 计算元素总数（标量为 1；数组取维度过大乘积，超 255 截断）
-std::uint8_t ElementCountOf(const a2l::SymbolInfo& symbol) noexcept {
+/// @brief 将桥接层的同形物理值 variant 复制到核心类型。
+MeasurementValue ToCorePhysicalValue(const a2l::PhysicalValue& value) {
+    MeasurementValue result;
+    if (std::holds_alternative<std::int64_t>(value)) {
+        result = std::get<std::int64_t>(value);
+    } else if (std::holds_alternative<std::uint64_t>(value)) {
+        result = std::get<std::uint64_t>(value);
+    } else if (std::holds_alternative<double>(value)) {
+        result = std::get<double>(value);
+    } else if (std::holds_alternative<std::string>(value)) {
+        result = std::get<std::string>(value);
+    } else {
+        result = std::get<bool>(value);
+    }
+    return result;
+}
+
+/// @brief 计算并验证首期支持的 A2L 数组元素数；不截断不支持的布局。
+MeasurementResult<std::uint8_t> ElementCountOf(const a2l::SymbolInfo& symbol) {
     if (symbol.dimensions.empty()) {
-        return 1;
+        return std::uint8_t{1};
     }
-    std::uint64_t total = 1;
-    for (const a2l::Dimension& d : symbol.dimensions) {
-        total *= d.extent;
-        if (total > 255) {
-            return 255;  // 数组过大，适配层按 255 上限（核心侧对数组不展开）
-        }
+    const auto invalid = [&symbol](std::string message) {
+        return MeasurementResult<std::uint8_t>{MeasurementError{
+            MeasurementErrorCode::InvalidLayout, std::move(message), symbol.name}};
+    };
+    if (symbol.kind != a2l::SymbolKind::Measurement) {
+        return invalid("首期 DAQ 数组只支持 A2L MEASUREMENT");
     }
-    return static_cast<std::uint8_t>(total);
+    if (symbol.dimensions.size() != 1U) {
+        return invalid("首期 DAQ 数组只支持一维连续布局");
+    }
+    const a2l::Dimension& dimension = symbol.dimensions.front();
+    if (dimension.extent == 0U || dimension.extent > 255U) {
+        return invalid("DAQ 数组元素数必须在 1 到 255 之间");
+    }
+    if (symbol.element_size_bytes == 0U ||
+        dimension.byte_stride != symbol.element_size_bytes) {
+        return invalid("DAQ 数组必须具有固定宽度且元素连续排列");
+    }
+    if (symbol.daq_bit_offset.has_value() || symbol.bit_mask != 0U) {
+        return invalid("首期 DAQ 数组不支持位字段");
+    }
+
+    const std::uint64_t total_bytes =
+        dimension.extent * symbol.element_size_bytes;
+    constexpr std::uint64_t kMaxAddress =
+        std::numeric_limits<std::uint32_t>::max();
+    if (symbol.xcp_address > kMaxAddress || total_bytes == 0U ||
+        total_bytes - 1U > kMaxAddress - symbol.xcp_address) {
+        return invalid("DAQ 数组字节范围超出 32 位 XCP 地址空间");
+    }
+    return static_cast<std::uint8_t>(dimension.extent);
 }
 
 }  // namespace
@@ -94,6 +135,10 @@ MeasurementResult<MeasurementSymbolInfo> A2lMeasurementDatabase::Find(
         return ToCoreError<MeasurementSymbolInfo>(res.ErrorInfo());
     }
     const a2l::SymbolInfo& symbol = res.Value();
+    const MeasurementResult<std::uint8_t> element_count = ElementCountOf(symbol);
+    if (!element_count.HasValue()) {
+        return element_count.ErrorInfo();
+    }
 
     MeasurementSymbolInfo info;
     // 地址：A2L 的 xcp_address 在大面是 32 位 XCP 地址；显式收窄到核心 Address。
@@ -103,7 +148,8 @@ MeasurementResult<MeasurementSymbolInfo> A2lMeasurementDatabase::Find(
     // 运行时事件绑定由上层 QueryDaqEventInfo 取证后另行补充。
     info.event_channel = 0;
     info.element_size_bytes = symbol.element_size_bytes;
-    info.element_count = ElementCountOf(symbol);
+    info.element_count = element_count.Value();
+    info.is_array = !symbol.dimensions.empty();
     return detail::MakeMeasurementOk(info);
 }
 
@@ -114,22 +160,18 @@ MeasurementResult<MeasurementValue> A2lMeasurementDatabase::ToPhysical(
     if (!res.HasValue()) {
         return ToCoreError<MeasurementValue>(res.ErrorInfo());
     }
-    // a2l::PhysicalValue 与核心 MeasurementValue 是同形 variant
-    // （int64/uint64/double/string/bool），逐分支复制到核心类型。
-    const a2l::PhysicalValue& pv = res.Value();
-    MeasurementValue out;
-    if (std::holds_alternative<std::int64_t>(pv)) {
-        out = std::get<std::int64_t>(pv);
-    } else if (std::holds_alternative<std::uint64_t>(pv)) {
-        out = std::get<std::uint64_t>(pv);
-    } else if (std::holds_alternative<double>(pv)) {
-        out = std::get<double>(pv);
-    } else if (std::holds_alternative<std::string>(pv)) {
-        out = std::get<std::string>(pv);
-    } else {
-        out = std::get<bool>(pv);
+    // a2l::PhysicalValue 与核心 MeasurementValue 是同形 variant。
+    return detail::MakeMeasurementOk(ToCorePhysicalValue(res.Value()));
+}
+
+MeasurementResult<MeasurementValue> A2lMeasurementDatabase::ToPhysicalElement(
+    std::string_view name, std::uint64_t element_index, BytesView raw) const {
+    const a2l::Result<a2l::PhysicalValue> res =
+        m_database_.ToPhysicalElement(name, element_index, a2l::BytesView{raw});
+    if (!res.HasValue()) {
+        return ToCoreError<MeasurementValue>(res.ErrorInfo());
     }
-    return detail::MakeMeasurementOk(out);
+    return detail::MakeMeasurementOk(ToCorePhysicalValue(res.Value()));
 }
 
 }  // namespace calmcar::xcp

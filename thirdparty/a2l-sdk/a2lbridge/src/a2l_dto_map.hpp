@@ -45,6 +45,15 @@ namespace calmcar::xcp::a2l::detail {
  */
 [[nodiscard]] SymbolInfo ConvertStructure(const liba2l::StructInfoDto& dto);
 
+/// @brief
+/// TYPEDEF_CHARACTERISTIC类型事实→领域符号基类（实例权限不从typedef推导）。
+[[nodiscard]] SymbolInfo ConvertTypedefCharacteristic(
+    const liba2l::TypedefCharacteristicDto& dto);
+
+/// @brief MEMORY_SEGMENT及PAGE静态访问事实→领域类型。
+[[nodiscard]] MemorySegmentInfo ConvertMemorySegment(
+    const liba2l::MemorySegmentDto& dto);
+
 /**
  * @brief SymbolDto 的 RECORD_LAYOUT 字段 → 领域 RecordLayoutInfo（批次13 接线）
  * @param dto SDK 符号快照
@@ -105,13 +114,15 @@ class A2lDatabaseImpl;
  * @param leaf_symbols 结构体成员叶子（批次18，STRUCTLEAF；由
  *        BuildStructureLeaves 解析产出）
  * @param leaf_warnings 叶子解析的不可证拒绝告警（批次18，随快照发布）
+ * @param memory_segments MEMORY_SEGMENT地址范围与静态XCP PAGE信息
  */
 [[nodiscard]] std::unique_ptr<A2lDatabaseImpl> MakeDatabase(
     std::vector<liba2l::SymbolDto> dtos,
     std::vector<liba2l::StructInfoDto> structs,
     std::unordered_map<std::string, RecordLayoutInfo> record_layouts,
     std::vector<SymbolInfo> leaf_symbols,
-    std::vector<LoadWarning> leaf_warnings);
+    std::vector<LoadWarning> leaf_warnings,
+    std::vector<MemorySegmentInfo> memory_segments);
 
 /// @brief 按基地址反查规范符号名；无匹配或歧义地址返回空串（禁止猜测归属）
 [[nodiscard]] std::string FindByAddress(const A2lDatabaseImpl& db,

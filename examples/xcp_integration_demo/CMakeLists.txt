@@ -5,6 +5,7 @@ target_compile_features(xcp_integration_demo PRIVATE cxx_std_20)
 target_link_libraries(xcp_integration_demo PRIVATE
         libxcp::libxcp
         libxcp_measurement_adapter)
+libxcp_configure_program_logging(xcp_integration_demo)
 target_include_directories(xcp_integration_demo PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../xcp_master_udp")
 target_compile_definitions(xcp_integration_demo PRIVATE
@@ -24,6 +25,18 @@ add_test(NAME ExampleXcpIntegrationDemoHelp
 set_tests_properties(ExampleXcpIntegrationDemoHelp PROPERTIES
         RUN_SERIAL TRUE
         TIMEOUT 10)
+
+if(LIBXCP_ENABLE_LOG)
+  add_test(NAME ExampleXcpIntegrationDemoInvalidCliLogIsolation
+          COMMAND ${CMAKE_COMMAND}
+                  "-DMODE=cli-error"
+                  "-DPROGRAM_EXE=$<TARGET_FILE:xcp_integration_demo>"
+                  "-DTEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/logging-cli"
+                  -P "${PROJECT_SOURCE_DIR}/tests/logging_behavior_test.cmake")
+  set_tests_properties(ExampleXcpIntegrationDemoInvalidCliLogIsolation PROPERTIES
+          RUN_SERIAL TRUE
+          TIMEOUT 10)
+endif()
 
 add_test(NAME ExampleXcpIntegrationDemoCppDemo
         COMMAND xcp_integration_demo

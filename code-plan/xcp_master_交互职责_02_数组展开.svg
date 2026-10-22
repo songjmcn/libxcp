@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="920" viewBox="0 0 1440 920"><title>B / 原位展开：数组全部可达，采样与显示分离</title>
+<g font-family="SFMono-Regular, Menlo, Consolas, monospace">
+<rect x="0" y="0" width="1440" height="920" rx="5" fill="#0b1220" stroke="none"/>
+<text x="36" y="44" fill="#f3f7fc" font-size="26">B / 原位展开：数组全部可达，采样与显示分离</text>
+<text x="36" y="76" fill="#93a5ba" font-size="15">设计效果图 · 非运行截图 · 示例值及写入资格均为虚构</text>
+<rect x="24" y="100" width="1392" height="776" rx="5" fill="#111c2d" stroke="#33475f"/>
+<text x="44" y="132" fill="#6ee7df" font-size="19">XCP MASTER   UDP 127.0.0.1:5555   |   cpp_demo_V201.a2l</text>
+<text x="44" y="164" fill="#b9cadb" font-size="18">已连接  |  POLL 运行中 · 100 ms  |  观测集合 2 项  |  最近完整批次 18:30:01</text>
+<rect x="36" y="182" width="1368" height="36" rx="5" fill="#1e3048" stroke="none"/>
+<text x="48" y="207" fill="#6ee7df" font-size="18">[ 变量预览 ]       命令结果       日志</text>
+<text x="48" y="246" fill="#b9cadb" font-size="18">搜索: loop_                         范围: 全部变量 / 观测集合</text>
+<rect x="42" y="269" width="1350" height="40" rx="5" fill="#234b60" stroke="#6ee7df"/>
+<text x="50" y="296" fill="#dce5ef" font-size="19">▾  [✓]  cpp_demo::loop_histogram     MEAS · ULONG · 数组[128]     采样中</text>
+<text x="78" y="339" fill="#6ee7df" font-size="17">全部 128 项已展开  |  当前可视索引 0–7  |  最近批次完整  |  数组只读</text>
+<text x="100" y="383" fill="#93a5ba" font-size="17">索引             值                 状态                  时间</text>
+<text x="100" y="421" fill="#dce5ef" font-size="18">[000]</text>
+<text x="300" y="421" fill="#dce5ef" font-size="18">1</text>
+<text x="490" y="421" fill="#a6d4c8" font-size="17">本批次有效</text>
+<text x="780" y="421" fill="#dce5ef" font-size="17">18:30:01</text>
+<text x="100" y="457" fill="#dce5ef" font-size="18">[001]</text>
+<text x="300" y="457" fill="#dce5ef" font-size="18">0</text>
+<text x="490" y="457" fill="#a6d4c8" font-size="17">本批次有效</text>
+<text x="780" y="457" fill="#dce5ef" font-size="17">18:30:01</text>
+<text x="100" y="493" fill="#dce5ef" font-size="18">[002]</text>
+<text x="300" y="493" fill="#dce5ef" font-size="18">4</text>
+<text x="490" y="493" fill="#a6d4c8" font-size="17">本批次有效</text>
+<text x="780" y="493" fill="#dce5ef" font-size="17">18:30:01</text>
+<text x="100" y="529" fill="#dce5ef" font-size="18">[003]</text>
+<text x="300" y="529" fill="#dce5ef" font-size="18">18</text>
+<text x="490" y="529" fill="#a6d4c8" font-size="17">本批次有效</text>
+<text x="780" y="529" fill="#dce5ef" font-size="17">18:30:01</text>
+<text x="100" y="565" fill="#dce5ef" font-size="18">[004]</text>
+<text x="300" y="565" fill="#dce5ef" font-size="18">42</text>
+<text x="490" y="565" fill="#a6d4c8" font-size="17">本批次有效</text>
+<text x="780" y="565" fill="#dce5ef" font-size="17">18:30:01</text>
+<text x="100" y="601" fill="#dce5ef" font-size="18">[005]</text>
+<text x="300" y="601" fill="#dce5ef" font-size="18">96</text>
+<text x="490" y="601" fill="#a6d4c8" font-size="17">本批次有效</text>
+<text x="780" y="601" fill="#dce5ef" font-size="17">18:30:01</text>
+<text x="100" y="637" fill="#dce5ef" font-size="18">[006]</text>
+<text x="300" y="637" fill="#dce5ef" font-size="18">21</text>
+<text x="490" y="637" fill="#a6d4c8" font-size="17">本批次有效</text>
+<text x="780" y="637" fill="#dce5ef" font-size="17">18:30:01</text>
+<text x="100" y="673" fill="#dce5ef" font-size="18">[007]</text>
+<text x="300" y="673" fill="#dce5ef" font-size="18">3</text>
+<text x="490" y="673" fill="#a6d4c8" font-size="17">本批次有效</text>
+<text x="780" y="673" fill="#dce5ef" font-size="17">18:30:01</text>
+<rect x="1338" y="365" width="9" height="330" rx="5" fill="#304058" stroke="none"/>
+<rect x="1338" y="365" width="9" height="35" rx="5" fill="#6ee7df" stroke="none"/>
+<text x="100" y="735" fill="#f2cb75" font-size="17">↓ 继续滚动查看 [008] … [127]；PgDn 翻动可视区域，不切换读取页。</text>
+<text x="50" y="769" fill="#dce5ef" font-size="17">▸  [✓]  cpp_demo::loop_cycletime       A_UINT64 · 标量       采样中（已折叠）</text>
+<rect x="36" y="786" width="1368" height="36" rx="5" fill="#1e3048" stroke="none"/>
+<text x="48" y="811" fill="#dce5ef" font-size="18">命令 &gt; </text>
+<text x="48" y="852" fill="#6ee7df" font-size="16">Enter 折叠   ↑↓ / PgUp / PgDn 滚动   F5 停止   Ctrl+A / ⌘A 成员切换</text>
+<text x="36" y="904" fill="#93a5ba" font-size="16">折叠仅隐藏，不停止采样；完整数组按块读取，非单包/原子快照；失败明确标旧值。</text>
+</g></svg>

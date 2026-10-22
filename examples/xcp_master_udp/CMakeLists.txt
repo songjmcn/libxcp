@@ -34,6 +34,7 @@ target_compile_features(xcp_master_udp PRIVATE cxx_std_20)
 target_link_libraries(xcp_master_udp PRIVATE
         libxcp::libxcp
         libxcp::a2lbridge)
+libxcp_configure_program_logging(xcp_master_udp)
 # 示例定位 cpp_demo 可执行文件：经 CMake 注入，禁止硬编码
 # （沿用 tests/CMakeLists.txt:84-96 XCPLITE_SLAVE_EXECUTABLE 先例）
 target_compile_definitions(xcp_master_udp PRIVATE

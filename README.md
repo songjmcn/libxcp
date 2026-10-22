@@ -1,21 +1,38 @@
-# libxcp —— XCP 1.3.0 Master 协议栈（C++20）
+# libxcp —— XCP Master 协议栈（C++20）
 
 `libxcp` 是一个跨平台（Windows / Linux / macOS）的 **XCP Master 静态库**，
 命名空间 `calmcar::xcp`，CMake 目标 `libxcp::libxcp`（产物名 `libxcp.lib` /
 `libxcp.a`）。面向汽车 ECU 标定与测量场景，提供从协议编解码、UDP/IP 传输、
 DAQ 数据接收到 A2L 描述文件集成的完整 Master 侧能力。
 
+> **版本声明（批次 G 收口）**：库版本 **2.0.0**。协议侧工程支持范围为
+> **XCP PL V1.3 / V1.4 / V1.5**，传输侧为 **XCP on Ethernet TL V1.5**
+> （IPv4 UDP 单播 Profile）。版本通过 `GET_VERSION` 运行时发现；
+> 探测不可用时进入 `1.x-conservative` 保守能力集，**不伪造具体 Minor**。
+> 详细能力与证据边界见 §5「能力矩阵与验收证据」。
+
 ## 1. 工程用途
 
 | 能力 | 说明 | 状态 |
 |------|------|------|
-| XCP 1.3.0 协议核心 | CONNECT/DISCONNECT 会话状态机、CTO 命令编码、RES/ERR/EV/SERV 响应解析、Seed&Key 安全解锁 | ✅ |
-| XCP on UDP/IP Transport | 标准 4 字节 Transport Header（LEN/CTR），跨平台 IPv4 Socket，传输层抽象接口 `IXcpTransport` | ✅ |
+| XCP 协议核心（PL V1.3～V1.5） | CONNECT/DISCONNECT 会话状态机、CTO 命令编码、RES/ERR/EV/SERV 响应解析、Seed&Key 安全解锁 | ✅ |
+| 版本发现（GET_VERSION） | Level-1 命令族 `0xC0,0x00`；PL/TL **独立**快照（reported/effective/source/confidence/capped）、冲突可见、重连重探 | ✅ 批次 B1 |
+| XCP on UDP/IP Transport | 标准 4 字节 Transport Header（LEN/CTR），跨平台 IPv4 Socket，传输层抽象接口 `IXcpTransport`；TL V1.5 `PACKET_ALIGNMENT` 8/16/32 的 Tail 编解码 | ✅ 批次 B2 |
 | 内存读写 | `MemoryAccess`：SHORT_UPLOAD 优先、必要时降级 SET_MTA+UPLOAD 分块；写路径 | ✅ |
 | Dynamic DAQ 测量 | 变量名 → `MeasurementPlanner` 规划 → 动态 DAQ 落表 → DTO 信封/净荷解码 → 时间戳回卷外推 → `MeasurementFrame` 物理值帧回调 | ✅ v1.0 封板 |
 | A2L 集成 | 经 A2L 桥接层（`libxcp::a2lbridge`，基于上游 a2llib）加载 A2L，变量名解析为地址 / CompuMethod / 事件通道 | ✅ 必编组件 |
-| Calibration / Programming | 标定写入、刷写 | ⛔ 不在 v1.0 承诺范围 |
-| CAN / CAN FD Transport | Vector / SocketCAN / Peak 等 | ⛔ v1.0 之后的下一步（见 `code-plan/libxcp_measurement_architecture.md` §25/§26） |
+| 标定（Calibration） | CAL/PAG 页切换、段管理、`MODIFY_BITS` 位级修改、写保护与访问权限错误分类 | ✅ 已实现 |
+| Programming（刷写） | Flash 编程流程 | ⛔ 未实现 |
+| CAN / CAN FD Transport | Vector / SocketCAN / Peak 等 | ⛔ 未实现（见 `code-plan/libxcp_measurement_architecture.md` §25/§26） |
+
+**明确不支持（能力边界，可经 `XcpMaster::IsCapabilityUnsupported()` 查询）**：
+
+| 能力 | 说明 |
+|------|------|
+| `DaqPackedMode` | `SET/GET_DAQ_PACKED_MODE`（`0xC0,0x01`/`0xC0,0x02`）为 V1.5 新特性，本实现未提供编码路径 |
+| `Level1OtherSubcommand` | `0xC0` 族除 `GET_VERSION` 外的子命令均未实现 |
+| `Ipv6Transport` | 本版本基础 Profile 只承诺 IPv4 UDP 单播 |
+| `OptionalTlSubcommand` | 四个 Optional TL Subcommand 未实现 |
 
 核心数据流：
 
@@ -30,8 +47,8 @@ A2L 变量名 → MeasurementPlanner → Dynamic DAQ 配置 → ECU DTO
 
 ```text
 libxcp/
-├── CMakeLists.txt              # 根构建脚本：核心库 + A2L 栈（必编）+ 3 个可选开关
-├── include/libxcp/             # 公开头文件（v1.0 冻结面）
+├── CMakeLists.txt              # 根构建脚本：核心库 + A2L 栈（必编）+ 可选构建开关
+├── include/libxcp/             # 公开头文件（API 2.0.0）
 │   ├── xcp_master.hpp          #   Master 顶层门面，用户唯一入口
 │   ├── session.hpp             #   会话状态机与协商参数管理
 │   ├── command_codec.hpp       #   高层参数 → CTO 字节序列编码
@@ -113,7 +130,7 @@ A2L 接入是独立 target（`adapter/a2l/A2lMeasurementDatabase` →
 | [A2L 集成](docs/modules/A2L集成.md) | 适配器、桥接层 `a2lbridge`、隔离门禁、构建与测试 |
 | [测试](docs/modules/测试.md) | L1-L4 分层、测试文件清单、测试设施、ctest fixture |
 | [示例程序](docs/modules/示例程序.md) | `xcp_master_udp`、`measurement_demo` 两轮流程与断言口径 |
-| [构建系统](docs/modules/构建系统.md) | CMake 目标、安装规则、3 个构建开关与 Boost 硬依赖、已知构建注意事项 |
+| [构建系统](docs/modules/构建系统.md) | CMake 目标、安装规则、构建开关与 Boost 硬依赖、已知构建注意事项 |
 | [第三方依赖](docs/modules/第三方依赖.md) | a2llib / a2l-sdk / XCPlite 子模块消费方式与边界纪律 |
 | [文档与工程规范](docs/modules/文档与工程规范.md) | `docs/`、`code-plan/`、`scripts/` 与 AGENTS.md 约定 |
 
@@ -176,6 +193,7 @@ cmake --build cmake-build-debug --target clean
 | `LIBXCP_BUILD_TESTS` | **ON** | GoogleTest 单测/集成测试（ctest 套件） |
 | `LIBXCP_BUILD_XCPLITE_SLAVE` | OFF | 构建 XCPlite 回环 Slave（L3 集成测试载体） |
 | `LIBXCP_BUILD_EXAMPLES` | OFF | 构建 `examples/`；开启时自动跟随打开 `LIBXCP_BUILD_XCPLITE_SLAVE`（无需手工同开两门） |
+| `LIBXCP_ENABLE_LOG` | **OFF** | 启用 `LIBXCP_LOG_INFO/WARNING/ERROR`；ON 时要求 C++20 `<format>` 与 glog 0.7.1+ |
 
 A2L 桥接层（`thirdparty/a2l-sdk` → `liba2l` / `libxcp::a2lbridge`）与测量适配器
 `libxcp_measurement_adapter` 为**必编组件**，随主工程无条件构建，不再提供任何开关。
@@ -190,6 +208,44 @@ cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release `
 
 `thirdparty/a2l-sdk/build-sdk.ps1` 保留为独立 SDK 开发入口（单独产出预构建
 SDK 根的场景），不再是主树构建的前置步骤。
+
+### 3.6 日志功能
+
+日志默认关闭；关闭时不查找或下载 glog，三个日志宏也不会求值参数。启用方式：
+
+```bash
+cmake -B cmake-build-release -S . -DCMAKE_BUILD_TYPE=Release -DLIBXCP_ENABLE_LOG=ON
+cmake --build cmake-build-release -j 4
+```
+
+启用后要求编译器/标准库支持 C++20 `<format>`。构建优先复用 glog 0.7.1+ CONFIG
+包；找不到时按固定版本和校验值通过 FetchContent 按需获取，也可用
+`FETCHCONTENT_SOURCE_DIR_GLOG` 指定本地源码目录。`libxcp::libxcp` 会向同一 CMake
+构建中的消费者传递启用宏和 glog 链接依赖。
+
+使用日志宏时包含 `libxcp/log.hpp`，格式串使用 `{}`：
+
+```cpp
+#include "libxcp/log.hpp"
+
+LIBXCP_LOG_INFO("XCP packet bytes={}", packet_size);
+LIBXCP_LOG_WARNING("retry={}", retry_count);
+LIBXCP_LOG_ERROR("operation failed: {}", reason);
+```
+
+libxcp 核心库不初始化或关闭进程级 glog。启用日志的外部宿主需在工作线程启动前
+初始化 glog，并在相关对象/线程销毁后关闭；若要求文件输出而不在终端显示，应在
+初始化前设置 `FLAGS_log_dir`、`FLAGS_logtostderr=false`、
+`FLAGS_alsologtostderr=false`，并把 `FLAGS_stderrthreshold` 设为高于 ERROR。
+本项目自有 tools/examples/tests 已由入口辅助代码配置为文件输出，日志目录相对
+进程当前工作目录为 `logs/<模块>/<可执行程序名>/`；文件名按级别生成
+`<程序名>.<级别>.<时间>.<PID>.glog`，不以点开头，也不创建无 `.glog` 后缀的默认软链接。
+普通 CLI、示例结果和 GoogleTest 报告仍使用原有终端输出。
+
+单独链接已安装的静态库时，本项目当前没有导出的 CMake package target；日志开启时
+消费方需定义 `LIBXCP_ENABLE_LOG=1` 并自行链接 glog 0.7.1+。运行期间若底层文件系统
+写入失败，日志后端自身诊断行为不由 libxcp 保证；核心日志宏会隔离格式化/写日志异常，
+不会将日志消息改为另一条业务输出通道。
 
 ## 4. 测试
 
@@ -237,9 +293,14 @@ session.Stop();
 `DaqTimestampConverter` 外推并计入 `Statistics().timestamp_wraps`。
 
 端到端可运行样例：`examples/measurement_demo/measurement_demo.cpp`
-（启动 XCPlite Slave → UPLOAD 取 A2L → 适配器 → 会话全链路，含 RAII 守卫范式）。
+（默认启动 examples 内的 cpp_demo → UPLOAD 取 A2L → 适配器 → 会话全链路，含 RAII 守卫范式；无需开启 tests）。
 
-## 6. 公开头文件（v1.0 冻结面）
+## 6. 公开头文件
+
+> **API/ABI 说明**：库版本已升至 **2.0.0**，含破坏性变更（`XcpMaster` 构造
+> 接口由 `XcpMasterOptions` 替换）。迁移清单见
+> [`code-plan/XCP_V1.5_批次B1_实施记录.md`](code-plan/XCP_V1.5_批次B1_实施记录.md)
+> 与 §5.2。下列 v1.0 子面保持不变。
 
 - `include/libxcp/daq/`：`dto_envelope_types.hpp`、`dto_envelope_decoder.hpp`、
   `dto_payload_decoder.hpp`、`daq_timestamp.hpp`
@@ -253,9 +314,17 @@ session.Stop();
 
 ## 7. 文档资源
 
-- `docs/`：XCP 1.3.0 规范与中文速查、ASAM Part 3（XCP on Ethernet TCP/UDP）、
+- `docs/`：XCP 规范与中文速查——PL 基线
+  `docs/ASAM_XCP_Part2_Protocol_Layer_1.3.md`、PL V1.5
+  `docs/Asam-Ae-Mcd-1-Xcp-Bs-Protocol-Layer-v1-5-0.md`（**以同目录原始 PDF 为
+  权威准据**，Markdown 转换版存在图文错位）、TL V1.5
+  `docs/ASAM_XCP_Part3_XCP_on_Ethernet_TCP_UDP_1.5.md`（Dev 版，仅作过渡）、
   `XCPlite_对手端协议调试指南.md`；**模块文档索引见
   [§2.2](#22-模块文档索引)（`docs/modules/`）**
 - `code-plan/`：详细设计（`XCP_1.3.0_详细设计_类接口与头文件.md`、
-  `libxcp_measurement_architecture.md`、A2L 集成 R4 系列）与各批次实施记录
+  `libxcp_measurement_architecture.md`、A2L 集成 R4 系列）、各批次实施记录，
+  以及 V1.5 工程三份入口文档——规范符合性裁决与修复方案
+  （`XCP_V1.5_规范符合性裁决与修复方案.md`）、总进度与下一步修改计划
+  （`XCP_V1.5_总进度与下一步修改计划.md`）、批次 G 实施记录
+  （`XCP_V1.5_批次G_实施记录.md`）
 - 开发规范：`AGENTS.md`（C++20、Doxygen 中文注释、测试与文档要求）；格式：`.clang-format`

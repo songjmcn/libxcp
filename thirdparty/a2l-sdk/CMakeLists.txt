@@ -16,7 +16,8 @@
 #              find_package；旧"假包文件对 + CMAKE_PREFIX_PATH"机制批次9退役）
 #
 # 上游 thirdparty/a2llib 为 git 子模块，本工程只 add_subdirectory 消费，
-# 绝不修改其任何文件；仅通过缓存级 option 强制关闭 TOOLS/TEST/DOC/FLEX。
+# 绝不修改其任何文件；通过缓存级 option 关闭 TOOLS/TEST/DOC/FLEX，并由本 SDK
+# 在目标级处理跨平台构建差异（日志实现替换、标准头兼容），不写入子模块。
 # =============================================================================
 
 cmake_minimum_required(VERSION 3.24)
@@ -54,6 +55,23 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../a2llib
                  ${CMAKE_CURRENT_BINARY_DIR}/a2llib-build)
 
+# --- 用 Boost.Locale 替换上游日志的 chrono tzdb 实现 -----------------------------
+# 部分 libc++ 尚未实现 std::chrono::current_zone/time_zone。只调整 a2l target
+# 的 source 列表，不改 git 子模块文件；保留日志类的其余接口和行为。
+get_target_property(_a2l_source_files a2l SOURCES)
+list(LENGTH _a2l_source_files _a2l_source_count_before)
+list(FILTER _a2l_source_files EXCLUDE REGEX "(^|/)src/a2llogstream\\.cpp$")
+list(LENGTH _a2l_source_files _a2l_source_count_after)
+if (_a2l_source_count_before EQUAL _a2l_source_count_after)
+    message(FATAL_ERROR "Unable to replace a2llib src/a2llogstream.cpp")
+endif ()
+set_property(TARGET a2l PROPERTY SOURCES "${_a2l_source_files}")
+target_sources(a2l PRIVATE src/a2llogstream_boost_locale.cpp)
+
+# 上游源文件有未显式包含的标准头：amlsection.cpp 使用 ranges::find_if，
+# a2ltask.cpp 使用 std::ostringstream。通过 PCH 提供直接依赖，避免依赖传递包含。
+target_precompile_headers(a2l PRIVATE <algorithm> <sstream>)
+
 # --- Boost 库目录注入链接搜索路径 ---------------------------------------------
 # a2l.lib 内嵌 /DEFAULTLIB:libboost_locale-vc143-mt-x64-1_86.lib 引用（裸文件名，
 # 由上游把 Boost 头文件中的 autolink 指令一并编入静态库）。VS 生成器不会自动提供
@@ -81,8 +99,10 @@ message(STATUS "liba2l: Boost 库搜索目录 = ${_liba2l_boost_libdir}")
 
 # --- liba2l 共享库 ------------------------------------------------------------
 add_library(liba2l SHARED
-        src/liba2l_export.cpp       # 唯一触碰 <a2l/...> 的翻译单元
-        src/dll_main.cpp)           # DllMain 占位（无自定义初始化）
+        src/liba2l_export.cpp)      # 唯一触碰 <a2l/...> 的翻译单元
+if(WIN32)
+    target_sources(liba2l PRIVATE src/dll_main.cpp)  # Windows DLL 入口占位
+endif()
 
 target_include_directories(liba2l
         PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
@@ -90,8 +110,8 @@ target_include_directories(liba2l
 # 导出宏方向：本目标 dllexport；消费方不定义 → dllimport（liba2l_export.h）
 target_compile_definitions(liba2l PRIVATE LIBA2L_MAKE_SHARED)
 
-# 上游静态库整体链入（PRIVATE：其接口绝不出现在 liba2l 的使用要求里）
-target_link_libraries(liba2l PRIVATE a2l)
+# 上游静态库及其 Boost.Locale 运行依赖整体链入；依赖仅用于实现，不向消费者传播。
+target_link_libraries(liba2l PRIVATE a2l Boost::locale)
 
 set_target_properties(liba2l PROPERTIES
         OUTPUT_NAME liba2l

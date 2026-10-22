@@ -114,9 +114,11 @@ UdpTransportConfig MakeConfig(std::uint16_t slave_port) {
 std::unique_ptr<XcpMaster> MakeMaster(
     std::uint16_t slave_port, CommandTimeouts timeouts = CommandTimeouts{},
     IEventListener* listener = nullptr) {
+    XcpMasterOptions options;
+    options.timeouts = timeouts;
+    options.event_listener = listener;
     return std::make_unique<XcpMaster>(
-        std::make_unique<UdpTransport>(MakeConfig(slave_port)), timeouts,
-        listener);
+        std::make_unique<UdpTransport>(MakeConfig(slave_port)), options);
 }
 
 /// @brief 记录 EV 的监听器
@@ -869,6 +871,77 @@ TEST(SeedKeyEndToEnd, WrongKeyDisconnectsSlaveAndFailsSession) {
     EXPECT_FALSE(slave.IsConnected());
     // master 析构对 Failed 状态安全（IsConnected 为 false，跳过 DISCONNECT）
     master.reset();
+    slave.Stop();
+}
+
+// ===========================================================================
+// T-03/T-04/T-05 端到端：PACKET_ALIGNMENT 16/32-bit 真实 UDP 收发
+//
+// 单元测试只验证编解码器本身；这一组用例让 Master 与测试 Slave 都按
+// 非 8-bit 对齐走**真实 UDP Socket**，以证明传输层确实把配置传了下去
+// （而不是仍然在某处硬编码 8-bit）。
+// ===========================================================================
+
+/// @brief 用指定对齐构造 Master 与 Slave 并跑一次完整会话
+/// @param alignment 双方统一的 PACKET_ALIGNMENT
+/// @note 双方对齐**必须一致**：不一致时 LEN/Tail 解析会错位，
+///       这正是本组用例要防的集成缺陷。
+void RunAlignedSession(PacketAlignment alignment) {
+    test::UdpTestSlave slave;
+    slave.SetPacketAlignment(alignment);
+    slave.Start();
+
+    const Bytes content = BytesOf({0x11, 0x22, 0x33, 0x44, 0x55});
+    slave.SetMemory(0x70012400, content);
+
+    auto cfg = MakeConfig(slave.Port());
+    cfg.packet_alignment = alignment;
+    XcpMasterOptions options;
+    auto master = std::make_unique<XcpMaster>(
+        std::make_unique<UdpTransport>(cfg), options);
+
+    master->Connect();
+    EXPECT_TRUE(master->IsConnected());
+
+    // 读回必须逐字节一致：若 Tail 处理错位，这里会拿到错位数据
+    const Bytes got = master->ReadMemoryBytes(0x70012400, 0x00, 5);
+    EXPECT_EQ(got, content);
+
+    master->Disconnect();
+    EXPECT_FALSE(master->IsConnected());
+    slave.Stop();
+}
+
+TEST(UdpLoopbackAlignment, SixteenBitSessionRoundTripsData) {
+    RunAlignedSession(PacketAlignment::Bit16);
+}
+
+TEST(UdpLoopbackAlignment, ThirtyTwoBitSessionRoundTripsData) {
+    RunAlignedSession(PacketAlignment::Bit32);
+}
+
+TEST(UdpLoopbackAlignment, EightBitSessionStillRoundTripsData) {
+    // 回归保护：显式传 Bit8 必须与默认行为一致
+    RunAlignedSession(PacketAlignment::Bit8);
+}
+
+TEST(UdpLoopbackAlignment, MismatchedAlignmentFailsRatherThanCorrupts) {
+    // 反例：Slave 用 32-bit、Master 用 8-bit。双方对 Tail 的理解不同，
+    // 会话**必须失败**，绝不能悄悄读到错位数据。
+    test::UdpTestSlave slave;
+    slave.SetPacketAlignment(PacketAlignment::Bit32);
+    slave.Start();
+
+    slave.SetMemory(0x70012500, BytesOf({0xAA, 0xBB, 0xCC}));
+
+    auto cfg = MakeConfig(slave.Port());
+    cfg.packet_alignment = PacketAlignment::Bit8;  // 故意不一致
+    XcpMasterOptions options;
+    auto master = std::make_unique<XcpMaster>(
+        std::make_unique<UdpTransport>(cfg), options);
+
+    // CONNECT 的响应就会因 Tail 错位而无法正确解析
+    EXPECT_THROW(master->Connect(), XcpException);
     slave.Stop();
 }
 

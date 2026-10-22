@@ -50,19 +50,30 @@ constexpr std::uint8_t kSlaveBlockModeMask = 0x40U;
 constexpr std::uint8_t kOptionalMask = 0x80U;
 
 /// @brief Current Session Status 位掩码（GET_STATUS Byte 1）
+/// @note 位序依据 ASAM XCP V1.5.0 原始 PDF 第 116 页 Table 49
+///       （位号行 Bit7..Bit0 与位名行逐列对齐），并由第 117 页 Table 50
+///       的编码表升序排列互为佐证。修正前 kStoreDaqReqMask 误用 bit1，
+///       而 bit1 实为 CAL_PAG_CFG_LOST，导致 STORE_DAQ_REQ 误报/漏报。
 constexpr std::uint8_t kStoreCalReqMask = 0x01U;
-constexpr std::uint8_t kStoreDaqReqMask = 0x02U;
+constexpr std::uint8_t kCalPagCfgLostMask = 0x02U;
+constexpr std::uint8_t kStoreDaqReqMask = 0x04U;
 constexpr std::uint8_t kClearDaqReqMask = 0x08U;
+constexpr std::uint8_t kDaqCfgLostMask = 0x10U;
 constexpr std::uint8_t kDaqRunningMask = 0x40U;
 constexpr std::uint8_t kResumeMask = 0x80U;
 
 }  // namespace
 
-ResponseParser::ResponseParser(ByteOrder byte_order) noexcept
-    : m_byte_order_(byte_order) {}
+ResponseParser::ResponseParser(ByteOrder byte_order,
+                              AddressGranularity ag) noexcept
+    : m_byte_order_(byte_order), m_ag_(ag) {}
 
 ByteOrder ResponseParser::GetByteOrder() const noexcept {
     return m_byte_order_;
+}
+
+AddressGranularity ResponseParser::GetAddressGranularity() const noexcept {
+    return m_ag_;
 }
 
 std::optional<std::uint8_t> ResponseParser::ReadU8(
@@ -223,6 +234,10 @@ std::optional<GetStatusResponse> ResponseParser::ParseGetStatusResponse(
     resp.clear_daq_req = (session_status & kClearDaqReqMask) != 0U;
     resp.store_daq_req = (session_status & kStoreDaqReqMask) != 0U;
     resp.store_cal_req = (session_status & kStoreCalReqMask) != 0U;
+    // DAQ_CFG_LOST(bit4) 与 CAL_PAG_CFG_LOST(bit1) 当前未纳入 GetStatusResponse，
+    // 仅在此处据原始 PDF 第 116 页 Table 49 登记掩码，避免后续实现再次误用位号。
+    static_cast<void>(kDaqCfgLostMask);
+    static_cast<void>(kCalPagCfgLostMask);
     resp.resource_protection = res_data[1];
     resp.state_number = res_data[2];
     const auto config_id = ReadU16(res_data, 3);
@@ -249,6 +264,23 @@ ResponseParser::ParseGetCommModeInfoResponse(BytesView res_data) const {
         static_cast<std::uint8_t>((driver_version >> 4) & 0x0FU);
     resp.driver_version_minor =
         static_cast<std::uint8_t>(driver_version & 0x0FU);
+    return resp;
+}
+
+std::optional<GetVersionResponse> ResponseParser::ParseGetVersionResponse(
+    BytesView res_data) const {
+    // GET_VERSION RES（原始 PDF 第 114 页 Table 45，剥 0xFF 后索引 -1）：
+    // [Reserved@0][Major PL@1][Minor PL@2][Major TL@3][Minor TL@4]，共 5 字节。
+    // 全为单字节字段，故不使用 m_byte_order_（字节序对本响应无影响）。
+    if (res_data.size() < 5U) {
+        return std::nullopt;
+    }
+    GetVersionResponse resp;
+    resp.reserved = res_data[0];
+    resp.protocol_major = res_data[1];
+    resp.protocol_minor = res_data[2];
+    resp.transport_major = res_data[3];
+    resp.transport_minor = res_data[4];
     return resp;
 }
 
@@ -394,19 +426,30 @@ std::optional<ReadDaqResponse> ResponseParser::ParseReadDaq(
 
 std::optional<GetIdResponse> ResponseParser::ParseGetId(
     BytesView res_data) const {
-    // GET_ID RES（XCPlite 实然 xcp.h:521-525）：剥 0xFF 后
-    // [MODE@0][reserved×2][LENGTH DWORD@3..6][DATA@7..]；规范 §7.5.1.6
-    // 的 LENGTH 为 WORD 且偏移不同——实然优先（批次21 21-2）。
+    // GET_ID RES（原始 PDF 第 123 页 Table 60，剥 0xFF 后索引 -1）：
+    // [MODE@0][Reserved WORD@1..2][LENGTH DWORD@3..6][DATA@7..]
+    // 说明：LENGTH 为 DWORD 与实现一致，审计所称「XCPlite 方言」不成立。
     if (res_data.size() < 7U) {
         return std::nullopt;
     }
     GetIdResponse resp;
-    resp.transfer_mode = res_data[0];
+    resp.raw_mode = res_data[0];
+    // F-03b：Table 61 位掩码——bit 0 = TRANSFER_MODE，bit 1 =
+    // COMPRESSED_ENCRYPTED，bit 7..2 = 保留（x）。必须拆位而非整字节比较，
+    // 否则 Mode=0x02/0x03（置了压缩位）会被误当作普通 UPLOAD 通路。
+    resp.transfer_mode = static_cast<std::uint8_t>(resp.raw_mode & 0x01U);
+    resp.compressed_encrypted = (resp.raw_mode & 0x02U) != 0U;
+    resp.reserved_bits_clear = (resp.raw_mode & 0xFCU) == 0U;
     const auto length = ReadU32(res_data, 3);
     if (!length) {
         return std::nullopt;
     }
     resp.length = *length;
+    // F-03c：Table 60 下方原文「The following rule applies: Length mod AG = 0」。
+    // 只记录判定结果，不在解析层抛错——由调用方按上下文决定拒绝方式。
+    const std::uint32_t ag_bytes =
+        static_cast<std::uint32_t>(AgToBytes(m_ag_));
+    resp.length_aligned_to_ag = ag_bytes != 0U && (resp.length % ag_bytes) == 0U;
     if (res_data.size() > 7U) {
         const std::size_t avail = res_data.size() - 7U;
         const std::size_t take =

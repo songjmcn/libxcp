@@ -78,6 +78,16 @@ public:
         m_defaults_[cmd] = std::move(response);
     }
 
+    /// @brief 令某命令的第 n 次调用（1 起）不产生响应，模拟超时
+    /// @details 返回空 Bytes 时 MockTransport 不投递任何包，执行器等待到
+    ///          超时后进入恢复流程。
+    void DropNthCall(CommandCode cmd, int n) { m_drop_[cmd] = n; }
+
+    /// @brief 令某命令自第 from 次调用（1 起）起的所有调用都不产生响应
+    /// @details 与 DropNthCall 不同，可用于同一命令需要多次超时的场景
+    ///          （单条目 map 会互相覆盖）。
+    void DropCallsFrom(CommandCode cmd, int from) { m_drop_from_[cmd] = from; }
+
     /// @brief 某命令被调用的次数
     [[nodiscard]] int Count(CommandCode cmd) const {
         const auto it = m_counts_.find(cmd);
@@ -91,6 +101,14 @@ public:
         }
         const auto cmd = static_cast<CommandCode>(packet[0]);
         ++m_counts_[cmd];
+        const auto drop_it = m_drop_.find(cmd);
+        if (drop_it != m_drop_.end() && m_counts_[cmd] == drop_it->second) {
+            return {};  // 该次调用不回响应，模拟超时
+        }
+        const auto from_it = m_drop_from_.find(cmd);
+        if (from_it != m_drop_from_.end() && m_counts_[cmd] >= from_it->second) {
+            return {};  // 自该次起全部不回响应，模拟连续超时
+        }
         const auto queue_it = m_queues_.find(cmd);
         if (queue_it != m_queues_.end() && !queue_it->second.empty()) {
             Bytes front = std::move(queue_it->second.front());
@@ -107,6 +125,8 @@ public:
 private:
     std::map<CommandCode, std::deque<Bytes>> m_queues_;
     std::map<CommandCode, Bytes> m_defaults_;
+    std::map<CommandCode, int> m_drop_;
+    std::map<CommandCode, int> m_drop_from_;
     std::map<CommandCode, int> m_counts_;
 };
 
@@ -118,6 +138,12 @@ void InstallSessionDefaults(QueuedSlave& slave) {
     slave.SetDefault(CommandCode::GetCommModeInfo,
                      BytesOf({0xFF, 0x00, 0x0E, 0x00, 0x04, 0x02, 0x08, 0x13}));
     slave.SetDefault(CommandCode::Synch, ErrBytes(ErrorCode::CmdSynch));
+    // 批次 B1：XcpMaster::Connect 会在 GET_STATUS 之后探测 GET_VERSION。
+    // 本脚本 Slave 模拟的是 **不支持该 optional 命令** 的对端（V1.3 语义），
+    // 按规范要求回 ERR_CMD_UNKNOWN —— 这让连接照常成功、版本进入
+    // ConnectMajor + MajorOnly 保守状态，正是要测的既有行为。
+    // 若不装此默认值，QueuedSlave 会回 1 字节裸 RES，导致解析报长度不足。
+    slave.SetDefault(CommandCode::GetVersion, ErrBytes(ErrorCode::CmdUnknown));
 }
 
 // ===========================================================================
@@ -210,7 +236,8 @@ TEST(SeedKeyExecutor, UnlockSegmentGolden) {
 
     const auto before = rig.transport.SentPackets().size();
     const UnlockResponse result =
-        rig.executor.ExecuteUnlock(0x04, BytesOf({0xAA, 0xBB, 0xCC, 0xDD}));
+        rig.executor.ExecuteUnlock(0x04, BytesOf({0xAA, 0xBB, 0xCC, 0xDD}),
+                                    true);
 
     EXPECT_EQ(result.resource_protection, 0x1CU);
 
@@ -227,7 +254,7 @@ TEST(SeedKeyExecutor, UnlockAccessLockedFailsSession) {
     rig.slave.Push(CommandCode::Unlock, ErrBytes(ErrorCode::AccessLocked));
 
     try {
-        (void)rig.executor.ExecuteUnlock(0x01, BytesOf({0x00}));
+        (void)rig.executor.ExecuteUnlock(0x01, BytesOf({0x00}), true);
         FAIL() << "UNLOCK 收到 ERR_ACCESS_LOCKED 应抛 ProtocolError";
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::ProtocolError);
@@ -283,10 +310,10 @@ struct MasterRig {
         transport_ptr = transport.get();
         InstallSessionDefaults(slave);
         transport_ptr->SetResponse([this](BytesView p) { return slave(p); });
-        master = std::make_unique<XcpMaster>(
-            std::move(transport),
-            CommandTimeouts{std::chrono::milliseconds(300),
-                            std::chrono::milliseconds(300), 2});
+        XcpMasterOptions options;
+        options.timeouts = CommandTimeouts{std::chrono::milliseconds(300),
+                                           std::chrono::milliseconds(300), 2};
+        master = std::make_unique<XcpMaster>(std::move(transport), options);
     }
 
     QueuedSlave slave;  ///< 脚本从机
@@ -522,6 +549,154 @@ TEST(SeedKeyUnlock, AccessLockedMarksSessionFailed) {
     // Slave 已主动断开会话：本地必须停止于 Failed（再次 Connect 自动重建）
     EXPECT_EQ(rig.master->GetSessionState(), SessionState::Failed);
     EXPECT_FALSE(rig.master->IsConnected());
+}
+
+// ===========================================================================
+// F-10：分段 Seed&Key 超时的事务级恢复
+// ===========================================================================
+//
+// 规范对「多段序列中途超时」未给出专门处理，通用路径的「SYNCH + 重放当前
+// 段」会因 Slave 侧段偏移不确定而静默失步（Key 直到序列完成后才校验，
+// 原始 PDF 第 130 页）。以下用例锁定「拒绝盲重放」这一安全属性。
+
+/// @brief 场景二：GET_SEED 续段超时 → 从 Mode=0 完整重启一次并成功
+TEST(SeedKeyTimeoutRecovery, GetSeedRemainderTimeoutRestartsFromScratch) {
+    MasterRig rig;
+    // 第一轮：首段正常（总长 8、给 6 字节），续段超时
+    rig.slave.Push(CommandCode::GetSeed,
+                   BytesOf({0xFF, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}));
+    // 第 2 次 GET_SEED（续段）超时：SYNCH 之后事务层必须回到 Mode=0
+    rig.slave.DropNthCall(CommandCode::GetSeed, 2);
+    // 第二轮：完整重新收满 8 字节 Seed（首段 + 续段）
+    rig.slave.Push(CommandCode::GetSeed,
+                   BytesOf({0xFF, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16}));
+    rig.slave.Push(CommandCode::GetSeed, BytesOf({0xFF, 0x02, 0x17, 0x18}));
+    rig.slave.SetDefault(CommandCode::Unlock, BytesOf({0xFF, 0x00}));
+    rig.master->Connect();
+
+    const UnlockResult result =
+        rig.master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+
+    // 重启后用的是第二轮 Seed 算出的 Key
+    EXPECT_FALSE(result.was_already_unlocked);
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetSeed), 4);   // 1 + 1(超时) + 2
+    EXPECT_EQ(rig.slave.Count(CommandCode::Synch), 1);     // 仅一次 SYNCH
+
+    // SYNCH 之后的第一条 GET_SEED 必须是 Mode=0（重新开始，而非重放续段）
+    const auto sent = rig.transport_ptr->SentPackets();
+    std::size_t synch_at = 0;
+    for (std::size_t i = 0; i < sent.size(); ++i) {
+        if (!sent[i].empty() &&
+            static_cast<CommandCode>(sent[i][0]) == CommandCode::Synch) {
+            synch_at = i;
+            break;
+        }
+    }
+    ASSERT_GT(synch_at, 0U);
+    ASSERT_GT(sent.size(), synch_at + 1);
+    // [F8][Mode][Resource]：重启后必须 Mode=0
+    EXPECT_EQ(sent[synch_at + 1],
+              BytesOf({0xF8, 0x00, 0x01}));
+}
+
+/// @brief 场景三：UNLOCK 末段超时 → 结果未知，禁止重放，不重连
+TEST(SeedKeyTimeoutRecovery, UnlockFinalSegmentTimeoutIsOutcomeUnknown) {
+    MasterRig rig;
+    // 单段 Seed（4 字节，一帧即可），Key 同长 → UNLOCK 只有一帧（末段）
+    rig.slave.Push(CommandCode::GetSeed,
+                   BytesOf({0xFF, 0x04, 0x01, 0x02, 0x03, 0x04}));
+    rig.slave.SetDefault(CommandCode::Unlock, BytesOf({0xFF, 0x00}));
+    rig.slave.DropNthCall(CommandCode::Unlock, 1);  // 唯一一帧即末段，超时
+    rig.master->Connect();
+
+    try {
+        (void)rig.master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+        FAIL() << "UNLOCK 末段超时应抛 OperationOutcomeUnknown";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::OperationOutcomeUnknown);
+        EXPECT_EQ(e.GetCommandCode(),
+                  std::optional<CommandCode>(CommandCode::Unlock));
+    }
+    // 安全属性：末段超时绝不重放 UNLOCK
+    EXPECT_EQ(rig.slave.Count(CommandCode::Unlock), 1);
+    // 安全属性：也不需要 SYNCH（不重连、不重启）
+    EXPECT_EQ(rig.slave.Count(CommandCode::Synch), 0);
+}
+
+/// @brief 场景四：UNLOCK 非末段超时 → 结果未知，禁止重放且不自动 SYNCH
+TEST(SeedKeyTimeoutRecovery, UnlockMidSegmentTimeoutRequiresReconnect) {
+    MasterRig rig;
+    // Seed 16 字节 → Key 16 字节 → UNLOCK 需 3 帧；令第 2 帧（非末段）超时
+    rig.slave.Push(CommandCode::GetSeed,
+                   BytesOf({0xFF, 0x10, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}));
+    rig.slave.Push(CommandCode::GetSeed,
+                   BytesOf({0xFF, 0x0A, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C}));
+    rig.slave.Push(CommandCode::GetSeed,
+                   BytesOf({0xFF, 0x04, 0x0D, 0x0E, 0x0F, 0x10}));
+    rig.slave.SetDefault(CommandCode::Unlock, BytesOf({0xFF, 0x00}));
+    rig.slave.DropNthCall(CommandCode::Unlock, 2);  // 第 2 帧属非末段
+    rig.master->Connect();
+
+    try {
+        (void)rig.master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+        FAIL() << "UNLOCK 非末段超时应抛 OperationOutcomeUnknown";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::OperationOutcomeUnknown);
+    }
+    // 安全属性：超时那一段不得被重放（Slave 只看到 2 帧：首帧 + 超时帧）
+    EXPECT_EQ(rig.slave.Count(CommandCode::Unlock), 2);
+    // 非末段要求调用方断开重连，执行器自身不发 SYNCH
+    EXPECT_EQ(rig.slave.Count(CommandCode::Synch), 0);
+}
+
+/// @brief 场景五：分段事务重启预算用尽后不再无限重启
+TEST(SeedKeyTimeoutRecovery, RestartBudgetExhaustedStopsRetrying) {
+    MasterRig rig;
+    // 首轮：续段超时 → 触发一次重启
+    rig.slave.Push(CommandCode::GetSeed,
+                   BytesOf({0xFF, 0x08, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06}));
+    rig.slave.DropNthCall(CommandCode::GetSeed, 2);
+    // 重启轮：首段正常，续段再次超时 → 预算已用尽，必须直接失败
+    rig.slave.Push(CommandCode::GetSeed,
+                   BytesOf({0xFF, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16}));
+    // 第 4 次调用（重启轮的续段）同样超时；DropNthCall 单条目会覆盖前值，
+    // 故这里改用「全部剩余调用都丢弃」的表述
+    rig.slave.DropCallsFrom(CommandCode::GetSeed, 4);
+    rig.master->Connect();
+
+    try {
+        (void)rig.master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+        FAIL() << "重启预算用尽后应抛异常而非无限重试";
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::RecoveryFailed);
+    }
+    // 两次超时各触发一次恢复：SYNCH 至多 2 次；GET_SEED 共 4 帧
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetSeed), 4);
+    EXPECT_LE(rig.slave.Count(CommandCode::Synch), 2);
+    EXPECT_EQ(rig.slave.Count(CommandCode::Unlock), 0);
+}
+
+/// @brief 分段状态不得泄漏：一次成功解锁后，后续调用仍按 Mode=0 起手
+TEST(SeedKeyTimeoutRecovery, SegmentStateDoesNotLeakAcrossCalls) {
+    MasterRig rig;
+    rig.slave.SetDefault(CommandCode::GetSeed,
+                         BytesOf({0xFF, 0x04, 0x01, 0x02, 0x03, 0x04}));
+    rig.slave.SetDefault(CommandCode::Unlock, BytesOf({0xFF, 0x00}));
+    rig.master->Connect();
+
+    (void)rig.master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+    (void)rig.master->Unlock(Resource::CalPag, test::TestKeyAlgorithm);
+
+    // 两次调用都必须以 Mode=0 起手（第二次若沿用非 NotSegmented 状态会走错分支）
+    const auto sent = rig.transport_ptr->SentPackets();
+    int mode0 = 0;
+    for (const auto& p : sent) {
+        if (p.size() == 3U && p[0] == 0xF8U && p[1] == 0x00U) {
+            ++mode0;
+        }
+    }
+    EXPECT_EQ(mode0, 2);
+    EXPECT_EQ(rig.slave.Count(CommandCode::GetSeed), 2);
 }
 
 }  // namespace

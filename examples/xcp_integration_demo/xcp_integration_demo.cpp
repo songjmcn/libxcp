@@ -27,11 +27,16 @@
 #include <libxcp/measurement/measurement_database.hpp>
 #include <libxcp/measurement/measurement_sample.hpp>
 #include <libxcp/measurement/measurement_session.hpp>
+#include <libxcp/log.hpp>
 #include <libxcp/protocol_types.hpp>
 #include <libxcp/udp_transport.hpp>
 #include <libxcp/udp_transport_config.hpp>
 #include <libxcp/xcp_error.hpp>
 #include <libxcp/xcp_master.hpp>
+
+#if LIBXCP_ENABLE_LOG
+#include "program_logging.hpp"
+#endif
 
 #include <a2l/a2l_measurement_database.hpp>
 #include <a2l/measurement_runtime_profile.hpp>
@@ -57,7 +62,6 @@ struct Options {
     fs::path uploaded_a2l_path = "uploaded.a2l";
     fs::path run_dir = "xcp_integration_demo_run";
     bool upload_a2l = false;
-    bool xcplite_profile = false;
     bool cpp_demo_profile = false;
     std::vector<std::string> symbols;
     std::uint16_t event_channel = 0;
@@ -156,7 +160,6 @@ void ApplyCppDemoProfile(Options& o) {
     if (!o.cpp_demo_profile) return;
     o.host = "127.0.0.1";
     o.port = 5555;
-    o.xcplite_profile = true;
     o.upload_a2l = true;
     o.a2l_path = o.run_dir / "uploaded.a2l";
     o.uploaded_a2l_path = o.a2l_path;
@@ -165,9 +168,13 @@ void ApplyCppDemoProfile(Options& o) {
                      "cpp_demo::counter",        "cpp_demo::sum",
                      "cpp_demo::SigGen1.value_", "cpp_demo::SigGen2.value_"};
     }
-    o.event_metadata = {{"SigGen1", "SigGen1", 0, 0, 0},
-                        {"SigGen2", "SigGen2", 1, 0, 0},
-                        {"mainloop", "mainloop", 2, 0, 0}};
+    // 字段顺序：name, short_name, channel, time_cycle, time_unit, type,
+    // max_daq_list。A2L 中三个 EVENT 均声明为 `DAQ`（type=1）且
+    // max_daq_list=0xFF，此处必须如实补齐——max_daq_list 默认 0 会被
+    // 运行时能力校验判为「未声明动态列表容量」而拒绝。
+    o.event_metadata = {{"SigGen1", "SigGen1", 0, 0, 0, 1U, 0xFFU},
+                        {"SigGen2", "SigGen2", 1, 0, 0, 1U, 0xFFU},
+                        {"mainloop", "mainloop", 2, 0, 0, 1U, 0xFFU}};
     for (const auto& symbol : o.symbols) {
         std::uint64_t channel = 2;
         if (symbol.find("SigGen1") != std::string::npos)
@@ -192,12 +199,12 @@ void PrintUsage() {
 Usage:
   xcp_integration_demo --profile cpp_demo [--run-dir DIR] [--seconds N]
   xcp_integration_demo --a2l FILE --symbols A,B --symbol-event A=CHANNEL
-      --event-meta CHANNEL:CYCLE:UNIT --id-field absolute|relative-byte|relative-word
+      --event-meta CHANNEL:CYCLE:UNIT
+      --id-field absolute|relative-byte|relative-word|relative-word-aligned
       --header-bytes N [--tick-ns N] [--timestamp-first-odt-only]
       [--host IPv4] [--port N] [--seconds N]
 
   --upload-a2l FILE       Fetch A2L through GET_ID+UPLOAD before measurement.
-  --xcplite-profile       Derive the XCPlite DTO/timestamp profile at runtime.
   --write-address HEX --write-value HEX --confirm-write
                           Temporarily write 1..4 raw bytes, verify, then restore.
   --expected-original HEX Required pre-write raw-value guard for DOWNLOAD/MODIFY_BITS.
@@ -236,8 +243,6 @@ Options ParseOptions(int argc, char** argv) {
         } else if (arg == "--upload-a2l") {
             o.upload_a2l = true;
             o.uploaded_a2l_path = value();
-        } else if (arg == "--xcplite-profile") {
-            o.xcplite_profile = true;
         } else if (arg == "--profile") {
             const auto profile = value();
             if (profile != "cpp_demo")
@@ -301,9 +306,12 @@ Options ParseOptions(int argc, char** argv) {
                 o.id_type = IdentificationFieldType::RelativeByte;
             else if (v == "relative-word")
                 o.id_type = IdentificationFieldType::RelativeWord;
+            else if (v == "relative-word-aligned")
+                o.id_type = IdentificationFieldType::RelativeWordAligned;
             else
                 UsageError(
-                    "当前示例仅接受 absolute/relative-byte/relative-word");
+                    "示例接受 absolute/relative-byte/relative-word/"
+                    "relative-word-aligned");
             o.id_type_set = true;
         } else if (arg == "--header-bytes") {
             o.id_header_bytes = static_cast<std::size_t>(ParseInteger(value()));
@@ -445,9 +453,6 @@ Options ParseOptions(int argc, char** argv) {
         UsageError("--modify-bits 必须与 --confirm-modify-bits 一起使用");
     }
     if (!o.symbols.empty()) {
-        if (!o.xcplite_profile && (!o.id_type_set || o.id_header_bytes == 0)) {
-            UsageError("通用模式必须显式设置 --id-field 与 --header-bytes");
-        }
         for (const auto& symbol : o.symbols) {
             if (!o.event_channel_set && !o.symbol_events.contains(symbol)) {
                 UsageError(
@@ -455,7 +460,7 @@ Options ParseOptions(int argc, char** argv) {
                     "--symbol-event 绑定");
             }
         }
-        if (o.xcplite_profile) {
+        {
             std::vector<std::uint16_t> bound_channels;
             for (const auto& symbol : o.symbols) {
                 const auto it = o.symbol_events.find(symbol);
@@ -474,7 +479,7 @@ Options ParseOptions(int argc, char** argv) {
                     });
                 if (!found)
                     UsageError(
-                        "XCPlite profile 需要每个通道的显式 --event-meta "
+                        "DAQ 自动布局需要每个通道的显式 --event-meta "
                         "CHANNEL:CYCLE:UNIT");
             }
         }
@@ -672,8 +677,13 @@ void RunModifyBitsRoundTrip(XcpMaster& master, Address address,
     }
 }
 
-void UnlockWithInjectedSeedKey(XcpMaster& master,
-                               const SeedKeyCalculator& vendor_calculator) {
+/// @brief 用注入的 Seed&Key 计算器执行 Cal/Pag 资源解锁（演示用）。
+/// @details 本示例当前流程未调用它（对手端的 Seed&Key 在演示脚本的更早步骤
+///          已直接注入完成），但保留以演示"解锁结果不暴露 seed"的调用范式。
+///          标注 `[[maybe_unused]]` 表明这是**有意保留的示范代码**，而非
+///          遗漏的调用点。
+[[maybe_unused]] void UnlockWithInjectedSeedKey(
+    XcpMaster& master, const SeedKeyCalculator& vendor_calculator) {
     if (!vendor_calculator) {
         throw std::invalid_argument("Seed&Key provider is not configured");
     }
@@ -785,8 +795,10 @@ std::unique_ptr<XcpMaster> ConnectWithRetry(
     const auto deadline = std::chrono::steady_clock::now() + 15s;
     std::string last_error;
     while (std::chrono::steady_clock::now() < deadline) {
-        auto master = std::make_unique<XcpMaster>(MakeTransport(o),
-                                                  CommandTimeouts{}, listener);
+        XcpMasterOptions options;
+        options.event_listener = listener;
+        auto master =
+            std::make_unique<XcpMaster>(MakeTransport(o), options);
         try {
             master->Connect();
             return master;
@@ -813,8 +825,20 @@ Bytes FetchAndSaveA2l(const Options& o) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if LIBXCP_ENABLE_LOG
+    calmcar::xcp::internal::ProgramLogSession logging;
+    bool logging_initialized = false;
+#endif
     try {
         const Options options = ParseOptions(argc, argv);
+#if LIBXCP_ENABLE_LOG
+        std::string log_error;
+        if (!logging.Initialize(argv[0], "examples", log_error)) {
+            std::fprintf(stderr, "日志初始化失败: %s\n", log_error.c_str());
+            return 2;
+        }
+        logging_initialized = true;
+#endif
         xcp_example::DemoProcess cpp_demo_process;
         if (options.cpp_demo_profile) {
             StartLocalCppDemo(options, cpp_demo_process);
@@ -880,24 +904,15 @@ int main(int argc, char** argv) {
         RunTemporaryWrite(*master, options);
 
         if (!options.symbols.empty()) {
-            XcpliteMeasurementRuntimeProfile xcplite_profile;
-            if (options.xcplite_profile) {
-                auto profile_result = BuildXcpliteMeasurementRuntimeProfile(
-                    *master, options.event_metadata);
-                if (!profile_result.HasValue()) {
-                    throw std::runtime_error(
-                        "XCPlite profile 不匹配：" +
-                        profile_result.ErrorInfo().message);
-                }
-                xcplite_profile = profile_result.Value();
-                ApplyMeasurementRuntimeProfile(session, xcplite_profile);
-            } else {
-                session.SetEnvelopeMode(options.id_type,
-                                        options.id_header_bytes);
-                session.SetTimestampFirstOdtOnly(
-                    options.timestamp_first_odt_only);
-                session.SetTimestampUnit(options.timestamp_unit_ns);
+            // DTO 布局由从站上报的识别字段模式自动决定，无需预先声明厂商。
+            auto profile_result =
+                BuildMeasurementRuntimeProfile(*master, options.event_metadata);
+            if (!profile_result.HasValue()) {
+                throw std::runtime_error(
+                    "DAQ 能力校验失败：" +
+                    profile_result.ErrorInfo().message);
             }
+            ApplyMeasurementRuntimeProfile(session, profile_result.Value());
             for (const auto& symbol : options.symbols) session.Add(symbol);
             session.Prepare();
             std::atomic<std::uint64_t> frames{0};
@@ -937,9 +952,21 @@ int main(int argc, char** argv) {
         master->Disconnect();
         return 0;
     } catch (const XcpException& error) {
+#if LIBXCP_ENABLE_LOG
+        if (logging_initialized) {
+            LIBXCP_LOG_ERROR(
+                "XCP integration example failed with XcpException");
+        }
+#endif
         std::fprintf(stderr, "XCP error: %s\n", error.what());
         return 1;
     } catch (const std::exception& error) {
+#if LIBXCP_ENABLE_LOG
+        if (logging_initialized) {
+            LIBXCP_LOG_ERROR(
+                "XCP integration example failed with std::exception");
+        }
+#endif
         std::fprintf(stderr, "Error: %s\n", error.what());
         return 2;
     }

@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="920" viewBox="0 0 1440 920"><title>C / 独立标定：编辑 → 预读校验 → 明确确认</title>
+<g font-family="SFMono-Regular, Menlo, Consolas, monospace">
+<rect x="0" y="0" width="1440" height="920" rx="5" fill="#0b1220" stroke="none"/>
+<text x="36" y="44" fill="#f3f7fc" font-size="26">C / 独立标定：编辑 → 预读校验 → 明确确认</text>
+<text x="36" y="76" fill="#93a5ba" font-size="15">设计效果图 · 非运行截图 · 示例值及写入资格均为虚构</text>
+<rect x="24" y="100" width="1392" height="776" rx="5" fill="#111c2d" stroke="#33475f"/>
+<text x="44" y="132" fill="#6ee7df" font-size="19">XCP MASTER   UDP 127.0.0.1:5555   |   cpp_demo_V201.a2l</text>
+<text x="44" y="164" fill="#b9cadb" font-size="18">已连接  |  已停止  |  背景列表锁定  |  两幅面板表示先后步骤，非同时打开</text>
+<rect x="36" y="182" width="1368" height="36" rx="5" fill="#1e3048" stroke="none"/>
+<text x="48" y="207" fill="#6ee7df" font-size="18">[ 变量预览 ]       命令结果       日志</text>
+<text x="48" y="246" fill="#b9cadb" font-size="18">搜索: loop_                         范围: 全部变量 / 观测集合</text>
+<text x="48" y="287" fill="#6ee7df" font-size="18">预览选中 demo::calibration_gain → Ctrl+S / ⌘S（备用 F4）进入编辑</text>
+<rect x="48" y="321" width="624" height="418" rx="5" fill="#18293d" stroke="#54718e"/>
+<text x="70" y="358" fill="#6ee7df" font-size="23">步骤 1 / 标定编辑</text>
+<text x="70" y="405" fill="#dce5ef" font-size="19">demo::calibration_gain</text>
+<text x="70" y="444" fill="#dce5ef" font-size="16">CHARACTERISTIC / VALUE · FLOAT64_IEEE</text>
+<rect x="760" y="321" width="624" height="418" rx="5" fill="#18293d" stroke="#54718e"/>
+<text x="782" y="358" fill="#6ee7df" font-size="23">步骤 2 / 写入确认</text>
+<text x="782" y="405" fill="#dce5ef" font-size="19">demo::calibration_gain</text>
+<text x="782" y="444" fill="#dce5ef" font-size="16">CHARACTERISTIC / VALUE · FLOAT64_IEEE</text>
+<text x="70" y="486" fill="#dce5ef" font-size="18">当前值：1.00   |   读取时间：18:30:10</text>
+<text x="70" y="528" fill="#dce5ef" font-size="18">目标值：</text>
+<rect x="184" y="502" width="220" height="39" rx="5" fill="#0b1220" stroke="#6ee7df"/>
+<text x="200" y="529" fill="#dce5ef" font-size="18">1.25</text>
+<text x="70" y="578" fill="#a6d4c8" font-size="16">写资格：已通过静态及运行时检查（示意）</text>
+<rect x="70" y="617" width="212" height="42" rx="5" fill="#234b60" stroke="none"/>
+<text x="88" y="646" fill="#dce5ef" font-size="18">申请写入…</text>
+<text x="304" y="646" fill="#dce5ef" font-size="18">取消 / Esc</text>
+<text x="70" y="706" fill="#f2cb75" font-size="17">编辑或按 Enter 不直接下发。</text>
+<text x="782" y="486" fill="#dce5ef" font-size="18">当前值：1.00    →    目标值：1.25</text>
+<text x="782" y="532" fill="#f2cb75" font-size="18">风险：将修改 ECU 标定值。</text>
+<text x="782" y="577" fill="#dce5ef" font-size="16">确认前再次校验权限、页信息与选择代际。</text>
+<rect x="782" y="617" width="180" height="42" rx="5" fill="#35435a" stroke="#f2cb75"/>
+<text x="804" y="646" fill="#f2cb75" font-size="18">[ 默认取消 ]</text>
+<text x="990" y="646" fill="#dce5ef" font-size="18">Y 明确写入</text>
+<text x="782" y="706" fill="#f2cb75" font-size="17">Enter 不接受；N / Esc 返回编辑。</text>
+<text x="696" y="547" fill="#6ee7df" font-size="30">→</text>
+<rect x="36" y="786" width="1368" height="36" rx="5" fill="#1e3048" stroke="none"/>
+<text x="48" y="811" fill="#dce5ef" font-size="18">命令 &gt; （模态期间不可编辑）</text>
+<text x="48" y="852" fill="#6ee7df" font-size="16">Tab 模态内切换   Esc 分层返回   Y 仅在确认步骤接受   F5 取消并停止</text>
+<text x="36" y="904" fill="#93a5ba" font-size="16">只读详情由 F3 单独打开；数组维持只读；示例写权限不代表真实 A2L 允许写入。</text>
+</g></svg>

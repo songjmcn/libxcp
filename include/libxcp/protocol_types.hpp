@@ -113,6 +113,13 @@ enum class CommandCode : std::uint8_t {
     AllocDaq = 0xD5,       ///< 一次性分配 n 个 DAQ List（ALLOC_DAQ）
     AllocOdt = 0xD4,       ///< 为指定 List 追加 ODT（ALLOC_ODT）
     AllocOdtEntry = 0xD3,  ///< 为指定 ODT 追加 Entry 槽（ALLOC_ODT_ENTRY）
+    // ---- 批次 B1：Level-1 命令族（原始 PDF 第 106 页 §7.4 / 第 114 页 Table 44）
+    //      Level 1 由**双字节命令码**定义、以 0xC0 起始。本枚举按现有纪律
+    //      「只登记已实现的码」收录；0xC0 族其余子命令
+    //      （0xC0,0x01 SET_DAQ_PACKED_MODE、0xC0,0x02 GET_DAQ_PACKED_MODE）
+    //      尚未实现，故不登记（方案 §4.3 将其归为 Block，返回
+    //      UnsupportedFeature，不做内容探测式尝试）。----
+    GetVersion = 0xC0,  ///< Level-1 命令族前缀；实际报文为 [0xC0][子命令 0x00]
 };
 
 /**
@@ -495,6 +502,22 @@ enum class AddressGranularity : std::uint8_t {
 [[nodiscard]] constexpr std::uint8_t AgToBytes(AddressGranularity ag) noexcept;
 
 /**
+ * @brief DOWNLOAD 命令在数据段前所需的对齐字节数
+ * @param ag 地址粒度
+ * @return AG=DWord 时返回 2，其余返回 0
+ *
+ * 依据 ASAM XCP V1.5.0 原始 PDF 第 142 页 Table 82：
+ *   - ".. BYTEs Used for alignment, **only if AG >2**"
+ *   - "If AG = DWORD, 2 alignment bytes must be used"
+ * 即仅 DWORD 需要在数据前插 2 字节对齐，BYTE/WORD 不插。
+ *
+ * @note 与 UPLOAD 响应**不对称**：Table 71（第 134 页）为
+ *       "only if AG > 1"，WORD 也要对齐 —— 两者不得互相套用。
+ */
+[[nodiscard]] constexpr std::size_t DownloadAlignmentBytes(
+    AddressGranularity ag) noexcept;
+
+/**
  * @brief 将 COMM_MODE_BASIC 的 AG 位域编码（bit1-2）转为 AG
  * @param field_value 取自 COMM_MODE_BASIC 的 bit1-2（00/01/10 有效，11 保留）
  * @return 合法时返回对应 AG；11（保留值）返回 std::nullopt
@@ -608,10 +631,13 @@ struct XcpAddress40 {
     AddressExtension extension{};  ///< 8 位地址扩展
 
     /**
-     * @brief 地址前进指定元素数（按 AG 换算为字节数）
+     * @brief 地址前进指定元素数
      * @param elements 前进的元素数
-     * @param ag 地址粒度
+     * @param ag 地址粒度（仅作为语义说明保留，不参与地址推进计算）
      * @return 前进后的新地址；32 位地址部分溢出时返回 std::nullopt
+     * @note 地址按元素计数：前进 n 个元素即 address + n。依据 XCP V1.5.0
+     *       原始 PDF 第 112 页（AG 是单个地址所含元素的尺寸）与第 113 页
+     *       Table 43（WORD 下 Address n+1 = Byte 02）。AG 只用于字节长度换算。
      * @note 地址扩展不参与本次进位（跨扩展边界的处理属于后续 SEGMENT 功能）。
      */
     [[nodiscard]] std::optional<XcpAddress40> Advance(
@@ -750,6 +776,11 @@ constexpr std::uint8_t AgToBytes(AddressGranularity ag) noexcept {
     return static_cast<std::uint8_t>(ag);
 }
 
+constexpr std::size_t DownloadAlignmentBytes(AddressGranularity ag) noexcept {
+    // 见声明处注明之原始 PDF 第 142 页 Table 82："only if AG >2"
+    return (ag == AddressGranularity::DWord) ? std::size_t{2} : std::size_t{0};
+}
+
 constexpr bool HasResource(ResourceMask mask, Resource res) noexcept {
     return (mask & static_cast<ResourceMask>(res)) != 0;
 }
@@ -861,6 +892,115 @@ constexpr DaqKeyByte ParseDaqKeyByte(std::uint8_t raw) noexcept {
     key.identification_field_type =
         static_cast<std::uint8_t>((raw & 0xC0U) >> 6);
     return key;
+}
+
+/**
+ * @brief XCP on Ethernet 的 PACKET_ALIGNMENT（TL V1.5 §4.3.2，PDF 第 9-10 页）
+ *
+ * @details 规范原文："PACKET_ALIGNMENT_x (x = 8, 16, 32) indicates the
+ *          alignment that has to be used for XCP packets." 且
+ *          "The alignment indicated by PACKET_ALIGNMENT_x must be fulfilled
+ *          for each XCP packet."
+ *
+ *          本枚举用 **位宽**（8/16/32 bit）而非字节数命名，与 A2L 关键字
+ *          `PACKET_ALIGNMENT_8/16/32` 及规范文字一一对应，避免调用方在
+ *          「位」与「字节」之间自行换算出错。字节数请用 AlignmentBytes()。
+ *
+ * @note 规范的 `Unknown` 表示「没有任何来源可证明对齐」——此时**不得**
+ *       假定 8-bit。方案 §1.9A.4 明确：无 A2L/配置证据时 Alignment 必须
+ *       保持 Unknown，并阻断依赖多 Frame/Tail 的能力（见 T-06）。
+ */
+enum class PacketAlignment : std::uint8_t {
+    /// @brief 对齐未知：既无 A2L 声明也无显式配置，不得推断
+    Unknown = 0,
+
+    /// @brief PACKET_ALIGNMENT_8：1 字节对齐（等价于不填充）
+    Bit8 = 8,
+
+    /// @brief PACKET_ALIGNMENT_16：2 字节对齐
+    Bit16 = 16,
+
+    /// @brief PACKET_ALIGNMENT_32：4 字节对齐
+    Bit32 = 32,
+};
+
+/**
+ * @brief 取 PACKET_ALIGNMENT 对应的**字节**数
+ * @param alignment 对齐位宽
+ * @return 8→1、16→2、32→4；`Unknown` 返回 0（调用方须先判 Unknown）
+ *
+ * @note `Unknown` 返回 0 而非 1：0 无法作为模数参与对齐计算，会迫使调用方
+ *       显式处理「未知」分支，而不是悄悄退化成一个看似合理的 1 字节对齐。
+ */
+[[nodiscard]] constexpr std::uint8_t AlignmentBytes(
+    PacketAlignment alignment) noexcept {
+    switch (alignment) {
+        case PacketAlignment::Bit8:
+            return 1;
+        case PacketAlignment::Bit16:
+            return 2;
+        case PacketAlignment::Bit32:
+            return 4;
+        case PacketAlignment::Unknown:
+            break;
+    }
+    return 0;
+}
+
+/**
+ * @brief 解析 A2L `PACKET_ALIGNMENT_x` 的**原始位宽**为强类型
+ * @param raw_bits 原始位宽（8/16/32），0 或其它值表示未知
+ * @return 对应枚举；非 8/16/32 一律返回 `Unknown`
+ *
+ * @details 上游 A2L 桥接层（第三方 A2L SDK 的 DTO 映射）提供的
+ *          `packet_alignment` 字段已是位宽（8/16/32，0 表示未知）。这里做
+ *          防御性收敛：任何非 {8,16,32} 的取值都归为 `Unknown`，**不猜测**成 8。
+ */
+[[nodiscard]] constexpr PacketAlignment ParsePacketAlignment(
+    std::uint8_t raw_bits) noexcept {
+    switch (raw_bits) {
+        case 8:
+            return PacketAlignment::Bit8;
+        case 16:
+            return PacketAlignment::Bit16;
+        case 32:
+            return PacketAlignment::Bit32;
+        default:
+            break;
+    }
+    return PacketAlignment::Unknown;
+}
+
+/**
+ * @brief 计算把后续 XCP Packet 对齐到 `alignment` 所需的 Tail 字节数
+ * @param alignment 对齐位宽（`Unknown` 时返回 0）
+ * @param frame_without_tail_bytes 当前 Frame 的「Header + XCP Packet」长度
+ * @return 0..3 字节的 FILL 数量
+ *
+ * @details 依据 TL V1.5 §4.3.2.2（PDF 第 10 页）：
+ *          "The tail of a preceding XCP message is built in such a way that
+ *          the required alignment of the XCP packet of the subsequent message
+ *          is fulfilled. Depending on the length of its XCP packet and
+ *          depending on the required alignment, the tail can consist of 0, 1,
+ *          2 or 3 FILL bytes."
+ *
+ *          公式与方案 §1.9A.3 冻结式一致：
+ *          `tail = (a - (node_len mod a)) mod a`，其中 `a = alignment/8`。
+ *          该式与「后继 Packet 的 Datagram 绝对偏移须为 a 的整数倍」等价——
+ *          因为 Header 恒为 4 字节、后继 Packet 紧跟在当前 Frame 的 Tail 之后。
+ *
+ * @note FILL 字节内容规范定为 "do not care"（§4.3.2.2），本库固定填 0x00，
+ *       便于测试与日志比对。
+ */
+[[nodiscard]] constexpr std::uint8_t TailBytesForAlignment(
+    PacketAlignment alignment, std::size_t frame_without_tail_bytes) noexcept {
+    const std::uint8_t a = AlignmentBytes(alignment);
+    if (a == 0U) {
+        // Unknown：无对齐依据，不填充（调用方须自行决定是否允许该能力）
+        return 0;
+    }
+    const std::size_t rem = frame_without_tail_bytes % a;
+    return static_cast<std::uint8_t>((a - rem) % a);
 }
 
 }  // namespace calmcar::xcp
