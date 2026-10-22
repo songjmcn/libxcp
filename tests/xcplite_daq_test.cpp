@@ -15,7 +15,8 @@
  *    启动必须走 StartDaqSync()（逐表 SELECT + START_STOP_SYNCH(start
  * selected)）；
  *  - DTO 信封（DAQ_KEY_BYTE=0xC0，D6/D13）：每 ODT 一帧，头 4 字节
- *    = [ODTrel(b0)][0xAA(b1)][DAQ16 LE(b2..3)]，无单字节 PID；
+ *    = [PID(relODT)(b0)][FILL=0xAA(b1)][DAQ16 LE(b2..3)]，即规范
+ *    Figure 53 的 (WORD, aligned) 布局（FILL 取值由规范留白）；
  *    每事件的**首个** ODT 帧再跟 4 字节时间戳（1ns tick，LE32，会回绕）；
  *  - 队列 wire 补白（D21）：queueAcquire 按 XCPTL_PACKET_ALIGNMENT(4)
  * 向上取整，且 填充计入 LEN（queue32m.c:291-296 TODO，客户可见尾部填充字节）→
@@ -29,7 +30,7 @@
  *    从 Slave 运行时生成的 A2L EVENT 段解析 testev 的通道号。
  *
  * v0.9：信封切分统一走核心 DtoEnvelopeDecoder（A2L-free），不再保留测试专用
- * 手工拆包（原 SplitEnvelope 已删除）；RelativeByte + 首 ODT 才带时间戳的
+ * 手工拆包（原 SplitEnvelope 已删除）；(WORD, aligned) + 首 ODT 才带时间戳的
  * XCPlite 实然（D13）经 DtoFrameLayout::timestamp_relative_first_only 表达。
  * 每用例独立 Slave 进程（夹具 SetUp/TearDown），流污染不跨用例。
  */
@@ -134,14 +135,17 @@ bool BytesPrefixEq(BytesView payload, BytesView want) {
            std::memcmp(payload.data(), want.data(), want.size()) == 0;
 }
 
-/// @brief XCPlite 信封的运行时布局取证（D6/D13：DAQ_KEY_BYTE=0xC0 方言）
-/// @details [ODTrel(b0)][0xAA(b1)][DAQ16 LE(b2..3)] 识别字段 4 字节；
+/// @brief XCPlite 信封的运行时布局取证（D6/D13：DAQ_KEY_BYTE=0xC0）
+/// @details wire code `11` 按原始 PDF 第 96 页 Figure 53 与第 183 页 Table 143
+///          的标准语义是 **(WORD, aligned)**：
+///          [PID(relODT)][FILL][DAQ(WORD)] 识别字段 4 字节。
+///          XCPlite 的 FILL 恰好取 0xAA，但 FILL 取值由规范留白、不参与判定。
 ///          4 字节 LE 时间戳只随**本事件首 ODT 帧**出现
 ///          （timestamp_relative_first_only=true，v0.9 解码器新增表达）。
-///          与已删除的测试专用手工拆包等价，走核心统一入口。
 DtoFrameLayout MakeXcpliteEnvelopeLayout() {
     DtoFrameLayout layout;
-    layout.identification_field_type = IdentificationFieldType::RelativeByte;
+    layout.identification_field_type =
+        IdentificationFieldType::RelativeWordAligned;
     layout.first_odt = 0;
     layout.counter_enabled = false;
     layout.timestamp_enabled = true;

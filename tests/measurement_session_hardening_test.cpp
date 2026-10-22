@@ -161,12 +161,15 @@ class SessionSlave {
   std::map<CommandCode, int> m_counts_;
 };
 
-/// @brief 构造一个 RelativeWord 布局的 DTO 帧（2 字节识别头 + 4 字节 ts + 净荷）
+/// @brief 构造一个 RelativeWord 布局的 DTO 帧
+/// @details 按原始 PDF 第 96 页 Figure 52：[PID(relODT)][DAQ(WORD)][ts 4B][净荷]。
+///          DAQ 为 WORD 且按会话字节序（本夹具 Intel → 小端）。
 Bytes MakeFrame(std::uint8_t daq, std::uint8_t rel_odt, std::uint32_t ts,
                 BytesView payload) {
   Bytes frame;
-  frame.push_back(daq);
-  frame.push_back(rel_odt);
+  frame.push_back(rel_odt);  // PID：相对 ODT 在前
+  frame.push_back(daq);      // DAQ(WORD) 低字节
+  frame.push_back(0x00U);    // DAQ(WORD) 高字节
   for (std::size_t i = 0; i < 4U; ++i) {
     frame.push_back(static_cast<std::uint8_t>((ts >> (8U * i)) & 0xFFU));
   }
@@ -195,11 +198,11 @@ struct Rig {
     transport_owner = std::make_unique<MockTransport>();
     transport = transport_owner.get();
     transport->SetResponse([this](BytesView p) { return slave(p); });
-    master = std::make_unique<XcpMaster>(
-        std::move(transport_owner),
-        CommandTimeouts{std::chrono::milliseconds(150),
-                        std::chrono::milliseconds(150), 2},
-        &session);
+    XcpMasterOptions options;
+    options.timeouts = CommandTimeouts{std::chrono::milliseconds(150),
+                                       std::chrono::milliseconds(150), 2};
+    options.event_listener = &session;
+    master = std::make_unique<XcpMaster>(std::move(transport_owner), options);
     session.Bind(*master);
     master->Connect();
     // v0.6：时间戳单位显式注入（R13 无权威码表，不猜）。unit=1ns 让换算

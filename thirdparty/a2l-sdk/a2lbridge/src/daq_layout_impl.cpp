@@ -36,26 +36,35 @@ Error LayoutError(ErrorCode code, std::string message) {
  */
 std::size_t EnvelopeExtraBytes(const DtoFrameLayout& frame) {
     std::size_t extra = 0;
-    if (frame.counter_enabled) {
-        extra += 1;  // DTO 计数器 1 字节
-    }
     if (frame.timestamp_enabled) {
         extra += (frame.timestamp_size_bits + 7) / 8;
     }
     if (frame.first_odt) {
         extra += 1;  // FIRST_ODT 1 字节
     }
+    // 识别字段：按原始 PDF 第 95-96 页 Figure 51/52/53 计算，PID 之外的字节数
+    //  - Absolute：0（PID 即绝对 ODT 号）
+    //  - RelativeByte：1（DAQ BYTE）
+    //  - RelativeWord：2（DAQ WORD）
+    //  - RelativeWordAligned：3（FILL + DAQ WORD）
     switch (frame.identification_field_type) {
         case DaqInfo::IdFieldType::Absolute:
-            break;  // EPK 已含在 PID 之外？——A2L 绝对标识即 DAQ
-                    // 号本身，无额外字节
+            break;
         case DaqInfo::IdFieldType::RelativeByte:
             extra += 1;
             break;
         case DaqInfo::IdFieldType::RelativeWord:
-        case DaqInfo::IdFieldType::RelativeWordAligned:
             extra += 2;
             break;
+        case DaqInfo::IdFieldType::RelativeWordAligned:
+            extra += 3;  // FILL(1) + DAQ WORD(2)
+            break;
+    }
+    // DTO 计数器：仅 RelativeWordAligned 时**取代 FILL 字节**（原始 PDF 第
+    // 97-98 页 Figure 56），不额外占长度；其余模式位于识别字段之后，占 1 字节。
+    if (frame.counter_enabled &&
+        frame.identification_field_type != DaqInfo::IdFieldType::RelativeWordAligned) {
+        extra += 1;
     }
     return extra;
 }

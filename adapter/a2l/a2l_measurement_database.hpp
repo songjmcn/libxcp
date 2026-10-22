@@ -9,8 +9,8 @@
  *   2. `ToPhysical(name, raw)` → `MeasurementValue`（a2l::PhysicalValue → core 值）。
  * 物理换算、地址/宽度探测全部委托给桥接库，本类**不实现任何换算 / AG 逻辑**。
  *
- * 依赖方向：适配器 `.cpp` 仅包含核心 `<libxcp/measurement/*.hpp>` 与桥接层
- * `<libxcp/a2l/ia2l_database.hpp>`；核心**绝不**包含 `<libxcp/a2l/*>`。
+ * 依赖方向：适配器 `.cpp` 仅包含核心 `<libxcp/measurement/.hpp>` 与桥接层
+ * `<libxcp/a2l/ia2l_database.hpp>`；核心**绝不**包含 `<libxcp/a2l/>`。
  * A2lIsolation 门禁（tests/a2l_isolation_check.cmake）据此保证 S1/S2 0 命中。
  */
 
@@ -68,6 +68,17 @@ public:
      */
     [[nodiscard]] MeasurementResult<MeasurementValue> ToPhysical(
         std::string_view name, BytesView raw) const override;
+
+    /**
+     * @brief 指定0基数组元素的原始字节 → 物理值（直接委托桥接库）
+     * @param name 规范键或全库唯一裸名
+     * @param element_index 0基线性元素下标
+     * @param raw 恰好一个元素宽度的原始字节
+     * @return MeasurementValue，或核心侧换算/布局错误
+     */
+    [[nodiscard]] MeasurementResult<MeasurementValue> ToPhysicalElement(
+        std::string_view name, std::uint64_t element_index,
+        BytesView raw) const override;
 
 private:
     const a2l::IA2lDatabase& m_database_;  ///< A2L 桥接层数据库（非拥有）

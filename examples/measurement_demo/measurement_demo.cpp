@@ -4,30 +4,31 @@
 //
 // 流程（与 tests/xcplite_measurement_test.cpp L3 同构，此处以交付示例形态
 // 重写；对应 code-plan/libxcp_测量子系统代码增长计划.md v0.9 交付物 3）：
-//   1) 启动 xcp_test_slave 子进程（工作目录 = run-dir），就绪探测 = CONNECT；
-//   2) 经 GET_ID(IDT_ASAM_UPLOAD)+UPLOAD 从 Slave 拉回运行时 A2L（协议面取证，
+//   1) 启动 examples 内的 cpp_demo 子进程（工作目录 = run-dir），就绪探测 =
+//   CONNECT； 2) 经 GET_ID(IDT_ASAM_UPLOAD)+UPLOAD 从 Slave 拉回运行时
+//   A2L（协议面取证，
 //      不读盘捷径），落盘 run-dir/uploaded.a2l（与 Slave 写的 XCP_104.aml 同
 //      目录，保证 include 链解析）；
 //   3) libxcp::a2lbridge 加载上传副本；A2lMeasurementDatabase 包装为核心
 //      IMeasurementDatabase；事件通道按符号从上传 A2L 的 MEASUREMENT 段取证
 //      （多事件 Slave 如 cpp_demo 一机多通道同样适用），取不到时回退
-//      --event 命名事件（默认 "testev"）的 EVENT 段通道；
+//      --event 命名事件（默认 "mainloop"）的 EVENT 段通道；
 //   4) MeasurementSession：先构造（作 IEventListener）→ Bind → Connect →
-//      SetEnvelopeMode(RelativeByte,4)+SetTimestampFirstOdtOnly(true)+
+//      SetEnvelopeMode(RelativeWordAligned,4)+SetTimestampFirstOdtOnly(true)+
 //      SetTimestampUnit(1)（XCPlite 实然取证值，生产环境应改从
 //      GET_DAQ_PROCESSOR_INFO / GET_DAQ_RESOLUTION_INFO / A2L EVENT 取证）→
 //      Add → Prepare → Start（回调收 MeasurementFrame）；
-//   5) 采集 --seconds 秒（默认 2）：mode=fixed（默认）断言首符号定标值 ==
-//      --expect（默认 0xDEADBEEF）；mode=dynamic 面向物理值真实运动的 Slave
-//      （如 cpp_demo，L4 冒烟口径）断言逐符号覆盖、变化性（窗口内 ≥2 个
-//      不同原始值）与 --range 值域；两种模式都断言解码零错误；
+//   5) 采集 --seconds 秒（默认 4）：mode=dynamic（默认，cpp_demo）断言逐符号
+//      覆盖、变化性（窗口内 ≥2 个不同原始值）与 --range 值域；mode=fixed 用于
+//      用户指定的固定值 Slave，按 --expect 断言首符号定标值；两种模式都断言
+//      解码零错误；
 //      Stop → Disconnect → 终止 Slave。
 //
 // 退出码：0 = 全部断言通过；1 = 断言失败；2 = 环境错误（Slave 缺失/端口占用/
 // 连接失败）。
 //
-// 约束：不修改 thirdparty；不引用 tests/ 源码（Slave 经 CMake 注入的可执行
-// 文件路径寻址）；C++20。
+// 约束：不修改 thirdparty；不依赖 tests/ 目标或源码（cpp_demo 经 CMake 注入的
+// 可执行文件路径寻址）；C++20。
 
 #include <algorithm>
 #include <cctype>
@@ -68,6 +69,10 @@
 #include <libxcp/xcp_error.hpp>
 #include <libxcp/xcp_master.hpp>
 
+#if LIBXCP_ENABLE_LOG
+#include "program_logging.hpp"
+#endif
+
 #include <a2l/a2l_measurement_database.hpp>
 #include <a2l/measurement_runtime_profile.hpp>
 
@@ -79,25 +84,24 @@ using namespace calmcar::xcp;
 
 namespace {
 
-/// @brief 命令行配置（全部有默认值，零参数即 v0.9 xcp_test_slave 旧行为）。
+/// @brief 命令行配置（全部有默认值，零参数启动 examples 内的 cpp_demo）。
 struct Options {
-    fs::path runDir = "measurement_demo_run";       ///< Slave 工作目录。
-    fs::path slaveExe = XCP_TEST_SLAVE_EXECUTABLE;  ///< Slave 可执行（注入）。
-    std::string host = "127.0.0.1";                 ///< XCP 地址。
-    std::uint16_t port = 5556;  ///< XCP 端口（slave 缺省）。
-    int sampleSeconds = 2;      ///< 采集时长（秒）。
-    std::chrono::milliseconds commandTimeout{2000};  ///< 单命令超时。
-    std::string project =
-        "xcp_test_slave";  ///< MODULE 限定名前缀（cpp_demo 即 "cpp_demo"）。
-    std::string symbolsSpec =
-        "g_basic_u32,g_basic_f32";         ///< 逗号分隔符号短名。
-    std::string event = "testev";          ///< 回退命名事件（EVENT 段取证）。
+    fs::path runDir = "measurement_demo_run";  ///< Slave 工作目录。
+    fs::path slaveExe = CPP_DEMO_EXECUTABLE;   ///< 默认 cpp_demo 可执行文件。
+    std::string host = "127.0.0.1";            ///< XCP 地址。
+    std::uint16_t port = 5555;                 ///< cpp_demo 的 XCP 端口。
+    int sampleSeconds = 4;                     ///< 采集时长（秒）。
+    std::chrono::milliseconds commandTimeout{2000};   ///< 单命令超时。
+    std::string project = "cpp_demo";                 ///< MODULE 限定名前缀。
+    std::string symbolsSpec = "temperature,counter";  ///< 逗号分隔符号短名。
+    std::string event = "mainloop";  ///< EVENT 段缺少测量关联时的回退名称。
     std::string a2lName = "uploaded.a2l";  ///< 上传 A2L 落盘文件名。
-    bool dynamicMode = false;              ///< --mode dynamic（L4 冒烟口径）。
-    bool calibrationProbe = false;         ///< 本地 cpp_demo 在线标定→DAQ 闭环。
-    std::uint64_t expect = 0xDEADBEEFU;    ///< fixed 模式首符号期望定标值。
-    /// short_name → [min, max]（物理值域，dynamic 模式可选断言）。
-    std::map<std::string, std::pair<double, double>> ranges;
+    bool dynamicMode = true;  ///< cpp_demo 变量随时间变化，默认启用动态断言。
+    bool calibrationProbe = false;       ///< 本地 cpp_demo 在线标定→DAQ 闭环。
+    std::uint64_t expect = 0xDEADBEEFU;  ///< fixed 模式首符号期望定标值。
+    /// short_name → [min, max]（cpp_demo 默认变量的物理值域断言）。
+    std::map<std::string, std::pair<double, double>> ranges{
+        {"temperature", {-50.0, 100.0}}, {"counter", {0.0, 65535.0}}};
 
     /// @brief 符号短名列表（逗号分隔，去空白；保序）。
     std::vector<std::string> Symbols() const {
@@ -523,8 +527,11 @@ std::unique_ptr<XcpMaster> MakeMaster(const Options& opt,
     timeouts.command_timeout = opt.commandTimeout;
     timeouts.synch_timeout = opt.commandTimeout;
     timeouts.max_retries = 1;
+    XcpMasterOptions options;
+    options.timeouts = timeouts;
+    options.event_listener = listener;
     return std::make_unique<XcpMaster>(std::make_unique<UdpTransport>(cfg),
-                                       timeouts, listener);
+                                       options);
 }
 
 /// @brief 等待 Slave 达到可 CONNECT 状态；超时返回 nullptr。
@@ -587,20 +594,36 @@ std::optional<std::vector<A2lEventMetadata>> ResolveA2lEvents(
             return std::nullopt;
         }
         std::uint64_t channel = 0;
+        std::uint64_t max_daq_list = 0;
         std::uint64_t cycle = 0;
         std::uint64_t unit = 0;
+        std::uint8_t event_type = 0;
+        if (type == "DAQ") {
+            event_type = 1U;
+        } else if (type == "STIM") {
+            event_type = 2U;
+        } else if (type == "DAQ_STIM") {
+            event_type = 3U;
+        } else {
+            return std::nullopt;
+        }
         if (!ParseUnsignedToken(channel_token, channel) ||
+            !ParseUnsignedToken(max_daq, max_daq_list) ||
             !ParseUnsignedToken(cycle_token, cycle) ||
             !ParseUnsignedToken(unit_token, unit) ||
             channel > std::numeric_limits<std::uint16_t>::max() ||
+            max_daq_list > std::numeric_limits<std::uint8_t>::max() ||
             cycle > std::numeric_limits<std::uint8_t>::max() ||
             unit > std::numeric_limits<std::uint8_t>::max()) {
             return std::nullopt;
         }
+        // A2L `DAQ`/`STIM`/`DAQ_STIM` 对应 EventType 1/2/3；完整保留容量，
+        // 否则默认构造的 max_daq_list=0 会错误拒绝有效的动态 DAQ 事件。
         events.push_back(A2lEventMetadata{
             std::move(long_name), std::move(short_name),
             static_cast<std::uint16_t>(channel),
-            static_cast<std::uint8_t>(cycle), static_cast<std::uint8_t>(unit)});
+            static_cast<std::uint8_t>(cycle), static_cast<std::uint8_t>(unit),
+            event_type, static_cast<std::uint8_t>(max_daq_list)});
     }
     return events;
 }
@@ -672,7 +695,9 @@ bool ParseArgs(int argc, char** argv, Options& opt) {
                 "          [--a2l-name FILE] [--mode fixed|dynamic]\n"
                 "          [--expect 0xHEX] [--range NAME=min:max]...\n"
                 "          [--calibration-probe]（仅本地 cpp_demo）\n"
-                "零参数 = v0.9 xcp_test_slave 旧行为（fixed/2s/0xDEADBEEF）。\n"
+                "零参数默认启动 cpp_demo（dynamic/4s，观测 "
+                "temperature,counter）。\n"
+                "固定值 Slave 可用 --mode fixed --expect 指定首符号期望值。\n"
                 "cpp_demo L4 冒烟示例：\n"
                 "  measurement_demo --slave <cpp_demo.exe> --port 5555 \\\n"
                 "      --project cpp_demo --event mainloop --mode dynamic \\\n"
@@ -947,8 +972,7 @@ bool RunCounterCalibrationProbe(XcpMaster& master,
     sink.ResetRawTrace(counter_name);
     const bool restored_behavior = sink.WaitUntil(
         [&] { return sink.SawRawAbove(counter_name, kReduced); }, 3s);
-    check.Check(restored_behavior,
-                "恢复原值后 DAQ counter 再次观测到 >20");
+    check.Check(restored_behavior, "恢复原值后 DAQ counter 再次观测到 >20");
     return reduced_applied && behavior_ok && restored && restored_behavior;
 }
 
@@ -969,9 +993,6 @@ int main(int argc, char** argv) {
     const std::string projectPrefix = opt.project + "::";
     auto Qualified = [&](std::string_view symbol) {
         return projectPrefix + std::string(symbol);
-    };
-    auto ShortName = [&](std::string_view qualified) {
-        return qualified.substr(projectPrefix.size());
     };
 
     std::error_code ec;
@@ -999,7 +1020,7 @@ int main(int argc, char** argv) {
 #ifdef XCP_104_AML_FILE
     // XCPlite 生成 A2L 含 `/include "XCP_104.aml"`（a2l_writer.c:474）。为
     // cpp_demo 一类不内嵌 AML 的 Slave 预置同目录副本，保证桥接 include 链
-    // 可解析；已存在则不动（xcp_test_slave 自写的以 Slave 为准）。
+    // 可解析；已存在则保留 Slave 提供的文件。
     {
         const fs::path aml = opt.runDir / "XCP_104.aml";
         if (!fs::exists(aml, ec) && !ec) {
@@ -1013,6 +1034,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
         }
+    }
+#endif
+
+#if LIBXCP_ENABLE_LOG
+    calmcar::xcp::internal::ProgramLogSession logging;
+    std::string log_error;
+    if (!logging.Initialize(argv[0], "examples", log_error)) {
+        std::fprintf(stderr, "日志初始化失败: %s\n", log_error.c_str());
+        return 2;
     }
 #endif
 
@@ -1199,7 +1229,7 @@ int main(int argc, char** argv) {
         // 由适配层查询 GET_DAQ_PROCESSOR_INFO / GET_DAQ_RESOLUTION_INFO /
         // GET_DAQ_EVENT_INFO，并与上传 A2L EVENT 元数据逐通道交叉校验。
         const auto profile =
-            BuildXcpliteMeasurementRuntimeProfile(*master, bound_events);
+            BuildMeasurementRuntimeProfile(*master, bound_events);
         if (!profile.HasValue()) {
             std::printf("[env] Slave profile 取证失败：%s\n",
                         profile.ErrorInfo().message.c_str());

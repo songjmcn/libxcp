@@ -589,16 +589,19 @@ Result<Bytes> EvaluateFromPhysical(const SymbolInfo& symbol,
     }
     const double i = inverse.Value();
 
-    // 原始值必须是整数；负值仅允许出现在有符号类型
-    if (i != std::trunc(i)) {
+    // 只有整数ASAM类型要求逆算原始值为整数；IEEE浮点必须保留小数和负值。
+    const bool floating_type = symbol.data_type == AsamDataType::Float16 ||
+                               symbol.data_type == AsamDataType::Float32 ||
+                               symbol.data_type == AsamDataType::Float64;
+    if (!floating_type && i != std::trunc(i)) {
         return ConvError(ErrorCode::ConversionOutOfRange, symbol,
-                         "逆算原始值非整数（B-15）");
+                         "整数类型逆算原始值非整数（B-15）");
     }
     const bool signed_type = symbol.data_type == AsamDataType::SByte ||
                              symbol.data_type == AsamDataType::SWord ||
                              symbol.data_type == AsamDataType::SLong ||
                              symbol.data_type == AsamDataType::SLong64;
-    if (i < 0.0 && !signed_type) {
+    if (i < 0.0 && !signed_type && !floating_type) {
         return ConvError(ErrorCode::ConversionOutOfRange, symbol,
                          "逆算原始值为负数，超出无符号域（B-15）");
     }

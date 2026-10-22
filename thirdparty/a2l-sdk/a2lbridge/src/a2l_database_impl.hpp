@@ -35,12 +35,14 @@ public:
     /// @param leaf_symbols 结构体成员叶子 SymbolInfo（批次18，STRUCTLEAF；
     ///        name 为 "instance.member[.member][[idx]]" 限定路径）
     /// @param leaf_warnings 叶子解析产生的不可证拒绝告警（16-B，随快照发布）
+    /// @param memory_segments MEMORY_SEGMENT地址范围与PAGE静态权限事实
     A2lDatabaseImpl(
         std::vector<liba2l::SymbolDto> dtos,
         std::vector<liba2l::StructInfoDto> structs,
         std::unordered_map<std::string, RecordLayoutInfo> record_layouts,
         std::vector<SymbolInfo> leaf_symbols,
-        std::vector<LoadWarning> leaf_warnings);
+        std::vector<LoadWarning> leaf_warnings,
+        std::vector<MemorySegmentInfo> memory_segments);
 
     /// @brief 加载期被放弃的事实（批次15，F6：同名冲突跳过的结构体等）
     /// @details 门面 A2lBridge::ListLoadWarnings() 在此基础上再补自己的告警
@@ -85,9 +87,19 @@ public:
     [[nodiscard]] Result<PhysicalValue> ToPhysical(
         std::string_view qualified_name, BytesView raw) const override;
 
+    /// @copydoc IA2lDatabase::ToPhysicalElement
+    [[nodiscard]] Result<PhysicalValue> ToPhysicalElement(
+        std::string_view qualified_name, std::uint64_t element_index,
+        BytesView raw) const override;
+
     /// @copydoc IA2lDatabase::FromPhysical
     [[nodiscard]] Result<Bytes> FromPhysical(
         std::string_view qualified_name,
+        const PhysicalValue& physical_value) const override;
+
+    /// @copydoc IA2lDatabase::FromPhysicalElement
+    [[nodiscard]] Result<Bytes> FromPhysicalElement(
+        std::string_view qualified_name, std::uint64_t element_index,
         const PhysicalValue& physical_value) const override;
 
 private:
@@ -121,6 +133,8 @@ private:
     std::unordered_map<std::uint64_t, std::vector<std::string>> m_addr_to_all_;
     /// @brief 规范键 → RECORD_LAYOUT 元数据（批次13；无类别的符号不在此表）
     std::unordered_map<std::string, RecordLayoutInfo> m_record_layouts_;
+    /// @brief 已解析MEMORY_SEGMENT集合，用于符号的唯一完整范围关联。
+    std::vector<MemorySegmentInfo> m_memory_segments_;
     /// @brief 结构体叶子在 m_symbols_ 中的位置集合（批次18）：地址反查表
     ///        **排除**这些项，保持既有 FindByAddress/aliases 行为不变
     ///        （叶子的归属检索是批次20 DAQ 成员路由的前置，另行接线）

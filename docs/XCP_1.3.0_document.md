@@ -55,42 +55,48 @@ Event Channel
 
 # 目录（中文）
 
-1. 前言  
-2. 引言  
-3. 与其他标准的关系  
-   3.1 与早期版本的向后兼容性  
-   3.2 对其他标准的引用；CCP 与 XCP  
-4. XCP 特性与概念  
-   4.1 同步数据传输：DAQ、STIM、ODT、事件通道、动态 DAQ、RESUME、优先级与优化  
-   4.2 测量模式：轮询、标准突发、改进突发、交替模式  
-   4.3 Bypassing（旁路/RCP）  
-   4.4 在线标定：SECTOR、SEGMENT、PAGE、页面切换/冻结  
-   4.5 Flash 编程  
-   4.6 时间相关/时间同步  
-   4.7 ECU 状态  
-5. XCP 协议：拓扑、通信模型、状态机、保护、帧格式  
-6. 性能极限与 ECU 资源消耗  
-7. XCP 协议层  
-   7.1 XCP Packet、CTO、DTO、PID  
-   7.2 Event Code  
-   7.3 Service Request Code  
-   7.4 Command Code  
-   7.5 命令详细说明  
-       - 标准命令  
-       - 标定命令  
-       - 页面切换命令  
-       - DAQ/STIM 命令  
-       - 非易失存储器编程命令  
-       - 时间相关命令  
-   7.6 通信错误处理  
-   7.7 Event 详细说明  
-8. 与 ASAM MCD-2 MC（A2L）描述文件的接口  
-9. 外部 Seed&Key 函数接口  
-10. 外部 Checksum 函数接口  
-11. 外部 A2L 解压/解密函数接口  
-12. 示例：会话建立、标定、DAQ、重编程、会话关闭、时间相关  
-13. 符号与缩略语  
-14. 参考文献  
+1. [前言](#1-前言)  
+2. [引言](#2-引言)  
+3. [与其他标准的关系](#3-与其他标准的关系)  
+   3.1 [与早期版本的向后兼容性](#31-与早期版本的向后兼容性)  
+   3.2 [对其他标准的引用；CCP 与 XCP](#32-对其他标准的引用)  
+4. [XCP 特性与概念](#4-xcp-特性与概念)  
+   4.1 [同步数据传输：DAQ、STIM、ODT、事件通道、动态 DAQ、RESUME、优先级与优化](#41-同步数据传输)  
+   4.2 [测量模式：轮询、标准突发、改进突发、交替模式](#42-测量模式)  
+   4.3 [Bypassing（旁路/RCP）](#43-bypassing旁路rcp)  
+   4.4 [在线标定：SECTOR、SEGMENT、PAGE、页面切换/冻结](#44-在线标定)  
+   4.5 [Flash 编程](#45-flash-programming)  
+   4.6 [时间相关/时间同步](#46-时间相关time-correlation)  
+   4.7 [ECU 状态](#47-ecu-states)  
+5. [XCP 协议：拓扑、通信模型、状态机、保护、帧格式](#5-xcp-协议)  
+6. [性能极限与 ECU 资源消耗](#6-性能极限)  
+7. [XCP 协议层](#7-xcp-协议层)  
+   7.1 [XCP Packet、CTO、DTO、PID](#71-xcp-packet)  
+   7.2 [Event Code](#72-event-code)  
+   7.3 [Service Request Code](#73-service-request-code)  
+   7.4 [Command Code](#74-command-code)  
+   7.5 [命令详细说明](#75-command-描述的通用规则)  
+       - [标准命令](#751-标准命令standard-commands)  
+       - [标定命令](#752-calibration-command)  
+       - [页面切换命令](#753-page-switching-command)  
+       - [DAQ/STIM 命令](#754-data-acquisition-and-stimulation-command)  
+       - [非易失存储器编程命令](#755-non-volatile-memory-programming)  
+       - [时间相关命令](#756-time-correlation)  
+   7.6 [通信错误处理](#76-communication-error-handling)  
+   7.7 [Event 详细说明](#77-event-packet-描述)  
+8. [与 ASAM MCD-2 MC（A2L）描述文件的接口](#8-与-asam-mcd-2-mc-description-file-的接口)  
+9. [外部 Seed&Key 函数接口](#9-外部-seedkey-函数接口)  
+10. [外部 Checksum 函数接口](#10-外部-checksum-函数接口)  
+11. [外部 A2L 解压/解密函数接口](#11-外部-a2l-解压解密接口)  
+12. [示例：会话建立、标定、DAQ、重编程、会话关闭、时间相关](#12-示例)  
+13. [符号与缩略语](#13-符号与缩略语)  
+14. [参考文献](#14-参考文献)  
+附录 A. [面向“CANape 类变量读取工具”的实现总结](#附录-a面向canape-类变量读取工具的实现总结)  
+   A.1 [第一阶段：Polling Measurement MVP](#a1-第一阶段polling-measurement-mvp)  
+   A.2 [第二阶段：高速 DAQ Measurement](#a2-第二阶段高速-daq-measurement)  
+   A.3 [第三阶段：Calibration/完整工具](#a3-第三阶段calibration完整工具)  
+   A.4 [推荐 C++ 模块划分](#a4-推荐-c-模块划分)  
+   A.5 [规范阅读优先级](#a5-规范阅读优先级)  
 
 ---
 

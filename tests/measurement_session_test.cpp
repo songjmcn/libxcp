@@ -13,9 +13,9 @@
  *   - 未运行时 OnDto 不入队不计数；Stop 幂等、析构 join；
  *   - 统计计数（received/dropped/decode_errors）。
  *
- * 识别字段模式用会话默认取证（RelativeWord：byte0=DAQ 号、byte1=相对 ODT，
- * 头长 2），时间戳 4 字节（GET_DAQ_RESOLUTION_INFO TIMESTAMP_MODE=0x0C），
- * 注入帧按该布局构造。
+ * 识别字段模式用会话默认取证（RelativeWord：PID（相对 ODT）在前、DAQ(WORD)
+ * 在后，头长 3——原始 PDF 第 96 页 Figure 52），时间戳 4 字节
+ * （GET_DAQ_RESOLUTION_INFO TIMESTAMP_MODE=0x0C），注入帧按该布局构造。
  */
 
 #include <gtest/gtest.h>
@@ -75,8 +75,25 @@ class FakeDb final : public IMeasurementDatabase {
     return detail::MakeMeasurementOk(MeasurementValue{v});
   }
 
+  /// @brief 测试数组元素按下标换算；默认保留旧数据库明确不支持的行为。
+  MeasurementResult<MeasurementValue> ToPhysicalElement(
+      std::string_view name, std::uint64_t element_index,
+      BytesView raw) const override {
+    if (!support_array_elements)
+      return IMeasurementDatabase::ToPhysicalElement(name, element_index, raw);
+    if (failing_element && *failing_element == element_index)
+      return detail::MakeMeasurementError<MeasurementValue>(
+          MeasurementErrorCode::UnsupportedConversion, "注入的数组元素换算失败",
+          std::string(name));
+    const auto value = static_cast<std::int64_t>(element_index * 100U) +
+                       (raw.empty() ? 0 : static_cast<std::int64_t>(raw[0]));
+    return detail::MakeMeasurementOk(MeasurementValue{value});
+  }
+
   std::map<std::string, MeasurementSymbolInfo> symbols;
   std::set<std::string> failing;  ///< 命中即 ToPhysical 报错的符号
+  bool support_array_elements = false;  ///< 测试显式启用元素级换算
+  std::optional<std::uint64_t> failing_element;  ///< 注入失败的数组下标
 };
 
 /// @brief 构造符号信息（地址/扩展/事件通道/元素宽/元素数）
@@ -118,9 +135,19 @@ class SessionSlave {
         // MIN_DAQ=0，DAQ_KEY=0
         return Res({0x11, 0x04, 0x00, 0x02, 0x00, 0x00, 0x00});
       case CommandCode::GetDaqResolutionInfo:
-        // GRAN_DAQ=1, MAX_ODT_ENTRY=8, GRAN_STIM=1, MAX_SIZE_STIM=8,
+        // GRAN_DAQ=1, MAX_ODT_ENTRY=248（**AG 单位**，见下）, GRAN_STIM=1,
+        // MAX_SIZE_STIM=8,
         // TIMESTAMP_MODE=0x0C（size_code=4→4 字节, fixed）, TICKS=1
-        return Res({0x01, 0x08, 0x01, 0x08, 0x0C, 0x01, 0x00});
+        //
+        // 批次 E2/F-12 修正：MAX_ODT_ENTRY_SIZE_x 的单位是 **AG 元素数**，
+        // 不是字节（原始 PDF 第 15 页 §4.1.2：
+        //   "MAX_ODT_ENTRY_SIZE_x ... indicate the upper limits for the size
+        //    of the element described by an ODT entry in ADDRESS_GRANULARITY"）。
+        // 本用例配置 8 个 4 字节元素 = 32 个 AG 元素（本夹具 AG=BYTE=1），
+        // 故 Slave 必须声明 >= 32；此处取 248 与用例中
+        // SetDaqEntryCapabilities(...{true,1,248}) 的意图保持一致。
+        // 修改前声明 8（旧字节口径下的笔误）会被 F-12 C5 正确拒绝。
+        return Res({0x01, 0xF8, 0x01, 0x08, 0x0C, 0x01, 0x00});
       case CommandCode::FreeDaq:
       case CommandCode::AllocDaq:
       case CommandCode::AllocOdt:
@@ -161,12 +188,15 @@ class SessionSlave {
   std::map<CommandCode, int> m_counts_;
 };
 
-/// @brief 构造一个 RelativeWord 布局的 DTO 帧（2 字节识别头 + 4 字节 ts + 净荷）
+/// @brief 构造一个 RelativeWord 布局的 DTO 帧
+/// @details 按原始 PDF 第 96 页 Figure 52：[PID(relODT)][DAQ(WORD)][ts 4B][净荷]。
+///          DAQ 为 WORD 且按会话字节序（本夹具 Intel → 小端）。
 Bytes MakeFrame(std::uint8_t daq, std::uint8_t rel_odt, std::uint32_t ts,
                 BytesView payload) {
   Bytes frame;
-  frame.push_back(daq);
-  frame.push_back(rel_odt);
+  frame.push_back(rel_odt);              // PID：相对 ODT 在前
+  frame.push_back(daq);                  // DAQ(WORD) 低字节
+  frame.push_back(0x00U);                // DAQ(WORD) 高字节
   for (std::size_t i = 0; i < 4U; ++i) {
     frame.push_back(static_cast<std::uint8_t>((ts >> (8U * i)) & 0xFFU));
   }
@@ -195,11 +225,11 @@ struct Rig {
     transport_owner = std::make_unique<MockTransport>();
     transport = transport_owner.get();
     transport->SetResponse([this](BytesView p) { return slave(p); });
-    master = std::make_unique<XcpMaster>(
-        std::move(transport_owner),
-        CommandTimeouts{std::chrono::milliseconds(150),
-                        std::chrono::milliseconds(150), 2},
-        &session);
+    XcpMasterOptions options;
+    options.timeouts = CommandTimeouts{std::chrono::milliseconds(150),
+                                       std::chrono::milliseconds(150), 2};
+    options.event_listener = &session;
+    master = std::make_unique<XcpMaster>(std::move(transport_owner), options);
     session.Bind(*master);
     master->Connect();
     // v0.6：时间戳单位必须显式取证注入（R13 无权威码表，不猜）。此处取
@@ -269,9 +299,13 @@ TEST(MeasurementSessionLifecycle, RejectsUnknownEnvelopeModeAndShortHeader) {
   EXPECT_THROW(session.SetEnvelopeMode(
                    static_cast<IdentificationFieldType>(0xFFU), 4U),
                XcpException);
+  // RelativeByte 的规范头长是 2（Figure 51：PID + DAQ(BYTE)），故 1 字节非法。
   EXPECT_THROW(session.SetEnvelopeMode(IdentificationFieldType::RelativeByte,
-                                       3U),
+                                       1U),
                XcpException);
+  // 恰好等于规范头长应被接受。
+  EXPECT_NO_THROW(session.SetEnvelopeMode(
+      IdentificationFieldType::RelativeByte, 2U));
 }
 
 TEST(MeasurementSessionLifecycle, StartRejectsStaleDaqGeneration) {
@@ -457,6 +491,101 @@ TEST(MeasurementSessionPipeline, MultiEventRoutesToSeparateLists) {
   rig.session.Stop();
 }
 
+TEST(MeasurementSessionPipeline, ArrayDtoConvertsAtomicallyWithScalarSample) {
+  Rig rig;
+  rig.db.symbols["array"] = MeasurementSymbolInfo{
+      0x4000U, 0x12U, 0U, 4U, 8U, true};
+  rig.db.support_array_elements = true;
+  rig.session.SetDaqEntryCapabilities(MeasurementDaqCapabilities{true, 1, 248});
+  rig.session.Add("array");
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+  ASSERT_EQ(rig.slave.Count(CommandCode::WriteDaq), 2);
+
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& f) { collector(f); }));
+  Bytes payload(36U, 0U);
+  for (std::size_t i = 0; i < 8U; ++i)
+    payload[i * 4U] = static_cast<std::uint8_t>(i + 1U);
+  payload[32U] = 17U;
+  rig.transport->InjectPacket(BytesView{MakeFrame(0, 0, 5, BytesView{payload})});
+  ASSERT_TRUE(collector.WaitFor(1));
+  const auto frames = collector.Frames();
+  ASSERT_EQ(frames.size(), 1U);
+  ASSERT_EQ(frames[0].samples.size(), 2U);
+  const auto& array = frames[0].samples[0];
+  EXPECT_TRUE(array.is_array);
+  EXPECT_TRUE(array.valid);
+  EXPECT_EQ(array.raw, Bytes(payload.begin(), payload.begin() + 32));
+  ASSERT_EQ(array.elements.size(), 8U);
+  for (std::size_t i = 0; i < 8U; ++i)
+    EXPECT_EQ(std::get<std::int64_t>(array.elements[i]),
+              static_cast<std::int64_t>(i * 101U + 1U));
+  EXPECT_FALSE(frames[0].samples[1].is_array);
+  EXPECT_TRUE(frames[0].samples[1].valid);
+  EXPECT_EQ(std::get<std::int64_t>(frames[0].samples[1].value), 21);
+  rig.session.Stop();
+}
+
+TEST(MeasurementSessionPipeline, ArrayElementFailureDropsWholeArrayOnly) {
+  Rig rig;
+  rig.db.symbols["array"] = MeasurementSymbolInfo{
+      0x4000U, 0U, 0U, 4U, 8U, true};
+  rig.db.support_array_elements = true;
+  rig.db.failing_element = 3U;
+  rig.session.SetDaqEntryCapabilities(MeasurementDaqCapabilities{true, 1, 248});
+  rig.session.Add("array");
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& f) { collector(f); }));
+  Bytes payload(36U, 0U);
+  payload[32U] = 17U;
+  rig.transport->InjectPacket(BytesView{MakeFrame(0, 0, 5, BytesView{payload})});
+  ASSERT_TRUE(collector.WaitFor(1));
+  const auto frames = collector.Frames();
+  ASSERT_EQ(frames.size(), 1U);
+  ASSERT_EQ(frames[0].samples.size(), 2U);
+  EXPECT_FALSE(frames[0].samples[0].valid);
+  EXPECT_TRUE(frames[0].samples[0].is_array);
+  EXPECT_TRUE(frames[0].samples[0].elements.empty());
+  EXPECT_EQ(frames[0].samples[0].raw.size(), 32U);
+  EXPECT_FALSE(frames[0].samples[0].error.empty());
+  EXPECT_TRUE(frames[0].samples[1].valid);
+  EXPECT_EQ(rig.session.Statistics().decode_errors, 1U);
+  rig.session.Stop();
+}
+
+/// @brief 未实现元素换算的旧数据库不会退化为标量首元素的伪成功。
+TEST(MeasurementSessionPipeline, LegacyDatabaseFailsArrayConversionExplicitly) {
+  Rig rig;
+  rig.db.symbols["array"] = MeasurementSymbolInfo{
+      0x4000U, 0U, 0U, 4U, 8U, true};
+  rig.session.SetDaqEntryCapabilities(MeasurementDaqCapabilities{true, 1, 248});
+  rig.session.Add("array");
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& frame) { collector(frame); }));
+  Bytes payload(36U, 0U);
+  payload[32U] = 17U;
+  rig.transport->InjectPacket(BytesView{MakeFrame(0, 0, 5, BytesView{payload})});
+  ASSERT_TRUE(collector.WaitFor(1));
+  const auto frames = collector.Frames();
+  ASSERT_EQ(frames.size(), 1U);
+  ASSERT_EQ(frames[0].samples.size(), 2U);
+  EXPECT_TRUE(frames[0].samples[0].is_array);
+  EXPECT_FALSE(frames[0].samples[0].valid);
+  EXPECT_TRUE(frames[0].samples[0].elements.empty());
+  EXPECT_NE(frames[0].samples[0].error.find("未实现数组元素换算"),
+            std::string::npos);
+  EXPECT_TRUE(frames[0].samples[1].valid);
+  rig.session.Stop();
+}
+
 TEST(MeasurementSessionPipeline, MalformedFrameCountsDecodeErrorWithoutCallback) {
   Rig rig;
   rig.session.Add("EngineSpeed");
@@ -558,6 +687,25 @@ TEST(MeasurementSessionPipeline, PrepareIssuesDynamicDaqTransaction) {
   EXPECT_EQ(rig.slave.Count(CommandCode::SetDaqListMode), 1);
   // 规划期取证：分辨率（时间戳 4 字节）被查询
   EXPECT_GE(rig.slave.Count(CommandCode::GetDaqResolutionInfo), 1);
+}
+
+TEST(MeasurementSessionPipeline, UnsupportedArraysNeverSendFreeDaq) {
+  for (const auto capabilities : {
+           MeasurementDaqCapabilities{},
+           MeasurementDaqCapabilities{true, 1, 16}}) {
+    Rig rig;
+    rig.db.symbols["array"] = MeasurementSymbolInfo{
+        0x4000U, 0U, 0U, 4U, 8U, true};
+    rig.session.SetDaqEntryCapabilities(capabilities);
+    rig.session.Add("array");
+    EXPECT_THROW(rig.session.Prepare(), XcpException);
+    EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
+    EXPECT_EQ(rig.slave.Count(CommandCode::WriteDaq), 0);
+  }
+  Rig rig;
+  EXPECT_THROW(rig.session.SetDaqEntryCapabilities(
+                   MeasurementDaqCapabilities{true, 0, 248}), XcpException);
+  EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
 }
 
 TEST(MeasurementSessionPipeline, PrepareFailureWithUnknownSymbolThrowsBeforeDaq) {

@@ -60,9 +60,9 @@ class FakeDb final : public IMeasurementDatabase {
 MeasurementSymbolInfo MakeInfo(uint32_t address, uint8_t extension,
                                uint16_t event_channel,
                                uint8_t element_size_bytes,
-                               uint8_t element_count = 1) {
+                               uint8_t element_count = 1, bool is_array = false) {
   return MeasurementSymbolInfo{address, extension, event_channel,
-                               element_size_bytes, element_count};
+                               element_size_bytes, element_count, is_array};
 }
 
 // 校验给定计划：每条 route 都能回查到所属 (daq_list, odt, payload_offset)，
@@ -230,6 +230,20 @@ TEST(MeasurementPlannerTest, ByteWidthNotDivisibleByAgErrors) {
 // ---------------------------------------------------------------------------
 // timestamp 头扣除：usable 变小 + timestamp 置位
 // ---------------------------------------------------------------------------
+TEST(MeasurementPlannerTest, IdentificationHeaderDeduction) {
+  FakeDb db;
+  db.symbols.emplace("fits", MakeInfo(0x1000, 0, 1, 11));
+  db.symbols.emplace("too_big", MakeInfo(0x1100, 0, 1, 13));
+
+  MeasurementPlanner planner(db, /*max_dto=*/16, AddressGranularity::Byte,
+                             /*timestamp_bytes=*/0, /*identification_bytes=*/4);
+  const auto fits = planner.Build({"fits"});
+  ASSERT_TRUE(fits.HasValue()) << fits.ErrorInfo().message;
+  const auto too_big = planner.Build({"too_big"});
+  ASSERT_FALSE(too_big.HasValue());
+  EXPECT_EQ(too_big.ErrorInfo().code, MeasurementErrorCode::DaqConfigurationError);
+}
+
 TEST(MeasurementPlannerTest, TimestampHeaderDeduction) {
   FakeDb db;
   // max_dto=16, timestamp_bytes=4 → usable = 16 - 4 - 1 = 11
@@ -307,20 +321,79 @@ TEST(MeasurementPlannerTest, MultiEventMultiList) {
 }
 
 // ---------------------------------------------------------------------------
-// 8 位 AG 上限（size 是 uint8）→ DaqConfigurationError
+// 数组单 Entry 超出 Slave 运行期上限 → DaqConfigurationError
 // ---------------------------------------------------------------------------
-TEST(MeasurementPlannerTest, AgUnitsOver255Errors) {
+TEST(MeasurementPlannerTest, ArrayLargerThanRuntimeEntryLimitErrors) {
   FakeDb db;
   // AG=Byte → ag_units == byte_width。宽度 = 元素宽度 × 元素数 = 100 × 3 = 300，
   // 元素宽度/数量都不超 uint8（分别 100 / 3），但总宽 300 > 255 → 报错。
   db.symbols.emplace("huge", MakeInfo(0x1000, 0, 1, /*esize=*/100,
-                                      /*ecount=*/3));
+                                      /*ecount=*/3, /*is_array=*/true));
 
-  MeasurementPlanner planner(db, /*max_dto=*/512, AddressGranularity::Byte);
+  // 单 Entry 上限 255 字节；300 字节应在进入 Slave 配置前拒绝。
+  MeasurementPlanner planner(db, /*max_dto=*/512, AddressGranularity::Byte,
+                             /*timestamp_bytes=*/0, /*id_bytes=*/1,
+                             MeasurementDaqCapabilities{true, 1, 255});
   const auto result = planner.Build({"huge"});
-  // 300 > usable(512-0-1=511) 不触发单变量报错，但 300 > 255 触发 AG 上限
+  // 300 < usable(512-0-1=511)，但大于运行期单 Entry 最大 255。
   ASSERT_FALSE(result.HasValue());
   EXPECT_EQ(result.ErrorInfo().code, MeasurementErrorCode::DaqConfigurationError);
+}
+
+// ---------------------------------------------------------------------------
+// 显式 XCPlite 能力下：一维数组始终为完整 Entry，标量同 ODT 可独立路由。
+// ---------------------------------------------------------------------------
+TEST(MeasurementPlannerTest, ContiguousArraysAreOneEntryWithExactRoutes) {
+  FakeDb db;
+  db.symbols.emplace("fast", MakeInfo(0x1000, 0x12, 0, 4, 8, true));
+  db.symbols.emplace("scalar", MakeInfo(0x1100, 0x34, 0, 4));
+  db.symbols.emplace("slow", MakeInfo(0x2000, 0x56, 1, 4, 8, true));
+  db.symbols.emplace("single", MakeInfo(0x3000, 0, 1, 4, 1, true));
+  MeasurementPlanner planner(db, 64, AddressGranularity::Byte,
+                             /*timestamp_bytes=*/4, /*id_bytes=*/4,
+                             MeasurementDaqCapabilities{true, 1, 248});
+  const auto result = planner.Build({"fast", "scalar", "slow", "single"});
+  ASSERT_TRUE(result.HasValue()) << result.ErrorInfo().message;
+  const auto& plan = result.Value();
+  ASSERT_EQ(plan.daq_lists.size(), 2U);
+  ASSERT_EQ(plan.routes.size(), 4U);
+  ASSERT_EQ(plan.daq_lists[0].odts[0].entries.size(), 2U);
+  EXPECT_EQ(plan.daq_lists[0].odts[0].entries[0].size, 32U);
+  EXPECT_EQ(plan.daq_lists[0].odts[0].entries[0].extension, 0x12U);
+  EXPECT_EQ(plan.routes[0].size, 32U);
+  EXPECT_TRUE(plan.routes[0].is_array);
+  EXPECT_EQ(plan.routes[0].element_count, 8U);
+  EXPECT_EQ(plan.routes[0].element_size_bytes, 4U);
+  EXPECT_EQ(plan.routes[1].payload_offset, 32U);
+  EXPECT_FALSE(plan.routes[1].is_array);
+  EXPECT_EQ(plan.routes[2].daq_list, 1U);
+  EXPECT_EQ(plan.routes[2].size, 32U);
+  EXPECT_TRUE(plan.routes[3].is_array);  // 1 元素数组不是标量
+  EXPECT_EQ(plan.routes[3].element_count, 1U);
+}
+
+TEST(MeasurementPlannerTest, ArraysRejectGenericUnknownLimitsAndOdtOverflow) {
+  FakeDb db;
+  db.symbols.emplace("array", MakeInfo(0x1000, 0, 0, 4, 8, true));
+  const auto generic = MeasurementPlanner(db, 64, AddressGranularity::Byte)
+                           .Build({"array"});
+  ASSERT_FALSE(generic.HasValue());
+  EXPECT_EQ(generic.ErrorInfo().code,
+            MeasurementErrorCode::DaqConfigurationError);
+  const auto unknown = MeasurementPlanner(
+      db, 64, AddressGranularity::Byte, 4, 4,
+      MeasurementDaqCapabilities{true, 0, 0}).Build({"array"});
+  ASSERT_FALSE(unknown.HasValue());
+  const auto max_entry = MeasurementPlanner(
+      db, 64, AddressGranularity::Byte, 4, 4,
+      MeasurementDaqCapabilities{true, 1, 16}).Build({"array"});
+  ASSERT_FALSE(max_entry.HasValue());
+  const auto odt_overflow = MeasurementPlanner(
+      db, 39, AddressGranularity::Byte, 4, 4,
+      MeasurementDaqCapabilities{true, 1, 248}).Build({"array"});
+  ASSERT_FALSE(odt_overflow.HasValue());
+  EXPECT_EQ(odt_overflow.ErrorInfo().code,
+            MeasurementErrorCode::DaqConfigurationError);
 }
 
 // ---------------------------------------------------------------------------

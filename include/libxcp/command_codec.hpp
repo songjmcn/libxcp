@@ -51,6 +51,10 @@ namespace calmcar::xcp {
 //                              MAX_SIZE_STIM@4 TIMESTAMP_MODE@5
 //                              TIMESTAMP_TICKS=WORD@6..7        xcp.h:799-805
 //       DOWNLOAD           LEN 2+n  SIZE@1 DATA 起 @2           xcp.h:578-582
+//                          **ASAM V1.5.0 Table 82：AG=DWORD 时须在
+//                          [F0][SIZE] 后插 2 字节对齐，数据起 @4；
+//                          XCPlite 无此概念（xcp.h:581 数据固定 @2），
+//                          因其 AG 恒为 BYTE，AG>2 分支不触发，两者不冲突**
 //       SHORT_DOWNLOAD     LEN 8+n  SIZE@1 EXT@3 ADDR=DWORD@4..7
 //                              DATA 起 @8                       xcp.h:597-602
 //     只可参考其 DAQ/DOWNLOAD 组：XCPlite 的 SET_MTA 是 XCP 1.4 的 8 字节
@@ -68,10 +72,17 @@ public:
     /// @brief 构造编码器
     /// @param byte_order Session 字节序（CONNECT
     /// 后确定），决定多字节字段编码方向
-    explicit CommandCodec(ByteOrder byte_order) noexcept;
+    /// @param ag 当前 Session 的地址粒度（AG）。DOWNLOAD 在 AG=DWORD 时
+    /// 必须在数据段前插入 2 字节对齐（见 EncodeDownload 的 @note），
+    /// 故编码器需持有该参数。
+    explicit CommandCodec(ByteOrder byte_order,
+                          AddressGranularity ag = AddressGranularity::Byte) noexcept;
 
     /// @brief 当前使用的字节序
     [[nodiscard]] ByteOrder GetByteOrder() const noexcept;
+
+    /// @brief 当前使用的地址粒度
+    [[nodiscard]] AddressGranularity GetAddressGranularity() const noexcept;
 
     // ---- 命令编码 ----
 
@@ -96,6 +107,41 @@ public:
     /// @return CTO: [0xFB][0x00]
     [[nodiscard]] Bytes EncodeGetCommModeInfo() const;
 
+    /**
+     * @brief 编码 GET_VERSION 命令（Level-1 命令族的 GET_VERSION 子命令）
+     * @return CTO: `[0xC0][0x00]`
+     *
+     * @par 规范依据（原始 PDF 第 114 页 Table 44「GET_VERSION command
+     *      structure」，逐字）
+     * @verbatim
+     *      Position Type Description
+     *      0        BYTE Command Code = 0xC0
+     *      1        BYTE Level 1 Command Code = 0x00
+     * @endverbatim
+     *      共 **2 字节**，无保留字节、**无长度字段**。类别
+     *      `Category Standard, optional`。
+     *
+     * @par Level-1 命令族（原始 PDF 第 106 页 §7.4 逐字）
+     *      原文："Commands are defined as "Level 0" commands and "Level 1"
+     *      commands; the first defined by a one byte command code
+     *      (0xC1..0xFF), the latter defined by a **two byte command code
+     *      starting with 0xC0**."
+     *      故 GET_VERSION 是**双字节命令码**，第二个字节是**子命令码**，
+     *      **不是参数或长度**——这一点是探测逻辑与错误码判定的基础。
+     *
+     * @par 为什么需要它
+     *      CONNECT 响应**只返回协议层主版本字节**（Table 38，原始 PDF 第 109
+     *      页；§3.1.1 原文 "The slave only returns the most significant byte"），
+     *      因此**仅凭 CONNECT 无法获得 Minor**，也无法区分 V1.3/V1.4/V1.5。
+     *      GET_VERSION 是该维度上唯一的运行时来源。
+     *
+     * @note 本命令为 optional：对端未实现时返回 `ERR_CMD_UNKNOWN(0x20)`；
+     *       认识 `0xC0` 族但不认识 `0x00` 子命令时返回
+     *       `ERR_SUBCMD_UNKNOWN(0x34)`。调用方必须把两者都视为"不可用"，
+     *       **不得**据此推定任何具体 Minor。
+     */
+    [[nodiscard]] Bytes EncodeGetVersion() const;
+
     /// @brief 编码 SET_MTA 命令（设置 Slave 隐含内存地址）
     /// @param extension 地址扩展（8 位）
     /// @param address 32 位地址，按 Session 字节序编码
@@ -109,11 +155,15 @@ public:
     /// @throws XcpException(InvalidArgument) 元素数为 0 或超过单字段 0xFF 上限
     [[nodiscard]] Bytes EncodeUpload(ElementCount number_of_elements) const;
 
-    /// @brief 编码 SHORT_UPLOAD 命令（一次命令完成定址读取，不改动 MTA）
+    /// @brief 编码 SHORT_UPLOAD 命令（一次命令完成定址读取）
     /// @param number_of_elements 要读取的元素数（以 AG 为单位），1..0xFF
     /// @param extension 地址扩展（8 位）
     /// @param address 32 位地址，按 Session 字节序编码
     /// @return CTO:
+    /// @note SHORT_UPLOAD **会**改变 Slave 的 MTA：规范规定成功后 MTA 指向
+    ///       「上传数据块之后的第一个数据字节」（原始 PDF §7.5.1.8）。
+    ///       本函数只负责编码；同步本端隐含 MTA 由
+    ///       CommandExecutor::ExecuteShortUpload 完成。
     /// [0xF4][number_of_elements][reserved][extension][addr_b0..b3]
     /// @throws XcpException(InvalidArgument) 元素数为 0 或超过单字段 0xFF 上限
     [[nodiscard]] Bytes EncodeShortUpload(ElementCount number_of_elements,
@@ -306,19 +356,37 @@ public:
                                             std::uint8_t count) const;
 
     /**
-     * @brief 编码 DOWNLOAD 命令（docs L1979-1987；Mandatory，CAL/PAG 可用时）
+     * @brief 编码 DOWNLOAD 命令（ASAM XCP V1.5.0 原始 PDF 第 142 页 Table 82；
+     *        Mandatory，CAL/PAG 可用时）
      * @param number_of_elements 本帧写入的元素数（以 AG 为单位，1..0xFF）
      * @param data 本帧数据字节
-     * @return CTO: [0xF0][number_of_elements][data...]
+     * @return CTO: [0xF0][number_of_elements][pad...][data...]
      * @throws XcpException(InvalidArgument) 元素数为 0/超 0xFF，或数据段为空
-     * @note 「数据字节数 == 元素数 × AG」与「整帧 ≤ MAX_CTO」不在此校验——
-     *       Codec 不持有 Session 参数（既有设计），这两条由 MemoryAccess
-     *       的分块编排负责（与 UPLOAD 侧同一范式，禁止两处口径不一致）。
+     * @note 对齐规则（原始 PDF 第 142 页 Table 82 原文）：对齐字节
+     *       ".. BYTEs Used for alignment, **only if AG >2**"；
+     *       首元素位置：`AG = 1: 2`、`AG > 1: AG`；且原文
+     *       "If AG = DWORD, 2 alignment bytes must be used"。
+     *       即**仅 AG=DWORD** 时在数据前插入 2 字节对齐，AG=BYTE/WORD 不插。
+     *       （注意与 UPLOAD 响应不同：Table 71 第 134 页为 "only if AG > 1"，
+     *       WORD 也要对齐——两者不对称，不得互相套用。）
+     * @note 本函数**只负责对齐字节**；「数据字节数 == 元素数 × AG」与
+     *       「整帧 ≤ MAX_CTO」仍由 MemoryAccess 的分块编排负责，且其容量口径
+     *       必须按对齐字节数扣减（见 MemoryAccess::MaxDownloadAlignmentBytes）。
      * @note MTA 由前置 SET_MTA 决定，DOWNLOAD 完成后 Slave 自动前移 MTA
-     *       （docs L1983）。
+     *       （原始 PDF 第 142 页："The MTA will be post-incremented by the
+     *       number of data elements"）。
      */
     [[nodiscard]] Bytes EncodeDownload(ElementCount number_of_elements,
                                        BytesView data) const;
+
+    /**
+     * @brief DOWNLOAD 在数据段前需要插入的对齐字节数
+     * @return AG=DWord 时返回 2，其余返回 0
+     * @note 依据原始 PDF 第 142 页 Table 82："Used for alignment, only if
+     *       AG >2"；"If AG = DWORD, 2 alignment bytes must be used"。
+     *       供 MemoryAccess 计算本帧可用元素数时扣减。
+     */
+    [[nodiscard]] std::size_t DownloadAlignmentBytes() const noexcept;
 
     /**
      * @brief 编码 SHORT_DOWNLOAD 命令（docs L2018-2026；Optional）
@@ -331,6 +399,9 @@ public:
      * @throws XcpException(InvalidArgument) 元素数为 0/超 0xFF，或数据段为空
      * @note 固定头 8 字节：MAX_CTO=8 时无处放数据（docs L2026），编排层必须
      *       在此情形下回落 SET_MTA+DOWNLOAD；AG/MAX_CTO 校验同 EncodeDownload。
+     * @note SHORT_DOWNLOAD 的数据段前**不插对齐字节**：其 CTO 头固定 8 字节，
+     *       数据自然位于 8 字节边界（8 mod 4 = 0），已满足原始 PDF 第 142 页
+     *       Table 82 的对齐要求，故 AG 不参与本函数编码。
      */
     [[nodiscard]] Bytes EncodeShortDownload(ElementCount number_of_elements,
                                             AddressExtension extension,
@@ -433,6 +504,9 @@ public:
 private:
     /// @brief 构造时确定的 Session 字节序
     ByteOrder m_byte_order_;
+
+    /// @brief 构造时确定的 Session 地址粒度（用于 DOWNLOAD 对齐）
+    AddressGranularity m_ag_;
 
     /// @brief 按 Session 字节序向缓冲区写入 16 位值
     void WriteU16(Bytes& buf, std::uint16_t val) const;

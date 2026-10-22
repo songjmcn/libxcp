@@ -334,6 +334,16 @@ void UdpTestSlave::SetDaqSimulationEnabled(bool enabled) {
     }
 }
 
+void UdpTestSlave::SetPacketAlignment(PacketAlignment alignment) {
+    // Unknown 视为非法：测试 Slave 不做"猜测对齐"的容错，
+    // 以便暴露 Master 侧的静默假定（TL V1.5 §4.3.2.2 要求显式能力声明）
+    if (alignment == PacketAlignment::Unknown) {
+        throw detail::MakeInvalidArgument(
+            "测试 Slave 的 PACKET_ALIGNMENT 不能为 Unknown");
+    }
+    m_alignment_ = alignment;
+}
+
 bool UdpTestSlave::DaqSimulationEnabled() const {
     const std::lock_guard<std::mutex> lock(m_state_mutex_);
     return m_daq_enabled_;
@@ -899,8 +909,9 @@ void UdpTestSlave::ReceiveLoop() {
         const std::uint16_t src_port = ntohs(src.sin_port);
 
         // 按 XCP 1.1：一个 Datagram 可能包含多个完整 Frame，逐个解析后依序处理
-        const auto frames = DecodeUdpDatagram(
-            BytesView{buffer.data(), static_cast<std::size_t>(received)});
+        const auto frames = DecodeUdpDatagramAligned(
+            BytesView{buffer.data(), static_cast<std::size_t>(received)},
+            m_alignment_);
         if (!frames) {
             continue;  // 畸形 Datagram：测试 Slave 直接忽略
         }
@@ -1203,7 +1214,7 @@ void UdpTestSlave::SendResponseTo(BytesView xcp_packet, const std::string& ip,
         std::memcpy(datagram.data() + kUdpHeaderSize, xcp_packet.data(),
                     xcp_packet.size());
     } else {
-        datagram = EncodeUdpFrame(xcp_packet, ctr).data;
+        datagram = EncodeUdpFrameAligned(xcp_packet, ctr, m_alignment_).data;
     }
 
     sockaddr_in dst{};
@@ -1270,7 +1281,7 @@ void UdpTestSlave::SendPackedFrames(std::span<const BytesView> xcp_packets) {
             // 每个 Frame 独立消耗一个 CTR（设计 §15.3 第 5 条）
             const auto ctr = m_send_ctr_;
             ++m_send_ctr_;
-            const auto frame = EncodeUdpFrame(packet, ctr);
+            const auto frame = EncodeUdpFrameAligned(packet, ctr, m_alignment_);
             if (datagram.size() + frame.data.size() > kUdpMaxDatagramSize) {
                 throw detail::MakeInvalidArgument(
                     "SendPackedFrames: Datagram 总长超过上限");

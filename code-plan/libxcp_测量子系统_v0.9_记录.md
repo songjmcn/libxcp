@@ -92,3 +92,7 @@
 - **单元/mock 通过 ≠ 真流正确**：notify 缺失这类并发缺陷只有真实帧率能暴露——L3 的存在意义即此。
 - 断言口径必须来自被测实然（testev=0 基），先入为主写"非零"反而制造假缺陷。
 - 测试/示例 RAII 顺序是 SDK 可用性的一部分：`SessionGuard` 模式已写入示例正文，供用户抄用。
+
+## 9. 后续依赖解耦修正
+
+本记录 §5 原第 3 项准确记录 v0.9 交付时 `measurement_demo` 依赖 `xcp_test_slave` 的状态；该耦合已由 `code-plan/measurement_demo_解耦测试Slave_实施记录.md` 后续修正：默认改用 `examples/xcp_master_udp` 定义的 `cpp_demo`，保留 `--slave` 覆盖，不再要求 `LIBXCP_BUILD_TESTS=ON`。

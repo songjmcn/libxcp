@@ -16,7 +16,7 @@
  *     A2L 不声明 symbol→event 关联，因此绑定表由调用点显式提供，缺失/多值
  *     均报 InvalidLayout，不把 adapter 的中性 event_channel=0 当成证据；
  *  4) DTO identification field 与时间戳宽度/单位/TICKS 从运行时查询读取；
- *     XCPlite 专有 4-byte RelativeByte header 与首 ODT timestamp 仅作为
+ *     XCPlite 专有 4-byte (WORD, aligned) header 与首 ODT timestamp 仅作为
  *     单独 profile 配置，不推广成通用 XCP 默认值。
  */
 
@@ -149,9 +149,9 @@ std::optional<MeasurementRuntimeProfile> QueryXcpliteProfile(
         error = "缺少 DAQ processor/resolution/event 运行时取证";
         return std::nullopt;
     }
-    // XCPlite advertises DAQ_HDR_ODT_FIL_DAQW (key-byte code 3): its
-    // four-byte vendor envelope is mapped to the decoder's RelativeByte mode.
-    // Source: thirdparty/XCPlite/src/xcp.h:384-388 and observed DTO dialect.
+    // XCPlite advertises DAQ_HDR_ODT_FIL_DAQW (key-byte code 3), whose standard
+    // meaning is (WORD, aligned) — see code-plan/XCP_V1.5_规范符合性裁决与修复方案.md
+    // §2B.2A. Source: thirdparty/XCPlite/src/xcp.h:380-388.
     if (processor->key_byte.identification_field_type != 3U) {
         error = "Slave DAQ_KEY_BYTE 未声明 XCPlite ODT_FIL_DAQW (code 3)";
         return std::nullopt;
@@ -184,11 +184,12 @@ std::optional<MeasurementRuntimeProfile> QueryXcpliteProfile(
         return std::nullopt;
     }
 
-    // XCPlite profile dialect: RelativeByte wire header is
-    // [ODTrel][0xAA][DAQ16 LE] (4 bytes), and only ODT0 carries timestamp.
-    // These two quirks are profile-specific, not inferred from generic XCP.
+    // XCPlite 申报 wire code 3，按原始 PDF 第 96 页 Figure 53 与第 183 页
+    // Table 143 的标准语义是 (WORD, aligned)：[PID(relODT)][FILL][DAQ(WORD)]
+    // 共 4 字节；XCPlite 的 FILL 恰好取 0xAA，但取值由规范留白。
+    // 仅 ODT0 携带时间戳是 profile 特例。
     return MeasurementRuntimeProfile{
-        IdentificationFieldType::RelativeByte, 4U,
+        IdentificationFieldType::RelativeWordAligned, 4U,
         kUnitNs[unit_code] * resolution->timestamp_ticks, true};
 }
 

@@ -29,6 +29,8 @@ std::string_view ErrorCategoryName(ErrorCategory cat) noexcept {
             return "RecoveryFailed";
         case ErrorCategory::OperationOutcomeUnknown:
             return "OperationOutcomeUnknown";
+        case ErrorCategory::Cancelled:
+            return "Cancelled";
     }
     return "Unknown";
 }
@@ -102,6 +104,10 @@ XcpException MakeRecoveryFailed(std::string msg, std::optional<CommandCode> cmd,
                                 int retry) {
     return XcpException(ErrorCategory::RecoveryFailed, std::move(msg), cmd,
                         std::nullopt, retry);
+}
+
+XcpException MakeCancelled(std::string msg, std::optional<CommandCode> cmd) {
+    return XcpException(ErrorCategory::Cancelled, std::move(msg), cmd);
 }
 
 }  // namespace calmcar::xcp::detail

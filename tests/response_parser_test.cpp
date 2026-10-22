@@ -210,20 +210,43 @@ TEST(ParseConnectResponse, LongerThanMinimumAccepted) {
 
 TEST(ParseGetStatusResponse, DecodesAllStatusBits) {
     const ResponseParser parser(ByteOrder::Intel);
-    // Session Status = 0xCA: bit7 RESUME, bit6 DAQ_RUNNING, bit3 CLEAR_DAQ_REQ,
-    // bit2 STORE_DAQ_REQ Protection = 0x15, STATE_NUMBER = 0x04, ConfigID =
-    // 0x1234 (Intel)
+    // Session Status = 0xCA = 1100 1010b。依据原始 PDF 第 116 页 Table 49
+    // 的逐位定义：
+    //   bit7 RESUME、bit6 DAQ_RUNNING、bit5 x、bit4 DAQ_CFG_LOST、
+    //   bit3 CLEAR_DAQ_REQ、bit2 STORE_DAQ_REQ、bit1 CAL_PAG_CFG_LOST、
+    //   bit0 STORE_CAL_REQ
+    // 故 0xCA 只置起 bit7/bit6/bit3/bit1：
+    //   RESUME=1、DAQ_RUNNING=1、CLEAR_DAQ_REQ=1、CAL_PAG_CFG_LOST=1，
+    //   而 STORE_DAQ_REQ(bit2)=0、STORE_CAL_REQ(bit0)=0。
+    // Protection = 0x15, STATE_NUMBER = 0x04, ConfigID = 0x1234 (Intel)
     const auto resp = parser.ParseGetStatusResponse(
         BytesView{BytesOf({0xCA, 0x15, 0x04, 0x34, 0x12})});
     ASSERT_TRUE(resp.has_value());
     EXPECT_TRUE(resp->resume);
     EXPECT_TRUE(resp->daq_running);
     EXPECT_TRUE(resp->clear_daq_req);
-    EXPECT_TRUE(resp->store_daq_req);
+    EXPECT_FALSE(resp->store_daq_req) << "0xCA 的 bit2 为 0";
     EXPECT_FALSE(resp->store_cal_req);
     EXPECT_EQ(resp->resource_protection, 0x15U);
     EXPECT_EQ(resp->state_number, 0x04U);
     EXPECT_EQ(resp->session_config_id, 0x1234U);
+}
+
+TEST(ParseGetStatusResponse, StoreDaqReqIsBit2PerSpec) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // 原始 PDF 第 116 页 Table 49：STORE_DAQ_REQ 为 bit2（掩码 0x04），
+    // 修正前误用 bit1（0x02，实为 CAL_PAG_CFG_LOST）。
+    const auto bit2 = parser.ParseGetStatusResponse(
+        BytesView{BytesOf({0x04, 0x00, 0x00, 0x00, 0x00})});
+    ASSERT_TRUE(bit2.has_value());
+    EXPECT_TRUE(bit2->store_daq_req) << "bit2 应置起 STORE_DAQ_REQ";
+    EXPECT_FALSE(bit2->store_cal_req);
+
+    const auto bit1 = parser.ParseGetStatusResponse(
+        BytesView{BytesOf({0x02, 0x00, 0x00, 0x00, 0x00})});
+    ASSERT_TRUE(bit1.has_value());
+    EXPECT_FALSE(bit1->store_daq_req) << "bit1 是 CAL_PAG_CFG_LOST，不是 STORE_DAQ_REQ";
+    EXPECT_FALSE(bit1->store_cal_req);
 }
 
 TEST(ParseGetStatusResponse, StoreCalReqBit0) {
@@ -589,6 +612,212 @@ TEST(ParseCalibrationResponses, GetSegmentModeReadsModeAtOffsetOne) {
     ASSERT_TRUE(running.has_value());
     EXPECT_FALSE(HasSegmentMode(running->mode, SegmentModeBit::kFreeze));
     EXPECT_FALSE(parser.ParseGetSegmentMode(BytesOf({0x00})).has_value());
+}
+
+// --------------------------------------------------------------------------
+// F-03a/F-03b/F-03c：GET_ID 响应按原始 PDF Table 60/61 的布局与位域语义
+// --------------------------------------------------------------------------
+
+/// @brief 构造 GET_ID 响应（已剥 0xFF）：[Mode][Reserved WORD][Length DWORD][Data...]
+/// @details 布局依据原始 PDF 第 123 页 Table 60。Length/Reserved 按 Intel 小端
+///          写入（ResponseParser 默认 ByteOrder::Intel）。
+Bytes MakeGetIdResponse(std::uint8_t mode, std::uint32_t length,
+                        const Bytes& data) {
+    Bytes out;
+    out.push_back(mode);
+    out.push_back(0x00);  // Reserved WORD 低字节
+    out.push_back(0x00);  // Reserved WORD 高字节
+    for (int i = 0; i < 4; ++i) {  // Length DWORD 小端
+        out.push_back(static_cast<std::uint8_t>((length >> (8 * i)) & 0xFFU));
+    }
+    out.insert(out.end(), data.begin(), data.end());
+    return out;
+}
+
+/// @brief F-03a：布局与 Table 60 逐字段一致（LENGTH 为 DWORD@3..6）
+TEST(GetIdLayout, MatchesTable60FieldForField) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const Bytes res = MakeGetIdResponse(0x00U, 0x00000010U, Bytes{});
+    const auto parsed = parser.ParseGetId(BytesView{res});
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->length, 0x10U) << "LENGTH 必须按 DWORD@3..6 读取";
+    EXPECT_EQ(parsed->transfer_mode, 0x00U);
+    EXPECT_FALSE(parsed->compressed_encrypted);
+}
+
+/// @brief F-03b：Mode 是位域——bit1 COMPRESSED_ENCRYPTED 与 bit0 TRANSFER_MODE 正交
+TEST(GetIdMode, SplitsTransferModeAndCompressedEncryptedBits) {
+    const ResponseParser parser(ByteOrder::Intel);
+    struct Case {
+        std::uint8_t raw;
+        std::uint8_t transfer;
+        bool compressed;
+    };
+    // 原始 PDF 第 124 页 Table 61：bit7..2=x，bit1=COMPRESSED_ENCRYPTED，
+    // bit0=TRANSFER_MODE。四个组合必须两两区分。
+    const Case cases[] = {
+        {0x00U, 0x00U, false}, {0x01U, 0x01U, false},
+        {0x02U, 0x00U, true},  {0x03U, 0x01U, true},
+    };
+    for (const auto& c : cases) {
+        const auto parsed =
+            parser.ParseGetId(BytesView{MakeGetIdResponse(c.raw, 0U, Bytes{})});
+        ASSERT_TRUE(parsed.has_value()) << "raw=" << int(c.raw);
+        EXPECT_EQ(parsed->raw_mode, c.raw) << "raw mode 必须保留";
+        EXPECT_EQ(parsed->transfer_mode, c.transfer)
+            << "TRANSFER_MODE 应为 bit0，raw=" << int(c.raw);
+        EXPECT_EQ(parsed->compressed_encrypted, c.compressed)
+            << "COMPRESSED_ENCRYPTED 应为 bit1，raw=" << int(c.raw);
+        EXPECT_TRUE(parsed->reserved_bits_clear) << "raw=" << int(c.raw);
+    }
+}
+
+/// @brief F-03b：保留位（bit7..2）非零须被标记，不得静默接受
+TEST(GetIdMode, FlagsNonZeroReservedBits) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto parsed =
+        parser.ParseGetId(BytesView{MakeGetIdResponse(0x04U, 0U, Bytes{})});
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_FALSE(parsed->reserved_bits_clear)
+        << "bit2 属保留位，非零时 reserved_bits_clear 应为 false";
+    EXPECT_EQ(parsed->transfer_mode, 0x00U) << "保留位不得污染 TRANSFER_MODE";
+}
+
+/// @brief F-03c：Length mod AG == 0 判定
+TEST(GetIdLength, ChecksModuloAddressGranularity) {
+    // AG=BYTE(1)：任何长度都合法。
+    const ResponseParser byte_parser(ByteOrder::Intel,
+                                     AddressGranularity::Byte);
+    EXPECT_TRUE(byte_parser.ParseGetId(BytesView{MakeGetIdResponse(0U, 7U,
+                                                                  Bytes{})})
+                    ->length_aligned_to_ag);
+
+    // AG=WORD(2)：奇数长度非法，偶数合法。
+    const ResponseParser word_parser(ByteOrder::Intel,
+                                     AddressGranularity::Word);
+    EXPECT_FALSE(word_parser.ParseGetId(BytesView{MakeGetIdResponse(0U, 7U,
+                                                                   Bytes{})})
+                     ->length_aligned_to_ag)
+        << "Length=7 不满足 mod 2 == 0";
+    EXPECT_TRUE(word_parser.ParseGetId(BytesView{MakeGetIdResponse(0U, 8U,
+                                                                  Bytes{})})
+                    ->length_aligned_to_ag);
+
+    // AG=DWORD(4)：非 4 倍数非法。
+    const ResponseParser dword_parser(ByteOrder::Intel,
+                                      AddressGranularity::DWord);
+    EXPECT_FALSE(dword_parser.ParseGetId(BytesView{MakeGetIdResponse(0U, 6U,
+                                                                    Bytes{})})
+                     ->length_aligned_to_ag)
+        << "Length=6 不满足 mod 4 == 0";
+    EXPECT_TRUE(dword_parser.ParseGetId(BytesView{MakeGetIdResponse(0U, 12U,
+                                                                   Bytes{})})
+                    ->length_aligned_to_ag);
+}
+
+/// @brief F-03c：短帧（不足 7 字节）必须返回 nullopt，不得越界读取
+TEST(GetIdLength, RejectsShortFrames) {
+    const ResponseParser parser(ByteOrder::Intel);
+    for (std::size_t n = 0; n < 7U; ++n) {
+        const Bytes short_res(n, 0x00U);
+        EXPECT_FALSE(parser.ParseGetId(BytesView{short_res}).has_value())
+            << "长度 " << n << " 的帧必须被拒绝";
+    }
+}
+
+/// @brief F-03c：Length 大于实际数据时按可用字节截取，不越界
+TEST(GetIdLength, TruncatesToAvailableDataWithoutOverread) {
+    const ResponseParser parser(ByteOrder::Intel);
+    // 上报 Length=16，但只附带 3 字节数据。
+    const auto parsed = parser.ParseGetId(BytesView{
+        MakeGetIdResponse(0x01U, 16U, Bytes{0xAA, 0xBB, 0xCC})});
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->length, 16U);
+    EXPECT_EQ(parsed->identification_data, BytesOf({0xAA, 0xBB, 0xCC}))
+        << "不得因上报长度大于实际数据而越界";
+}
+
+/// @brief F-03b：TRANSFER_MODE=1 时数据内联；=0 时无内联数据
+TEST(GetIdMode, InlineDataOnlyWhenTransferModeSet) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto inline_res = parser.ParseGetId(
+        BytesView{MakeGetIdResponse(0x01U, 2U, Bytes{0x41, 0x42})});
+    ASSERT_TRUE(inline_res.has_value());
+    EXPECT_EQ(inline_res->identification_data, BytesOf({0x41, 0x42}));
+    EXPECT_EQ(inline_res->transfer_mode, 0x01U);
+}
+
+// --------------------------------------------------------------------------
+// GET_VERSION 响应解析（批次 B1）
+// 原始 PDF 第 114 页 Table 45：
+//   [0] Reserved [1] Major PL [2] Minor PL [3] Major TL [4] Minor TL
+// 调用方拿到的 res_data 已剥掉 0xFF/0xFE 前缀，故索引从 0 起共 5 字节。
+// --------------------------------------------------------------------------
+
+TEST(GetVersionParseGolden, DecodesProtocolAndTransportIndependently) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto parsed =
+        parser.ParseGetVersionResponse(BytesOf({0x00, 0x01, 0x05, 0x01, 0x04}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->reserved, 0x00U);
+    EXPECT_EQ(parsed->protocol_major, 0x01U);
+    EXPECT_EQ(parsed->protocol_minor, 0x05U);
+    EXPECT_EQ(parsed->transport_major, 0x01U);
+    EXPECT_EQ(parsed->transport_minor, 0x04U);
+}
+
+/// @brief 非零 Reserved 必须原样保留（规范未定义其语义，不得擅改）
+TEST(GetVersionParseGolden, ReservedByteIsPreservedNotMasked) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto parsed =
+        parser.ParseGetVersionResponse(BytesOf({0xAB, 0x01, 0x03, 0x01, 0x03}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->reserved, 0xABU);
+}
+
+/// @brief 精确 5 字节为最小合法长度（边界）
+TEST(GetVersionParseBoundary, ExactlyFiveBytesIsAccepted) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto parsed =
+        parser.ParseGetVersionResponse(BytesOf({0x00, 0x01, 0x03, 0x01, 0x03}));
+    EXPECT_TRUE(parsed.has_value());
+}
+
+/// @brief 4 字节必须被拒绝（缺 Minor TL，不能靠补零猜）
+TEST(GetVersionParseBoundary, FourBytesIsRejected) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto parsed =
+        parser.ParseGetVersionResponse(BytesOf({0x00, 0x01, 0x05, 0x01}));
+    EXPECT_FALSE(parsed.has_value()) << "长度不足时必须拒绝，不得补零猜测";
+}
+
+/// @brief 空响应必须被拒绝
+TEST(GetVersionParseBoundary, EmptyResponseIsRejected) {
+    const ResponseParser parser(ByteOrder::Intel);
+    EXPECT_FALSE(parser.ParseGetVersionResponse(BytesOf({})).has_value());
+}
+
+/// @brief 超长响应只取前 5 字节字段（多出的字节不参与解析）
+TEST(GetVersionParseBoundary, ExtraBytesAreIgnored) {
+    const ResponseParser parser(ByteOrder::Intel);
+    const auto parsed = parser.ParseGetVersionResponse(
+        BytesOf({0x00, 0x01, 0x05, 0x01, 0x04, 0xDE, 0xAD}));
+    ASSERT_TRUE(parsed.has_value());
+    EXPECT_EQ(parsed->protocol_minor, 0x05U);
+    EXPECT_EQ(parsed->transport_minor, 0x04U);
+}
+
+/// @brief 全单字节字段，故大端字节序下解析结果必须一致
+TEST(GetVersionParseGolden, ParseIsByteOrderIndependent) {
+    const ResponseParser intel(ByteOrder::Intel);
+    const ResponseParser motorola(ByteOrder::Motorola);
+    const Bytes res = BytesOf({0x00, 0x01, 0x05, 0x01, 0x04});
+    const auto a = intel.ParseGetVersionResponse(res);
+    const auto b = motorola.ParseGetVersionResponse(res);
+    ASSERT_TRUE(a.has_value());
+    ASSERT_TRUE(b.has_value());
+    EXPECT_EQ(a->protocol_major, b->protocol_major);
+    EXPECT_EQ(a->transport_minor, b->transport_minor);
 }
 
 }  // namespace

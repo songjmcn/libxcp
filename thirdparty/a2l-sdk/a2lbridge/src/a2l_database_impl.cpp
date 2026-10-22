@@ -73,6 +73,75 @@ Error QueryError(ErrorCode code, std::string symbol, std::string message) {
     return e;
 }
 
+/**
+ * @brief 计算符号到最高被占用字节的可证明范围（包含末尾元素）。
+ * @param symbol 符号快照
+ * @param byte_span 输出的地址跨度
+ * @return 类型宽度、维度和步长均可证明且无溢出时返回true
+ */
+bool TryGetByteSpan(const SymbolInfo& symbol, std::uint64_t* byte_span) {
+    if (byte_span == nullptr || symbol.element_size_bytes == 0) {
+        return false;
+    }
+    std::uint64_t span = symbol.element_size_bytes;
+    for (const Dimension& dimension : symbol.dimensions) {
+        if (dimension.extent == 0 || dimension.byte_stride == 0) {
+            return false;
+        }
+        const std::uint64_t steps = dimension.extent - 1;
+        if (steps > (std::numeric_limits<std::uint64_t>::max() - span) /
+                        dimension.byte_stride) {
+            return false;
+        }
+        span += steps * dimension.byte_stride;
+    }
+    *byte_span = span;
+    return true;
+}
+
+/**
+ * @brief 按模块、可选REF名、地址扩展及完整字节范围关联唯一MEMORY_SEGMENT。
+ * @param symbol 符号
+ * @param segments 已解码的静态MEMORY_SEGMENT快照
+ * @return 唯一匹配段；无匹配或多个匹配时为空
+ */
+std::optional<MemorySegmentInfo> FindUniqueMemorySegment(
+    const SymbolInfo& symbol, const std::vector<MemorySegmentInfo>& segments) {
+    if (symbol.kind == SymbolKind::Structure) {
+        return std::nullopt;
+    }
+    std::uint64_t byte_span = 0;
+    if (!TryGetByteSpan(symbol, &byte_span) || byte_span == 0 ||
+        symbol.xcp_address >
+            std::numeric_limits<std::uint64_t>::max() - byte_span) {
+        return std::nullopt;
+    }
+    const std::uint64_t symbol_end = symbol.xcp_address + byte_span;
+    const MemorySegmentInfo* match = nullptr;
+    for (const MemorySegmentInfo& segment : segments) {
+        if (segment.module_name != symbol.module_name || segment.size == 0 ||
+            segment.address_extension != symbol.address_extension ||
+            (!symbol.ref_memory_segment.empty() &&
+             symbol.ref_memory_segment != segment.name) ||
+            segment.address >
+                std::numeric_limits<std::uint64_t>::max() - segment.size) {
+            continue;
+        }
+        const std::uint64_t segment_end = segment.address + segment.size;
+        if (symbol.xcp_address < segment.address || symbol_end > segment_end) {
+            continue;
+        }
+        if (match != nullptr) {
+            return std::nullopt;
+        }
+        match = &segment;
+    }
+    if (match == nullptr) {
+        return std::nullopt;
+    }
+    return *match;
+}
+
 }  // namespace
 
 namespace detail {
@@ -86,8 +155,10 @@ A2lDatabaseImpl::A2lDatabaseImpl(
     std::vector<liba2l::StructInfoDto> structs,
     std::unordered_map<std::string, RecordLayoutInfo> record_layouts,
     std::vector<SymbolInfo> leaf_symbols,
-    std::vector<LoadWarning> leaf_warnings) {
+    std::vector<LoadWarning> leaf_warnings,
+    std::vector<MemorySegmentInfo> memory_segments) {
     m_record_layouts_ = std::move(record_layouts);
+    m_memory_segments_ = std::move(memory_segments);
     // 批次18（16-B08）：resolver 的不可证拒绝告警并入加载告警清单
     // （同一 F6 纪律："某个事实被放弃了"必须可见）
     m_load_warnings_ = std::move(leaf_warnings);
@@ -143,6 +214,11 @@ A2lDatabaseImpl::A2lDatabaseImpl(
         ++m_bare_counts_[ToLower(leaf.name)];
         leaf_keys.insert(key);
         m_symbols_.push_back(std::move(leaf));
+    }
+    // 只有完整字节范围、MODULE、地址扩展和可选REF均唯一匹配时才附加PAGE门事实。
+    for (SymbolInfo& symbol : m_symbols_) {
+        symbol.memory_segment =
+            FindUniqueMemorySegment(symbol, m_memory_segments_);
     }
     // 稳定排序：按全限定名字典序（Search 输出顺序承诺，B-13）
     std::sort(m_symbols_.begin(), m_symbols_.end(),
@@ -289,6 +365,11 @@ Result<std::size_t> A2lDatabaseImpl::ByteSizeOf(std::string_view name) const {
         return QueryError(ErrorCode::UnsupportedDataType, std::string(name),
                           "元素宽度未知，无法计算字节数（B-3）");
     }
+    if (elements.Value() >
+        std::numeric_limits<std::uint64_t>::max() / s.element_size_bytes) {
+        return QueryError(ErrorCode::InvalidLayout, std::string(name),
+                          "元素数乘元素宽度溢出");
+    }
     const std::uint64_t bytes = elements.Value() * s.element_size_bytes;
     if (bytes > std::numeric_limits<std::size_t>::max()) {
         return QueryError(ErrorCode::InvalidLayout, std::string(name),
@@ -315,6 +396,52 @@ Result<PhysicalValue> A2lDatabaseImpl::ToPhysical(std::string_view name,
     return EvaluateToPhysical(s, raw);
 }
 
+Result<PhysicalValue> A2lDatabaseImpl::ToPhysicalElement(
+    std::string_view name, std::uint64_t element_index, BytesView raw) const {
+    Result<SymbolInfo> found = Resolve(name);
+    if (!found.HasValue()) {
+        return found.TakeError();
+    }
+    const SymbolInfo& symbol = found.Value();
+    Result<void> gate = GateExecutable(symbol, name);
+    if (!gate.HasValue()) {
+        return gate.TakeError();
+    }
+    if (symbol.kind == SymbolKind::Characteristic) {
+        if (symbol.characteristic_type == CharacteristicType::Value) {
+            if (!symbol.dimensions.empty() || element_index != 0) {
+                return QueryError(ErrorCode::UnsupportedOperation,
+                                  std::string(name), "VALUE只支持标量元素0");
+            }
+        } else if (symbol.characteristic_type != CharacteristicType::Curve ||
+                   !symbol.fixed_curve_axis.has_value()) {
+            return QueryError(ErrorCode::UnsupportedOperation,
+                              std::string(name),
+                              "仅支持VALUE标量与已验证固定轴CURVE元素");
+        }
+    } else if (symbol.kind != SymbolKind::Measurement) {
+        return QueryError(ErrorCode::UnsupportedOperation, std::string(name),
+                          "该符号类型不支持元素级数值解码");
+    }
+    Result<std::uint64_t> element_count = CountElements(symbol);
+    if (!element_count.HasValue()) {
+        return element_count.TakeError();
+    }
+    if (element_index >= element_count.Value()) {
+        return QueryError(ErrorCode::BadArgument, std::string(name),
+                          "元素索引超出已证明维度范围");
+    }
+    if (symbol.element_size_bytes == 0 ||
+        raw.size() != symbol.element_size_bytes) {
+        return QueryError(ErrorCode::RawSizeMismatch, std::string(name),
+                          "单个raw元素长度必须等于元素宽度");
+    }
+    SymbolInfo scalar = symbol;
+    scalar.dimensions.clear();
+    scalar.fixed_curve_axis.reset();
+    return EvaluateToPhysical(scalar, raw);
+}
+
 Result<Bytes> A2lDatabaseImpl::FromPhysical(std::string_view name,
                                             const PhysicalValue& value) const {
     Result<SymbolInfo> found = Resolve(name);
@@ -331,6 +458,46 @@ Result<Bytes> A2lDatabaseImpl::FromPhysical(std::string_view name,
                           "数组/多维符号不支持整体写入（首里程碑范围）");
     }
     return EvaluateFromPhysical(s, value);
+}
+
+Result<Bytes> A2lDatabaseImpl::FromPhysicalElement(
+    std::string_view name, std::uint64_t element_index,
+    const PhysicalValue& value) const {
+    Result<SymbolInfo> found = Resolve(name);
+    if (!found.HasValue()) {
+        return found.TakeError();
+    }
+    const SymbolInfo& symbol = found.Value();
+    Result<void> gate = GateExecutable(symbol, name);
+    if (!gate.HasValue()) {
+        return gate.TakeError();
+    }
+    if (symbol.kind != SymbolKind::Characteristic) {
+        return QueryError(ErrorCode::UnsupportedOperation, std::string(name),
+                          "元素级写入仅支持CHARACTERISTIC");
+    }
+    if (symbol.characteristic_type == CharacteristicType::Value) {
+        if (!symbol.dimensions.empty() || element_index != 0) {
+            return QueryError(ErrorCode::UnsupportedOperation,
+                              std::string(name), "VALUE仅支持标量元素0");
+        }
+    } else if (symbol.characteristic_type != CharacteristicType::Curve ||
+               !symbol.fixed_curve_axis.has_value()) {
+        return QueryError(ErrorCode::UnsupportedOperation, std::string(name),
+                          "元素级写入仅支持VALUE标量与已验证固定轴CURVE点");
+    }
+    Result<std::uint64_t> element_count = CountElements(symbol);
+    if (!element_count.HasValue()) {
+        return element_count.TakeError();
+    }
+    if (element_index >= element_count.Value()) {
+        return QueryError(ErrorCode::BadArgument, std::string(name),
+                          "元素索引超出已证明维度范围");
+    }
+    SymbolInfo scalar = symbol;
+    scalar.dimensions.clear();
+    scalar.fixed_curve_axis.reset();
+    return EvaluateFromPhysical(scalar, value);
 }
 
 // B-13/B-17 解析：module::name 精确；裸名须全库唯一
@@ -377,10 +544,12 @@ std::unique_ptr<A2lDatabaseImpl> MakeDatabase(
     std::vector<liba2l::StructInfoDto> structs,
     std::unordered_map<std::string, RecordLayoutInfo> record_layouts,
     std::vector<SymbolInfo> leaf_symbols,
-    std::vector<LoadWarning> leaf_warnings) {
+    std::vector<LoadWarning> leaf_warnings,
+    std::vector<MemorySegmentInfo> memory_segments) {
     auto db = std::make_unique<A2lDatabaseImpl>(
         std::move(dtos), std::move(structs), std::move(record_layouts),
-        std::move(leaf_symbols), std::move(leaf_warnings));
+        std::move(leaf_symbols), std::move(leaf_warnings),
+        std::move(memory_segments));
     db->BuildAddressIndex();
     return db;
 }

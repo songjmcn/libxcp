@@ -275,6 +275,51 @@ TEST(CommandCodecGolden, DownloadAndShortDownloadLayouts) {
         {0xED, 0x02, 0x00, 0x12, 0x00, 0x31, 0x00, 0x00, 0x34, 0x12});
 }
 
+TEST(CommandCodecGolden, DownloadAlignmentFollowsAddressGranularity) {
+    // 依据 ASAM XCP V1.5.0 原始 PDF 第 142 页 Table 82：
+    //   ".. BYTEs Used for alignment, only if AG >2"
+    //   "If AG = DWORD, 2 alignment bytes must be used"
+    // 即仅 AG=DWORD 时在 [F0][SIZE] 之后插 2 字节对齐，AG=BYTE/WORD 不插。
+    const Bytes data = BytesOf({0x11, 0x22, 0x33, 0x44});
+
+    // AG=BYTE(1)：无对齐，与修正前逐字节一致
+    ExpectBytes(CommandCodec(ByteOrder::Intel, AddressGranularity::Byte)
+                    .EncodeDownload(1, data),
+                {0xF0, 0x01, 0x11, 0x22, 0x33, 0x44});
+    // AG=WORD(2)：仍无对齐（规范是 AG >2，不是 AG >1）
+    ExpectBytes(CommandCodec(ByteOrder::Intel, AddressGranularity::Word)
+                    .EncodeDownload(1, data),
+                {0xF0, 0x01, 0x11, 0x22, 0x33, 0x44});
+    // AG=DWORD(4)：插 2 字节对齐
+    ExpectBytes(CommandCodec(ByteOrder::Intel, AddressGranularity::DWord)
+                    .EncodeDownload(1, data),
+                {0xF0, 0x01, 0x00, 0x00, 0x11, 0x22, 0x33, 0x44});
+
+    // 对齐字节数查询接口与规范一致
+    EXPECT_EQ(DownloadAlignmentBytes(AddressGranularity::Byte), 0U);
+    EXPECT_EQ(DownloadAlignmentBytes(AddressGranularity::Word), 0U);
+    EXPECT_EQ(DownloadAlignmentBytes(AddressGranularity::DWord), 2U);
+    EXPECT_EQ(CommandCodec(ByteOrder::Intel, AddressGranularity::DWord)
+                  .DownloadAlignmentBytes(),
+              2U);
+    EXPECT_EQ(CommandCodec(ByteOrder::Intel).GetAddressGranularity(),
+              AddressGranularity::Byte);
+}
+
+TEST(CommandCodecGolden, ShortDownloadNeverInsertsAlignment) {
+    // SHORT_DOWNLOAD 头固定 8 字节，数据天然 4 字节对齐，AG 不参与编码
+    const Bytes data{0x34, 0x12};
+    const auto byte_mode =
+        CommandCodec(ByteOrder::Intel, AddressGranularity::Byte)
+            .EncodeShortDownload(2, 0x12, 0x00003100, data);
+    const auto dword_mode =
+        CommandCodec(ByteOrder::Intel, AddressGranularity::DWord)
+            .EncodeShortDownload(2, 0x12, 0x00003100, data);
+    EXPECT_EQ(byte_mode, dword_mode);
+    ExpectBytes(byte_mode,
+                {0xED, 0x02, 0x00, 0x12, 0x00, 0x31, 0x00, 0x00, 0x34, 0x12});
+}
+
 TEST(CommandCodecBoundary, DownloadRejectsEmptyAndOutOfRangeElements) {
     const CommandCodec codec(ByteOrder::Intel);
     try {
@@ -455,6 +500,25 @@ TEST(CommandCodecBoundary, GetSegmentInfoRejectsOutOfRangeModeAndInfo) {
     } catch (const XcpException& e) {
         EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
     }
+}
+
+// --------------------------------------------------------------------------
+// GET_VERSION：Level-1 双字节命令码（批次 B1）
+// 原始 PDF 第 114 页 Table 44：命令为 [0xC0][0x00]。第二字节是**子命令码**，
+// 不是参数，因此不得像普通 2 字节命令那样写 reserved/长度。
+// --------------------------------------------------------------------------
+
+TEST(CommandCodecGolden, GetVersionLevel1TwoByteCommandCode) {
+    const CommandCodec codec(ByteOrder::Intel);
+    ExpectBytes(codec.EncodeGetVersion(), {0xC0, 0x00});
+}
+
+/// @brief GET_VERSION 编码不受字节序影响（两个字节都是命令码，非数值域）
+TEST(CommandCodecGolden, GetVersionIsByteOrderIndependent) {
+    const CommandCodec intel(ByteOrder::Intel);
+    const CommandCodec motorola(ByteOrder::Motorola);
+    EXPECT_EQ(intel.EncodeGetVersion(), motorola.EncodeGetVersion());
+    ExpectBytes(motorola.EncodeGetVersion(), {0xC0, 0x00});
 }
 
 }  // namespace

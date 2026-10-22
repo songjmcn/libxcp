@@ -119,7 +119,8 @@ public:
     /**
      * @brief 设定 DTO 识别字段模式（运行时取证用；须在 Prepare 前调用）
      * @param type 识别字段模式（默认 RelativeWord）
-     * @param id_field_bytes 识别字段头长（默认 2；RelativeByte 为 4）
+     * @param id_field_bytes 识别字段头长（默认 3；按规范 Figure 51/52/53：
+     *        Absolute=1，RelativeByte=2，RelativeWord=3，RelativeWordAligned=4）
      * @details 信封布局只能来自会话取证，绝不猜测（B-16）。worker 解码时
      *          按此模式 + 取证到的时间戳宽度切分识别字段（时间戳段不计入
      *          id_field_bytes，由解码器按 timestamp_size_bits 单独消费）。
@@ -139,6 +140,12 @@ public:
     void SetTimestampUnit(std::uint64_t unit_ns);
 
     /**
+     * @brief 配置 DTO 是否携带时间戳（须在 Prepare 前调用）
+     * @param enabled false 时不请求时间戳并按无时间戳布局规划/解码
+     */
+    void SetTimestampEnabled(bool enabled);
+
+    /**
      * @brief 时间戳是否只随**本事件首个 ODT 帧**出现（v0.9，XCPlite 实然 D13）
      * @param first_only true=相对模式下只有相对 ODT 为 0 的帧带时间戳段；
      *                   false（默认）=每个 DTO 帧都带（v0.2 通用口径）
@@ -148,6 +155,12 @@ public:
      *          Absolute 识别模式不受该开关影响。运行中调用抛 InvalidState。
      */
     void SetTimestampFirstOdtOnly(bool first_only);
+
+    /**
+     * @brief 注入已验证的 DAQ Entry 限制（须在 Prepare 前调用）
+     * @param capabilities 仅来自运行时 profile；默认能力不开放数组
+     */
+    void SetDaqEntryCapabilities(MeasurementDaqCapabilities capabilities);
 
     // ---- IEventListener（供 XcpMaster 回调；RX 线程只入队，不阻塞）----
     void OnEvent(const EventPacket& /*event*/) override {}   ///< EV 不处理
@@ -166,6 +179,7 @@ private:
     IMeasurementDatabase& m_database_;
     XcpMaster* m_master_{nullptr};         ///< 经 Bind 绑定（可为空）
     bool m_bound_{false};
+    bool m_prepared_{false};
 
     std::vector<std::string> m_names_;     ///< 待测变量（用户线程持有锁访问）
     mutable std::mutex m_names_mutex_;
@@ -177,11 +191,15 @@ private:
     std::uint32_t m_plan_generation_{0};   ///< Prepare 时记录的代际
     IdentificationFieldType m_id_field_type_{
         IdentificationFieldType::RelativeWord};  ///< 识别字段模式（取证可改）
-    std::size_t m_id_field_bytes_{2};            ///< 识别字段头长（不含时间戳）
+    std::size_t m_id_field_bytes_{3};  ///< 识别字段头长（不含时间戳）；
+                                       ///< RelativeWord=3（Figure 52）
     std::uint64_t m_timestamp_unit_ns_{
         0};  ///< tick→纳秒（0=未知不猜，R13；SetTimestampUnit 取证注入）
     bool m_timestamp_first_odt_only_{
         false};  ///< 时间戳只随首 ODT 帧（v0.9 D13；SetTimestampFirstOdtOnly）
+    bool m_timestamp_enabled_{true};  ///< Prepare 前配置；默认保持原有取证行为
+    MeasurementDaqCapabilities m_daq_entry_capabilities_{};  ///< 已验证的 Entry 限制
+    std::uint8_t m_first_pid_{0};     ///< Absolute 模式 START 返回的 FIRST_PID
 
     // 运行态 + 队列 + worker（Start/Stop/OnDto/回调共享锁）
     mutable std::mutex m_run_mutex_;
@@ -201,10 +219,13 @@ private:
 
     /// @brief 已规划的路由视图（Prepare 时建立；(daq_list,odt) → 有序切片规格）
     struct OdtSlice {
-        std::string name;     ///< 变量名
-        std::size_t offset{0}; ///< 净荷内偏移（相对于 envelope.payload@0）
-        std::size_t size{0};   ///< 实占字节数
+        std::string name;          ///< 变量名
+        std::size_t offset{0};     ///< 净荷内偏移（相对于 envelope.payload@0）
+        std::size_t size{0};       ///< 实占字节数
         bool needs_timestamp{false};
+        bool is_array{false};      ///< 本 Entry 是完整的一维数组
+        std::uint8_t element_count{1};
+        std::uint8_t element_size_bytes{0};
     };
     struct OdtView {
         std::uint8_t odt_number{0};

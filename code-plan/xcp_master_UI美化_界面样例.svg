@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1340" viewBox="0 0 1200 1340">
+<title>XCP Master 四层终端布局设计样例</title><desc>三个设计状态：变量预览、选中标量编辑、默认取消的写入确认。所有数据是虚构示意，不是实际设备读数。</desc>
+<style>text{font-family:ui-monospace,'SFMono-Regular','Microsoft YaHei',monospace;fill:#dce4ed;font-size:17px}.title{font-size:23px;font-weight:bold}.muted{fill:#a9b5c4}.cyan{fill:#64cdda}.yellow{fill:#f3cf77}.small{font-size:15px}.line{stroke:#526176;stroke-width:1}.panel{fill:#17212e;stroke:#526176}.sel{fill:#263f53}</style>
+<rect width="1200" height="1340" fill="#0e1520"/>
+<text x="32" y="37" class="title">XCP Master · UI 美化方案 / 设计示意，非运行截图</text>
+<text x="32" y="65" class="muted small">四层固定结构；三个视图仅替换主显示区。示例名称与数值为虚构，终端实际尺寸按字符单元计算。</text>
+<text x="32" y="104" class="title">A · 变量预览（常态）</text>
+<rect x="32" y="120" width="1136" height="355" rx="4" class="panel"/>
+<text x="50" y="148">XCP Master   UDP 127.0.0.1:5555   POLL / 50 ms   已连接 · 已停止</text>
+<text x="50" y="176" class="muted">A2L demo.a2l   MODULE ECU   预览 3 项 / 采样集合 2 项</text>
+<path d="M32 189H1168 M32 391H1168 M32 434H1168" class="line"/>
+<text x="50" y="216"><tspan class="cyan">[变量预览]</tspan>    命令结果    日志</text>
+<text x="50" y="245">搜索 [                         ]    范围 [全部候选]    Enter 应用</text>
+<text x="50" y="276" class="muted">  变量名称                类型         当前值 / 单位      采样     状态</text>
+<rect x="43" y="285" width="1114" height="29" class="sel"/>
+<text x="50" y="306" class="cyan">&gt; ECU::temperature        MEASUREMENT   23.6 degC          是       已停止</text>
+<text x="50" y="335">  ECU::counter            MEASUREMENT   128                是       已停止</text>
+<text x="50" y="364">  ECU::gain               VALUE         —                  否       未读取</text>
+<text x="50" y="419">命令 &gt; <tspan class="muted">输入 help 查看命令；watch 开始采样，stop 停止，quit 退出</tspan></text>
+<text x="50" y="460" class="small">F2 视图 | Tab 焦点 | ↑↓ 选行 | Enter 详情 | PgUp/PgDn 翻页 | F5 停止 | Esc 命令</text>
+<text x="32" y="518" class="title">B · 选中变量按 Enter → 模态详情 / 编辑弹窗</text>
+<rect x="32" y="535" width="1136" height="355" rx="4" class="panel"/>
+<text x="50" y="563">XCP Master   UDP 127.0.0.1:5555   POLL / 50 ms   已连接 · 已停止</text>
+<text x="50" y="591" class="muted">A2L demo.a2l   MODULE ECU   预览 3 项 / 采样集合 2 项</text>
+<path d="M32 604H1168 M32 806H1168 M32 849H1168" class="line"/>
+<text x="50" y="631"><tspan class="cyan">[变量预览]</tspan>    命令结果    日志</text>
+<text x="50" y="663" class="muted">  ECU::temperature                         23.6 degC</text>
+<text x="50" y="695" class="muted">  ECU::counter                             128</text>
+<text x="50" y="727" class="muted">&gt; ECU::gain                                1.000</text>
+<rect x="33" y="605" width="1134" height="200" fill="#0e1520" opacity="0.65"/>
+<rect x="160" y="615" width="880" height="180" fill="#263344" stroke="#64cdda"/>
+<text x="182" y="643" class="cyan">变量详情 · ECU::gain     VALUE / 标量     [Esc 关闭]</text>
+<text x="182" y="675">当前 1.000   目标 [ 1.250          ]   [读取]   [申请写入…]</text>
+<text x="182" y="707">采样集合：未加入   [加入采样]    写入候选，仍需运行时检查</text>
+<text x="182" y="739" class="yellow">编辑不自动写入；申请后进入确认步骤。</text>
+<text x="182" y="776" class="small">Esc 关闭并丢弃草稿，恢复原筛选、选中行、滚动位置和表格焦点。</text>
+<text x="50" y="834" class="muted">命令 &gt; （弹窗期间锁定，保留草稿；背后列表不缩小、不重排）</text>
+<text x="50" y="875" class="small">Tab 弹窗内焦点 | Enter 激活控件 | F5 停止 | Esc 关闭回列表 | F2 暂不可用</text>
+<text x="32" y="933" class="title">C · 同一弹窗进入写入确认（默认取消，取消后回详情）</text>
+<rect x="32" y="950" width="1136" height="355" rx="4" class="panel"/>
+<text x="50" y="978">XCP Master   UDP 127.0.0.1:5555   POLL / 50 ms   等待写入确认</text>
+<text x="50" y="1006" class="muted">A2L demo.a2l   MODULE ECU</text>
+<path d="M32 1019H1168 M32 1221H1168 M32 1264H1168" class="line"/>
+<rect x="170" y="1032" width="860" height="174" fill="#263344" stroke="#f3cf77"/>
+<text x="194" y="1060" class="yellow">确认写入 ECU::gain ？</text>
+<text x="194" y="1091">当前值 1.000   →   目标值 1.250</text>
+<text x="194" y="1122">A2L 可写属性不代表 ECU 授权；写入失败可能已经部分修改。</text>
+<text x="194" y="1153">确认后重新校验许可，写入完成后回读；在途命令不能撤回。</text>
+<text x="194" y="1185" class="yellow">仅 Y 确认写入 | N / Esc 取消 | F5 取消并请求停止（默认不发送）</text>
+<text x="50" y="1249" class="muted">命令 &gt; （确认期间锁定输入，保留原草稿）</text>
+<text x="50" y="1290" class="small">确认期间仅接受 Y / N / Esc / F5；Enter 不作为接受写入。</text>
+</svg>

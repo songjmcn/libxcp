@@ -33,6 +33,13 @@ enum class ErrorCategory {
     UnsupportedFeature,      ///< 本阶段未实现的功能（如 DAQ、块模式）
     RecoveryFailed,          ///< SYNCH 恢复或重试耗尽
     OperationOutcomeUnknown, ///< 命令可能已生效但响应丢失，无法确认最终结果
+
+    /// @brief 操作被调用方主动取消（F-11）
+    /// @details 由 `XcpMaster::CancelPendingOperation()`、Transport 关闭、
+    ///          Disconnect 或析构唤醒等待者时使用。**必须与 Timeout /
+    ///          ProtocolError 区分**：取消不是协议故障，也不是对端无响应，
+    ///          调用方据此判定「本次操作未被确认且已放弃」。
+    Cancelled,
 };
 
 /// @brief 将错误分类转为字符串
@@ -118,6 +125,15 @@ namespace calmcar::xcp::detail {
 
 /// @brief 构造 UnsupportedFeature 异常（本地未开放的能力，如 DAQ、块模式）
 [[nodiscard]] XcpException MakeUnsupportedFeature(std::string msg);
+
+/// @brief 构造 Cancelled 异常（F-11：操作被调用方主动取消）
+/// @param msg 错误描述
+/// @param cmd 被取消的命令码（可为空）
+/// @details 用于取消、断连、Transport 关闭与析构唤醒等待者的场合。**不得**
+///          复用 `Timeout` 或 `ProtocolError` 表达取消语义——那会让调用方
+///          把主动放弃误判为对端故障并触发不必要的恢复。
+[[nodiscard]] XcpException MakeCancelled(std::string msg,
+                                         std::optional<CommandCode> cmd);
 
 /// @brief 构造 RecoveryFailed 异常（SYNCH 恢复未获确认或重试次数用尽）
 /// @param msg 错误描述

@@ -1,0 +1,16 @@
+{
+  "cmake.useCMakePresets": "always",
+  "cmake.configurePreset": "clangd",
+  "cmake.buildPreset": "clangd",
+  "clangd.arguments": [
+        "--background-index",
+        "--compile-commands-dir=${workspaceFolder}/cmake-build-release",
+        "-j=2",
+        "--clang-tidy=false",
+        "--completion-style=detailed",
+        "--pch-storage=disk",
+        "--header-insertion=iwyu",
+        "--limit-results=50"
+    ],
+  "cmake.copyCompileCommands": "${workspaceFolder}/compile_commands.json"
+}

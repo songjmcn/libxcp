@@ -32,8 +32,12 @@ struct MeasurementSample {
     std::string name;                        ///< 待测变量名（与 A2L 符号一致）
     std::chrono::nanoseconds timestamp{};    ///< 该样本时间戳（v0.5 直传原始时间戳）
     MeasurementValue value{};                ///< 换算后的物理值
-    Bytes raw;                               ///< 解码得到的原始字节切片副本
-    bool valid = true;                       ///< 该样本换算/解码失败时为 false
+    Bytes raw;                               ///< 解码得到的原始字节切片副本；数组时为整数组
+    bool valid = true;                       ///< 任一元素换算/解码失败时整条样本为 false
+    std::string error;                       ///< 解码/换算失败原因（成功时为空）
+    bool is_array = false;                   ///< 是否为数组样本（一元素数组也为 true）
+    /// @brief 数组物理值；仅当整条数组换算成功时填充，不对外暴露部分结果
+    std::vector<MeasurementValue> elements;
 };
 
 /**

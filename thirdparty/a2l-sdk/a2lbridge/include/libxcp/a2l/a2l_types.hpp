@@ -103,6 +103,44 @@ struct Dimension {
     std::uint64_t byte_stride = 0;        ///< 该维索引增加 1 时的实际字节跨度
 };
 
+/// @brief A2L PAGE 对 XCP 的静态写访问属性（值按已核验上游枚举映射）。
+enum class XcpPageWriteAccess : std::uint8_t {
+    NotAllowed,
+    WithoutEcuOnly,
+    WithEcuOnly,
+    DontCare,
+    Unknown,
+};
+
+/// @brief 一个 XCP calibration page 的静态访问属性。
+struct MemoryPageInfo {
+    std::uint8_t number = 0;           ///< PAGE号
+    std::uint8_t ecu_access = 0;       ///< 上游原始 ECU_ACCESS 枚举值
+    std::uint8_t xcp_read_access = 0;  ///< 上游原始 XCP_READ_ACCESS 枚举值
+    XcpPageWriteAccess xcp_write_access = XcpPageWriteAccess::Unknown;
+};
+
+/// @brief A2L MEMORY_SEGMENT 与其 XCP PAG/SEGMENT 页声明。
+struct MemorySegmentInfo {
+    std::string module_name;             ///< 所属MODULE
+    std::string name;                    ///< MEMORY_SEGMENT名
+    std::uint64_t address = 0;           ///< 地址范围起点（不乘AG）
+    std::uint64_t size = 0;              ///< 字节范围长度
+    std::uint8_t address_extension = 0;  ///< 段地址扩展
+    std::uint8_t segment_number = 0;     ///< XCP SEGMENT号
+    std::uint8_t page_count = 0;         ///< XCP声明的PAGE数
+    bool has_xcp_segment = false;        ///< 是否能证明含有效XCP SEGMENT块
+    std::vector<MemoryPageInfo> pages;   ///< 已解码PAGE列表
+};
+
+/// @brief 已验证的单轴FIX_AXIS_PAR_DIST曲线轴参数。
+struct FixedCurveAxisInfo {
+    double offset = 0.0;                  ///< 第0点物理轴值
+    double distance = 0.0;                ///< 相邻点物理轴间隔
+    std::uint64_t point_count = 0;        ///< 固定轴点数
+    std::vector<double> explicit_values;  ///< 若A2L另有显式点表则保留
+};
+
 /**
  * @brief 不丢失 64-bit 整数与文本换算结果的物理值（B-14）
  * @details IDENTICAL 整数保精度用 int64/uint64；数值换算结果用 double；
@@ -177,6 +215,7 @@ struct SymbolInfo {
     std::uint8_t element_size_bytes = 0;  ///< 由显式类型映射表取得（B-3）
     std::vector<Dimension>
         dimensions;  ///< 空表示标量；首版执行标量/1D/规则连续 2D
+    std::optional<FixedCurveAxisInfo> fixed_curve_axis;  ///< 已验证的曲线固定轴
     ArrayOrder array_order = ArrayOrder::RowMajor;
     ByteOrder byte_order = ByteOrder::MsbLast;
     std::optional<std::uint32_t>
@@ -187,9 +226,18 @@ struct SymbolInfo {
     bool read_write = false;         ///< 是否可写
     ConversionInfo conversion;       ///< 换算描述
     std::string ref_memory_segment;  ///< REF_MEMORY_SEGMENT（可空）
-    bool have_limit = false;         ///< 是否声明了符号级限值
-    double lower_limit = 0.0;        ///< 符号级下限（have_limit 时有效）
-    double upper_limit = 0.0;        ///< 符号级上限（have_limit 时有效）
+    /// @brief
+    /// 唯一且完整包含该符号字节范围的静态MEMORY_SEGMENT事实；无法证明时为空。
+    std::optional<MemorySegmentInfo> memory_segment;
+    bool have_limit = false;   ///< 是否声明了符号级限值
+    double lower_limit = 0.0;  ///< 符号级下限（have_limit 时有效）
+    double upper_limit = 0.0;  ///< 符号级上限（have_limit 时有效）
+    /// @brief 逐 MEASUREMENT DAQ_EVENT fixed event 号列表
+    std::vector<std::uint16_t> daq_event_fixed;
+    /// @brief 逐 MEASUREMENT DAQ_EVENT default event 号列表
+    std::vector<std::uint16_t> daq_event_default;
+    /// @brief 逐 MEASUREMENT DAQ_EVENT available event 号列表
+    std::vector<std::uint16_t> daq_event_available;
 };
 
 // ---------------------------------------------------------------------------
