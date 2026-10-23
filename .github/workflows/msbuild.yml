@@ -1,0 +1,63 @@
+# Windows / MSBuild 持续集成（第一阶段仅 master；后续把 branches 过滤去掉即可扩展到所有分支）
+name: MSBuild
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # 静态 Boost + 动态 CRT，与项目默认 /MD 一致
+  VCPKG_TRIPLET: x64-windows-static-md
+  BUILD_TYPE: Release
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 缓存 vcpkg 已安装的 Boost
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-boost-${{ env.VCPKG_TRIPLET }}-${{ runner.os }}-v1
+
+      - name: 安装 Boost（vcpkg）
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: >
+          vcpkg install
+          boost-locale:$env:VCPKG_TRIPLET
+          boost-filesystem:$env:VCPKG_TRIPLET
+          boost-process:$env:VCPKG_TRIPLET
+          --recurse
+
+      - name: Configure
+        shell: pwsh
+        run: >
+          cmake -B build -S .
+          -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          -DLIBXCP_BUILD_TESTS=OFF
+          -DLIBXCP_BUILD_TOOLS=ON
+          -DLIBXCP_BUILD_EXAMPLES=ON
+          -DLIBXCP_ENABLE_LOG=ON
+          -DBoost_USE_STATIC_LIBS=ON
+          "-DCMAKE_PREFIX_PATH=$env:VCPKG_INSTALLATION_ROOT/installed/$env:VCPKG_TRIPLET"
+          "-DBoost_DIR=$env:VCPKG_INSTALLATION_ROOT/installed/$env:VCPKG_TRIPLET/share/boost"
+
+      # 不加 -j：VS 生成器下并行构建会在 ZERO_CHECK 解析阶段失败（见 CMakeLists.txt 头注释）
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config $env:BUILD_TYPE
