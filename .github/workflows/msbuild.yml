@@ -25,16 +25,27 @@ jobs:
         with:
           submodules: recursive
 
-      # 预编译 Boost 1.86.0（MSVC 14.3，静态库 + 动态 CRT），自带 lib/cmake/Boost-1.86.0 配置包
-      - name: 安装 Boost ${{ env.BOOST_VERSION }}
-        id: install-boost
-        uses: MarkusJx/install-boost@v2.4.5
+      # 预编译包（MarkusJx/install-boost）实测不可用：包内是 x86 且依赖符号链接，7-Zip 解压失败。
+      # 改为用官方源码包 + b2 编译 Boost 1.86.0（x64，静态库 + 动态 CRT），并缓存安装目录。
+      - name: 缓存 Boost
+        id: boost-cache
+        uses: actions/cache@v4
         with:
-          boost_version: ${{ env.BOOST_VERSION }}
-          platform_version: 2022
-          toolset: msvc
-          link: static
-          boost_install_dir: C:\boost
+          path: C:\boost
+          key: boost-${{ env.BOOST_VERSION }}-msvc-x64-static-md-v1
+
+      - name: 编译安装 Boost ${{ env.BOOST_VERSION }}
+        if: steps.boost-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ver = "${{ env.BOOST_VERSION }}"
+          $under = $ver -replace '\.', '_'
+          $zip = "$env:RUNNER_TEMP\boost.zip"
+          Invoke-WebRequest -Uri "https://archives.boost.io/release/$ver/source/boost_$under.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          Set-Location "$env:RUNNER_TEMP\boost_$under"
+          cmd /c "call `"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat`" && bootstrap.bat vc143 && b2 install --prefix=C:\boost --with-locale --with-filesystem --with-process toolset=msvc-14.3 address-model=64 variant=release link=static runtime-link=shared threading=multi -j4"
+          if ($LASTEXITCODE -ne 0) { throw "Boost 编译失败" }
 
       - name: Configure
         shell: pwsh
@@ -47,7 +58,7 @@ jobs:
           -DLIBXCP_BUILD_EXAMPLES=ON
           -DLIBXCP_ENABLE_LOG=ON
           -DBoost_USE_STATIC_LIBS=ON
-          "-DBoost_DIR=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib/cmake/Boost-${{ env.BOOST_VERSION }}"
+          "-DBoost_DIR=C:/boost/lib/cmake/Boost-${{ env.BOOST_VERSION }}"
 
       # 不加 -j：VS 生成器下并行构建会在 ZERO_CHECK 解析阶段失败（见 CMakeLists.txt 头注释）
       - name: Build
