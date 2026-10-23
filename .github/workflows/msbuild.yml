@@ -1,0 +1,66 @@
+# Windows / MSBuild 持续集成（第一阶段仅 master；后续把 branches 过滤去掉即可扩展到所有分支）
+name: MSBuild
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  BOOST_VERSION: 1.86.0
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # 预编译包（MarkusJx/install-boost）实测不可用：包内是 x86 且依赖符号链接，7-Zip 解压失败。
+      # 改为用官方源码包 + b2 编译 Boost 1.86.0（x64，静态库 + 动态 CRT），并缓存安装目录。
+      - name: 缓存 Boost
+        id: boost-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\boost
+          key: boost-${{ env.BOOST_VERSION }}-msvc-x64-static-md-v1
+
+      - name: 编译安装 Boost ${{ env.BOOST_VERSION }}
+        if: steps.boost-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ver = "${{ env.BOOST_VERSION }}"
+          $under = $ver -replace '\.', '_'
+          $zip = "$env:RUNNER_TEMP\boost.zip"
+          Invoke-WebRequest -Uri "https://archives.boost.io/release/$ver/source/boost_$under.zip" -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          Set-Location "$env:RUNNER_TEMP\boost_$under"
+          cmd /c "call `"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat`" && bootstrap.bat vc143 && b2 install --prefix=C:\boost --with-locale --with-filesystem --with-process toolset=msvc-14.3 address-model=64 variant=release link=static runtime-link=shared threading=multi -j4"
+          if ($LASTEXITCODE -ne 0) { throw "Boost 编译失败" }
+
+      - name: Configure
+        shell: pwsh
+        run: >
+          cmake -B build -S .
+          -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          -DLIBXCP_BUILD_TESTS=OFF
+          -DLIBXCP_BUILD_TOOLS=ON
+          -DLIBXCP_BUILD_EXAMPLES=ON
+          -DLIBXCP_ENABLE_LOG=ON
+          -DBoost_USE_STATIC_LIBS=ON
+          "-DBoost_DIR=C:/boost/lib/cmake/Boost-${{ env.BOOST_VERSION }}"
+
+      # 不加 -j：VS 生成器下并行构建会在 ZERO_CHECK 解析阶段失败（见 CMakeLists.txt 头注释）
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config $env:BUILD_TYPE
