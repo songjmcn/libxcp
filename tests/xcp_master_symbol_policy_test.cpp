@@ -329,4 +329,60 @@ TEST(XcpMasterSymbolPolicyTest, BoundsEightElementArrayPages) {
     EXPECT_FALSE(NextElementPageStart(128, 0, 0).has_value());
 }
 
+/// @brief 界面必须能读到 A2L 声明的限值，且不能把「未声明」渲染成 0。
+TEST(XcpMasterSymbolPolicyTest, RendersDeclaredLimitRangeText) {
+    SymbolInfo symbol;
+    symbol.kind = SymbolKind::Characteristic;
+    symbol.characteristic_type = CharacteristicType::Value;
+    symbol.element_size_bytes = 4;
+    symbol.read_write = true;
+    symbol.have_limit = true;
+    symbol.lower_limit = 0.0;
+    symbol.upper_limit = 10.0;
+
+    EXPECT_EQ(calmcar::xcp::tools::CalibrationLimitText(symbol), "0 … 10");
+
+    symbol.have_limit = false;
+    EXPECT_EQ(calmcar::xcp::tools::CalibrationLimitText(symbol),
+              "A2L 未声明限值");
+}
+
+/// @brief 越界目标值必须即时提示，口径与换算层 B-15 一致。
+TEST(XcpMasterSymbolPolicyTest, HintsTargetValueBeyondDeclaredLimit) {
+    SymbolInfo symbol;
+    symbol.kind = SymbolKind::Characteristic;
+    symbol.characteristic_type = CharacteristicType::Value;
+    symbol.element_size_bytes = 4;
+    symbol.read_write = true;
+    symbol.have_limit = true;
+    symbol.lower_limit = 0.0;
+    symbol.upper_limit = 10.0;
+
+    const auto beyond = calmcar::xcp::tools::CalibrationTargetLimitHint(
+        symbol, "20");
+    EXPECT_NE(beyond.find("超出 A2L 允许范围"), std::string::npos);
+    EXPECT_NE(beyond.find("B-15"), std::string::npos);
+
+    const auto below = calmcar::xcp::tools::CalibrationTargetLimitHint(symbol,
+                                                                     "-1");
+    EXPECT_NE(below.find("超出 A2L 允许范围"), std::string::npos);
+
+    EXPECT_TRUE(
+        calmcar::xcp::tools::CalibrationTargetLimitHint(symbol, "5").empty());
+    EXPECT_TRUE(calmcar::xcp::tools::CalibrationTargetLimitHint(symbol, "0")
+                    .empty());
+    EXPECT_TRUE(calmcar::xcp::tools::CalibrationTargetLimitHint(symbol, "10")
+                    .empty());
+    EXPECT_TRUE(calmcar::xcp::tools::CalibrationTargetLimitHint(symbol, "abc")
+                    .empty());
+    EXPECT_TRUE(calmcar::xcp::tools::CalibrationTargetLimitHint(symbol, "5x")
+                    .empty());
+    EXPECT_TRUE(calmcar::xcp::tools::CalibrationTargetLimitHint(symbol, "")
+                    .empty());
+
+    symbol.have_limit = false;
+    EXPECT_TRUE(calmcar::xcp::tools::CalibrationTargetLimitHint(symbol, "20")
+                    .empty());
+}
+
 }  // namespace

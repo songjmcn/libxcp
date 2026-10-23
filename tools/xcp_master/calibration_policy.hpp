@@ -2,10 +2,14 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <iomanip>
 #include <limits>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <string_view>
 
@@ -146,6 +150,45 @@ inline std::string EncodedScalarUnsupportedReason(
         return "编码宽度或地址粒度不兼容";
     }
     return {};
+}
+
+/**
+ * @brief 把 A2L 符号级限值渲染成可读文本。
+ * @details 未声明限值时返回明确说明，避免界面把「未声明」误读成「0」而误判
+ *          为「什么都不能写」。
+ * @param symbol 目标 A2L 符号。
+ * @return 形如 `0 … 10` 的范围文本；未声明限值时返回「A2L 未声明限值」。
+ */
+inline std::string CalibrationLimitText(const a2l::SymbolInfo& symbol) {
+    if (!symbol.have_limit) return "A2L 未声明限值";
+    std::ostringstream out;
+    out << std::setprecision(12) << symbol.lower_limit << " … "
+        << symbol.upper_limit;
+    return out.str();
+}
+
+/**
+ * @brief 提示目标物理值已越出 A2L 符号限值（B-15）。
+ * @details 判定口径与 A2L 换算层一致：只在符号声明了限值、并且目标文本可解析
+ *          为有限数值时比较；文本型（TAB_VERB）与非法输入不产生提示，交由写入
+ *          路径给出权威结论。
+ * @param symbol 目标 A2L 符号。
+ * @param target_text 界面上输入的目标物理值文本。
+ * @return 越界提示文本；未越界或无法判定时返回空字符串。
+ */
+inline std::string CalibrationTargetLimitHint(const a2l::SymbolInfo& symbol,
+                                              std::string_view target_text) {
+    if (!symbol.have_limit || target_text.empty()) return {};
+    const std::string text{target_text};
+    char* end = nullptr;
+    const double value = std::strtod(text.c_str(), &end);
+    if (end == text.c_str() || *end != '\0' || !std::isfinite(value)) return {};
+    if (value >= symbol.lower_limit && value <= symbol.upper_limit) return {};
+    std::ostringstream out;
+    out << "目标值 " << std::setprecision(12) << value << " 超出 A2L 允许范围（"
+        << symbol.lower_limit << " … " << symbol.upper_limit
+        << "），写入会被拒绝（B-15）";
+    return out.str();
 }
 
 }  // namespace calmcar::xcp::tools

@@ -102,15 +102,27 @@ PL/TL 的 reported/effective、被降级能力），建链后再打印
 "多帧挤在一次 write"，覆盖等价路径，且结论有源码级依据。**这是可复现性优先的选择，
 不是能力缺失。**
 
-### 3.3 计划假设的正误更正（重要）
+### 3.3 计划假设的正误更正（**本节结论已二次更正，以新结论为准**）
 
 计划 §8.2 第 2 条写"GET_VERSION 预期 unavailable/`ERR_CMD_UNKNOWN`，随后依据
-显式或 A2L 证据解析为 PL1.2/TL1.4"。**实测与该假设相反**：
+显式或 A2L 证据解析为 PL1.2/TL1.4"。
 
-- XCPlite V1.2 的 TCP 服务**实现了 GET_VERSION**，`ProbeVersion()` 返回
-  `GetVersionOutcome::Available`，响应里 PL/TL major 均为 1；
-- 因此本期**不需要**为 XCPlite 链起"版本未知 → 降级解析"的兜底路径，
-  显式 `--protocol-version/--transport-version` 与 A2L 证据只是**交叉验证**用途。
+**本条初次给出的"实测与该假设相反"是错误结论，现更正为：计划假设正确。**
+
+- 误判根因：B-T5 的互操作对手端 `tests/xcp_test_slave` 链接的是
+  `thirdparty/XCPlite`（**V2.2.2**），它实现了 GET_VERSION，
+  `ProbeVersion()` 返回 `GetVersionOutcome::Available`。当时的结论把 **V2.2** 的
+  行为记成了 **V1.2** 的行为。
+- 真实 V1.2 行为（源码 + 实测双重确认）：
+  - `thirdparty/XCPliteV1.2/src/xcpLite.c:3274` 起，GET_VERSION 分支被
+    `#if XCP_PROTOCOL_LAYER_VERSION >= 0x0104` 排除；V1.2 的 PL 为 `0x0102`
+    （`src/xcp_cfg.h:28`），故 `0xC0` 落入 `default: error(CRC_CMD_UNKNOWN)`。
+  - 用 `examples/xcp_slave_demo_v12`（PL 1.2 / TL 1.4）实测：主站收到
+    `ERR_CMD_UNKNOWN`，`GetVersionProbe.outcome=1`（不可用），会话仍建立成功，
+    `conservative=1`、生效 PL=`1.2`，DISCONNECT 正常。
+- 因此 `XcpliteTcpInteropTest.GetVersionOverTcp` 只证明 **V2.2** 的 Available 路径；
+  V1.2 的 unavailable → 依赖显式/A2L 证据的降级路径由 `examples/xcp_slave_demo_v12`
+  联调覆盖（见 `code-plan/XCPliteV1.2_Slave测试程序_实施记录.md`）。
 
 计划文本保留原样（不追改历史计划），以本节为权威更正。
 

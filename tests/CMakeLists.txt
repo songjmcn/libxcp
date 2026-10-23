@@ -374,3 +374,21 @@ if(LIBXCP_ENABLE_LOG)
                    "-DTEST_ROOT=${LIBXCP_LOG_TEST_ROOT}"
                    -P "${CMAKE_CURRENT_SOURCE_DIR}/logging_behavior_test.cmake")
 endif()
+
+# XCPlite V1.2 从站示例的模型层单测（计划 §8：只做模型层，端到端靠手工联调）。
+# 目标刻意**只编译** examples/xcp_slave_demo_v12/slave_model.cpp，不链接
+# xcplite_v12，也不链接 libxcp，避免与 XcpliteIntegration 已链接的 V2.2 xcplite
+# 产生同名符号冲突。
+add_executable(XcpSlaveV12ModelTest
+        xcp_slave_demo_v12_model_test.cpp
+        ${PROJECT_SOURCE_DIR}/examples/xcp_slave_demo_v12/slave_model.cpp)
+target_compile_features(XcpSlaveV12ModelTest PRIVATE cxx_std_20)
+target_include_directories(XcpSlaveV12ModelTest PRIVATE
+        ${PROJECT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR}/examples/xcp_slave_demo_v12)
+target_link_libraries(XcpSlaveV12ModelTest PRIVATE
+        GTest::gtest libxcp_test_main)
+if(MSVC)
+  target_compile_options(XcpSlaveV12ModelTest PRIVATE /utf-8)
+endif()
+gtest_discover_tests(XcpSlaveV12ModelTest DISCOVERY_TIMEOUT 60)

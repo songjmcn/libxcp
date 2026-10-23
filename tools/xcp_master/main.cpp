@@ -589,26 +589,56 @@ public:
                 const auto write_status = write_reason.empty()
                                               ? "满足候选条件；仍需明确确认"
                                               : "拒绝：" + write_reason;
-                return vbox(
-                           {text("独立标定流程 · " + name + "    [Esc 返回]") |
-                                bold | color(Color::Yellow),
-                            separator(),
-                            text("类别：" + KindName(symbol) + " | 基础类型：" +
-                                 description.base_type),
-                            text("形态：" + description.data_shape +
-                                 " | 单元素宽度：" + description.element_width),
-                            text("当前值：" + calibration_form_.current),
-                            text("读取状态：" + read_reason),
-                            text("写入资格：" + write_status),
-                            calibration_element_index_control->Render(),
-                            target_control->Render(),
-                            hbox({calibration_read_control->Render(),
-                                  text("  "), write_control->Render(),
-                                  text("  "),
-                                  close_calibration_button->Render()}),
-                            text("标定值只在确认页按 Y 后发送；N/Esc 取消。") |
-                                color(Color::Yellow)}) |
-                       border |
+                // 标定表单的当前值/状态由工作线程在 output_mutex_ 保护下更新，
+                // 渲染必须取快照，避免读到正在被改写的 std::string。
+                std::string form_current;
+                std::string form_status;
+                std::string form_target;
+                {
+                    std::lock_guard lock(output_mutex_);
+                    form_current = calibration_form_.current;
+                    form_status = calibration_form_.status;
+                    form_target = calibration_form_.target;
+                }
+                // 行数随状态变化：越界提示只在需要时插入，避免空白占位行。
+                std::vector<Element> lines;
+                lines.push_back(text("独立标定流程 · " + name +
+                                     "    [Esc 返回]") |
+                                bold | color(Color::Yellow));
+                lines.push_back(separator());
+                lines.push_back(text("类别：" + KindName(symbol) +
+                                     " | 基础类型：" + description.base_type));
+                lines.push_back(text("形态：" + description.data_shape +
+                                     " | 单元素宽度：" +
+                                     description.element_width));
+                lines.push_back(text("当前值：" + form_current));
+                lines.push_back(
+                    text("允许范围：" +
+                         calmcar::xcp::tools::CalibrationLimitText(symbol)));
+                // 目标值一旦越出 A2L 限值就即时提示（B-15）：此前越界只会
+                // 在按下「申请写入」后写进主界面面板，而模态窗口正遮住它。
+                const auto limit_hint =
+                    calmcar::xcp::tools::CalibrationTargetLimitHint(
+                        symbol, form_target);
+                if (!limit_hint.empty())
+                    lines.push_back(text(limit_hint) | color(Color::Red));
+                lines.push_back(text("状态：" + form_status) |
+                                color(Color::Cyan));
+                lines.push_back(
+                    text("读取策略：" + (read_reason.empty()
+                                             ? "可用"
+                                             : "拒绝：" + read_reason)));
+                lines.push_back(text("写入资格：" + write_status));
+                lines.push_back(calibration_element_index_control->Render());
+                lines.push_back(target_control->Render());
+                lines.push_back(
+                    hbox({calibration_read_control->Render(), text("  "),
+                          write_control->Render(), text("  "),
+                          close_calibration_button->Render()}));
+                lines.push_back(
+                    text("标定值只在确认页按 Y 后发送；N/Esc 取消。") |
+                    color(Color::Yellow));
+                return vbox(std::move(lines)) | border |
                        size(WIDTH, LESS_THAN, std::max(1, layout.modal_width)) |
                        size(HEIGHT, LESS_THAN,
                             std::max(1, layout.modal_height));
@@ -1613,6 +1643,21 @@ private:
             calibration_form_.Apply(selection, status, std::move(current)));
     }
 
+    /**
+     * @brief 直接改写标定表单的状态行（界面线程的本地拒绝反馈）。
+     * @details 用于「还没进入异步命令」就被拒绝的分支：这些分支没有业务结果，
+     *          无法走 UpdateCalibrationState，而 Say 写的是被模态窗口遮挡的
+     *          主面板，因此必须显式更新表单状态并触发重绘。
+     * @param status 要展示给用户的状态文本。
+     */
+    void SetCalibrationFormStatus(const std::string& status) {
+        {
+            std::lock_guard lock(output_mutex_);
+            calibration_form_.status = status;
+        }
+        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
+    }
+
     /** @brief 判断详情对象是否需要0基元素索引输入。 */
     bool RequiresElementIndex(const SymbolInfo& symbol) const {
         return !symbol.dimensions.empty() ||
@@ -1689,9 +1734,13 @@ private:
 
     /** @brief 将详情弹窗中的目标值交给既有预读/确认/回写路径。 */
     void SubmitCalibrationWrite() {
-        if (!modal_symbol_info_.has_value()) return;
+        if (!modal_symbol_info_.has_value()) {
+            SetCalibrationFormStatus("尚未选择变量；请先在列表中选中对象");
+            return;
+        }
         const std::string reason = ModalWriteUnsupportedReason();
         if (!reason.empty()) {
+            SetCalibrationFormStatus("拒绝写入：" + reason);
             Say("该变量不允许写入: " + reason);
             return;
         }
@@ -1710,6 +1759,7 @@ private:
         }
         if (selection.name.empty() || target.empty() ||
             selection.name != QualifiedName(*modal_symbol_info_)) {
+            SetCalibrationFormStatus("请选择有效标量VALUE或曲线点，并填写目标物理值");
             Say("请选择有效标量VALUE或曲线点，并填写目标物理值。");
             return;
         }
@@ -2449,8 +2499,12 @@ private:
                                                 *element_index, target)
                 : database_.FromPhysical(QualifiedName(symbol), target);
         if (!encoded.HasValue()) {
+            // 把换算层的真实原因（如越出 A2L 限值 B-15）一并写进状态行，
+            // 否则界面只剩一句「无法换算或编码」，用户无从判断该改什么。
             if (from_calibration_view)
-                UpdateCalibrationState(*selection, "目标值无法换算或编码");
+                UpdateCalibrationState(*selection,
+                                       "目标值不可编码：" +
+                                           encoded.ErrorInfo().message);
             Say("目标值不可编码: " + encoded.ErrorInfo().message);
             return;
         }

@@ -710,12 +710,20 @@ B-T4 可在 B-T2 后并行准备，但合并时必须先解决 DTO ABI、版本�
 按 §12 第 8 条隐含要求，实施期间与本计划不一致之处在此登记（计划正文保留原文，
 以本节为权威更正）。
 
-1. **§8.2 GET_VERSION 假设不成立**。原文写"GET_VERSION 预期
-   unavailable/`ERR_CMD_UNKNOWN`，随后依据显式或 A2L 证据解析为 PL1.2/TL1.4"。
-   实测 `thirdparty/XCPliteV1.2` 的 TCP 服务**实现了** GET_VERSION，
-   `ProbeVersion()` 返回 `GetVersionOutcome::Available`，PL/TL major 均为 1。
-   因此 B-T5 不需要"版本未知 → 降级解析"的兜底路径，显式版本与 A2L 证据仅作
-   交叉验证。对应测试：`XcpliteTcpInteropTest.GetVersionOverTcp`。
+1. **§8.2 GET_VERSION 假设成立（本条曾被误判为"不成立"，已更正）**。原文写
+   "GET_VERSION 预期 unavailable/`ERR_CMD_UNKNOWN`，随后依据显式或 A2L 证据解析为
+   PL1.2/TL1.4"——**原文正确**。
+   - 误判来源：B-T5 的互操作对手端 `tests/xcp_test_slave` 链接的是
+     `thirdparty/XCPlite`（**V2.2.2**），它实现了 GET_VERSION，
+     `ProbeVersion()` 返回 `GetVersionOutcome::Available`，于是被误当作 V1.2 的行为。
+   - 真实 V1.2（PL `0x0102`）的 GET_VERSION 分支被
+     `thirdparty/XCPliteV1.2/src/xcpLite.c:3274` 的
+     `#if XCP_PROTOCOL_LAYER_VERSION >= 0x0104` 排除，命令码 `0xC0` 落入
+     `default: error(CRC_CMD_UNKNOWN)`；用 `examples/xcp_slave_demo_v12` 实测确认
+     主站收到 `ERR_CMD_UNKNOWN`（`outcome=1`），而会话仍正常建立
+     （`conservative=1`，生效 PL=1.2，DISCONNECT 正常）。
+   - 结论：`XcpliteTcpInteropTest.GetVersionOverTcp` 验证的是 **V2.2** 的 Available
+     路径；V1.2 的 unavailable 降级路径由 `examples/xcp_slave_demo_v12` 联调覆盖。
 2. **§8.2 第 7、8 条用故障注入替代真实进程**。"CRM/DTO 共用 CTR + 队列 lost
    只告警""多 DTO 单次 send / 任意 recv 分片"在真实 XCPlite 上无法确定性触发，
    改由 `tests/tcp_test_slave.cpp` 的注入点覆盖，并用源码复核
