@@ -13,9 +13,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # 静态 Boost + 动态 CRT，与项目默认 /MD 一致
-  VCPKG_TRIPLET: x64-windows-static-md
   BUILD_TYPE: Release
+  BOOST_VERSION: 1.86.0
 
 jobs:
   build-windows:
@@ -26,22 +25,16 @@ jobs:
         with:
           submodules: recursive
 
-      - name: 缓存 vcpkg 已安装的 Boost
-        id: vcpkg-cache
-        uses: actions/cache@v4
+      # 预编译 Boost 1.86.0（MSVC 14.3，静态库 + 动态 CRT），自带 lib/cmake/Boost-1.86.0 配置包
+      - name: 安装 Boost ${{ env.BOOST_VERSION }}
+        id: install-boost
+        uses: MarkusJx/install-boost@v2.4.5
         with:
-          path: C:\vcpkg\installed
-          key: vcpkg-boost-${{ env.VCPKG_TRIPLET }}-${{ runner.os }}-v1
-
-      - name: 安装 Boost（vcpkg）
-        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-        shell: pwsh
-        run: >
-          vcpkg install
-          boost-locale:$env:VCPKG_TRIPLET
-          boost-filesystem:$env:VCPKG_TRIPLET
-          boost-process:$env:VCPKG_TRIPLET
-          --recurse
+          boost_version: ${{ env.BOOST_VERSION }}
+          platform_version: 2022
+          toolset: msvc
+          link: static
+          boost_install_dir: C:\boost
 
       - name: Configure
         shell: pwsh
@@ -54,8 +47,7 @@ jobs:
           -DLIBXCP_BUILD_EXAMPLES=ON
           -DLIBXCP_ENABLE_LOG=ON
           -DBoost_USE_STATIC_LIBS=ON
-          "-DCMAKE_PREFIX_PATH=$env:VCPKG_INSTALLATION_ROOT/installed/$env:VCPKG_TRIPLET"
-          "-DBoost_DIR=$env:VCPKG_INSTALLATION_ROOT/installed/$env:VCPKG_TRIPLET/share/boost"
+          "-DBoost_DIR=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib/cmake/Boost-${{ env.BOOST_VERSION }}"
 
       # 不加 -j：VS 生成器下并行构建会在 ZERO_CHECK 解析阶段失败（见 CMakeLists.txt 头注释）
       - name: Build
