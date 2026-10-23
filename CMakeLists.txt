@@ -154,6 +154,10 @@ target_sources(libxcp PRIVATE
         src/response_parser.cpp
         src/session.cpp
         src/udp_header_codec.cpp
+        src/ethernet_header_codec.cpp
+        src/tcp_stream_decoder.cpp
+        src/socket_util.cpp
+        src/tcp_transport.cpp
         src/udp_transport.cpp
         src/link_budget.cpp
         src/command_executor.cpp

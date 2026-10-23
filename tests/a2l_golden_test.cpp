@@ -787,6 +787,220 @@ TEST_F(A2lGoldenTest, UdpEndpointAndProtocolLayer) {
     EXPECT_EQ(mx->transports[0].sub_commands[1], 0xFC);
 }
 
+// ============================================================================
+// B-T4（ABI v9）：XCPonTCP/IP 端点事实
+//
+// 本用例锁定 B-T4 修掉的两个真实缺陷：
+//   1) 桥接层曾无条件把 `dto.udp_host/udp_port` 赋给**所有**传输层类别，
+//      于是 TCP 端点的主机/端口只能借 UDP 命名的字段对外表达（语义错位，
+//      且 port/host 只是"碰巧"还能读到）。
+//   2) `packet_alignment`/`sub_commands` 曾**只对 UdpIp 填充**，TCP 端点
+//      拿不到这两个事实（规范 ASAM AE MCD-1 XCP on Ethernet 对两类传输层
+//      都定义了 PACKET_ALIGNMENT 与 OPTIONAL_TL_SUBCMD）。
+// 另锁定 v9 新增的 `packet_alignment_declared`（区分"A2L 写了 8bit"与
+// "A2L 根本没写"——上游对未识别字面量静默降级，二者在数值上都是 8）。
+// ============================================================================
+TEST_F(A2lGoldenTest, TcpEndpointFactsFromA2l) {
+    // 运行时写入一个 TCP 样本：不污染黄金脚本，也不依赖 fixture 生成器。
+    // 传输层段版本取 0x0104（真实 XCPlite TCP 样本的 TL 版本），与
+    // PROTOCOL_LAYER 的 0x0100 刻意不同，用于证明两者不被互相冒充。
+    const std::string path = Golden("scratch_tcp_endpoint.a2l");
+    {
+        std::ofstream out(path, std::ios::binary);
+        ASSERT_TRUE(out.good()) << "无法写入临时 A2L: " << path;
+        out << "ASAP2_VERSION 1 61\n"
+               "\n"
+               "/begin PROJECT TcpProj \"tcp endpoint\"\n"
+               "\n"
+               "  /begin MODULE TCP_ECU \"tcp module\"\n"
+               "\n"
+               "    /begin MOD_COMMON \"smoke\"\n"
+               "      BYTE_ORDER MSB_LAST\n"
+               "      DEPOSIT ABSOLUTE\n"
+               "      ALIGNMENT_BYTE 1\n"
+               "      ALIGNMENT_WORD 1\n"
+               "      ALIGNMENT_LONG 1\n"
+               "    /end MOD_COMMON\n"
+               "\n"
+               "    /begin COMPU_METHOD CM_IDENT \"identity\" IDENTICAL "
+               "\"%6.2\" \"\"\n"
+               "    /end COMPU_METHOD\n"
+               "\n"
+               "    /begin MEASUREMENT M_BYTE \"byte\" UBYTE CM_IDENT 0 0 0 "
+               "255\n"
+               "      BYTE_ORDER MSB_LAST\n"
+               "      ECU_ADDRESS 0x8010\n"
+               "    /end MEASUREMENT\n"
+               "\n"
+               "    /begin IF_DATA XCP\n"
+               "      /begin PROTOCOL_LAYER 0x100 1 1 5 5 5 1 1 0x10 0x400 "
+               "BYTE_ORDER_MSB_LAST ADDRESS_GRANULARITY_BYTE "
+               "/end PROTOCOL_LAYER\n"
+               "      /begin XCP_ON_TCP_IP 0x104 0x15B7\n"
+               "        HOST_NAME \"tcp.example\"\n"
+               "        PACKET_ALIGNMENT PACKET_ALIGNMENT_32\n"
+               "        OPTIONAL_TL_SUBCMD GET_SLAVE_ID\n"
+               "        OPTIONAL_TL_SUBCMD SET_SLAVE_IP_ADDRESS\n"
+               "      /end XCP_ON_TCP_IP\n"
+               "    /end IF_DATA\n"
+               "\n"
+               "  /end MODULE\n"
+               "/end PROJECT\n";
+    }
+
+    auto b = LoadOk(path);
+    ASSERT_NE(b, nullptr);
+    const IfDataXcpInfo* xcp = b->XcpInfo();
+    ASSERT_NE(xcp, nullptr);
+
+    // 传输层类别必须是 TcpIp（曾经即使识别为 TcpIp，字段也取不到东西）
+    ASSERT_EQ(xcp->transports.size(), 1u);
+    const TransportEndpoint& ep = xcp->transports[0];
+    EXPECT_EQ(ep.kind, TransportEndpoint::Kind::TcpIp);
+
+    // 缺陷 1 回归：TCP 端点的主机/端口必须真的读得到
+    EXPECT_EQ(ep.remote_port, 0x15B7);
+    EXPECT_EQ(ep.remote_host, "tcp.example");
+
+    // 缺陷 2 回归：TCP 端点同样要有 alignment 与子命令
+    EXPECT_EQ(ep.packet_alignment, 32);
+    EXPECT_TRUE(ep.packet_alignment_declared)
+        << "A2L 显式写了 PACKET_ALIGNMENT_32，声明位必须为真";
+    ASSERT_EQ(ep.sub_commands.size(), 2u);
+    EXPECT_EQ(ep.sub_commands[0], 0xFF);  // GET_SLAVE_ID
+    EXPECT_EQ(ep.sub_commands[1], 0xFC);  // SET_SLAVE_IP_ADDRESS
+
+    // 版本证据：Transport Layer 版本（0x0104）与 Protocol Layer 版本（0x0100）
+    // 是两个独立事实，端点段版本必须取前者
+    EXPECT_EQ(ep.version, 0x0104);
+    EXPECT_EQ(xcp->protocol_layer.version, 0x0100);
+
+    // 单实例：计数用于让消费方察觉"多实例时首个可能不是目标"
+    EXPECT_EQ(ep.instance_count, 1u);
+}
+
+TEST_F(A2lGoldenTest, AlignmentDeclaredFlagDistinguishesOmitted) {
+    // golden_basic 的 IF_DATA 里**没有** PACKET_ALIGNMENT 关键字。
+    // 上游对未声明保持默认 8 bit，故 packet_alignment 仍读 8——但
+    // packet_alignment_declared 必须为 false，否则消费方会把 AML 默认值
+    // 当作 ECU 实际对齐的事实（计划 §7.2 明令禁止据此推断 Wire Profile）。
+    auto b = LoadOk(Golden("golden_basic.a2l"));
+    ASSERT_NE(b, nullptr);
+    const IfDataXcpInfo* xcp = b->XcpInfo();
+    ASSERT_NE(xcp, nullptr);
+    ASSERT_EQ(xcp->transports.size(), 1u);
+    EXPECT_EQ(xcp->transports[0].packet_alignment, 8);
+    EXPECT_FALSE(xcp->transports[0].packet_alignment_declared)
+        << "A2L 未声明 PACKET_ALIGNMENT 时不得置声明位";
+
+    // 反例对照：golden_mask 显式声明了 32 bit
+    auto bm = LoadOk(Golden("golden_mask.a2l"));
+    ASSERT_NE(bm, nullptr);
+    const IfDataXcpInfo* mx = bm->XcpInfo();
+    ASSERT_NE(mx, nullptr);
+    ASSERT_EQ(mx->transports.size(), 1u);
+    EXPECT_EQ(mx->transports[0].packet_alignment, 32);
+    EXPECT_TRUE(mx->transports[0].packet_alignment_declared);
+}
+
+TEST_F(A2lGoldenTest, TcpEndpointConflictsAreReported) {
+    // B-T4：XCP 与 XCPplus 双块并存时，端点差异必须被报告。
+    // 修复前 DiffIfData 只比对 `udp_*`，而 SDK 从不给 TCP 端点填这四个字段，
+    // 于是**两个 TCP 端点的端口/主机差异全部漏报**（两侧皆空 → 判"无差异"）。
+    // 改用统一的 `endpoint_*` 后，TCP 端点差异应出现在 plus_conflicts 中。
+    const std::string path = Golden("scratch_tcp_plus.a2l");
+    {
+        std::ofstream out(path, std::ios::binary);
+        ASSERT_TRUE(out.good()) << "无法写入临时 A2L: " << path;
+        out << "ASAP2_VERSION 1 61\n"
+               "\n"
+               "/begin PROJECT TcpPlusProj \"tcp xcpplus\"\n"
+               "\n"
+               "  /begin MODULE TCP_PLUS_ECU \"tcp plus\"\n"
+               "\n"
+               "    /begin MOD_COMMON \"smoke\"\n"
+               "      BYTE_ORDER MSB_LAST\n"
+               "      DEPOSIT ABSOLUTE\n"
+               "      ALIGNMENT_BYTE 1\n"
+               "      ALIGNMENT_WORD 1\n"
+               "      ALIGNMENT_LONG 1\n"
+               "    /end MOD_COMMON\n"
+               "\n"
+               "    /begin COMPU_METHOD CM_IDENT \"identity\" IDENTICAL "
+               "\"%6.2\" \"\"\n"
+               "    /end COMPU_METHOD\n"
+               "\n"
+               "    /begin MEASUREMENT M_BYTE \"byte\" UBYTE CM_IDENT 0 0 0 "
+               "255\n"
+               "      BYTE_ORDER MSB_LAST\n"
+               "      ECU_ADDRESS 0x8010\n"
+               "    /end MEASUREMENT\n"
+               "\n"
+               "    /begin IF_DATA XCP\n"
+               "      /begin PROTOCOL_LAYER 0x100 1 1 5 5 5 1 1 0x10 0x400 "
+               "BYTE_ORDER_MSB_LAST ADDRESS_GRANULARITY_BYTE "
+               "/end PROTOCOL_LAYER\n"
+               "      /begin XCP_ON_TCP_IP 0x104 0x1000\n"
+               "        HOST_NAME \"a.example\"\n"
+               "        PACKET_ALIGNMENT PACKET_ALIGNMENT_8\n"
+               "      /end XCP_ON_TCP_IP\n"
+               "    /end IF_DATA\n"
+               "\n"
+               "    /begin IF_DATA XCPplus 11\n"
+               "      /begin PROTOCOL_LAYER 0x100 1 1 5 5 5 1 1 0x10 0x400 "
+               "BYTE_ORDER_MSB_LAST ADDRESS_GRANULARITY_BYTE "
+               "/end PROTOCOL_LAYER\n"
+               "      /begin XCP_ON_TCP_IP 0x104 0x2000\n"
+               "        HOST_NAME \"b.example\"\n"
+               "        PACKET_ALIGNMENT PACKET_ALIGNMENT_32\n"
+               "      /end XCP_ON_TCP_IP\n"
+               "    /end IF_DATA\n"
+               "\n"
+               "  /end MODULE\n"
+               "/end PROJECT\n";
+    }
+
+    auto b = LoadOk(path);
+    ASSERT_NE(b, nullptr);
+    const IfDataXcpInfo* xcp = b->XcpInfo();
+    ASSERT_NE(xcp, nullptr);
+    EXPECT_TRUE(xcp->from_xcp_plus);
+
+    // 逐项确认三处端点差异都被报告（顺序即 DiffIfData 的比对顺序）
+    const auto find_conflict =
+        [xcp](const std::string& key) -> const XcpPlusConflict* {
+        for (const auto& c : xcp->plus_conflicts) {
+            if (c.parameter == key) {
+                return &c;
+            }
+        }
+        return nullptr;
+    };
+
+    const XcpPlusConflict* port = find_conflict("ENDPOINT_PORT");
+    ASSERT_NE(port, nullptr)
+        << "TCP 端点的端口差异未被报告（DiffIfData 仍只看 udp_*？）";
+    EXPECT_EQ(port->xcp_value, std::to_string(0x1000));
+    EXPECT_EQ(port->xcpplus_value, std::to_string(0x2000));
+
+    const XcpPlusConflict* host = find_conflict("ENDPOINT_HOST");
+    ASSERT_NE(host, nullptr) << "TCP 端点的主机差异未被报告";
+    EXPECT_EQ(host->xcp_value, "a.example");
+    EXPECT_EQ(host->xcpplus_value, "b.example");
+
+    const XcpPlusConflict* align = find_conflict("PACKET_ALIGNMENT");
+    ASSERT_NE(align, nullptr);
+    EXPECT_EQ(align->xcp_value, "8");
+    EXPECT_EQ(align->xcpplus_value, "32");
+
+    // 胜出方为 XCPplus：端点事实取 plus 块
+    ASSERT_EQ(xcp->transports.size(), 1u);
+    EXPECT_EQ(xcp->transports[0].kind, TransportEndpoint::Kind::TcpIp);
+    EXPECT_EQ(xcp->transports[0].remote_port, 0x2000);
+    EXPECT_EQ(xcp->transports[0].remote_host, "b.example");
+    EXPECT_EQ(xcp->transports[0].packet_alignment, 32);
+}
+
 TEST_F(A2lGoldenTest, PacketAlignmentFlowsIntoLibxcpType) {
     // T-05：A2L 的 PACKET_ALIGNMENT -> libxcp 强类型 PacketAlignment 的贯通。
     // 上游 a2lbridge 已把原码（0/1/2）换算成**位宽**（8/16/32），

@@ -56,8 +56,19 @@ namespace liba2l {
 // v8：TYPEDEF_MEASUREMENT 事实 DTO 增 CHARACTERISTIC/固定轴语义；
 //     StructInfoDto 增 INSTANCE REF_MEMORY_SEGMENT；IDoc 增 MEMORY_SEGMENT
 //     页快照。
+// v9（TCP 传输批次 B-T4）：IfDataXcpDto 增统一端点字段 `endpoint_*`
+//     （endpoint_port/host_name/ipv4_address/ipv6_address/packet_alignment/
+//     alignment_declared/sub_commands/instance_count），承载 **XCPonTCP/IP 与
+//     XCPonUDP/IP 两者**的端点事实；同时新增版本证据字段
+//     （endpoint_protocol_version/endpoint_transport_version）。
+//     B-T5 收口：原本规划的 `endpoint_profile_hint`/`_declared` 两个**派生**
+//     字段已删除——候选 Profile 的判据（TL 版本）已在
+//     `endpoint_transport_version` 中，再放一份渲染后的字符串只会被误当证据。
+//     旧的 `udp_*` 字段**保留**一个兼容周期（deprecated，本期不删除）：
+//     UdpIp 同时填新旧两套，TcpIp **只**填新字段，从而不再把 TCP 端点塞进
+//     `udp_host`/`udp_port`（原桥接层无条件把 udp_* 赋给所有传输层类别）。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 8u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 9u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -406,19 +417,78 @@ struct IfDataXcpDto {
     std::uint8_t default_byte_order =
         0;  ///< BYTE_ORDER 数值编码（MSB_LAST=0/MSB_FIRST=1）
     XcpTransportDto transport = XcpTransportDto::kNone;  ///< 首个传输层实例类型
+    // ---- 以下 4 个 `udp_*` 字段自 v9 起 deprecated（保留一个兼容周期）----
+    // 请改用对应的 `endpoint_*` 字段：UdpIp 时两者内容一致，TcpIp 时这 4 个
+    // 字段恒为空/0（**不再**被 TCP 端点借用）。本期不删除，以便消费方平滑迁移。
+    /// @deprecated 改用 `endpoint_port`
     std::uint16_t udp_port =
         0;                 ///< XCPonUDP/IP 端口（transport==kUdpIp 时有效）
+    /// @deprecated 改用 `endpoint_host_name` / `endpoint_ipv4_address`
     std::string udp_host;  ///< XCPonUDP/IP 主机名/IP（可空）
     /// @brief PACKET_ALIGNMENT 上游**原始码**（批次12，不做语义换算）
+    /// @deprecated 改用 `endpoint_packet_alignment` + `endpoint_alignment_declared`
     /// @details 0/1/2 = 8/16/32 bit（上游 `UdpPacketAlignment`）。上游
     /// `SetPacketAlignment()` 对非 `PACKET_ALIGNMENT_8/16/32` 的字面量
     /// **静默保持默认 0**，故 0 无法区分“未声明”与“声明了非法值”
     /// （设计 §6.3 已知限制）。位宽换算由桥接层承担。
     std::uint8_t udp_packet_alignment = 0;
     /// @brief `OPTIONAL_TL_SUBCMD <IDENT>` 声明的子命令码（批次12）
+    /// @deprecated 改用 `endpoint_sub_commands`
     /// @details 原值透传（0xFA/0xFC/0xFD/0xFF）；上游对未识别名静默丢弃，
     ///          故本列表只含上游已识别项，空不代表 A2L 未声明。
     std::vector<std::uint8_t> udp_sub_commands;
+
+    // ---- v9：统一端点事实（XCPonTCP/IP 与 XCPonUDP/IP 共用一套字段）----
+    //
+    // 设计意图（批次 B-T4）：此前 TCP 端点无任何专属字段，`transport` 虽能
+    // 报出 kTcpIp，但端口/主机/对齐/子命令全部落在 `udp_*` 名下，消费方只能
+    // 去读名字带 udp 的字段来拿 TCP 端点，语义与命名直接冲突。v9 起改用
+    // 与传输层无关的 `endpoint_*` 命名，并按 `transport` 取值决定由哪一类
+    // 实例填充。旧的 `udp_*` 保留一个兼容周期，见下方 deprecated 标注。
+
+    /// @brief 端点端口（XCPonTCP/IP 或 XCPonUDP/IP 的首个实例）
+    std::uint16_t endpoint_port = 0;
+    /// @brief 端点主机名（`HOST_NAME` 原值；可空）
+    std::string endpoint_host_name;
+    /// @brief 端点 IPv4 地址（`ADDRESS` 原值；可空）
+    std::string endpoint_ipv4_address;
+    /// @brief 端点 IPv6 地址（`IPV6` 原值；可空）
+    std::string endpoint_ipv6_address;
+    /// @brief `PACKET_ALIGNMENT` 上游**原始码**（0/1/2 = 8/16/32 bit）
+    /// @details 与 `udp_packet_alignment` 同一口径：原码透传，位宽换算归
+    ///          桥接层。**0 无法区分"未声明"与"声明了非法值"**（上游
+    ///          `SetPacketAlignment()` 对未识别字面量静默保持默认 0），
+    ///          故必须配合 `endpoint_alignment_declared` 使用。
+    std::uint8_t endpoint_packet_alignment = 0;
+    /// @brief A2L 是否**显式声明**了 `PACKET_ALIGNMENT`
+    /// @details 批次 B-T4 新增判别位。计划 §7.2 明确要求区分"未声明"与
+    ///          "声明了 8 bit"：`XCPlite` 生成的 A2L 可能整块不写
+    ///          `PACKET_ALIGNMENT`，而上游对未声明的默认值恰是 8 bit(0)。
+    ///          若只看 `endpoint_packet_alignment == 0` 就断言"ECU 用 8 bit
+    ///          对齐"，等于把 AML 默认值当作声明事实——**该位为 false 时，
+    ///          消费方不得据 alignment 推断 Wire Profile**。
+    bool endpoint_alignment_declared = false;
+    /// @brief `OPTIONAL_TL_SUBCMD <IDENT>` 声明的子命令码
+    /// @details 原值透传。**注意上游表含空槽**：子命令码 = `0xFA + index`，
+    ///          而 `XcpOnTcpIp`/`XcpOnUdpIp` 的 `kCmdList` 内有空字符串槽位
+    ///          （`xcponudpip.cpp` 为 0xFB/0xFE，`xcpontcpip.cpp` 因相邻字符串
+    ///          字面量拼接只剩 0xFD），空槽对应的码值**永远取不到**。故本
+    ///          列表只含上游实际可识别的项，**空不代表 A2L 未声明**。
+    std::vector<std::uint8_t> endpoint_sub_commands;
+    /// @brief A2L 中该类传输层实例的个数（多实例不建模，仅报数量）
+    /// @details 计划 §7.3："多个 TCP 实例且 CLI 未覆盖时 fail closed"。
+    ///          上表各 `endpoint_*` 字段一律取自**首个实例**，本计数用于让
+    ///          消费方察觉"存在多个实例因而首个可能不是想要的"。
+    std::uint32_t endpoint_instance_count = 0;
+    /// @brief 端点所在 IF_DATA 块声明的 `PROTOCOL_LAYER VERSION`
+    /// @details 与顶层 `protocol_version` 同源（端点级冗余一份，便于消费方
+    ///          在不解析协议层块的前提下拿到版本证据）。0 = 未声明。
+    std::uint16_t endpoint_protocol_version = 0;
+    /// @brief 传输层段自身版本号（`XCP_ON_*` 块首字段）
+    /// @details 如 `/begin XCP_ON_TCP_IP 0x0104 5000` 中的 `0x0104`。这是
+    ///          **Transport Layer 版本**，与 `protocol_version`（Protocol
+    ///          Layer）是两个独立事实，不得互相冒充。0 = 未声明。
+    std::uint16_t endpoint_transport_version = 0;
     std::optional<double>
         resource_mask;  ///< 暂不透出的资源位图（保留扩展位，当前不用）
     // ---- 批次10 扩展（B-16/B-17/§6.1/§6.3-A 数据补全） ----

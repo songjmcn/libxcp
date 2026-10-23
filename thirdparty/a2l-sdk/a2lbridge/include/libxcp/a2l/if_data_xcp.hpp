@@ -20,20 +20,24 @@ namespace calmcar::xcp::a2l {
 
 /**
  * @brief 一种 transport 实例的连接参数
- * @details 当前 SDK 快照填 UDP 的 host/port/packet_alignment/sub_commands
- *          （批次12 补全后两项）；其余传输层保留 Kind，
- *          字段留待后续里程碑（§4.3）。多 XCPonUDP/IP 实例只取首个
- *          （设计 §6.3 已登记限制）。
+ * @details v9（批次 B-T4）起，XCPonTCP/IP 与 XCPonUDP/IP **两者**都填充
+ *          host/port/packet_alignment/sub_commands（此前只有 UDP 填，TCP
+ *          端点无字段可落，只能借 udp_* 命名对外表达）。CAN/FLX/USB/SXI
+ *          仍只保留 Kind，其余字段留待后续里程碑（§4.3）。多实例只取首个，
+ *          `instance_count` 记录实际个数（设计 §6.3 已登记限制）。
  */
 struct TransportEndpoint {
     /// @brief 传输层类别
     enum class Kind : std::uint8_t { UdpIp, TcpIp, Can, Sxi, Usb, Flx };
 
     Kind kind = Kind::UdpIp;         ///< IF_DATA XCP 段声明的传输层
-    /// @brief IF_DATA XCP 段版本号
-    /// @details 默认 0 表示「A2L 未声明」：上游 IfDataXcpDto 没有与
-    ///          PROTOCOL_LAYER 版本分开的段版本字段，桥接层无处可取，
-    ///          故不再用 0x0100 冒充 V1.0（V-04 同类问题）。
+    /// @brief IF_DATA XCP 段版本号（XCP_ON_UDP_IP / XCP_ON_TCP_IP 首字段）
+    /// @details 默认 0 表示「A2L 未声明」。v9 起上游 `IfDataXcpDto` 新增
+    ///          `endpoint_transport_version`（取自各 `XcpOn*Ip::GetVersion()`），
+    ///          桥接层据此填充；此前该字段恒为 0，因为当时确实没有可取的源。
+    ///          注意这是 **Transport Layer** 版本（如 0x0104），与
+    ///          `ProtocolLayerInfo::version`（Protocol Layer，如 0x0102）是
+    ///          两个独立事实，不得互相冒充。
     std::uint16_t version = 0;
     std::string remote_host;         ///< IPv4/IPv6 字符串；CAN 时为通道名
     std::uint16_t remote_port = 0;   ///< 远端端口
@@ -41,9 +45,20 @@ struct TransportEndpoint {
     std::uint16_t local_port = 0;    ///< 本地端口
     std::uint8_t packet_alignment =
         8;  ///< 位宽 8/16/32 bit（批次12：取自 A2L PACKET_ALIGNMENT；0=未知）
+    /// @brief A2L 是否**显式声明**了 PACKET_ALIGNMENT（v9 新增）
+    /// @details 上游对未识别字面量静默保持默认 8 bit，故 `packet_alignment == 8`
+    ///          既可能是"A2L 写了 PACKET_ALIGNMENT_8"，也可能是"A2L 根本没写
+    ///          这个关键字"（AML 默认值）。二者对 Wire Profile 推断的含义完全
+    ///          不同，必须靠本标志区分。**false 时消费方不得据 alignment
+    ///          推断 ECU 实际对齐**（计划 §7.2）。
+    bool packet_alignment_declared = false;
     std::vector<std::uint8_t>
         sub_commands;  ///< 传输层子命令码（批次12：A2L OPTIONAL_TL_SUBCMD；
                        ///< 仅含上游可识别项，空不代表未声明）
+    /// @brief A2L 中该类传输层实例的实际个数（v9 新增）
+    /// @details 上表字段一律取自首个实例；本计数让消费方察觉"存在多实例，
+    ///          首个可能不是目标"（计划 §7.3 多实例 fail-closed 依据）。
+    std::uint32_t instance_count = 0;
 };
 
 /**

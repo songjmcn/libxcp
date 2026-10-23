@@ -19,7 +19,10 @@
  *  - IF_DATA XCP 的 TRANSPORT_LAYER 段仅在绑定地址首字节非 0 时写出，
  *    因此必须绑定 127.0.0.1 而不是 0.0.0.0，否则 A2L 无端点信息。
  *
- * 命令行：xcp_test_slave [port [startup_delay_ms [ready_token]]]（缺省端口 5556）。
+ * 命令行：xcp_test_slave [port [startup_delay_ms [ready_token]]]
+ *                    [--tcp] [--queue-size <bytes>]
+ * 位置参数保持原有顺序以兼容既有夹具；`--tcp` 让 XCPlite 以 TCP 方式监听
+ * （B-T5 真实互操作），`--queue-size` 覆盖测量传输队列字节数。
  */
 
 #include <atomic>
@@ -126,18 +129,65 @@ void WriteAmlStub() {
 /**
  * @brief Slave 主入口
  * @param argc 参数个数
- * @param argv argv[1] = 监听端口（十进制，可选，默认 5556）
- * @return 0 正常退出；2 XCP Server 启动失败（端口占用等）；3 A2L 初始化失败；4 就绪标记写入失败
+ * @param argv 位置参数：argv[1]=监听端口（缺省 5556）、argv[2]=启动延迟毫秒、
+ *             argv[3]=就绪标记 token；选项：`--tcp`、`--queue-size <bytes>`
+ * @return 0 正常退出；2 XCP Server 启动失败（端口占用等）；3 A2L 初始化失败；
+ *         4 就绪标记写入失败；5 命令行参数非法
  */
 int main(int argc, char** argv) {
-    const std::uint16_t port =
-        argc > 1
-            ? static_cast<std::uint16_t>(std::strtoul(argv[1], nullptr, 10))
-            : kXcpliteSlaveDefaultPort;
-    const std::uint32_t startup_delay_ms =
-        argc > 2 ? static_cast<std::uint32_t>(std::strtoul(argv[2], nullptr, 10))
-                 : 0U;
-    const std::string ready_token = argc > 3 ? argv[3] : "";
+    // 位置参数与选项混排：位置参数按出现顺序填入 port/delay/token，选项
+    // 以 `--` 开头就地消费其后的取值。这样既兼容既有夹具的纯位置调用，
+    // 又不必让夹具改动参数顺序。
+    std::uint16_t port = kXcpliteSlaveDefaultPort;
+    std::uint32_t startup_delay_ms = 0U;
+    std::string ready_token;
+    bool use_tcp = false;
+    std::uint32_t queue_size = 1024U * 64U;
+    int positional_index = 0;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--tcp") {
+            use_tcp = true;
+            continue;
+        }
+        if (arg == "--queue-size") {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr,
+                             "xcp_test_slave: --queue-size 缺少取值\n");
+                return 5;
+            }
+            const unsigned long parsed = std::strtoul(argv[++i], nullptr, 10);
+            if (parsed == 0UL) {
+                std::fprintf(stderr,
+                             "xcp_test_slave: --queue-size 必须为正数\n");
+                return 5;
+            }
+            queue_size = static_cast<std::uint32_t>(parsed);
+            continue;
+        }
+        if (arg.rfind("--", 0U) == 0U) {
+            std::fprintf(stderr, "xcp_test_slave: 未知选项 %s\n", arg.c_str());
+            return 5;
+        }
+        switch (positional_index) {
+            case 0:
+                port = static_cast<std::uint16_t>(
+                    std::strtoul(arg.c_str(), nullptr, 10));
+                break;
+            case 1:
+                startup_delay_ms = static_cast<std::uint32_t>(
+                    std::strtoul(arg.c_str(), nullptr, 10));
+                break;
+            case 2:
+                ready_token = arg;
+                break;
+            default:
+                std::fprintf(stderr, "xcp_test_slave: 多余的位置参数 %s\n",
+                             arg.c_str());
+                return 5;
+        }
+        ++positional_index;
+    }
 
     std::signal(SIGINT, OnSignal);
     std::signal(SIGTERM, OnSignal);
@@ -157,14 +207,16 @@ int main(int argc, char** argv) {
 
     // 绑定 127.0.0.1（首字节非 0 → A2L 才会写出 TRANSPORT_LAYER 端点信息）
     const std::uint8_t addr[4] = {127, 0, 0, 1};
-    if (!XcpEthServerInit(addr, port, /*use_tcp=*/false, 1024U * 64U)) {
+    if (!XcpEthServerInit(addr, port, use_tcp, queue_size)) {
         std::fprintf(stderr, "xcp_test_slave: server init failed on port %u\n",
                      port);
         return 2;
     }
 
     // A2L 生成：WRITE_ALWAYS → 固定文件名 <project>.a2l，每次运行重写
-    if (!A2lInit(addr, port, /*use_tcp=*/false,
+    // A2L 的传输段落必须与实际监听方式一致：TCP 时写出 XCP_ON_TCP_IP，
+    // 否则夹具按 A2L 解析出来的端点类型与真实服务不符。
+    if (!A2lInit(addr, port, use_tcp,
                  A2L_MODE_WRITE_ALWAYS | A2L_MODE_AUTO_GROUPS)) {
         std::fprintf(stderr, "xcp_test_slave: A2L init failed\n");
         return 3;
@@ -249,8 +301,8 @@ int main(int argc, char** argv) {
             return 4;
         }
     }
-    std::printf("xcp_test_slave ready on 127.0.0.1:%u, a2l=%s\n", port,
-                A2lGetFilename());
+    std::printf("xcp_test_slave ready on 127.0.0.1:%u (%s), a2l=%s\n", port,
+                use_tcp ? "tcp" : "udp", A2lGetFilename());
     std::fflush(stdout);
 
     // 主循环：持续触发事件保持 Slave 活跃（变量值不修改，保证测试断言确定性）

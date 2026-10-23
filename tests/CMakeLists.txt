@@ -51,6 +51,9 @@ add_executable(libxcp_tests
         response_parser_test.cpp
         session_test.cpp
         udp_header_codec_test.cpp
+        ethernet_header_codec_test.cpp
+        tcp_stream_decoder_test.cpp
+        tcp_transport_test.cpp
         udp_transport_test.cpp
         link_budget_test.cpp
         udp_test_slave_test.cpp
@@ -61,6 +64,8 @@ add_executable(libxcp_tests
         xcp_daq_test.cpp
         xcp_udp_loopback_test.cpp
         udp_test_slave.cpp
+        tcp_test_slave.cpp
+        xcp_tcp_loopback_test.cpp
         dto_envelope_decoder_test.cpp
         get_daq_event_info_test.cpp
         measurement_planner_test.cpp
@@ -107,7 +112,9 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
           # A2L 读取用例：依赖桥接层（libxcp::a2lbridge + 运行期 liba2l.dll）
           xcplite_a2l_read_test.cpp
           # 测量子系统 L3 全链路（v0.9）：桥接 + 适配器 + MeasurementSession
-          xcplite_measurement_test.cpp)
+          xcplite_measurement_test.cpp
+          # B-T5：XCPlite 真实 TCP 互操作 Gate（计划 §8.2）
+          xcplite_tcp_interop_test.cpp)
   target_compile_features(XcpliteIntegration PRIVATE cxx_std_20)
   target_link_libraries(XcpliteIntegration PRIVATE
           libxcp::libxcp
@@ -308,12 +315,17 @@ if(LIBXCP_BUILD_TOOLS)
           xcp_master_symbol_policy_test.cpp
           xcp_master_calibration_policy_test.cpp
           xcp_master_tui_model_test.cpp
-          xcp_master_symbol_display_test.cpp)
+          xcp_master_symbol_display_test.cpp
+          # B-T5：传输层选择解析层（纯函数）的规则级用例。
+          xcp_master_transport_selection_test.cpp)
   target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
   target_include_directories(XcpMasterSymbolPolicyTest PRIVATE
           ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
+  # B-T5：传输层选择解析层使用 `XcpProtocolVersion::ToString()` 等实现符号，
+  # 故需链接 libxcp 本体（a2lbridge 自身不导出这些符号）。
   target_link_libraries(XcpMasterSymbolPolicyTest PRIVATE
-          libxcp::a2lbridge GTest::gtest libxcp_test_main Threads::Threads)
+          libxcp::libxcp libxcp::a2lbridge GTest::gtest libxcp_test_main
+          Threads::Threads)
   if(MSVC)
     target_compile_options(XcpMasterSymbolPolicyTest PRIVATE /utf-8)
   endif()

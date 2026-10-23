@@ -1357,8 +1357,9 @@ TEST(XcpMasterVersion, UnimplementedGetVersionYieldsConservativeState) {
     EXPECT_EQ(snap.evidence.reported.major, 0x15U);
     // Minor 恒为占位 0：**不是**声称对端是 21.0
     EXPECT_EQ(snap.evidence.reported.minor, 0U);
-    // 保守态生效版本取支持下限 V1.3（能力口径，非对端真实版本）
-    EXPECT_EQ(snap.effective, kProtocolVersion13);
+    // 保守态生效版本取支持下限（能力口径，非对端真实版本）。
+    // B-T1 §4.3：下限自 V1.3 下调至 V1.2，故此处随之下移。
+    EXPECT_EQ(snap.effective, kProtocolVersion12);
 
     const TransportVersionSnapshot tls =
         rig.master->GetTransportVersionSnapshot();
@@ -1677,8 +1678,9 @@ TEST(VersionUnknown_CoreSession, ConservativeModeStillConnects) {
     //   `confidence==MajorOnly` 区分，信息未丢失，但**调用方不得只看
     //   effective**——必须同时检查 conservative，否则会把保守口径误读为
     //   "对端是 V1.3"。本断言锁定当前行为，防止无声漂移。
-    EXPECT_EQ(ps.effective, (XcpProtocolVersion{1, 3}))
-        << "保守态 effective 现为下限口径；若改为'未知'表示法需同步本用例";
+    EXPECT_EQ(ps.effective, (XcpProtocolVersion{1, 2}))
+        << "保守态 effective 现为下限口径（B-T1 §4.3 起下限为 V1.2）；"
+           "若改为'未知'表示法需同步本用例";
     EXPECT_EQ(ps.evidence.confidence, VersionConfidence::MajorOnly)
         << "区分保守口径与真 V1.3 的判据：置信度必须为 MajorOnly";
     // 会话命令确实被发出（Allow 语义的可观测证据）

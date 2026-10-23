@@ -28,6 +28,8 @@
 #include <unistd.h>
 #endif
 
+#include "libxcp/tcp_transport.hpp"
+#include "libxcp/tcp_transport_config.hpp"
 #include "libxcp/udp_transport.hpp"
 
 #include "xcp_test_slave/xcplite_test_types.hpp"
@@ -90,6 +92,7 @@ struct XcpliteSlaveProcess::Impl {
     std::filesystem::path work_dir;    ///< Slave 工作目录
     std::optional<std::uint16_t> first_candidate_port;  ///< 测试指定首选端口
     std::uint32_t first_attempt_startup_delay_ms{0};    ///< 首次启动测试延迟
+    bool use_tcp{false};               ///< 是否以 TCP 服务启动
     std::atomic<bool> started{false};  ///< 是否已启动（Stop 幂等判定）
 
 #ifdef _WIN32
@@ -205,7 +208,7 @@ struct XcpliteSlaveProcess::Impl {
         std::string cmdline = std::string("\"") + XCPLITE_SLAVE_EXECUTABLE +
                               "\" " + std::to_string(use_port) + " " +
                               std::to_string(startup_delay_ms) + " " +
-                              ready_token;
+                              ready_token + (use_tcp ? " --tcp" : "");
         STARTUPINFOA si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
@@ -231,9 +234,15 @@ struct XcpliteSlaveProcess::Impl {
             }
             const std::string port_arg = std::to_string(use_port);
             const std::string delay_arg = std::to_string(startup_delay_ms);
-            execl(XCPLITE_SLAVE_EXECUTABLE, "xcp_test_slave", port_arg.c_str(),
-                  delay_arg.c_str(), ready_token.c_str(),
-                  static_cast<char*>(nullptr));
+            if (use_tcp) {
+                execl(XCPLITE_SLAVE_EXECUTABLE, "xcp_test_slave",
+                      port_arg.c_str(), delay_arg.c_str(), ready_token.c_str(),
+                      "--tcp", static_cast<char*>(nullptr));
+            } else {
+                execl(XCPLITE_SLAVE_EXECUTABLE, "xcp_test_slave",
+                      port_arg.c_str(), delay_arg.c_str(), ready_token.c_str(),
+                      static_cast<char*>(nullptr));
+            }
             _exit(126);  // exec 失败
         }
         // 新一轮子进程已就绪：必须重置 exited，否则上一轮遗留的
@@ -250,10 +259,11 @@ struct XcpliteSlaveProcess::Impl {
 
 XcpliteSlaveProcess::XcpliteSlaveProcess(
     std::optional<std::uint16_t> first_candidate_port,
-    std::uint32_t first_attempt_startup_delay_ms)
+    std::uint32_t first_attempt_startup_delay_ms, bool use_tcp)
     : impl_(std::make_unique<Impl>()) {
     impl_->first_candidate_port = first_candidate_port;
     impl_->first_attempt_startup_delay_ms = first_attempt_startup_delay_ms;
+    impl_->use_tcp = use_tcp;
 }
 
 XcpliteSlaveProcess::~XcpliteSlaveProcess() { Stop(); }
@@ -262,9 +272,38 @@ namespace {
 
 /**
  * @brief 对 Slave 端口做一次 CONNECT+DISCONNECT 探测
+ * @param port Slave 监听端口
+ * @param use_tcp 是否用 TCP 建链（必须与子进程的启动方式一致，否则探测
+ *                永远失败并让就绪判定超时）
  * @return 会话可建立 true；任何失败 false（异常吞掉即为未就绪）
  */
-bool ProbeOnce(std::uint16_t port) {
+bool ProbeOnce(std::uint16_t port, bool use_tcp) {
+    if (use_tcp) {
+        TcpTransportConfig tcp_cfg;
+        tcp_cfg.role = TcpRole::Master;
+        tcp_cfg.remote_host = "127.0.0.1";
+        tcp_cfg.remote_port = port;
+        tcp_cfg.local_host = "127.0.0.1";
+        tcp_cfg.local_port = 0;
+        tcp_cfg.packet_alignment = PacketAlignment::Bit8;
+        // XCPlite 的线路布局为 [LEN][CTR][Packet]（LEN 即 Packet 长度，
+        // 不含 LEN 外 Tail），因此对应 asam-v1.4 Profile。
+        tcp_cfg.wire_profile = TcpWireProfile::AsamV14;
+        tcp_cfg.connect_timeout_ms = 1000;
+        try {
+            XcpMasterOptions tcp_options;
+            tcp_options.timeouts = CommandTimeouts{
+                std::chrono::milliseconds(300), std::chrono::milliseconds(300),
+                0};
+            auto master = std::make_unique<XcpMaster>(
+                std::make_unique<TcpTransport>(tcp_cfg), tcp_options);
+            master->Connect();
+            master->Disconnect();
+            return true;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
     UdpTransportConfig cfg;
     cfg.remote_host = "127.0.0.1";
     cfg.remote_port = port;
@@ -377,7 +416,8 @@ void XcpliteSlaveProcess::Start() {
             if (!impl_->Alive()) {
                 break;  // Slave 早退（端口占用/启动失败）
             }
-            if (HasReadyMarker(dir, ready_token) && ProbeOnce(port)) {
+            if (HasReadyMarker(dir, ready_token) &&
+                ProbeOnce(port, impl_->use_tcp)) {
                 ready = true;
                 break;
             }
@@ -417,6 +457,8 @@ bool XcpliteSlaveProcess::IsRunning() const {
 }
 
 std::uint16_t XcpliteSlaveProcess::Port() const { return impl_->port; }
+
+bool XcpliteSlaveProcess::UsesTcp() const { return impl_->use_tcp; }
 
 const std::filesystem::path& XcpliteSlaveProcess::WorkDir() const {
     return impl_->work_dir;

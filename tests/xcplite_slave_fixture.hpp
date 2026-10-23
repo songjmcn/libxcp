@@ -48,10 +48,13 @@ public:
      * @brief 构造子进程控制器
      * @param first_candidate_port 可选首选端口，仅用于确定性端口冲突测试
      * @param first_attempt_startup_delay_ms 首次启动延迟，仅用于就绪竞态测试
+     * @param use_tcp true 时以 XCPlite 的 TCP 服务启动（B-T5 真实互操作），
+     *                否则保持既有 UDP 行为
      */
     explicit XcpliteSlaveProcess(
         std::optional<std::uint16_t> first_candidate_port = std::nullopt,
-        std::uint32_t first_attempt_startup_delay_ms = 0);
+        std::uint32_t first_attempt_startup_delay_ms = 0,
+        bool use_tcp = false);
     ~XcpliteSlaveProcess();
 
     XcpliteSlaveProcess(const XcpliteSlaveProcess&) = delete;
@@ -72,8 +75,11 @@ public:
     /// @brief Slave 进程是否仍在运行
     [[nodiscard]] bool IsRunning() const;
 
-    /// @brief Slave 实际监听的 UDP 端口（Start() 之后有效）
+    /// @brief Slave 实际监听的端口（Start() 之后有效；UDP 与 TCP 同一取值）
     [[nodiscard]] std::uint16_t Port() const;
+
+    /// @brief 本次启动是否使用 TCP（供用例选择建链方式）
+    [[nodiscard]] bool UsesTcp() const;
 
     /// @brief Slave 的工作目录（A2L/AML 落盘位置）
     [[nodiscard]] const std::filesystem::path& WorkDir() const;

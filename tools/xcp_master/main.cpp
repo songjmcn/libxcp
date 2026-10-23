@@ -46,12 +46,14 @@
 
 #include "calibration_policy.hpp"
 #include "symbol_display.hpp"
+#include "transport_selection.hpp"
 #include "tui_model.hpp"
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/a2l/ia2l_database.hpp"
 #include "libxcp/measurement/measurement_planner.hpp"
 #include "libxcp/measurement/measurement_session.hpp"
 #include "libxcp/log.hpp"
+#include "libxcp/tcp_transport.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "a2l/a2l_measurement_database.hpp"
 
@@ -123,16 +125,33 @@ struct Options {
     std::chrono::milliseconds interval{500};
     std::string mode{"poll"};
     bool interval_explicit{false};
+
+    /**
+     * @brief 传输层选择的原始请求（B-T5 §8.1）
+     * @details 这里保存的是**用户原样输入**，尚未与 A2L 事实合并。合并由
+     *          `calmcar::xcp::tools::ResolveTransportSelection()` 完成，
+     *          从而"用户给了什么"与"最终怎么连"可以分开断言。
+     */
+    calmcar::xcp::tools::TransportSelectionRequest transport_request;
 };
 
 void PrintUsage(std::ostream& out) {
     out << "Usage: xcp_master --a2l <path> --host <IPv4> --port <1..65535> "
            "[--module <name>] [--mode poll|daq] [--interval-ms <ms>]\n"
+           "                  [--transport udp|tcp] [--tcp-profile "
+           "asam-v1.5|asam-v1.4] [--packet-alignment 8|16|32]\n"
+           "                  [--protocol-version 1.2|1.3|1.4|1.5] "
+           "[--transport-version 1.4|1.5] [--preset xcplite]\n"
            "       xcp_master --help\n"
            "poll: --interval-ms is the target polling cycle (default 500 ms).\n"
            "daq: event-driven; --interval-ms is invalid. The DTO layout is "
            "selected automatically from the slave's reported identification "
-           "field type (DAQ_KEY_BYTE); no profile option is needed.\n";
+           "field type (DAQ_KEY_BYTE); no profile option is needed.\n"
+           "tcp: --tcp-profile is mandatory and never inferred from the A2L or "
+           "from version numbers. asam-v1.5 additionally needs "
+           "--packet-alignment (or an explicit A2L PACKET_ALIGNMENT_x).\n"
+           "--host/--port may be omitted for tcp when the A2L declares "
+           "XCP_ON_TCP_IP.\n";
 }
 
 bool ParseUnsigned(std::string_view text, std::uint64_t& value) {
@@ -155,6 +174,9 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                                     std::string& error) {
     Options options;
     help = false;
+    // 是否显式写下了 --transport：只有显式写作才能压过 --preset 隐含的 tcp，
+    // 且判断放在循环之后，避免"选项顺序不同、结果不同"的顺序依赖。
+    bool transport_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view key(argv[i]);
         if (key == "--help" || key == "-h") {
@@ -196,6 +218,50 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 return std::nullopt;
             }
             options.mode = value;
+        } else if (key == "--transport") {
+            const auto parsed = calmcar::xcp::tools::ParseTransportKind(value);
+            if (!parsed.has_value()) {
+                error = "--transport must be udp or tcp";
+                return std::nullopt;
+            }
+            options.transport_request.transport = *parsed;
+            transport_explicit = true;
+        } else if (key == "--tcp-profile") {
+            const auto parsed =
+                calmcar::xcp::tools::ParseTcpWireProfileText(value);
+            if (!parsed.has_value()) {
+                error = "--tcp-profile must be asam-v1.5 or asam-v1.4";
+                return std::nullopt;
+            }
+            options.transport_request.tcp_profile = *parsed;
+        } else if (key == "--packet-alignment") {
+            const auto parsed =
+                calmcar::xcp::tools::ParseAlignmentBitsText(value);
+            if (!parsed.has_value()) {
+                error = "--packet-alignment must be 8, 16 or 32";
+                return std::nullopt;
+            }
+            options.transport_request.packet_alignment_bits = *parsed;
+        } else if (key == "--protocol-version") {
+            const auto parsed = calmcar::xcp::tools::ParseVersionText(value);
+            if (!parsed.has_value()) {
+                error = "--protocol-version must be a version like 1.2";
+                return std::nullopt;
+            }
+            options.transport_request.protocol_version = *parsed;
+        } else if (key == "--transport-version") {
+            const auto parsed = calmcar::xcp::tools::ParseVersionText(value);
+            if (!parsed.has_value()) {
+                error = "--transport-version must be a version like 1.4";
+                return std::nullopt;
+            }
+            options.transport_request.transport_version = *parsed;
+        } else if (key == "--preset") {
+            if (value != "xcplite") {
+                error = "--preset only supports xcplite";
+                return std::nullopt;
+            }
+            options.transport_request.preset_xcplite = true;
         } else {
             error = "unknown option: " + std::string(key);
             return std::nullopt;
@@ -206,8 +272,27 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
             "--interval-ms controls polling only and conflicts with --mode daq";
         return std::nullopt;
     }
-    if (options.a2l_path.empty() || options.host.empty() || options.port == 0) {
-        error = "--a2l, --host and --port are required";
+
+    // ---- 传输层选择的收尾（B-T5 §8.1） ------------------------------------
+    const bool host_given = !options.host.empty();
+    const bool port_given = options.port != 0;
+    // 1) preset 隐含 tcp：`--preset xcplite` 描述的是 XCPlite 的 TCP 部署事实。
+    //    若调用方同行写了 `--transport udp`，交给解析层报冲突而不是在这里
+    //    悄悄改掉用户的显式选择。
+    if (options.transport_request.preset_xcplite && !transport_explicit) {
+        options.transport_request.transport =
+            calmcar::xcp::tools::TransportKind::Tcp;
+    }
+    // 2) host/port 交给解析层成对校验：UDP 仍要求两者齐全（既有契约），
+    //    TCP 允许两者都缺并在 A2L 中寻找 XCP_ON_TCP_IP 端点。
+    if (host_given) {
+        options.transport_request.host = options.host;
+    }
+    if (port_given) {
+        options.transport_request.port = options.port;
+    }
+    if (options.a2l_path.empty()) {
+        error = "--a2l is required";
         return std::nullopt;
     }
     return options;
@@ -3174,54 +3259,156 @@ int main(int argc, char** argv) {
         }
     }
 
-    calmcar::xcp::UdpTransportConfig config;
-    config.remote_host = options->host;
-    config.remote_port = options->port;
-    // T-05：PACKET_ALIGNMENT 自动贯通。
-    // A2L 的 IF_DATA XCP 以 UDP 传输声明了 PACKET_ALIGNMENT_x（8/16/32 bit）
-    // 时按声明设置；**未声明则保持 8-bit 并明确告知依据**，而不是让用户
-    // 误以为对齐来自 A2L（方案 §1.9A.4：无证据不得假定对齐）。
-    // 注意 a2lbridge 的 packet_alignment 字段为位宽，0 表示未知。
-    {
-        const auto* xcp_info = bridge->XcpInfo();
-        bool aligned_from_a2l = false;
-        if (xcp_info != nullptr && !xcp_info->ambiguous) {
-            for (const auto& endpoint : xcp_info->transports) {
-                if (endpoint.packet_alignment == 0U) continue;
-                const auto parsed = calmcar::xcp::ParsePacketAlignment(
-                    endpoint.packet_alignment);
-                if (parsed == calmcar::xcp::PacketAlignment::Unknown) continue;
-                if (aligned_from_a2l && parsed != config.packet_alignment) {
-                    // 同一 IF_DATA 内多个传输声明冲突：不静默覆盖
-                    std::cerr << "A2L PACKET_ALIGNMENT 声明冲突，"
-                                 "拒绝自动建链。\n";
-                    return 1;
+    // ---- 传输层选择（B-T5 §8.1）------------------------------------------
+    // 把 A2L 事实按本次 `--transport` **过滤后**再交给纯函数解析：
+    // 规则 5 要求端点/对齐/Profile 同属一个 transport kind，因此这里绝不
+    // 把另一类传输的端点或对齐"借"给本次连接。
+    calmcar::xcp::tools::A2lTransportFacts a2l_facts;
+    if (const auto* xcp_info = bridge->XcpInfo();
+        xcp_info != nullptr && !xcp_info->ambiguous) {
+        const auto wanted =
+            options->transport_request.transport ==
+                    calmcar::xcp::tools::TransportKind::Tcp
+                ? calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp
+                : calmcar::xcp::a2l::TransportEndpoint::Kind::UdpIp;
+        const auto other =
+            wanted == calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp
+                ? calmcar::xcp::a2l::TransportEndpoint::Kind::UdpIp
+                : calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp;
+        for (const auto& endpoint : xcp_info->transports) {
+            if (endpoint.kind == other) {
+                a2l_facts.other_kind_declared = true;
+                continue;
+            }
+            if (endpoint.kind != wanted) continue;
+            ++a2l_facts.instance_count;
+            // 逐实例明细交给纯函数层判定多实例冲突（计划 §7.3）：未显式声明
+            // 对齐时按 0 记录，避免把桥接层默认值当成"已声明 8 bit"。
+            a2l_facts.instances.push_back(
+                calmcar::xcp::tools::A2lEndpointInstance{
+                    endpoint.remote_host, endpoint.remote_port,
+                    endpoint.packet_alignment_declared
+                        ? endpoint.packet_alignment
+                        : static_cast<std::uint8_t>(0U),
+                    endpoint.version});
+            if (a2l_facts.declared) continue;  // 标量字段：先到先得
+            a2l_facts.declared = true;
+            a2l_facts.port = endpoint.remote_port;
+            a2l_facts.host = endpoint.remote_host;
+            // 位宽 0 与"未声明"都视为无证据：不得把默认值当成声明
+            if (endpoint.packet_alignment_declared &&
+                endpoint.packet_alignment != 0U) {
+                a2l_facts.packet_alignment_bits = endpoint.packet_alignment;
+                a2l_facts.alignment_declared = true;
+            }
+            if (endpoint.version != 0U) {
+                a2l_facts.transport_version = calmcar::xcp::XcpProtocolVersion{
+                    static_cast<std::uint8_t>(endpoint.version >> 8U),
+                    static_cast<std::uint8_t>(endpoint.version & 0xFFU)};
+            }
+            if (wanted == calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp) {
+                // 仅诊断用途：把 A2L 声明的 TL 版本渲染成可读提示。
+                // 它**不参与** Profile 选择（§1.2：A2L 不得推断 wire profile）。
+                a2l_facts.profile_hint = "XCP_ON_TCP_IP(TL ";
+                if (endpoint.version != 0U) {
+                    a2l_facts.profile_hint +=
+                        calmcar::xcp::XcpProtocolVersion{
+                            static_cast<std::uint8_t>(endpoint.version >> 8U),
+                            static_cast<std::uint8_t>(endpoint.version & 0xFFU)}
+                            .ToString();
+                } else {
+                    a2l_facts.profile_hint += "未声明";
                 }
-                config.packet_alignment = parsed;
-                aligned_from_a2l = true;
+                a2l_facts.profile_hint += ")";
             }
         }
-        if (aligned_from_a2l) {
-            std::cout << "PACKET_ALIGNMENT 取自 A2L: "
-                      << static_cast<int>(calmcar::xcp::AlignmentBytes(
-                             config.packet_alignment))
-                      << " 字节\n";
-        } else {
-            std::cout << "A2L 未声明 PACKET_ALIGNMENT，使用默认 8-bit 对齐；"
-                         "如对端使用 16/32-bit 请在 A2L 中声明。\n";
+        if (xcp_info->protocol_layer.version != 0U) {
+            a2l_facts.protocol_version = calmcar::xcp::XcpProtocolVersion{
+                static_cast<std::uint8_t>(xcp_info->protocol_layer.version >>
+                                          8U),
+                static_cast<std::uint8_t>(xcp_info->protocol_layer.version &
+                                          0xFFU)};
         }
     }
+
+    std::string selection_error;
+    const auto selection = calmcar::xcp::tools::ResolveTransportSelection(
+        options->transport_request, a2l_facts, &selection_error);
+    if (!selection.has_value()) {
+        std::cerr << "传输层配置错误: " << selection_error << '\n';
+        return 1;
+    }
+    // 端点可能来自 A2L：把生效值回写到 Options，供 TUI 标题与日志展示，
+    // 避免界面显示一个"用户没给因此为空"的端点。
+    options->host = selection->host;
+    options->port = selection->port;
+    std::cout << calmcar::xcp::tools::FormatSelectionSummary(*selection) << '\n';
+    for (const auto& note : selection->notes) {
+        std::cout << "  · " << note << '\n';
+    }
+
     try {
-        auto transport =
-            std::make_unique<calmcar::xcp::UdpTransport>(std::move(config));
+        // 按解析结果构造传输层；UDP/TCP 的差异只体现在这一处，
+        // 其后的命令流、DAQ、标定路径完全共用。
+        std::unique_ptr<calmcar::xcp::IXcpTransport> transport;
+        if (selection->transport == calmcar::xcp::tools::TransportKind::Tcp) {
+            calmcar::xcp::TcpTransportConfig tcp_config;
+            tcp_config.role = calmcar::xcp::TcpRole::Master;
+            tcp_config.remote_host = selection->host;
+            tcp_config.remote_port = selection->port;
+            tcp_config.packet_alignment = selection->alignment;
+            tcp_config.wire_profile = selection->wire_profile;
+            transport =
+                std::make_unique<calmcar::xcp::TcpTransport>(tcp_config);
+        } else {
+            calmcar::xcp::UdpTransportConfig udp_config;
+            udp_config.remote_host = selection->host;
+            udp_config.remote_port = selection->port;
+            udp_config.packet_alignment = selection->alignment;
+            transport =
+                std::make_unique<calmcar::xcp::UdpTransport>(udp_config);
+        }
         // 注意：外层已有名为 options 的 CLI 参数指针，此处变量名须避让
         calmcar::xcp::XcpMasterOptions master_options;
         master_options.event_listener = &measurement_session;
+        // 规则 6：PL/TL 作为独立先验下发，绝不因 Profile 自动声称版本。
+        master_options.version_policy.protocol_version =
+            selection->protocol_version;
+        master_options.version_policy.transport_version =
+            selection->transport_version;
         XcpMaster master(std::move(transport), master_options);
         master.Connect();
         measurement_session.Bind(master);
-        std::cout << "XCP on UDP 已连接: " << options->host << ':'
-                  << options->port << '\n';
+        {
+            // 运行期版本证据：reported 与 effective 必须并排展示（§8.1）
+            const auto pl = master.GetProtocolVersionSnapshot();
+            const auto tl = master.GetTransportVersionSnapshot();
+            calmcar::xcp::tools::RuntimeVersionStatus version_status;
+            version_status.pl_reported = pl.evidence.reported;
+            version_status.pl_effective = pl.effective;
+            version_status.tl_reported = tl.evidence.reported;
+            version_status.tl_effective = tl.effective;
+            version_status.pl_conservative = pl.conservative;
+            version_status.tl_conservative = tl.conservative;
+            version_status.get_version_outcome =
+                pl.evidence.source == calmcar::xcp::VersionSource::GetVersion
+                    ? "可用"
+                    : "不可用（按显式/A2L 证据解析）";
+            std::cout << calmcar::xcp::tools::FormatRuntimeVersionSummary(
+                             version_status)
+                      << '\n';
+            // 版本证据冲突不阻断，但必须可见；降级能力同理。
+            for (const auto& conflict : master.VersionConflicts()) {
+                std::cout << "  · 版本证据冲突: " << conflict << '\n';
+            }
+        }
+        std::cout << "XCP on "
+                  << (selection->transport ==
+                              calmcar::xcp::tools::TransportKind::Tcp
+                          ? "TCP"
+                          : "UDP")
+                  << " 已连接: " << options->host << ':' << options->port
+                  << '\n';
         CliApp app(*options, *database, event_bound_database,
                    measurement_session, master, std::move(event_metadata));
         app.Run();

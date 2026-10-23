@@ -1,80 +1,65 @@
 /**
  * @file udp_header_codec.hpp
- * @brief XCP on Ethernet Transport Header（4 字节 LEN/CTR）与 Tail
- * （PACKET_ALIGNMENT FILL）纯函数编解码。
+ * @brief UDP 侧 Transport Header 编解码 —— **兼容别名层**。
  *
- * 依据 code-plan/XCP_1.3.0_详细设计_类接口与头文件.md 第 6 节实现。
+ * @par 本文件自 B-T1 起的定位变更
+ *   原本体实现已泛化为以太网通用实现并迁至
+ *   `libxcp/ethernet_header_codec.hpp`（UDP 与 TCP 共享 LEN/CTR/Tail 算法）。
+ *   本头文件**只保留历史名称与前向声明**，不复制任何算法，确保 UDP 侧既有
+ *   调用点与二进制行为一字不变。
  *
- * @par 规范基线（TL V1.5 原始 PDF：
- *      `docs/ASAM-AE-MCD-1-XCP-AS-Ethernet-Transport-Layer-V1-5-0.pdf`）
- *   - §4.3.1（PDF 第 9 页）：Header 由 LEN 与 CTR 组成，二者恒为 Intel
- *     （小端）WORD；"LEN is the number of bytes in the original XCP Packet."
- *     —— **LEN 不含 Tail**。
- *   - §4.3.2（PDF 第 9 页）："the tail consists of a control field containing
- *     0,1,2 or 3 FILL bytes."
- *   - §4.3.2.1：单个 XCP 消息独占 Frame 时 "The tail is optional."。
- *   - §4.3.2.2（PDF 第 10 页）：多消息串联时，前一消息的 Tail 用于让后继
- *     XCP Packet 起始地址满足 PACKET_ALIGNMENT；FILL 内容 "do not care"。
+ *   迁移对照（新代码请直接使用 `ethernet_header_codec.hpp`）：
+ *   | 旧名（本文件，保留）              | 新名（通用层）|
+ *   |-----------------------------------|------------------------------------|
+ *   | `kUdpHeaderSize`                  | `kEthernetHeaderSize`              |
+ *   | `kUdpMaxDatagramSize`             | `kUdpMaxDatagramSize`（同名迁移）  |
+ *   | `kUdpMaxXcpPacket`                | `kUdpMaxXcpPacket`（同名迁移）     |
+ *   | `UdpFrame`                        | `EthernetFrame`                    |
+ *   | `UdpHeader`                       | `EthernetHeader`                   |
+ *   | `UdpFrameView`                    | `EthernetFrameView`                |
+ *   | `EncodeUdpFrame()`                | `EncodeUdpFrame()`（本文件内联转发）|
+ *   | `EncodeUdpFrameAligned()`         | `EncodeUdpFrameAligned()`（同左）  |
+ *   | `DecodeUdpDatagram()`             | `DecodeUdpDatagram()`（同左）      |
+ *   | `DecodeUdpDatagramAligned()`      | `DecodeUdpDatagramAligned()`（同左）|
  *
- * @note 旧基线（XCP 1.1 Part 3）称 "XCP on Ethernet 无 Tail"。该说法在
- *       PACKET_ALIGNMENT_8 下与 V1.5 一致（tail 恒为 0），故
- *       `EncodeUdpFrame()` / `DecodeUdpDatagram()` 保留为 **8-bit 语义**；
- *       需要 16/32-bit 对齐的路径必须显式调用带 `Aligned` 后缀的入口，
- *       不得依赖任何默认推断（方案 §1.9A.4）。
+ * @note UDP 专属的长度上界语义保持不变：`kUdpMaxXcpPacket` = 65503
+ *       （IPv4 Datagram 物理限制），**不是**通用层上界
+ *       `kEthernetMaxXcpPacket`(65535)。UDP 侧仍必须用前者校验，否则会生成
+ *       超过 IPv4 Datagram 容量的 Frame。
  */
 
 #ifndef CALMCAR_XCP_UDP_HEADER_CODEC_HPP_
 #define CALMCAR_XCP_UDP_HEADER_CODEC_HPP_
 
-#include <cstddef>
-#include <cstdint>
 #include <optional>
-#include <span>
 #include <vector>
 
+#include "libxcp/ethernet_header_codec.hpp"
 #include "libxcp/protocol_types.hpp"
 #include "libxcp/xcp_error.hpp"
 
 namespace calmcar::xcp {
 
 /// @brief UDP Transport Header 固定长度（字节）：LEN(2) + CTR(2)
-constexpr std::size_t kUdpHeaderSize = 4;
+/// @note 兼容别名，指向通用层的 `kEthernetHeaderSize`。
+constexpr std::size_t kUdpHeaderSize = kEthernetHeaderSize;
 
 /// @brief IPv4 UDP Payload 最大理论长度（65535 - 8 Byte UDP Header - 20 Byte IP
 /// Header）
-constexpr std::size_t kUdpMaxDatagramSize = 65507;
+/// @note 定义在通用层头文件中，此处经 included header 直接可见。
+///       保留本注释以维持旧文档锚点。
 
-/**
- * @brief 单个 XCP Frame 中原始 XCP Packet 的最大理论长度
- * @details 单 Frame 独占 UDP Datagram 时：65507 - 4 Byte Header = 65503。
- */
-constexpr std::size_t kUdpMaxXcpPacket = kUdpMaxDatagramSize - kUdpHeaderSize;
+/// @brief 编码后的单个 XCP on Ethernet Frame（UDP 视角的旧名）
+/// @note 兼容别名，与 `EthernetFrame` 是**同一类型**，可互相赋值。
+using UdpFrame = EthernetFrame;
 
-/// @brief 编码后的单个 XCP on Ethernet Frame
-/// （Header + 一个 XCP Packet [+ Tail FILL]）
-struct UdpFrame {
-    Bytes data;  ///< LEN(u16le) + CTR(u16le) + XCP Packet + [FILL...]
-    /// @brief 本 Frame 尾部 FILL 字节数（0..3）；8-bit 对齐时恒为 0
-    std::uint8_t tail_bytes{0};
-};
+/// @brief 解码后的 UDP Header 字段（UDP 视角的旧名）
+/// @note 兼容别名，与 `EthernetHeader` 是同一类型。
+using UdpHeader = EthernetHeader;
 
-/// @brief 解码后的 UDP Header 字段
-struct UdpHeader {
-    DatagramLen len{};  ///< 原始 XCP Packet 字节数（**不含 Tail**）
-    DatagramCtr ctr{};  ///< 该 XCP Frame 的独立计数器
-};
-
-/**
- * @brief Datagram 内单个 XCP Frame 的只读视图
- * @note xcp_packet 指向 DecodeUdpDatagram()
- * 入参的底层存储，生命周期不超过该视图。
- */
-struct UdpFrameView {
-    UdpHeader header;      ///< Frame 的 Transport Header
-    BytesView xcp_packet;  ///< Frame 内的 XCP Packet（不拥有存储）
-    /// @brief 本 Frame 尾随的 FILL 字节数（0..3），见 TL V1.5 §4.3.2.2
-    std::uint8_t tail_bytes{0};
-};
+/// @brief Datagram 内单个 XCP Frame 的只读视图（UDP 视角的旧名）
+/// @note 兼容别名，与 `EthernetFrameView` 是同一类型。
+using UdpFrameView = EthernetFrameView;
 
 /**
  * @brief 编码一个 XCP on Ethernet Frame（8-bit 对齐语义，Tail 恒为 0）
@@ -87,6 +72,8 @@ struct UdpFrameView {
  * @note 本函数等价于 `EncodeUdpFrameAligned(xcp_packet, ctr,
  *       PacketAlignment::Bit8)`。需要 16/32-bit 对齐时请改用
  *       `EncodeUdpFrameAligned()`——本函数**不会**根据任何会话状态推断对齐。
+ * @note 转发到 `EncodeEthernetFrameAligned()`，但先按 **UDP 专属上界**
+ *       校验，保持 UDP 侧既有的 65503 限制不变。
  */
 [[nodiscard]] UdpFrame EncodeUdpFrame(BytesView xcp_packet, DatagramCtr ctr);
 
