@@ -285,6 +285,18 @@ set_tests_properties(ParseLargeFileUnderBudget PROPERTIES
         FIXTURES_REQUIRED A2lPerf TIMEOUT 900)
 
 # ----------------------------------------------------------------------------
+# 界面性能基线（A2L 变大后交互变慢的回归门）：
+# 合成 40 MB 样本 ≈ 198k 符号，复现现场 A2L 的候选规模。
+# 样本只落 build tree（不入库）；也可用环境变量 LIBXCP_UI_PERF_A2L 指向真实文件。
+# ----------------------------------------------------------------------------
+add_test(NAME a2l_ui_perf_gen
+         COMMAND ${Python3_EXECUTABLE}
+                 "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
+                 --out "${A2L_GOLDEN_DIR}" --perf 40)
+set_tests_properties(a2l_ui_perf_gen PROPERTIES
+        FIXTURES_SETUP A2lUiPerf TIMEOUT 600)
+
+# ----------------------------------------------------------------------------
 # T10 隔离自动化（批次13 T13-18）：把 configure 期 P9 扫描变成 ctest 条目。
 # 两条大小写敏感扫描（桥接层禁含上游头 / 主树禁引用 A2L 栈），命中即非零退出。
 # ----------------------------------------------------------------------------
@@ -330,7 +342,55 @@ if(LIBXCP_BUILD_TOOLS)
     target_compile_options(XcpMasterSymbolPolicyTest PRIVATE /utf-8)
   endif()
   gtest_discover_tests(XcpMasterSymbolPolicyTest DISCOVERY_TIMEOUT 60)
+
+  # --------------------------------------------------------------------------
+  # 界面性能基准：headless 渲染（Screen::Create + Render，不需要 TTY）。
+  # FTXUI 由 tools/xcp_master/CMakeLists.txt 在 tools 子目录中 FetchContent 引入，
+  # 而 tools 先于 tests add_subdirectory，故此处只需判断目标是否已存在。
+  # --------------------------------------------------------------------------
+  if(TARGET ftxui::ftxui)
+    add_executable(XcpMasterRenderBenchTest xcp_master_render_bench_test.cpp)
+    target_compile_features(XcpMasterRenderBenchTest PRIVATE cxx_std_20)
+    target_include_directories(XcpMasterRenderBenchTest PRIVATE
+            ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
+    target_link_libraries(XcpMasterRenderBenchTest PRIVATE
+            libxcp::a2lbridge ftxui::ftxui GTest::gtest libxcp_test_main)
+    target_compile_definitions(XcpMasterRenderBenchTest PRIVATE
+            # 40 MB 合成样本（约 198k 符号）的路径；也可用环境变量
+            # LIBXCP_UI_PERF_A2L 指向真实大 A2L。
+            XCP_UI_PERF_A2L="${A2L_GOLDEN_DIR}/golden_perf_40mb.a2l")
+    if(MSVC)
+      target_compile_options(XcpMasterRenderBenchTest PRIVATE /utf-8)
+    endif()
+    # liba2l 由 A2lBridge 运行时加载，须与测试可执行文件同目录。
+    add_custom_command(TARGET XcpMasterRenderBenchTest POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:liba2l::liba2l>"
+                    "$<TARGET_FILE_DIR:XcpMasterRenderBenchTest>")
+    # 三条用例共用同一个 40 MB 样本夹具（a2l_ui_perf_gen 生成；缺失时检索用例
+    # 自行跳过）。gtest_discover_tests 在构建期发现用例名，故夹具属性按目标整体设置。
+    gtest_discover_tests(XcpMasterRenderBenchTest DISCOVERY_TIMEOUT 60
+            PROPERTIES FIXTURES_REQUIRED A2lUiPerf TIMEOUT 900)
+  endif()
 endif()
+
+# ----------------------------------------------------------------------------
+# A2lCalibrationAccessTest —— CALIBRATION_ACCESS 可写性判定（方案 A）
+# 语料内联在用例里（写到临时目录），不依赖 golden 夹具。
+# ----------------------------------------------------------------------------
+add_executable(A2lCalibrationAccessTest a2l_calibration_access_test.cpp)
+target_compile_features(A2lCalibrationAccessTest PRIVATE cxx_std_20)
+target_link_libraries(A2lCalibrationAccessTest PRIVATE
+        libxcp::a2lbridge GTest::gtest libxcp_test_main)
+if(MSVC)
+  target_compile_options(A2lCalibrationAccessTest PRIVATE /utf-8)
+endif()
+# 运行期寻址：把 liba2l.dll 复制到可执行文件目录（免改 PATH）
+add_custom_command(TARGET A2lCalibrationAccessTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:liba2l::liba2l>"
+                "$<TARGET_FILE_DIR:A2lCalibrationAccessTest>")
+gtest_discover_tests(A2lCalibrationAccessTest DISCOVERY_TIMEOUT 120)
 
 # Boost.Locale-backed A2L log timestamp compatibility test.
 add_executable(A2lLogTimestampTest a2l_log_timestamp_test.cpp)

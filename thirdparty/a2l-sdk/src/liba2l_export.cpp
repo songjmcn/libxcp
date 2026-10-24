@@ -731,6 +731,32 @@ SymbolDto BuildMeasurementSymbol(const a2l::Measurement& m,
 }
 
 /**
+ * @brief 判断 A2L 的 CALIBRATION_ACCESS 是否允许标定写入。
+ * @details ASAM MCD-2 MC V1.4 起用 CALIBRATION_ACCESS 取代 READ_ONLY 表达可写性
+ *          （规范 §4.7.28：「It substitutes the READ_ONLY attribute」）。
+ *          - 未声明（UNKNOWN）或显式 CALIBRATION：沿用 READ_ONLY / READ_WRITE 判据，
+ *            因此对本仓现有的 XCPlite 系（V1.2/V2.2 都不输出该关键字）行为不变。
+ *          - NO_CALIBRATION：规范要求"不可改、只能读"。
+ *          - OFFLINE_CALIBRATION：可刷写但不可在线标定。
+ *          - NOT_IN_MCD_SYSTEM：MCD 系统不可读写。
+ * @param access 上游枚举值。
+ * @return true 表示该声明不额外禁止写入。
+ */
+[[nodiscard]] bool CalibrationAccessAllowsWrite(
+    a2l::A2lCalibrationAccess access) {
+    switch (access) {
+        case a2l::A2lCalibrationAccess::NO_CALIBRATION:
+        case a2l::A2lCalibrationAccess::OFFLINE_CALIBRATION:
+        case a2l::A2lCalibrationAccess::NOT_IN_MCD_SYSTEM:
+            return false;
+        case a2l::A2lCalibrationAccess::CALIBRATION:
+        case a2l::A2lCalibrationAccess::UNKNOWN:
+        default:
+            return true;
+    }
+}
+
+/**
  * @brief 采集一个 CHARACTERISTIC 的完整快照。
  * @param c      上游特性对象。
  * @param module 所属模块。
@@ -810,7 +836,10 @@ SymbolDto BuildCharacteristicSymbol(const a2l::Characteristic& c,
         static_cast<std::uint8_t>(c.EcuAddressExtension() & 0xFF);
     s.byte_order = MapByteOrder(c.ByteOrder());
     s.bit_mask = c.BitMask();
-    s.read_write = !c.ReadOnly();
+    // 可写性 = 原有 READ_ONLY 判据 且 CALIBRATION_ACCESS 未额外禁止（方案 A）。
+    // XCPlite 系生成器不输出 CALIBRATION_ACCESS，此处取 UNKNOWN 分支，行为不变。
+    s.read_write =
+        !c.ReadOnly() && CalibrationAccessAllowsWrite(c.CalibrationAccess());
     if (c.HaveLimit()) {
         s.have_limit = true;
         s.lower_limit = c.LowerLimit();
@@ -895,7 +924,11 @@ StructInfoDto BuildInstanceInfo(const a2l::Instance& in,
     d.ref_memory_segment = in.RefMemorySegment();
     d.address_type = static_cast<std::uint8_t>(in.AddressType());
     d.layout = static_cast<std::uint8_t>(in.Layout());
-    d.read_write = in.ReadWrite();
+    // 可写性 = 原有 READ_WRITE 判据 且 CALIBRATION_ACCESS 未额外禁止（方案 A）。
+    // INSTANCE 在 ASAP2 里用 CALIBRATION_ACCESS 表达「能否标定」，
+    // 规范 §4.7.28：NO_CALIBRATION 只能读、OFFLINE_CALIBRATION 不可在线标定。
+    d.read_write =
+        in.ReadWrite() && CalibrationAccessAllowsWrite(in.CalibrationAccess());
     // 批次18（16-B）：INSTANCE 的 MATRIX_DIM 原值直传（上游实例属性规则
     // 显式接收：src/a2lparser.y:871）。丢失它会让结构体数组实例只剩第 0 个
     // 元素可寻址；逐元素展开与越界门归桥接层 StructureLayoutResolver。

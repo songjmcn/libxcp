@@ -251,8 +251,9 @@ TEST(XcpMasterSymbolPolicyTest, StaticWritePolicyUsesOnlyA2lMetadata) {
     value.element_size_bytes = 4;
     value.read_write = true;
 
-    EXPECT_NE(SymbolStaticWriteUnsupportedReason(value).find("MEMORY_SEGMENT"),
-              std::string::npos);
+    // P2：段页是可选能力。A2L 没有 MEMORY_SEGMENT 时静态策略放行，写入资格
+    // 交由运行时活动页校验（见 CliApp::CheckCalibrationPageWriteLocked）。
+    EXPECT_TRUE(SymbolStaticWriteUnsupportedReason(value).empty());
 
     MemorySegmentInfo segment;
     segment.name = "kParameters";
@@ -383,6 +384,97 @@ TEST(XcpMasterSymbolPolicyTest, HintsTargetValueBeyondDeclaredLimit) {
     symbol.have_limit = false;
     EXPECT_TRUE(calmcar::xcp::tools::CalibrationTargetLimitHint(symbol, "20")
                     .empty());
+}
+
+/// @brief A2L 未声明 MEMORY_SEGMENT 时不得再以「缺段页」为由拒绝写入（P2）。
+TEST(XcpMasterSymbolPolicyTest, RelaxesStaticWriteGateWithoutMemorySegment) {
+    SymbolInfo symbol;
+    symbol.kind = SymbolKind::Characteristic;
+    symbol.characteristic_type = CharacteristicType::Value;
+    symbol.element_size_bytes = 1;
+    symbol.read_write = true;
+
+    // 无段页事实：静态策略必须放行，页校验改由运行时决定。
+    EXPECT_FALSE(calmcar::xcp::tools::HasCalibrationPageFacts(symbol));
+    EXPECT_TRUE(calmcar::xcp::tools::SymbolStaticWriteUnsupportedReason(symbol)
+                    .empty());
+}
+
+/// @brief 有段页事实但没有任何 DontCare 页时，静态策略仍须拒绝。
+TEST(XcpMasterSymbolPolicyTest, KeepsStaticWriteGateWithReadOnlyPages) {
+    SymbolInfo symbol;
+    symbol.kind = SymbolKind::Characteristic;
+    symbol.characteristic_type = CharacteristicType::Value;
+    symbol.element_size_bytes = 1;
+    symbol.read_write = true;
+    MemorySegmentInfo segment;
+    segment.name = "cal";
+    segment.segment_number = 0;
+    segment.has_xcp_segment = true;
+    segment.pages = {{0, 0, 0, XcpPageWriteAccess::NotAllowed}};
+    symbol.memory_segment = segment;
+
+    EXPECT_TRUE(calmcar::xcp::tools::HasCalibrationPageFacts(symbol));
+    EXPECT_EQ(calmcar::xcp::tools::SymbolStaticWriteUnsupportedReason(symbol),
+              "A2L未声明允许无条件XCP写入的PAGE");
+}
+
+/// @brief OPTIONAL_CMD 必须能解析成页命令能力事实。
+TEST(XcpMasterSymbolPolicyTest, ParsesCalibrationPageFactsFromOptionalCommands) {
+    using calmcar::xcp::CommandCode;
+    using calmcar::xcp::tools::A2lDeclaresCommand;
+    using calmcar::xcp::tools::MakeCalibrationPageFacts;
+
+    const std::vector<std::uint8_t> commands{
+        static_cast<std::uint8_t>(CommandCode::GetCalPage),
+        static_cast<std::uint8_t>(CommandCode::GetPageInfo)};
+    EXPECT_TRUE(A2lDeclaresCommand(commands, CommandCode::GetCalPage));
+    EXPECT_FALSE(A2lDeclaresCommand(commands, CommandCode::SetCalPage));
+
+    const auto facts = MakeCalibrationPageFacts(commands);
+    EXPECT_TRUE(facts.declares_get_cal_page);
+    EXPECT_TRUE(facts.declares_get_page_info);
+    EXPECT_FALSE(facts.declares_set_cal_page);
+
+    const auto empty = MakeCalibrationPageFacts({});
+    EXPECT_FALSE(empty.declares_get_cal_page);
+    EXPECT_FALSE(empty.declares_get_page_info);
+}
+
+/// @brief 页判定依据的文案必须区分三种情形，不能都渲染成空。
+TEST(XcpMasterSymbolPolicyTest, ExplainsCalibrationPageDecisionBasis) {
+    using calmcar::xcp::tools::CalibrationPageFacts;
+    using calmcar::xcp::tools::CalibrationPageNote;
+
+    SymbolInfo symbol;
+    symbol.kind = SymbolKind::Characteristic;
+    symbol.characteristic_type = CharacteristicType::Value;
+    symbol.element_size_bytes = 1;
+    symbol.read_write = true;
+
+    // 1) 无段页事实且未声明任何页命令：按单页直写。
+    const auto none = CalibrationPageNote(symbol, CalibrationPageFacts{});
+    EXPECT_NE(none.find("单页直写"), std::string::npos);
+
+    // 2) 无段页事实但声明了 GET_CAL_PAGE：按 0 号段查询活动页。
+    CalibrationPageFacts with_cal_page;
+    with_cal_page.declares_get_cal_page = true;
+    const auto with_query = CalibrationPageNote(symbol, with_cal_page);
+    EXPECT_NE(with_query.find("0 号段"), std::string::npos);
+
+    // 3) 有段页事实但未声明 GET_PAGE_INFO：页写权限未取证。
+    MemorySegmentInfo segment;
+    segment.name = "cal";
+    segment.segment_number = 0;
+    segment.has_xcp_segment = true;
+    segment.pages = {{0, 0, 0, XcpPageWriteAccess::DontCare}};
+    symbol.memory_segment = segment;
+    const auto no_page_info = CalibrationPageNote(symbol, with_cal_page);
+    EXPECT_NE(no_page_info.find("未声明 GET_PAGE_INFO"), std::string::npos);
+
+    // 4) 有段页事实且声明了 GET_PAGE_INFO：无需附注。
+    with_cal_page.declares_get_page_info = true;
+    EXPECT_TRUE(CalibrationPageNote(symbol, with_cal_page).empty());
 }
 
 }  // namespace

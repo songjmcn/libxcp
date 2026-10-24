@@ -568,11 +568,14 @@ def main():
     if args.perf > 0:
         lines, count = build_perf_a2l(args.perf)
         perf_path = out_dir / f"golden_perf_{int(args.perf)}mb.a2l"
-        perf_path.write_text("\r\n".join(lines) + "\r\n", encoding="utf-8",
-                             newline="")
+        # 用 open(..., newline="") 而不是 Path.write_text(newline=...)：
+        # 后者需要 Python 3.10+，而部分构建机（如 miniconda 3.9）会因此失败。
+        with perf_path.open("w", encoding="utf-8", newline="") as output:
+            output.write("\r\n".join(lines) + "\r\n")
         # 侧车：符号数（用例据此校验"解析真的做完"，避免把数字硬编码进测试）
-        (out_dir / f"golden_perf_{int(args.perf)}mb.a2l.count").write_text(
-            f"{count}\n", encoding="utf-8", newline="")
+        with (out_dir / f"golden_perf_{int(args.perf)}mb.a2l.count").open(
+                "w", encoding="utf-8", newline="") as output:
+            output.write(f"{count}\n")
         mb = perf_path.stat().st_size / (1024 * 1024)
         print(f"generated: {perf_path} ({mb:.2f} MB, {count} MEASUREMENT)")
         return

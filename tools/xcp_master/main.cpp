@@ -69,6 +69,45 @@ namespace {
 /** @brief 数组详情每页读取的连续元素数量。 */
 constexpr std::uint64_t kArrayPageSize = 8U;
 
+/** @brief 单帧界面构建耗时超过该值（毫秒）时才逐帧写日志。 */
+constexpr double kFramePerfWarnMs = 50.0;
+
+/** @brief 界面渲染汇总日志的输出周期（秒）。 */
+constexpr double kFramePerfWindowSeconds = 1.0;
+
+/**
+ * @brief 轻量单调时钟计时器，用于性能日志。
+ *
+ * 只依赖 steady_clock，不参与业务逻辑；拷贝语义由编译器生成，
+ * 拷贝后两个对象都从各自构造时刻或拷贝时刻继续计时。
+ */
+class PerfStopwatch {
+public:
+    /** @brief 从当前时刻开始计时。 */
+    PerfStopwatch() : started_(std::chrono::steady_clock::now()) {}
+
+    /**
+     * @brief 返回自计时起点以来的毫秒数。
+     * @return 以毫秒为单位、单调递增的经过时间。
+     */
+    [[nodiscard]] double ElapsedMs() const {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - started_)
+            .count();
+    }
+
+    /**
+     * @brief 返回自计时起点以来的秒数。
+     * @return 以秒为单位、单调递增的经过时间。
+     */
+    [[nodiscard]] double ElapsedSeconds() const {
+        return ElapsedMs() / 1000.0;
+    }
+
+private:
+    std::chrono::steady_clock::time_point started_; /**< 计时起点。 */
+};
+
 /** @brief 判断标准输入和输出是否连接到交互终端。 */
 bool IsInteractiveTerminal() {
 #if defined(_WIN32)
@@ -392,12 +431,14 @@ public:
            calmcar::xcp::IMeasurementDatabase& measurement_database,
            calmcar::xcp::MeasurementSession& measurement_session,
            XcpMaster& master,
-           std::vector<calmcar::xcp::A2lEventMetadata> events)
+           std::vector<calmcar::xcp::A2lEventMetadata> events,
+           calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts = {})
         : options_(options),
           database_(database),
           measurement_database_(measurement_database),
           measurement_session_(measurement_session),
           master_(master),
+          calibration_page_facts_(calibration_page_facts),
           events_(std::move(events)) {}
 
     ~CliApp() { StopWatch(); }
@@ -629,6 +670,11 @@ public:
                                              ? "可用"
                                              : "拒绝：" + read_reason)));
                 lines.push_back(text("写入资格：" + write_status));
+                // P2：把页判定依据显式写出来，避免"A2L 缺段页声明"被误读成"不可写"。
+                const auto page_note = ModalCalibrationPageNote();
+                if (!page_note.empty())
+                    lines.push_back(text("页判定依据：" + page_note) |
+                                    color(Color::GrayLight));
                 lines.push_back(calibration_element_index_control->Render());
                 lines.push_back(target_control->Render());
                 lines.push_back(
@@ -669,6 +715,8 @@ public:
                                    input_mode_.Selector());
         preview_menu->TakeFocus();
         auto renderer = Renderer(root, [&] {
+            // 性能观测：统计单帧「元素树构建 + 菜单条目生成」耗时。
+            const PerfStopwatch frame_stopwatch;
             const auto terminal = Terminal::Size();
             current_layout_ = calmcar::xcp::tools::CalculateTuiLayout(
                 terminal.dimx, terminal.dimy);
@@ -781,13 +829,19 @@ public:
                       (view_selected_ == 0 ? preview_panel
                                            : view_content->Render()) |
                           flex});
-            return vbox({status_bar, main_panel | flex, separator(),
-                         hbox({text(input_mode_.InCommandMode()
-                                        ? "命令 > "
-                                        : "命令（按 F7 输入）> "),
-                               command_input->Render()}),
-                         hbox({dimensions, text("  |  "), text(help)})}) |
-                   border;
+            auto frame_element =
+                vbox({status_bar, main_panel | flex, separator(),
+                      hbox({text(input_mode_.InCommandMode()
+                                     ? "命令 > "
+                                     : "命令（按 F7 输入）> "),
+                            command_input->Render()}),
+                      hbox({dimensions, text("  |  "), text(help)})}) |
+                border;
+            // 性能观测：构建耗时超过阈值才逐帧记录，避免日志自身拖慢界面。
+            NoteFrameRendered(frame_stopwatch.ElapsedMs(),
+                              preview_symbols_.size(),
+                              preview_labels_.size());
+            return frame_element;
         });
         auto ui = Modal(renderer, modal_pages, &modal_visible_);
         ui = CatchEvent(ui, [this, command_input, search_input, scope_menu,
@@ -1049,6 +1103,8 @@ private:
 
     /** @brief 在界面线程重建父行/动作行/数据行并保留行身份。 */
     void RebuildPreviewLabels() {
+        // 性能观测：整表重建是 O(候选数) 的热路径，耗时直接决定界面响应。
+        const PerfStopwatch stopwatch;
         const auto old_selected_row =
             preview_selected_ >= 0 &&
                     static_cast<std::size_t>(preview_selected_) <
@@ -1191,6 +1247,11 @@ private:
                           "观测，F7 命令";
         if (preview_filter_ != preview_active_filter_)
             preview_status_ += " | 搜索框是未提交草稿";
+        // 性能日志：候选数、展开后的行数与真实耗时一并记录，便于定位 A2L 规模影响。
+        LIBXCP_LOG_INFO(
+            "UI 整表重建耗时 {:.1f} ms（候选 {} 个 / 展开后 {} 行 / 范围 {}）",
+            stopwatch.ElapsedMs(), preview_symbols_.size(), preview_rows_.size(),
+            preview_scope_selected_ == 1 ? "仅采样" : "全部");
     }
 
     /** @brief 保存一次成功样本；保留最近值并刷新预览行。 */
@@ -1699,9 +1760,9 @@ private:
             reason = calmcar::xcp::tools::SymbolWriteUnsupportedReason(symbol);
         }
         if (!reason.empty()) return reason;
-        if (!symbol.memory_segment.has_value() ||
-            !symbol.memory_segment->has_xcp_segment)
-            return "无法唯一关联有效的XCP MEMORY_SEGMENT/PAG";
+        // P2：A2L 未声明段页事实时不再拒绝（段页是可选能力），写入资格交由运行时
+        // 页校验决定；判定依据通过 ModalCalibrationPageNote() 单独展示。
+        if (!calmcar::xcp::tools::HasCalibrationPageFacts(symbol)) return {};
         for (const auto& page : symbol.memory_segment->pages) {
             if (calmcar::xcp::tools::CalibrationPageWriteUnsupportedReason(
                     symbol, page.number, calmcar::xcp::PageAccessType::DontCare)
@@ -1709,6 +1770,16 @@ private:
                 return {};
         }
         return "A2L未声明允许无条件XCP写入的PAGE";
+    }
+
+    /**
+     * @brief 写入资格的页判定依据（无附注时返回空串）。
+     * @details 用于界面区分"确实不可写"与"A2L 缺段页声明、按单页放行"。
+     */
+    std::string ModalCalibrationPageNote() const {
+        if (!modal_symbol_info_.has_value()) return {};
+        return calmcar::xcp::tools::CalibrationPageNote(*modal_symbol_info_,
+                                                       calibration_page_facts_);
     }
 
     /** @brief 标定页读取依赖独立的标定选择快照。 */
@@ -1794,7 +1865,13 @@ private:
         if (result.preview_revision.has_value() &&
             preview_input_revision_.Matches(*result.preview_revision))
             preview_filter_ = preview_active_filter_;
+        // 性能观测：应用结果含建索引与整表重建，是搜索后那一跳的主要成本。
+        const PerfStopwatch stopwatch;
         RebuildPreviewLabels();
+        LIBXCP_LOG_INFO("UI 应用搜索结果耗时 {:.1f} ms（{} 个候选，筛选 {}）",
+                        stopwatch.ElapsedMs(), preview_symbols_.size(),
+                        preview_active_filter_.empty() ? "*"
+                                                       : preview_active_filter_);
     }
 
     /** @brief 模态关闭后应用仍有效的延迟搜索结果。 */
@@ -1810,6 +1887,8 @@ private:
         const std::string& pattern,
         std::optional<std::uint64_t> preview_revision = std::nullopt) {
         const auto generation = ++preview_search_generation_;
+        // 性能观测：A2L 检索是库内全量线性扫描，耗时随符号总数线性增长。
+        const PerfStopwatch search_stopwatch;
         auto count = database_.Count();
         if (!count.HasValue()) {
             Say("A2L Count 失败: " + count.ErrorInfo().message);
@@ -1824,6 +1903,10 @@ private:
             Say("A2L Search 失败: " + result.ErrorInfo().message);
             return;
         }
+        // 性能日志：检索耗时与命中/过滤后的数量分开记，命中数是渲染成本的真正输入。
+        LIBXCP_LOG_INFO("UI 候选检索耗时 {:.1f} ms（模式 {} / 命中 {} 个 / 库内共 {} 个）",
+                        search_stopwatch.ElapsedMs(), query,
+                        result.Value().size(), count.Value());
         std::vector<SymbolInfo> symbols;
         for (const auto& symbol : result.Value()) {
             if ((!options_.module.empty() &&
@@ -2422,24 +2505,47 @@ private:
     /** @brief 在持有XCP命令互斥锁时复核活动页及实时PAGE_PROPERTIES。 */
     std::string CheckCalibrationPageWriteLocked(
         const SymbolInfo& symbol, std::uint8_t* active_page_number) {
-        if (!symbol.memory_segment.has_value() ||
-            !symbol.memory_segment->has_xcp_segment)
-            return "无法唯一关联有效的XCP MEMORY_SEGMENT/PAG";
-        const auto& segment = *symbol.memory_segment;
+        // P2：段页是可选能力。A2L 没有 MEMORY_SEGMENT 时按 0 号段处理，并且只查询
+        // A2L 真正声明过的页命令，避免每次写入都换回一个 ERR_CMD_UNKNOWN。
+        const bool has_page_facts =
+            calmcar::xcp::tools::HasCalibrationPageFacts(symbol);
+        if (!has_page_facts &&
+            !calibration_page_facts_.declares_get_cal_page &&
+            !calibration_page_facts_.declares_get_page_info) {
+            // 既无段页事实也无页命令声明：按单页直写，不做页校验。
+            return {};
+        }
+        const std::uint8_t segment_number =
+            has_page_facts ? symbol.memory_segment->segment_number : 0U;
         const auto active_page = master_.GetCalPage(
-            calmcar::xcp::CalPageAccessMode::Xcp, segment.segment_number);
-        if (!active_page.has_value()) return "无法查询XCP活动页，拒绝写入";
-        const auto page_info =
-            master_.GetPageInfo(segment.segment_number, active_page->page);
-        if (!page_info.has_value())
-            return "无法查询XCP PAGE_PROPERTIES，拒绝写入";
-        const std::string reason =
-            calmcar::xcp::tools::CalibrationPageWriteUnsupportedReason(
-                symbol, active_page->page,
-                page_info->properties.xcp_write_access);
-        if (!reason.empty()) return reason;
-        if (active_page_number != nullptr)
-            *active_page_number = active_page->page;
+            calmcar::xcp::CalPageAccessMode::Xcp, segment_number);
+        if (!active_page.has_value()) {
+            // 有段页事实却查不到活动页属于真问题；无事实时只是"该 ECU 不支持页",
+            // 写入权限仍由 ECU 侧 ERR_WRITE_PROTECTED 兜底。
+            return has_page_facts ? "无法查询XCP活动页，拒绝写入" : std::string{};
+        }
+        if (calibration_page_facts_.declares_get_page_info) {
+            const auto page_info =
+                master_.GetPageInfo(segment_number, active_page->page);
+            if (!page_info.has_value())
+                return has_page_facts ? "无法查询XCP PAGE_PROPERTIES，拒绝写入"
+                                     : std::string{};
+            if (has_page_facts) {
+                const std::string reason =
+                    calmcar::xcp::tools::CalibrationPageWriteUnsupportedReason(
+                        symbol, active_page->page,
+                        page_info->properties.xcp_write_access);
+                if (!reason.empty()) return reason;
+            } else if (page_info->properties.xcp_write_access !=
+                       calmcar::xcp::PageAccessType::DontCare) {
+                return "Slave 当前 PAGE_PROPERTIES 不允许无条件 XCP 写访问";
+            }
+        } else if (active_page->page != 0U) {
+            // 无法查询 PAGE_PROPERTIES 时，只把"活动页 0（工作页约定）"当作放行依据。
+            return "当前活动页为 " + std::to_string(active_page->page) +
+                   "，A2L 未声明 GET_PAGE_INFO，无法确认该页允许写入；请先切回工作页";
+        }
+        if (active_page_number != nullptr) *active_page_number = active_page->page;
         return {};
     }
 
@@ -3126,11 +3232,51 @@ private:
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
     }
 
+    /**
+     * @brief 记录一帧界面构建耗时：超阈值逐帧告警，并按固定窗口汇总一次。
+     *
+     * 只在界面线程调用（渲染器内），因此聚合状态无需加锁。
+     * 逐帧写日志本身会显著拖慢界面，故低于阈值的帧只累加计数。
+     * @param elapsed_ms 本帧元素构建耗时（毫秒）。
+     * @param candidate_count 当前候选符号数量。
+     * @param row_count 当前展开后的预览行数。
+     */
+    void NoteFrameRendered(double elapsed_ms, std::size_t candidate_count,
+                           std::size_t row_count) {
+        ++frame_perf_frames_;
+        frame_perf_total_ms_ += elapsed_ms;
+        if (elapsed_ms > frame_perf_max_ms_) frame_perf_max_ms_ = elapsed_ms;
+        if (elapsed_ms >= kFramePerfWarnMs) {
+            LIBXCP_LOG_WARNING(
+                "UI 单帧构建耗时 {:.1f} ms（候选 {} 个 / 展开后 {} 行）",
+                elapsed_ms, candidate_count, row_count);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const double window_seconds =
+            std::chrono::duration<double>(now - frame_perf_window_start_).count();
+        if (window_seconds < kFramePerfWindowSeconds) return;
+        const double average_ms =
+            frame_perf_frames_ == 0U
+                ? 0.0
+                : frame_perf_total_ms_ / static_cast<double>(frame_perf_frames_);
+        LIBXCP_LOG_INFO(
+            "UI 渲染汇总：近 {:.1f} s 共 {} 帧，均值 {:.1f} ms，峰值 {:.1f} ms"
+            "（候选 {} 个 / 展开后 {} 行）",
+            window_seconds, frame_perf_frames_, average_ms, frame_perf_max_ms_,
+            candidate_count, row_count);
+        frame_perf_window_start_ = now;
+        frame_perf_frames_ = 0U;
+        frame_perf_total_ms_ = 0.0;
+        frame_perf_max_ms_ = 0.0;
+    }
+
     const Options& options_;
     const calmcar::xcp::a2l::IA2lDatabase& database_;
     calmcar::xcp::IMeasurementDatabase& measurement_database_;
     MeasurementSession& measurement_session_;
     XcpMaster& master_;
+    /** @brief A2L 声明的标定页命令能力（决定运行时是否查询 GET_CAL_PAGE/GET_PAGE_INFO）。 */
+    calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts_;
     std::vector<A2lEventMetadata> events_;
     mutable std::mutex output_mutex_;
     std::mutex command_mutex_;
@@ -3139,6 +3285,15 @@ private:
     std::condition_variable wait_cv_;
     std::atomic<bool> watching_{false};
     std::atomic<bool> daq_running_{false};
+    /** @brief 单帧渲染耗时汇总窗口的起点（仅界面线程访问）。 */
+    std::chrono::steady_clock::time_point frame_perf_window_start_ =
+        std::chrono::steady_clock::now();
+    /** @brief 当前汇总窗口内已统计的帧数（仅界面线程访问）。 */
+    std::uint64_t frame_perf_frames_{0U};
+    /** @brief 当前汇总窗口内的帧耗时总和，毫秒（仅界面线程访问）。 */
+    double frame_perf_total_ms_{0.0};
+    /** @brief 当前汇总窗口内的单帧耗时峰值，毫秒（仅界面线程访问）。 */
+    double frame_perf_max_ms_{0.0};
     bool profile_configured_{false};
     std::thread watch_thread_;
     std::mutex frame_mutex_;
@@ -3260,6 +3415,8 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // 性能观测：A2L 解析是启动阶段的一次性大开销，耗时随文件规模线性增长。
+    const PerfStopwatch load_stopwatch;
     auto loaded = A2lBridge::Load(options->a2l_path);
     if (!loaded.HasValue()) {
         std::cerr << "A2L 加载失败: " << loaded.ErrorInfo().message << '\n';
@@ -3278,12 +3435,18 @@ int main(int argc, char** argv) {
     }
     std::cout << "A2L 加载成功: " << options->a2l_path << " | " << count.Value()
               << " 个符号\n";
+    // 性能日志：把解析耗时、符号总数与文件路径记在一起，便于对比不同 A2L。
+    LIBXCP_LOG_INFO("A2L 加载耗时 {:.1f} ms（{} 个符号 / {}）",
+                    load_stopwatch.ElapsedMs(), count.Value(),
+                    options->a2l_path);
     for (const auto& warning : bridge->ListLoadWarnings()) {
         std::cout << "A2L 告警: " << warning.message << '\n';
     }
 
     calmcar::xcp::A2lMeasurementDatabase a2l_measurement_database(*database);
     calmcar::xcp::MeasurementEventBindingCandidates event_bindings;
+    // 性能观测：启动时的一次全库检索（用于 DAQ 事件绑定），同样是 O(符号数)。
+    const PerfStopwatch boot_search_stopwatch;
     auto all_symbols =
         database->Search("*", std::max<std::size_t>(1, count.Value()));
     if (!all_symbols.HasValue()) {
@@ -3291,6 +3454,9 @@ int main(int argc, char** argv) {
                   << all_symbols.ErrorInfo().message << '\n';
         return 1;
     }
+    LIBXCP_LOG_INFO("A2L 启动全库检索耗时 {:.1f} ms（命中 {} 个）",
+                    boot_search_stopwatch.ElapsedMs(),
+                    all_symbols.Value().size());
     for (const auto& symbol : all_symbols.Value()) {
         if (symbol.kind != SymbolKind::Measurement) continue;
         auto& candidates = event_bindings[QualifiedName(symbol)];
@@ -3463,8 +3629,18 @@ int main(int argc, char** argv) {
                           : "UDP")
                   << " 已连接: " << options->host << ':' << options->port
                   << '\n';
+        // ---- 标定页能力（P2）-------------------------------------------------
+        // 页命令是否可用由 A2L 的 OPTIONAL_CMD 决定：Slave 明确声明不支持的命令
+        // 不该在每次写入时再去试探（那会换回一个 ERR_CMD_UNKNOWN 并拖慢确认流程）。
+        calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts;
+        if (const auto* xcp_info = bridge->XcpInfo(); xcp_info != nullptr) {
+            calibration_page_facts =
+                calmcar::xcp::tools::MakeCalibrationPageFacts(
+                    xcp_info->protocol_layer.optional_commands);
+        }
         CliApp app(*options, *database, event_bound_database,
-                   measurement_session, master, std::move(event_metadata));
+                   measurement_session, master, std::move(event_metadata),
+                   calibration_page_facts);
         app.Run();
         if (measurement_session.Running()) measurement_session.Stop();
         master.Disconnect();
