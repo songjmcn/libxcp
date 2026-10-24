@@ -25,10 +25,13 @@ jobs:
         with:
           submodules: recursive
 
-      - name: 安装构建工具
+      # 项目启用日志需要 C++20 <format>，ubuntu-22.04 默认 GCC 11 不支持，需安装 GCC 13
+      - name: 安装构建工具与 GCC 13
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build gcc-13 g++-13
 
       # 预编译 Boost（含 locale/filesystem/process，动态库）
       - name: 安装 Boost ${{ env.BOOST_VERSION }}
@@ -49,6 +52,8 @@ jobs:
       - name: Configure
         run: >
           cmake -B build -S . -G Ninja
+          -DCMAKE_C_COMPILER=gcc-13
+          -DCMAKE_CXX_COMPILER=g++-13
           -DCMAKE_BUILD_TYPE=$BUILD_TYPE
           -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           -DLIBXCP_BUILD_TESTS=ON
