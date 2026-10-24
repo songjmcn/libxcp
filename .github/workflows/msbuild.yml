@@ -53,7 +53,7 @@ jobs:
           cmake -B build -S .
           -G "Visual Studio 17 2022" -A x64
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
-          -DLIBXCP_BUILD_TESTS=OFF
+          -DLIBXCP_BUILD_TESTS=ON
           -DLIBXCP_BUILD_TOOLS=ON
           -DLIBXCP_BUILD_EXAMPLES=ON
           -DLIBXCP_ENABLE_LOG=ON
