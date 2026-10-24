@@ -77,7 +77,17 @@ struct XcpProtocolVersion {
     [[nodiscard]] std::string ToString() const;
 };
 
-/// @brief 支持的协议层版本下限：V1.3（方案 D1 工程支持范围起点）
+/// @brief 协议层 V1.2（AsamV14 兼容 Profile 的对端基线）
+///
+/// @details `thirdparty/XCPliteV1.2` 明确配置 Protocol Layer `0x0102`
+///          （即 V1.2）、Transport Layer `0x0104`（即 V1.4）。为与该参考实现
+///          互操作，V1.2 必须成为**被支持的**版本而非被拒绝的版本。
+///
+/// @note 本常量的存在**不改变** `kProtocolVersion15` 作为本库能力上限的地位：
+///       V1.2 是「需要兼容的旧对端」，不是「本库的目标版本」。
+inline constexpr XcpProtocolVersion kProtocolVersion12{1, 2};
+
+/// @brief 协议层 V1.3（保守能力集的基准版本）
 inline constexpr XcpProtocolVersion kProtocolVersion13{1, 3};
 
 /// @brief 支持的协议层版本上限：V1.5（方案 D1 冻结；**工程决策**，
@@ -86,6 +96,19 @@ inline constexpr XcpProtocolVersion kProtocolVersion15{1, 5};
 
 /// @brief 支持的传输层版本上限：Ethernet TL V1.5（方案 D1 工程支持范围）
 inline constexpr XcpProtocolVersion kTransportVersion15{1, 5};
+
+/// @brief 传输层 V1.4（`AsamV14` Wire Profile 的对端基线）
+///
+/// @details `thirdparty/XCPliteV1.2/src/xcptl_cfg.h` 配置
+///          `XCP_TRANSPORT_LAYER_VERSION 0x0104`，即 TL V1.4。这是
+///          `TcpWireProfile::AsamV14` / `UdpTransportConfig` 互操作基线的
+///          传输层版本，与 `kProtocolVersion12`（PL `0x0102`）配套出现。
+///
+/// @note 与 `kTransportVersion15` 是**并存的两个受支持版本**，不是上限与
+///       下限的关系：TL V1.4 的线路布局（无 LEN 外 Tail）与 V1.5 在
+///       `PACKET_ALIGNMENT_8` 下数值等价，但对齐非 8 时**不兼容**，因此
+///       二者必须由 Wire Profile 显式区分，绝不能按版本号自动推断布局。
+inline constexpr XcpProtocolVersion kTransportVersion14{1, 4};
 
 /**
  * @brief 版本证据来源
@@ -225,6 +248,65 @@ struct TransportVersionSnapshot {
     ///          相应功能而非静默采用其一。
     bool conflicts_with_a2l{false};
 };
+
+/**
+ * @brief 由协议层版本推导出的**能力集**
+ *
+ * @details **B-T1 §4.3 引入**。此前实现把「生效版本」直接当作能力判据散落在
+ *          各处判断，导致同一个版本问题在多个模块各自解释。本结构把
+ *          「某个协议层版本**确定支持什么**」集中成一个可测试的真值表。
+ *
+ * @par 为什么必须引入
+ *   AsamV14 兼容 Profile（XCPlite PL 1.2）对端缺少 V1.3 起加入的部分命令与
+ *   传输层 Subcommand。若仅在版本比较处零散判断，极易漏判某一项而生成对端
+ *   无法理解的报文。集中为能力集后，**任何**能力判断都必须经由
+ *   `CapabilitySetFor(version)`，不可再自行比较版本号。
+ *
+ * @note 各字段语义为「**确定可用**」：为 false 时表示不得使用该能力，而
+ *       不表示对端一定不支持（保守拒绝优于静默发错报文）。
+ */
+struct CapabilitySet {
+    /// @brief 是否支持 GET_VERSION（`0xC0,0x00`，V1.2 起可用）
+    /// @details 该命令自 XCP V1.0 即存在，V1.2 对端实测可用（XCPlite 支持），
+    ///          故 V1.2 亦为 true。
+    bool get_version{false};
+
+    /// @brief 是否支持 Level-1 双字节命令码族（`0xC0` 前缀）
+    /// @details V1.2 起可用；本库除 GET_VERSION 外未实现其它 0xC0 子命令。
+    bool level1_commands{false};
+
+    /// @brief 是否支持 V1.3 引入的扩展命令族
+    /// @details 例如 `GET_DAQ_LIST_INFO`/`GET_DAQ_EVENT_INFO` 等按 DAQ List
+    ///          逐项查询的接口；V1.2 对端不应假定具备，需运行时探测。
+    bool extended_daq_queries{false};
+
+    /// @brief 是否允许传输层 Optional Subcommand
+    /// @details 本库基础 Profile 一律不实现，故恒为 false。
+    bool optional_tl_subcommands{false};
+
+    /// @brief 是否支持 DAQ Packed 模式（V1.5 特性）
+    /// @details 仅 V1.5 起可用。
+    bool daq_packed_mode{false};
+};
+
+/**
+ * @brief 依据协议层**生效版本**推导能力集
+ * @param effective 生效协议层版本（`ProtocolVersionSnapshot::effective`）
+ * @return 该版本确定支持的能力集
+ *
+ * @details 推导规则（自低向高累加，高阶版本包含低阶能力）：
+ *   - `effective >= V1.2`：`get_version`、`level1_commands`；
+ *   - `effective >= V1.3`：追加 `extended_daq_queries`；
+ *   - `effective >= V1.5`：追加 `daq_packed_mode`；
+ *   - `optional_tl_subcommands` 恒为 false（本库不实现）。
+ *
+ * @note 传入无效版本（Major 为 0）时返回**全 false** 的保守能力集：无版本
+ *       证据时不得假定任何能力，这与 `VersionPolicy` 的「未配置」语义一致。
+ * @note `1.x-conservative` 状态下调用方应传入保守标识版本
+ *       （`kProtocolVersion13`），从而自动获得保守能力交集。
+ */
+[[nodiscard]] CapabilitySet CapabilitySetFor(
+    const XcpProtocolVersion& effective) noexcept;
 
 /**
  * @brief 版本策略配置（`XcpMasterOptions` 成员）

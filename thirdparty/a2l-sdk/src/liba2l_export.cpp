@@ -731,6 +731,32 @@ SymbolDto BuildMeasurementSymbol(const a2l::Measurement& m,
 }
 
 /**
+ * @brief 判断 A2L 的 CALIBRATION_ACCESS 是否允许标定写入。
+ * @details ASAM MCD-2 MC V1.4 起用 CALIBRATION_ACCESS 取代 READ_ONLY 表达可写性
+ *          （规范 §4.7.28：「It substitutes the READ_ONLY attribute」）。
+ *          - 未声明（UNKNOWN）或显式 CALIBRATION：沿用 READ_ONLY / READ_WRITE 判据，
+ *            因此对本仓现有的 XCPlite 系（V1.2/V2.2 都不输出该关键字）行为不变。
+ *          - NO_CALIBRATION：规范要求"不可改、只能读"。
+ *          - OFFLINE_CALIBRATION：可刷写但不可在线标定。
+ *          - NOT_IN_MCD_SYSTEM：MCD 系统不可读写。
+ * @param access 上游枚举值。
+ * @return true 表示该声明不额外禁止写入。
+ */
+[[nodiscard]] bool CalibrationAccessAllowsWrite(
+    a2l::A2lCalibrationAccess access) {
+    switch (access) {
+        case a2l::A2lCalibrationAccess::NO_CALIBRATION:
+        case a2l::A2lCalibrationAccess::OFFLINE_CALIBRATION:
+        case a2l::A2lCalibrationAccess::NOT_IN_MCD_SYSTEM:
+            return false;
+        case a2l::A2lCalibrationAccess::CALIBRATION:
+        case a2l::A2lCalibrationAccess::UNKNOWN:
+        default:
+            return true;
+    }
+}
+
+/**
  * @brief 采集一个 CHARACTERISTIC 的完整快照。
  * @param c      上游特性对象。
  * @param module 所属模块。
@@ -810,7 +836,10 @@ SymbolDto BuildCharacteristicSymbol(const a2l::Characteristic& c,
         static_cast<std::uint8_t>(c.EcuAddressExtension() & 0xFF);
     s.byte_order = MapByteOrder(c.ByteOrder());
     s.bit_mask = c.BitMask();
-    s.read_write = !c.ReadOnly();
+    // 可写性 = 原有 READ_ONLY 判据 且 CALIBRATION_ACCESS 未额外禁止（方案 A）。
+    // XCPlite 系生成器不输出 CALIBRATION_ACCESS，此处取 UNKNOWN 分支，行为不变。
+    s.read_write =
+        !c.ReadOnly() && CalibrationAccessAllowsWrite(c.CalibrationAccess());
     if (c.HaveLimit()) {
         s.have_limit = true;
         s.lower_limit = c.LowerLimit();
@@ -895,7 +924,11 @@ StructInfoDto BuildInstanceInfo(const a2l::Instance& in,
     d.ref_memory_segment = in.RefMemorySegment();
     d.address_type = static_cast<std::uint8_t>(in.AddressType());
     d.layout = static_cast<std::uint8_t>(in.Layout());
-    d.read_write = in.ReadWrite();
+    // 可写性 = 原有 READ_WRITE 判据 且 CALIBRATION_ACCESS 未额外禁止（方案 A）。
+    // INSTANCE 在 ASAP2 里用 CALIBRATION_ACCESS 表达「能否标定」，
+    // 规范 §4.7.28：NO_CALIBRATION 只能读、OFFLINE_CALIBRATION 不可在线标定。
+    d.read_write =
+        in.ReadWrite() && CalibrationAccessAllowsWrite(in.CalibrationAccess());
     // 批次18（16-B）：INSTANCE 的 MATRIX_DIM 原值直传（上游实例属性规则
     // 显式接收：src/a2lparser.y:871）。丢失它会让结构体数组实例只剩第 0 个
     // 元素可寻址；逐元素展开与越界门归桥接层 StructureLayoutResolver。
@@ -1235,16 +1268,33 @@ void DiffIfData(const IfDataXcpDto& plain, const IfDataXcpDto& plus,
     AppendConflict("TRANSPORT",
                    std::to_string(static_cast<int>(plain.transport)),
                    std::to_string(static_cast<int>(plus.transport)), out);
-    AppendConflict("UDP_PORT", std::to_string(plain.udp_port),
-                   std::to_string(plus.udp_port), out);
-    AppendConflict("UDP_HOST", plain.udp_host, plus.udp_host, out);
-    // 批次12（§6.3-A）：UDP 端点新增两项纳入同参数差异比对。文本按位宽呈现
+    // v9（批次 B-T4）：端点比对改用 `endpoint_*`。
+    // 此前这里只比对 `udp_*`，而 SDK 从未给 TCP 端点填过那四个字段，于是
+    // **TCP 端点的端口/主机/对齐/子命令差异一律漏报**（两侧都是空值，
+    // AppendConflict 判定"无差异"）。改用统一的 `endpoint_*` 后，UDP 与 TCP
+    // 的端点差异都能被发现。
+    // 标签：PORT/HOST 由 UDP 专属改为 ENDPOINT 通用（这两项此前无测试断言，
+    // 改名不影响既有契约）；PACKET_ALIGNMENT/SUB_CMDS 本就是传输层中性的
+    // 名称，保持不变。
+    AppendConflict("ENDPOINT_PORT", std::to_string(plain.endpoint_port),
+                   std::to_string(plus.endpoint_port), out);
+    AppendConflict("ENDPOINT_HOST", plain.endpoint_host_name,
+                   plus.endpoint_host_name, out);
+    // 批次12（§6.3-A）：端点新增两项纳入同参数差异比对。文本按位宽呈现
     // （8/16/32），原始码 0/1/2 不直接示人；越界码显示 UNKNOWN。
+    //
+    // 契约（B-T5 收口，明确边界）：本函数只报**数值**差异，绝不比对
+    // `endpoint_alignment_declared`。理由：XCP 侧显式 `PACKET_ALIGNMENT_8` 与
+    // XCPplus 侧未声明（默认 8）在数值上相同、语义上证据强度不同，
+    // 而 `XcpPlusConflict` 只有三个字符串字段，无法表达"值同、声明状态不同"，
+    // 硬塞只会伪造文本。声明状态由 `endpoint_alignment_declared` 独立承担，
+    // 消费方（如 `libxcp::a2l::TransportEndpoint::packet_alignment_declared`）
+    // 自行判别。
     const auto align_name = [](std::uint8_t raw) -> std::string {
         return raw <= 2 ? std::to_string(8u << raw) : std::string("UNKNOWN");
     };
-    AppendConflict("PACKET_ALIGNMENT", align_name(plain.udp_packet_alignment),
-                   align_name(plus.udp_packet_alignment), out);
+    AppendConflict("PACKET_ALIGNMENT", align_name(plain.endpoint_packet_alignment),
+                   align_name(plus.endpoint_packet_alignment), out);
     const auto subcmd_name = [](const std::vector<std::uint8_t>& cmds) {
         std::string s;
         for (const std::uint8_t c : cmds) {
@@ -1255,8 +1305,8 @@ void DiffIfData(const IfDataXcpDto& plain, const IfDataXcpDto& plus,
         }
         return s;
     };
-    AppendConflict("SUB_CMDS", subcmd_name(plain.udp_sub_commands),
-                   subcmd_name(plus.udp_sub_commands), out);
+    AppendConflict("SUB_CMDS", subcmd_name(plain.endpoint_sub_commands),
+                   subcmd_name(plus.endpoint_sub_commands), out);
     AppendConflict("SEED_AND_KEY", plain.seed_and_key_function,
                    plus.seed_and_key_function, out);
 }
@@ -1913,6 +1963,15 @@ private:
             dto->has_ecu_states = !pl->GetEcuStates().empty();
         }
         dto->transport = PickTransport(blk);
+        // ---- v9：统一端点字段（TCP 与 UDP 共用一套填充逻辑）----
+        //
+        // 旧实现只处理 kUdpIp，TCP 端点因此没有任何专属字段（消费方只能去
+        // 读 `udp_host`/`udp_port` 拿 TCP 参数）。此处按 transport 类别取对应
+        // 上游列表，统一填 `endpoint_*`；UDP 额外把同样内容回填旧的 `udp_*`
+        // 以维持一个兼容周期。
+        //
+        // 端点级版本证据（endpoint_protocol_version）在此后统一填，因为它与
+        // 传输层类别无关。
         if (dto->transport == XcpTransportDto::kUdpIp) {
             const auto& udps = blk.GetXcpOnUdpIps();
             if (!udps.empty()) {
@@ -1920,13 +1979,28 @@ private:
                 // （port/host/alignment/sub_cmds 同一实例，多实例建模延后，
                 //  见设计 §6.3；不得出现端口取 front 而子命令取全体的混合口径）
                 const a2l::xcp::XcpOnUdpIp& udp = udps.front();
-                dto->udp_port = udp.GetPort();
-                // HOST_NAME 与 ADDRESS 是 ASAP2 的两个不同关键字：上游把
-                // HOST_NAME 存进 host_name_、ADDRESS 存进 address_。
-                // XCPlite 等运行时生成器只写 `ADDRESS "IP"`（Vector 工具链
-                // 事实约定），若只取 GetHostName 则端点主机恒空（协议调试
-                // 对手端核证）。回退链：HOST_NAME → ADDRESS → IPV6，
-                // 保持"首个实例"口径不变，仅补齐同一实例内的取值来源。
+                dto->endpoint_instance_count =
+                    static_cast<std::uint32_t>(udps.size());
+                dto->endpoint_port = udp.GetPort();
+                dto->endpoint_host_name = udp.GetHostName();
+                dto->endpoint_ipv4_address = udp.GetAddress();
+                dto->endpoint_ipv6_address = udp.GetIpv6();
+                // 原码透传，不做 8/16/32 换算（换算归桥接层，§4.3）。
+                // declared 位来自上游新增的 IsAlignmentDeclared()：上游对
+                // 未识别字面量静默保持默认 8 bit(0)，故**只有**该标志能区分
+                // "A2L 未声明"（false）与"声明了 8bit 或声明了非法值"（true）。
+                dto->endpoint_packet_alignment =
+                    static_cast<std::uint8_t>(udp.GetPacketAlignment());
+                dto->endpoint_alignment_declared = udp.IsAlignmentDeclared();
+                for (const a2l::xcp::UdpSubCmd sc : udp.GetSubCmds()) {
+                    dto->endpoint_sub_commands.push_back(
+                        static_cast<std::uint8_t>(sc));
+                }
+                dto->endpoint_transport_version =
+                    static_cast<std::uint16_t>(udp.GetVersion());
+
+                // 兼容周期：UDP 同时填旧字段（内容与 endpoint_* 一致）。
+                dto->udp_port = dto->endpoint_port;
                 dto->udp_host = udp.GetHostName();
                 if (dto->udp_host.empty()) {
                     dto->udp_host = udp.GetAddress();
@@ -1934,15 +2008,35 @@ private:
                 if (dto->udp_host.empty()) {
                     dto->udp_host = udp.GetIpv6();
                 }
-                // 原码透传，不做 8/16/32 换算（换算归桥接层，§4.3）
-                dto->udp_packet_alignment =
-                    static_cast<std::uint8_t>(udp.GetPacketAlignment());
-                for (const a2l::xcp::UdpSubCmd sc : udp.GetSubCmds()) {
-                    dto->udp_sub_commands.push_back(
+                dto->udp_packet_alignment = dto->endpoint_packet_alignment;
+                dto->udp_sub_commands = dto->endpoint_sub_commands;
+            }
+        } else if (dto->transport == XcpTransportDto::kTcpIp) {
+            const auto& tcps = blk.GetXcpOnTcpIps();
+            if (!tcps.empty()) {
+                const a2l::xcp::XcpOnTcpIp& tcp = tcps.front();
+                dto->endpoint_instance_count =
+                    static_cast<std::uint32_t>(tcps.size());
+                dto->endpoint_port = tcp.GetPort();
+                dto->endpoint_host_name = tcp.GetHostName();
+                dto->endpoint_ipv4_address = tcp.GetAddress();
+                dto->endpoint_ipv6_address = tcp.GetIpv6();
+                dto->endpoint_packet_alignment =
+                    static_cast<std::uint8_t>(tcp.GetPacketAlignment());
+                dto->endpoint_alignment_declared = tcp.IsAlignmentDeclared();
+                for (const a2l::xcp::TcpSubCmd sc : tcp.GetSubCmds()) {
+                    dto->endpoint_sub_commands.push_back(
                         static_cast<std::uint8_t>(sc));
                 }
+                dto->endpoint_transport_version =
+                    static_cast<std::uint16_t>(tcp.GetVersion());
+                // TCP **不**填旧 udp_* 字段：那正是本次要修掉的"TCP 端点
+                // 借 UDP 字段对外表达"的错位。
             }
         }
+
+        // 端点级版本冗余：无论哪类传输层，都把协议层版本同步一份到端点字段。
+        dto->endpoint_protocol_version = dto->protocol_version;
 
         if (const auto* dq = cp.GetDaq(); dq != nullptr) {
             // DAQ 能力块 + 事件通道（批次10）

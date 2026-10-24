@@ -153,6 +153,52 @@ namespace calmcar::xcp::tools {
     return {};
 }
 
+/// @brief A2L 声明的标定页命令能力（源自 PROTOCOL_LAYER 的 OPTIONAL_CMD）。
+struct CalibrationPageFacts {
+    bool declares_get_cal_page{false};   ///< A2L 是否声明 GET_CAL_PAGE
+    bool declares_set_cal_page{false};   ///< A2L 是否声明 SET_CAL_PAGE
+    bool declares_get_page_info{false};  ///< A2L 是否声明 GET_PAGE_INFO
+};
+
+/// @brief 判断命令码是否出现在 A2L OPTIONAL_CMD 声明中。
+[[nodiscard]] inline bool A2lDeclaresCommand(
+    const std::vector<std::uint8_t>& optional_commands, CommandCode code) {
+    const auto value = static_cast<std::uint8_t>(code);
+    return std::find(optional_commands.begin(), optional_commands.end(), value) !=
+           optional_commands.end();
+}
+
+/// @brief 从 A2L OPTIONAL_CMD 命令码构造标定页能力事实。
+[[nodiscard]] inline CalibrationPageFacts MakeCalibrationPageFacts(
+    const std::vector<std::uint8_t>& optional_commands) {
+    CalibrationPageFacts facts;
+    facts.declares_get_cal_page =
+        A2lDeclaresCommand(optional_commands, CommandCode::GetCalPage);
+    facts.declares_set_cal_page =
+        A2lDeclaresCommand(optional_commands, CommandCode::SetCalPage);
+    facts.declares_get_page_info =
+        A2lDeclaresCommand(optional_commands, CommandCode::GetPageInfo);
+    return facts;
+}
+
+/// @brief 符号是否带可用的段页事实（MEMORY_SEGMENT 且声明了有效 XCP SEGMENT）。
+[[nodiscard]] inline bool HasCalibrationPageFacts(const a2l::SymbolInfo& symbol) {
+    return symbol.memory_segment.has_value() &&
+           symbol.memory_segment->has_xcp_segment;
+}
+
+/// @brief 写入资格的界面附注：说明本轮判定依据（无附注时返回空串）。
+[[nodiscard]] inline std::string CalibrationPageNote(
+    const a2l::SymbolInfo& symbol, const CalibrationPageFacts& facts) {
+    if (HasCalibrationPageFacts(symbol)) {
+        if (facts.declares_get_page_info) return {};
+        return "A2L 未声明 GET_PAGE_INFO：仅按活动页判定，页写权限未取证";
+    }
+    if (!facts.declares_get_cal_page)
+        return "A2L 未声明 MEMORY_SEGMENT 与 GET_CAL_PAGE：按单页直写，未做页校验";
+    return "A2L 未声明 MEMORY_SEGMENT：按 0 号段查询活动页，活动页 0 视为工作页";
+}
+
 /// @brief 只根据A2L静态信息检查标定写入候选，不读取ECU状态。
 [[nodiscard]] inline std::string SymbolStaticWriteUnsupportedReason(
     const a2l::SymbolInfo& symbol) {
@@ -169,9 +215,10 @@ namespace calmcar::xcp::tools {
         if (!reason.empty()) return reason;
     }
 
-    if (!symbol.memory_segment.has_value() ||
-        !symbol.memory_segment->has_xcp_segment)
-        return "无法唯一关联有效的XCP MEMORY_SEGMENT/PAG";
+    // P2：段页是可选能力。A2L 没有 MEMORY_SEGMENT 时不再拒绝写入，改为在运行时
+    // 按活动页判定（见 CliApp::CheckCalibrationPageWriteLocked）；只有确实声明了
+    // 段页事实时才要求存在"允许无条件 XCP 写"的 PAGE。
+    if (!HasCalibrationPageFacts(symbol)) return {};
     const auto& pages = symbol.memory_segment->pages;
     if (std::none_of(pages.begin(), pages.end(), [](const auto& page) {
             return page.xcp_write_access == a2l::XcpPageWriteAccess::DontCare;

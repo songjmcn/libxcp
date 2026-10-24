@@ -308,6 +308,17 @@ session.Stop();
   `measurement_database.hpp`、`measurement_planner.hpp`、`measurement_sample.hpp`、
   `measurement_session.hpp`
 - 既有协议核心（`xcp_master.hpp` 等）仅追加式扩展，签名未变。
+- TCP 传输（与既有 `UdpTransport` 并列，同实现 `IXcpTransport`）：
+  `include/libxcp/tcp_transport.hpp`、`tcp_transport_config.hpp`、
+  `tcp_wire_profile.hpp`（`AsamV15` / `AsamV14` 双线路布局），以及通用帧层
+  `ethernet_header_codec.hpp`、`tcp_stream_decoder.hpp`。
+  命令行示例：`xcp_master --transport tcp --tcp-profile asam-v1.4 --preset xcplite`。
+
+> **V1.5 线路布局的验证边界**：`asam-v1.5`（LEN 外 Tail、8/16/32 alignment、
+> strict CTR）目前只由本库自有 loopback 与解码器单测覆盖，**尚未与独立实现做
+> 互操作验证**；`asam-v1.4` 已与 XCPlite V1.2 真实进程做过 TCP 互操作 Gate
+> （macOS）。生产使用 `asam-v1.5` 前应先与目标 ECU 联调。详见
+> [`code-plan/B-T5_实施记录_CLI传输选择与XCPlite真实TCP互操作.md`](code-plan/B-T5_实施记录_CLI传输选择与XCPlite真实TCP互操作.md)。
 
 封板与已知限制记录：`code-plan/libxcp_测量子系统_v1.0_封板记录.md`；
 各里程碑实施记录见 `code-plan/libxcp_测量子系统_v0.*_记录.md`。
@@ -319,6 +330,9 @@ session.Stop();
   `docs/Asam-Ae-Mcd-1-Xcp-Bs-Protocol-Layer-v1-5-0.md`（**以同目录原始 PDF 为
   权威准据**，Markdown 转换版存在图文错位）、TL V1.5
   `docs/ASAM_XCP_Part3_XCP_on_Ethernet_TCP_UDP_1.5.md`（Dev 版，仅作过渡）、
+  TL V1.5 正式转换版 `docs/ASAM-AE-MCD-1-XCP-AS-Ethernet-Transport-Layer-V1-5-0.md`、
+  **XCP V1.5 Quick Start（标定与测量最小闭环，规范讲解向，TCP/UDP 双承载）
+  `docs/XCP_V1.5_QuickStart_标定与测量.md`**、
   `XCPlite_对手端协议调试指南.md`；**模块文档索引见
   [§2.2](#22-模块文档索引)（`docs/modules/`）**
 - `code-plan/`：详细设计（`XCP_1.3.0_详细设计_类接口与头文件.md`、

@@ -94,9 +94,12 @@ TEST(VersionResolverTest, ConnectOnlyYieldsConservativeWithoutFabricatingMinor) 
     EXPECT_EQ(result.protocol.evidence.reported.major, 1U);
     EXPECT_EQ(result.protocol.evidence.reported.minor, 0U);
 
-    // 裁决层：保守标志置位，生效版本取支持范围下限
+    // 裁决层：保守标志置位，生效版本取支持范围下限。
+    // B-T1 §4.3：下限自 V1.3 下调至 V1.2（容纳 XCPlite PL 0x0102），
+    // 保守口径随之取 V1.2——保守语义是"按支持范围内最低版本的能力集
+    // 执行"，下限改变后能力口径必须同步，否则会高估 V1.2 对端的能力。
     EXPECT_TRUE(result.protocol.conservative);
-    EXPECT_EQ(result.protocol.effective, kProtocolVersion13);
+    EXPECT_EQ(result.protocol.effective, kProtocolVersion12);
     EXPECT_TRUE(result.transport.conservative);
 }
 

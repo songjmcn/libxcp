@@ -28,6 +28,7 @@
 #include <thread>
 #include <variant>
 #include <vector>
+#include <cstring>
 
 #include <libxcp/a2l/a2l_bridge.hpp>
 #include <libxcp/a2l/a2l_result.hpp>

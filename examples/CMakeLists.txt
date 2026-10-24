@@ -22,3 +22,7 @@ add_subdirectory(xcp_integration_demo)
 
 # 独立 XCPlite Slave：可运行 UDP 服务或显式生成 A2L 后退出。
 add_subdirectory(xcp_slave_demo)
+
+# 基于 XCPlite V1.2（协议层 1.2 / 传输层 1.4）的从站测试程序：自带独立静态库
+# xcplite_v12，不复用 V2.2 的 xcplite 目标（原因见该目录 CMakeLists.txt 文件头）。
+add_subdirectory(xcp_slave_demo_v12)

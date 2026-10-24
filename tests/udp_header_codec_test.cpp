@@ -47,11 +47,22 @@ TEST(UdpHeaderEncode, CounterWrapsUseFullSixteenBits) {
     EXPECT_EQ(frame.data, BytesOf({0x02, 0x00, 0xFF, 0xFF, 0xFD, 0x00}));
 }
 
-TEST(UdpHeaderEncode, EmptyPacketProducesLenZeroButIsRejectedOnDecode) {
-    // 编码器不禁止空 Packet（LEN=0），但解码器必须拒绝 LEN==0 的 Frame
-    const auto frame = EncodeUdpFrame(BytesView{}, 0);
-    EXPECT_EQ(frame.data.size(), kUdpHeaderSize);
-    EXPECT_FALSE(DecodeUdpDatagram(BytesView{frame.data}).has_value());
+TEST(UdpHeaderEncode, EmptyPacketIsRejectedByEncoder) {
+    // B-T1 用户裁决（m00560）：按计划 §4.1，编码器直接拒绝空 Packet。
+    // 此前"编码器允许编出 LEN=0、由解码器拒绝"的不对称契约已取消，
+    // 编码与解码在 LEN=0 上口径一致。
+    EXPECT_THROW((void)EncodeUdpFrame(BytesView{}, 0), XcpException);
+    try {
+        (void)EncodeUdpFrame(BytesView{}, 0);
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+}
+
+TEST(UdpHeaderDecode, ZeroLenFrameStillRejectedOnDecode) {
+    // 解码侧对 LEN==0 的拒绝必须保留：对端可能仍然发出 LEN=0 的畸形 Frame
+    const Bytes datagram = BytesOf({0x00, 0x00, 0x01, 0x00});
+    EXPECT_FALSE(DecodeUdpDatagram(datagram).has_value());
 }
 
 TEST(UdpHeaderEncode, RejectsOversizedPacket) {

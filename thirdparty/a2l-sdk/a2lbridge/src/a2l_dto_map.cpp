@@ -478,18 +478,44 @@ void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
                 ep.kind = TransportEndpoint::Kind::UdpIp;
                 break;
         }
-        ep.remote_host = dto.udp_host;
-        ep.remote_port = dto.udp_port;
-        // 批次12（§4.3）：alignment / 子命令语义上属 XCPonUDP/IP，
-        // 其它传输层不拿这两个字段凑数（保持默认值，不臆造）。
-        if (ep.kind == TransportEndpoint::Kind::UdpIp) {
+        // v9（批次 B-T4）：端点事实统一从 `endpoint_*` 读取。
+        // 此前这里无条件读 `dto.udp_host/udp_port`，对所有传输层类别都赋值，
+        // 导致 TCP 端点的主机/端口只能借 UDP 命名的字段对外表达（语义错位）。
+        // 现在 UDP 与 TCP 由 SDK 各自填好同一套 `endpoint_*`，桥接层不再关心
+        // 传输层类别即可取到正确端点。`udp_*` 已 deprecated，此处不再引用。
+        //
+        // 取值优先级：HOST_NAME 优先，回退 ADDRESS，再回退 IPV6
+        // （Vector 工具链事实约定：运行时生成器常只写 `ADDRESS "IP"`，
+        //  此时 HOST_NAME 为空，必须回退，否则端点主机恒空）。
+        ep.remote_host = dto.endpoint_host_name;
+        if (ep.remote_host.empty()) {
+            ep.remote_host = dto.endpoint_ipv4_address;
+        }
+        if (ep.remote_host.empty()) {
+            ep.remote_host = dto.endpoint_ipv6_address;
+        }
+        ep.remote_port = dto.endpoint_port;
+        // Transport Layer 版本（不是 PROTOCOL_LAYER 的版本）：v9 起上游
+        // 提供了独立字段，0 仍表示「A2L 未声明该段版本」。
+        ep.version = dto.endpoint_transport_version;
+        // alignment / 子命令对 XCPonTCP/IP 与 XCPonUDP/IP 均有意义
+        // （规范 ASAM AE MCD-1 XCP on Ethernet 两类传输层都定义
+        //  PACKET_ALIGNMENT 与 OPTIONAL_TL_SUBCMD）。CAN/FLX/USB/SXI
+        // 不取这两个字段，保持默认值，不臆造。
+        if (ep.kind == TransportEndpoint::Kind::UdpIp ||
+            ep.kind == TransportEndpoint::Kind::TcpIp) {
             // 上游原码 0/1/2 = 8/16/32 bit；>2 判为未知 → 0（防御分支，
             // 上游枚举实际只会给 0/1/2）。
             ep.packet_alignment =
-                dto.udp_packet_alignment <= 2
-                    ? static_cast<std::uint8_t>(8u << dto.udp_packet_alignment)
+                dto.endpoint_packet_alignment <= 2
+                    ? static_cast<std::uint8_t>(8u << dto.endpoint_packet_alignment)
                     : 0;
-            ep.sub_commands = dto.udp_sub_commands;
+            // alignment 声明位：false 表示 A2L 未写 PACKET_ALIGNMENT，
+            // 此时上面的 packet_alignment 只是 AML 默认值（8 bit），
+            // **不构成** ECU 实际对齐的事实，消费方不得据此推断 Profile。
+            ep.packet_alignment_declared = dto.endpoint_alignment_declared;
+            ep.sub_commands = dto.endpoint_sub_commands;
+            ep.instance_count = dto.endpoint_instance_count;
         }
         transports->push_back(std::move(ep));
     }

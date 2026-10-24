@@ -134,8 +134,11 @@ VersionResolver::Result VersionResolver::Resolve(const Inputs& inputs) {
         result.protocol.effective = XcpProtocolVersion{};
         result.protocol.conservative = false;
     } else if (!pl_evidence.minor_confirmed) {
-        // 保守能力集：以支持范围下限 V1.3 作为能力口径
-        result.protocol.effective = kProtocolVersion13;
+        // 保守能力集：以支持范围下限作为能力口径。
+        // B-T1 §4.3：下限自 V1.3 下调至 V1.2，故保守口径同步下移——
+        // 保守模式的语义是"按支持范围内最低版本的能力集执行"，
+        // 下限改变后若仍固定按 V1.3，会在对端实为 V1.2 时高估其能力。
+        result.protocol.effective = kProtocolVersion12;
         result.protocol.conservative = true;
     } else if (kProtocolVersion15 < pl_evidence.reported) {
         result.protocol.effective = kProtocolVersion15;

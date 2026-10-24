@@ -45,13 +45,17 @@
 #include <ftxui/dom/elements.hpp>
 
 #include "calibration_policy.hpp"
+#include "preview_refresh.hpp"
+#include "windowed_menu.hpp"
 #include "symbol_display.hpp"
+#include "transport_selection.hpp"
 #include "tui_model.hpp"
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/a2l/ia2l_database.hpp"
 #include "libxcp/measurement/measurement_planner.hpp"
 #include "libxcp/measurement/measurement_session.hpp"
 #include "libxcp/log.hpp"
+#include "libxcp/tcp_transport.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "a2l/a2l_measurement_database.hpp"
 
@@ -66,6 +70,45 @@ namespace {
 
 /** @brief 数组详情每页读取的连续元素数量。 */
 constexpr std::uint64_t kArrayPageSize = 8U;
+
+/** @brief 单帧界面构建耗时超过该值（毫秒）时才逐帧写日志。 */
+constexpr double kFramePerfWarnMs = 50.0;
+
+/** @brief 界面渲染汇总日志的输出周期（秒）。 */
+constexpr double kFramePerfWindowSeconds = 1.0;
+
+/**
+ * @brief 轻量单调时钟计时器，用于性能日志。
+ *
+ * 只依赖 steady_clock，不参与业务逻辑；拷贝语义由编译器生成，
+ * 拷贝后两个对象都从各自构造时刻或拷贝时刻继续计时。
+ */
+class PerfStopwatch {
+public:
+    /** @brief 从当前时刻开始计时。 */
+    PerfStopwatch() : started_(std::chrono::steady_clock::now()) {}
+
+    /**
+     * @brief 返回自计时起点以来的毫秒数。
+     * @return 以毫秒为单位、单调递增的经过时间。
+     */
+    [[nodiscard]] double ElapsedMs() const {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now() - started_)
+            .count();
+    }
+
+    /**
+     * @brief 返回自计时起点以来的秒数。
+     * @return 以秒为单位、单调递增的经过时间。
+     */
+    [[nodiscard]] double ElapsedSeconds() const {
+        return ElapsedMs() / 1000.0;
+    }
+
+private:
+    std::chrono::steady_clock::time_point started_; /**< 计时起点。 */
+};
 
 /** @brief 判断标准输入和输出是否连接到交互终端。 */
 bool IsInteractiveTerminal() {
@@ -123,16 +166,33 @@ struct Options {
     std::chrono::milliseconds interval{500};
     std::string mode{"poll"};
     bool interval_explicit{false};
+
+    /**
+     * @brief 传输层选择的原始请求（B-T5 §8.1）
+     * @details 这里保存的是**用户原样输入**，尚未与 A2L 事实合并。合并由
+     *          `calmcar::xcp::tools::ResolveTransportSelection()` 完成，
+     *          从而"用户给了什么"与"最终怎么连"可以分开断言。
+     */
+    calmcar::xcp::tools::TransportSelectionRequest transport_request;
 };
 
 void PrintUsage(std::ostream& out) {
     out << "Usage: xcp_master --a2l <path> --host <IPv4> --port <1..65535> "
            "[--module <name>] [--mode poll|daq] [--interval-ms <ms>]\n"
+           "                  [--transport udp|tcp] [--tcp-profile "
+           "asam-v1.5|asam-v1.4] [--packet-alignment 8|16|32]\n"
+           "                  [--protocol-version 1.2|1.3|1.4|1.5] "
+           "[--transport-version 1.4|1.5] [--preset xcplite]\n"
            "       xcp_master --help\n"
            "poll: --interval-ms is the target polling cycle (default 500 ms).\n"
            "daq: event-driven; --interval-ms is invalid. The DTO layout is "
            "selected automatically from the slave's reported identification "
-           "field type (DAQ_KEY_BYTE); no profile option is needed.\n";
+           "field type (DAQ_KEY_BYTE); no profile option is needed.\n"
+           "tcp: --tcp-profile is mandatory and never inferred from the A2L or "
+           "from version numbers. asam-v1.5 additionally needs "
+           "--packet-alignment (or an explicit A2L PACKET_ALIGNMENT_x).\n"
+           "--host/--port may be omitted for tcp when the A2L declares "
+           "XCP_ON_TCP_IP.\n";
 }
 
 bool ParseUnsigned(std::string_view text, std::uint64_t& value) {
@@ -155,6 +215,9 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                                     std::string& error) {
     Options options;
     help = false;
+    // 是否显式写下了 --transport：只有显式写作才能压过 --preset 隐含的 tcp，
+    // 且判断放在循环之后，避免"选项顺序不同、结果不同"的顺序依赖。
+    bool transport_explicit = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view key(argv[i]);
         if (key == "--help" || key == "-h") {
@@ -196,6 +259,50 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 return std::nullopt;
             }
             options.mode = value;
+        } else if (key == "--transport") {
+            const auto parsed = calmcar::xcp::tools::ParseTransportKind(value);
+            if (!parsed.has_value()) {
+                error = "--transport must be udp or tcp";
+                return std::nullopt;
+            }
+            options.transport_request.transport = *parsed;
+            transport_explicit = true;
+        } else if (key == "--tcp-profile") {
+            const auto parsed =
+                calmcar::xcp::tools::ParseTcpWireProfileText(value);
+            if (!parsed.has_value()) {
+                error = "--tcp-profile must be asam-v1.5 or asam-v1.4";
+                return std::nullopt;
+            }
+            options.transport_request.tcp_profile = *parsed;
+        } else if (key == "--packet-alignment") {
+            const auto parsed =
+                calmcar::xcp::tools::ParseAlignmentBitsText(value);
+            if (!parsed.has_value()) {
+                error = "--packet-alignment must be 8, 16 or 32";
+                return std::nullopt;
+            }
+            options.transport_request.packet_alignment_bits = *parsed;
+        } else if (key == "--protocol-version") {
+            const auto parsed = calmcar::xcp::tools::ParseVersionText(value);
+            if (!parsed.has_value()) {
+                error = "--protocol-version must be a version like 1.2";
+                return std::nullopt;
+            }
+            options.transport_request.protocol_version = *parsed;
+        } else if (key == "--transport-version") {
+            const auto parsed = calmcar::xcp::tools::ParseVersionText(value);
+            if (!parsed.has_value()) {
+                error = "--transport-version must be a version like 1.4";
+                return std::nullopt;
+            }
+            options.transport_request.transport_version = *parsed;
+        } else if (key == "--preset") {
+            if (value != "xcplite") {
+                error = "--preset only supports xcplite";
+                return std::nullopt;
+            }
+            options.transport_request.preset_xcplite = true;
         } else {
             error = "unknown option: " + std::string(key);
             return std::nullopt;
@@ -206,8 +313,27 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
             "--interval-ms controls polling only and conflicts with --mode daq";
         return std::nullopt;
     }
-    if (options.a2l_path.empty() || options.host.empty() || options.port == 0) {
-        error = "--a2l, --host and --port are required";
+
+    // ---- 传输层选择的收尾（B-T5 §8.1） ------------------------------------
+    const bool host_given = !options.host.empty();
+    const bool port_given = options.port != 0;
+    // 1) preset 隐含 tcp：`--preset xcplite` 描述的是 XCPlite 的 TCP 部署事实。
+    //    若调用方同行写了 `--transport udp`，交给解析层报冲突而不是在这里
+    //    悄悄改掉用户的显式选择。
+    if (options.transport_request.preset_xcplite && !transport_explicit) {
+        options.transport_request.transport =
+            calmcar::xcp::tools::TransportKind::Tcp;
+    }
+    // 2) host/port 交给解析层成对校验：UDP 仍要求两者齐全（既有契约），
+    //    TCP 允许两者都缺并在 A2L 中寻找 XCP_ON_TCP_IP 端点。
+    if (host_given) {
+        options.transport_request.host = options.host;
+    }
+    if (port_given) {
+        options.transport_request.port = options.port;
+    }
+    if (options.a2l_path.empty()) {
+        error = "--a2l is required";
         return std::nullopt;
     }
     return options;
@@ -307,12 +433,14 @@ public:
            calmcar::xcp::IMeasurementDatabase& measurement_database,
            calmcar::xcp::MeasurementSession& measurement_session,
            XcpMaster& master,
-           std::vector<calmcar::xcp::A2lEventMetadata> events)
+           std::vector<calmcar::xcp::A2lEventMetadata> events,
+           calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts = {})
         : options_(options),
           database_(database),
           measurement_database_(measurement_database),
           measurement_session_(measurement_session),
           master_(master),
+          calibration_page_facts_(calibration_page_facts),
           events_(std::move(events)) {}
 
     ~CliApp() { StopWatch(); }
@@ -357,10 +485,15 @@ public:
         scope_options.on_change = [this] { OnPreviewScopeChanged(); };
         auto scope_menu = Menu(&preview_scope_labels_, &preview_scope_selected_,
                                scope_options);
-        MenuOption preview_options;
-        preview_options.on_enter = [this] { ActivatePreviewRow(); };
-        auto preview_menu =
-            Menu(&preview_labels_, &preview_selected_, preview_options);
+        // 预览列表可能是 198k 行，FTXUI Menu 会为每一行构造元素，
+        // 单帧耗时约 170 ms；改用只构造可视行的虚拟菜单。
+        auto windowed_preview_menu =
+            std::make_shared<calmcar::xcp::tools::WindowedMenu>(
+                &preview_labels_, &preview_selected_,
+                calmcar::xcp::tools::WindowedMenuOptions{
+                    [this] { ActivatePreviewRow(); }});
+        preview_menu_typed_ = windowed_preview_menu.get();
+        ftxui::Component preview_menu = windowed_preview_menu;
         auto preview_view =
             Container::Vertical({search_input, scope_menu, preview_menu});
 
@@ -504,26 +637,61 @@ public:
                 const auto write_status = write_reason.empty()
                                               ? "满足候选条件；仍需明确确认"
                                               : "拒绝：" + write_reason;
-                return vbox(
-                           {text("独立标定流程 · " + name + "    [Esc 返回]") |
-                                bold | color(Color::Yellow),
-                            separator(),
-                            text("类别：" + KindName(symbol) + " | 基础类型：" +
-                                 description.base_type),
-                            text("形态：" + description.data_shape +
-                                 " | 单元素宽度：" + description.element_width),
-                            text("当前值：" + calibration_form_.current),
-                            text("读取状态：" + read_reason),
-                            text("写入资格：" + write_status),
-                            calibration_element_index_control->Render(),
-                            target_control->Render(),
-                            hbox({calibration_read_control->Render(),
-                                  text("  "), write_control->Render(),
-                                  text("  "),
-                                  close_calibration_button->Render()}),
-                            text("标定值只在确认页按 Y 后发送；N/Esc 取消。") |
-                                color(Color::Yellow)}) |
-                       border |
+                // 标定表单的当前值/状态由工作线程在 output_mutex_ 保护下更新，
+                // 渲染必须取快照，避免读到正在被改写的 std::string。
+                std::string form_current;
+                std::string form_status;
+                std::string form_target;
+                {
+                    std::lock_guard lock(output_mutex_);
+                    form_current = calibration_form_.current;
+                    form_status = calibration_form_.status;
+                    form_target = calibration_form_.target;
+                }
+                // 行数随状态变化：越界提示只在需要时插入，避免空白占位行。
+                std::vector<Element> lines;
+                lines.push_back(text("独立标定流程 · " + name +
+                                     "    [Esc 返回]") |
+                                bold | color(Color::Yellow));
+                lines.push_back(separator());
+                lines.push_back(text("类别：" + KindName(symbol) +
+                                     " | 基础类型：" + description.base_type));
+                lines.push_back(text("形态：" + description.data_shape +
+                                     " | 单元素宽度：" +
+                                     description.element_width));
+                lines.push_back(text("当前值：" + form_current));
+                lines.push_back(
+                    text("允许范围：" +
+                         calmcar::xcp::tools::CalibrationLimitText(symbol)));
+                // 目标值一旦越出 A2L 限值就即时提示（B-15）：此前越界只会
+                // 在按下「申请写入」后写进主界面面板，而模态窗口正遮住它。
+                const auto limit_hint =
+                    calmcar::xcp::tools::CalibrationTargetLimitHint(
+                        symbol, form_target);
+                if (!limit_hint.empty())
+                    lines.push_back(text(limit_hint) | color(Color::Red));
+                lines.push_back(text("状态：" + form_status) |
+                                color(Color::Cyan));
+                lines.push_back(
+                    text("读取策略：" + (read_reason.empty()
+                                             ? "可用"
+                                             : "拒绝：" + read_reason)));
+                lines.push_back(text("写入资格：" + write_status));
+                // P2：把页判定依据显式写出来，避免"A2L 缺段页声明"被误读成"不可写"。
+                const auto page_note = ModalCalibrationPageNote();
+                if (!page_note.empty())
+                    lines.push_back(text("页判定依据：" + page_note) |
+                                    color(Color::GrayLight));
+                lines.push_back(calibration_element_index_control->Render());
+                lines.push_back(target_control->Render());
+                lines.push_back(
+                    hbox({calibration_read_control->Render(), text("  "),
+                          write_control->Render(), text("  "),
+                          close_calibration_button->Render()}));
+                lines.push_back(
+                    text("标定值只在确认页按 Y 后发送；N/Esc 取消。") |
+                    color(Color::Yellow));
+                return vbox(std::move(lines)) | border |
                        size(WIDTH, LESS_THAN, std::max(1, layout.modal_width)) |
                        size(HEIGHT, LESS_THAN,
                             std::max(1, layout.modal_height));
@@ -554,6 +722,8 @@ public:
                                    input_mode_.Selector());
         preview_menu->TakeFocus();
         auto renderer = Renderer(root, [&] {
+            // 性能观测：统计单帧「元素树构建 + 菜单条目生成」耗时。
+            const PerfStopwatch frame_stopwatch;
             const auto terminal = Terminal::Size();
             current_layout_ = calmcar::xcp::tools::CalculateTuiLayout(
                 terminal.dimx, terminal.dimy);
@@ -652,27 +822,53 @@ public:
                                  std::to_string(preview_symbols_.size()) +
                                  "  |  采样集合 " +
                                  std::to_string(watched_count))})});
+            // 虚拟菜单需要每帧知道可视行数；窗口位置在此处提前算好，
+            // 供状态行显示"第 a–b / N 行"（虚拟化后滚动条已无意义）。
+            const std::size_t preview_visible_rows =
+                std::max<std::size_t>(1U, current_layout_.preview_rows);
+            if (preview_menu_typed_ != nullptr)
+                preview_menu_typed_->SetVisibleRows(preview_visible_rows);
+            const auto preview_window = calmcar::xcp::tools::ComputePreviewWindow(
+                preview_labels_.size(),
+                static_cast<std::size_t>(std::max(0, preview_selected_)),
+                preview_visible_rows,
+                preview_menu_typed_ == nullptr
+                    ? 0U
+                    : preview_menu_typed_->WindowFirstRow());
+            std::string preview_window_text;
+            if (preview_window.count > 0U) {
+                preview_window_text =
+                    "第 " + std::to_string(preview_window.first + 1U) + "–" +
+                    std::to_string(preview_window.first + preview_window.count) +
+                    " / " + std::to_string(preview_labels_.size()) + " 行";
+            }
             const auto preview_panel =
                 vbox({hbox({text("搜索："), search_input->Render(),
                             text("  范围："), scope_menu->Render()}),
                       text(preview_status_),
-                      preview_menu->Render() | vscroll_indicator | frame |
+                      text(preview_window_text),
+                      preview_menu->Render() | frame |
                           size(HEIGHT, LESS_THAN,
-                               static_cast<int>(std::max<std::size_t>(
-                                   1U, current_layout_.preview_rows))) |
+                               static_cast<int>(preview_visible_rows)) |
                           flex});
             const auto main_panel =
                 vbox({view_menu->Render(), separator(),
                       (view_selected_ == 0 ? preview_panel
                                            : view_content->Render()) |
                           flex});
-            return vbox({status_bar, main_panel | flex, separator(),
-                         hbox({text(input_mode_.InCommandMode()
-                                        ? "命令 > "
-                                        : "命令（按 F7 输入）> "),
-                               command_input->Render()}),
-                         hbox({dimensions, text("  |  "), text(help)})}) |
-                   border;
+            auto frame_element =
+                vbox({status_bar, main_panel | flex, separator(),
+                      hbox({text(input_mode_.InCommandMode()
+                                     ? "命令 > "
+                                     : "命令（按 F7 输入）> "),
+                            command_input->Render()}),
+                      hbox({dimensions, text("  |  "), text(help)})}) |
+                border;
+            // 性能观测：构建耗时超过阈值才逐帧记录，避免日志自身拖慢界面。
+            NoteFrameRendered(frame_stopwatch.ElapsedMs(),
+                              preview_symbols_.size(),
+                              preview_labels_.size());
+            return frame_element;
         });
         auto ui = Modal(renderer, modal_pages, &modal_visible_);
         ui = CatchEvent(ui, [this, command_input, search_input, scope_menu,
@@ -932,8 +1128,57 @@ private:
         return label;
     }
 
+    /**
+     * @brief 按行类型格式化一行预览文本。
+     * @param row 行布局描述（父行/子行/占位行/读取动作行）。
+     * @param symbol 该行所属 A2L 符号；为空表示候选已失效。
+     * @param sample 该符号最新的观测样本快照。
+     * @param watched 该符号是否已加入采样集合。
+     * @param read_reason 一次性读取的拒绝原因，空表示可读。
+     * @return 该行显示文本。
+     * @note 整表重建与增量刷新共用本函数，保证两条路径的文本完全一致；
+     *       调用方必须已经持有 output_mutex_ 与 watched_mutex_。
+     */
+    std::string FormatPreviewRowLabel(
+        const PreviewRow& row, const SymbolInfo* symbol,
+        const std::optional<calmcar::xcp::tools::ObservationSnapshot>& sample,
+        bool watched, const std::string& read_reason) const {
+        if (symbol == nullptr) return row.symbol_name + " | A2L候选已失效";
+        if (!row.is_child) return FormatPreviewLabel(*symbol, sample, watched);
+        if (row.is_read_action)
+            return "  └ [单次读取] 按 Enter 读取完整变量（不加入观测）";
+        if (row.is_placeholder) {
+            std::string status;
+            if (sample.has_value() && !sample->status.empty()) {
+                status = sample->status;
+            } else if (watched && watching_.load()) {
+                status = "等待首次完整样本";
+            } else if (!read_reason.empty()) {
+                status = "读取不可用: " + read_reason;
+            } else if (watched) {
+                status = "观测已停止；尚无样本";
+            } else {
+                status = "尚无样本";
+            }
+            return "  └ " + status;
+        }
+        if (row.element_index.has_value() && sample.has_value() &&
+            sample->has_value && sample->is_array &&
+            *row.element_index < sample->array_values.size()) {
+            return FormatExpandedArrayValue(
+                *symbol, static_cast<std::size_t>(*row.element_index),
+                sample->array_values[*row.element_index],
+                sample->stale || sample->stopped);
+        }
+        if (sample.has_value() && sample->has_value && !sample->is_array)
+            return FormatExpandedScalarValue(*symbol, *sample);
+        return "  └ 尚无可显示的完整样本";
+    }
+
     /** @brief 在界面线程重建父行/动作行/数据行并保留行身份。 */
     void RebuildPreviewLabels() {
+        // 性能观测：整表重建是 O(候选数) 的热路径，耗时直接决定界面响应。
+        const PerfStopwatch stopwatch;
         const auto old_selected_row =
             preview_selected_ >= 0 &&
                     static_cast<std::size_t>(preview_selected_) <
@@ -977,60 +1222,35 @@ private:
         }
 
         preview_rows_ = BuildPreviewRows(row_sources);
+        // 行索引与标签同批生成：索引让观测更新只重算该符号占据的行，
+        // 避免 198k 候选规模下每次采样都重建整表。
+        preview_row_index_.Rebuild(preview_rows_);
         for (const auto& row : preview_rows_) {
             preview_visible_names_.push_back(row.symbol_name);
             const auto symbol_index =
                 preview_symbol_index_.find(row.symbol_name);
-            if (symbol_index == preview_symbol_index_.end()) {
-                preview_labels_.push_back(row.symbol_name + " | A2L候选已失效");
-                continue;
+            const SymbolInfo* symbol =
+                symbol_index == preview_symbol_index_.end()
+                    ? nullptr
+                    : &preview_symbols_[symbol_index->second];
+            if (symbol != nullptr && !row.is_child) {
+                preview_visible_index_.try_emplace(row.symbol_name,
+                                                   preview_labels_.size());
             }
-            const auto& symbol = preview_symbols_[symbol_index->second];
             const auto sample_it = samples_by_name.find(row.symbol_name);
             const auto watched_it = watched_by_name.find(row.symbol_name);
             const auto reason_it = read_reasons_by_name.find(row.symbol_name);
             const std::optional<calmcar::xcp::tools::ObservationSnapshot>
-                sample = sample_it == samples_by_name.end() ? std::nullopt
-                                                            : sample_it->second;
+                sample = sample_it == samples_by_name.end()
+                             ? std::nullopt
+                             : sample_it->second;
             const bool watched =
                 watched_it != watched_by_name.end() && watched_it->second;
-            if (!row.is_child) {
-                preview_visible_index_.try_emplace(row.symbol_name,
-                                                   preview_labels_.size());
-                preview_labels_.push_back(
-                    FormatPreviewLabel(symbol, sample, watched));
-            } else if (row.is_read_action) {
-                preview_labels_.push_back(
-                    "  └ [单次读取] 按 Enter 读取完整变量（不加入观测）");
-            } else if (row.is_placeholder) {
-                std::string status;
-                if (sample.has_value() && !sample->status.empty()) {
-                    status = sample->status;
-                } else if (watched && watching_.load()) {
-                    status = "等待首次完整样本";
-                } else if (reason_it != read_reasons_by_name.end() &&
-                           !reason_it->second.empty()) {
-                    status = "读取不可用: " + reason_it->second;
-                } else if (watched) {
-                    status = "观测已停止；尚无样本";
-                } else {
-                    status = "尚无样本";
-                }
-                preview_labels_.push_back("  └ " + status);
-            } else if (row.element_index.has_value() && sample.has_value() &&
-                       sample->has_value && sample->is_array &&
-                       *row.element_index < sample->array_values.size()) {
-                preview_labels_.push_back(FormatExpandedArrayValue(
-                    symbol, static_cast<std::size_t>(*row.element_index),
-                    sample->array_values[*row.element_index],
-                    sample->stale || sample->stopped));
-            } else if (sample.has_value() && sample->has_value &&
-                       !sample->is_array) {
-                preview_labels_.push_back(
-                    FormatExpandedScalarValue(symbol, *sample));
-            } else {
-                preview_labels_.push_back("  └ 尚无可显示的完整样本");
-            }
+            const std::string read_reason =
+                reason_it == read_reasons_by_name.end() ? std::string()
+                                                        : reason_it->second;
+            preview_labels_.push_back(FormatPreviewRowLabel(
+                row, symbol, sample, watched, read_reason));
         }
 
         // 空搜索结果也留一个不可操作的菜单占位行，保持列表可聚焦。
@@ -1076,6 +1296,11 @@ private:
                           "观测，F7 命令";
         if (preview_filter_ != preview_active_filter_)
             preview_status_ += " | 搜索框是未提交草稿";
+        // 性能日志：候选数、展开后的行数与真实耗时一并记录，便于定位 A2L 规模影响。
+        LIBXCP_LOG_INFO(
+            "UI 整表重建耗时 {:.1f} ms（候选 {} 个 / 展开后 {} 行 / 范围 {}）",
+            stopwatch.ElapsedMs(), preview_symbols_.size(), preview_rows_.size(),
+            preview_scope_selected_ == 1 ? "仅采样" : "全部");
     }
 
     /** @brief 保存一次成功样本；保留最近值并刷新预览行。 */
@@ -1112,28 +1337,28 @@ private:
         RequestPreviewRefresh(name);
     }
 
-    /** @brief 只更新已显示符号的一行，避免高速采样时重建整张表。 */
+    /**
+     * @brief 只刷新某个符号占据的行，避免高速采样时重建整张表。
+     * @param name 符号规范名。
+     * @note 展开符号的父行与全部子值行一起刷新，代价为 O(该符号行数)；
+     *       符号不在当前可见行集合时什么也不做。
+     */
     void UpdatePreviewLabel(const std::string& name) {
-        const auto visible = preview_visible_index_.find(name);
-        if (visible == preview_visible_index_.end()) return;
+        std::lock_guard lock(output_mutex_);
+        std::lock_guard watched_lock(watched_mutex_);
         const auto symbol_index = preview_symbol_index_.find(name);
         if (symbol_index == preview_symbol_index_.end()) return;
-        bool rebuild = false;
-        {
-            std::lock_guard lock(output_mutex_);
-            std::lock_guard watched_lock(watched_mutex_);
-            const bool watched = std::find(watched_.begin(), watched_.end(),
-                                           name) != watched_.end();
-            if ((preview_scope_selected_ == 1 && !watched) ||
-                expanded_preview_names_.contains(name)) {
-                rebuild = true;
-            } else {
-                preview_labels_[visible->second] =
-                    FormatPreviewLabel(preview_symbols_[symbol_index->second],
-                                       observation_model_.Find(name), watched);
-            }
-        }
-        if (rebuild) RebuildPreviewLabels();
+        const auto& symbol = preview_symbols_[symbol_index->second];
+        const bool watched =
+            std::find(watched_.begin(), watched_.end(), name) != watched_.end();
+        const auto sample = observation_model_.Find(name);
+        const auto read_reason = PreviewReadUnsupportedReason(symbol);
+        static_cast<void>(calmcar::xcp::tools::RefreshPreviewRows(
+            preview_labels_, preview_row_index_, name,
+            [&](std::size_t row_index) {
+                return FormatPreviewRowLabel(preview_rows_[row_index], &symbol,
+                                             sample, watched, read_reason);
+            }));
     }
 
     /** @brief 处理“全部/仅采样”范围切换。 */
@@ -1528,6 +1753,21 @@ private:
             calibration_form_.Apply(selection, status, std::move(current)));
     }
 
+    /**
+     * @brief 直接改写标定表单的状态行（界面线程的本地拒绝反馈）。
+     * @details 用于「还没进入异步命令」就被拒绝的分支：这些分支没有业务结果，
+     *          无法走 UpdateCalibrationState，而 Say 写的是被模态窗口遮挡的
+     *          主面板，因此必须显式更新表单状态并触发重绘。
+     * @param status 要展示给用户的状态文本。
+     */
+    void SetCalibrationFormStatus(const std::string& status) {
+        {
+            std::lock_guard lock(output_mutex_);
+            calibration_form_.status = status;
+        }
+        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
+    }
+
     /** @brief 判断详情对象是否需要0基元素索引输入。 */
     bool RequiresElementIndex(const SymbolInfo& symbol) const {
         return !symbol.dimensions.empty() ||
@@ -1569,9 +1809,9 @@ private:
             reason = calmcar::xcp::tools::SymbolWriteUnsupportedReason(symbol);
         }
         if (!reason.empty()) return reason;
-        if (!symbol.memory_segment.has_value() ||
-            !symbol.memory_segment->has_xcp_segment)
-            return "无法唯一关联有效的XCP MEMORY_SEGMENT/PAG";
+        // P2：A2L 未声明段页事实时不再拒绝（段页是可选能力），写入资格交由运行时
+        // 页校验决定；判定依据通过 ModalCalibrationPageNote() 单独展示。
+        if (!calmcar::xcp::tools::HasCalibrationPageFacts(symbol)) return {};
         for (const auto& page : symbol.memory_segment->pages) {
             if (calmcar::xcp::tools::CalibrationPageWriteUnsupportedReason(
                     symbol, page.number, calmcar::xcp::PageAccessType::DontCare)
@@ -1579,6 +1819,16 @@ private:
                 return {};
         }
         return "A2L未声明允许无条件XCP写入的PAGE";
+    }
+
+    /**
+     * @brief 写入资格的页判定依据（无附注时返回空串）。
+     * @details 用于界面区分"确实不可写"与"A2L 缺段页声明、按单页放行"。
+     */
+    std::string ModalCalibrationPageNote() const {
+        if (!modal_symbol_info_.has_value()) return {};
+        return calmcar::xcp::tools::CalibrationPageNote(*modal_symbol_info_,
+                                                       calibration_page_facts_);
     }
 
     /** @brief 标定页读取依赖独立的标定选择快照。 */
@@ -1604,9 +1854,13 @@ private:
 
     /** @brief 将详情弹窗中的目标值交给既有预读/确认/回写路径。 */
     void SubmitCalibrationWrite() {
-        if (!modal_symbol_info_.has_value()) return;
+        if (!modal_symbol_info_.has_value()) {
+            SetCalibrationFormStatus("尚未选择变量；请先在列表中选中对象");
+            return;
+        }
         const std::string reason = ModalWriteUnsupportedReason();
         if (!reason.empty()) {
+            SetCalibrationFormStatus("拒绝写入：" + reason);
             Say("该变量不允许写入: " + reason);
             return;
         }
@@ -1625,6 +1879,7 @@ private:
         }
         if (selection.name.empty() || target.empty() ||
             selection.name != QualifiedName(*modal_symbol_info_)) {
+            SetCalibrationFormStatus("请选择有效标量VALUE或曲线点，并填写目标物理值");
             Say("请选择有效标量VALUE或曲线点，并填写目标物理值。");
             return;
         }
@@ -1659,7 +1914,13 @@ private:
         if (result.preview_revision.has_value() &&
             preview_input_revision_.Matches(*result.preview_revision))
             preview_filter_ = preview_active_filter_;
+        // 性能观测：应用结果含建索引与整表重建，是搜索后那一跳的主要成本。
+        const PerfStopwatch stopwatch;
         RebuildPreviewLabels();
+        LIBXCP_LOG_INFO("UI 应用搜索结果耗时 {:.1f} ms（{} 个候选，筛选 {}）",
+                        stopwatch.ElapsedMs(), preview_symbols_.size(),
+                        preview_active_filter_.empty() ? "*"
+                                                       : preview_active_filter_);
     }
 
     /** @brief 模态关闭后应用仍有效的延迟搜索结果。 */
@@ -1675,6 +1936,8 @@ private:
         const std::string& pattern,
         std::optional<std::uint64_t> preview_revision = std::nullopt) {
         const auto generation = ++preview_search_generation_;
+        // 性能观测：A2L 检索是库内全量线性扫描，耗时随符号总数线性增长。
+        const PerfStopwatch search_stopwatch;
         auto count = database_.Count();
         if (!count.HasValue()) {
             Say("A2L Count 失败: " + count.ErrorInfo().message);
@@ -1689,6 +1952,10 @@ private:
             Say("A2L Search 失败: " + result.ErrorInfo().message);
             return;
         }
+        // 性能日志：检索耗时与命中/过滤后的数量分开记，命中数是渲染成本的真正输入。
+        LIBXCP_LOG_INFO("UI 候选检索耗时 {:.1f} ms（模式 {} / 命中 {} 个 / 库内共 {} 个）",
+                        search_stopwatch.ElapsedMs(), query,
+                        result.Value().size(), count.Value());
         std::vector<SymbolInfo> symbols;
         for (const auto& symbol : result.Value()) {
             if ((!options_.module.empty() &&
@@ -2287,24 +2554,47 @@ private:
     /** @brief 在持有XCP命令互斥锁时复核活动页及实时PAGE_PROPERTIES。 */
     std::string CheckCalibrationPageWriteLocked(
         const SymbolInfo& symbol, std::uint8_t* active_page_number) {
-        if (!symbol.memory_segment.has_value() ||
-            !symbol.memory_segment->has_xcp_segment)
-            return "无法唯一关联有效的XCP MEMORY_SEGMENT/PAG";
-        const auto& segment = *symbol.memory_segment;
+        // P2：段页是可选能力。A2L 没有 MEMORY_SEGMENT 时按 0 号段处理，并且只查询
+        // A2L 真正声明过的页命令，避免每次写入都换回一个 ERR_CMD_UNKNOWN。
+        const bool has_page_facts =
+            calmcar::xcp::tools::HasCalibrationPageFacts(symbol);
+        if (!has_page_facts &&
+            !calibration_page_facts_.declares_get_cal_page &&
+            !calibration_page_facts_.declares_get_page_info) {
+            // 既无段页事实也无页命令声明：按单页直写，不做页校验。
+            return {};
+        }
+        const std::uint8_t segment_number =
+            has_page_facts ? symbol.memory_segment->segment_number : 0U;
         const auto active_page = master_.GetCalPage(
-            calmcar::xcp::CalPageAccessMode::Xcp, segment.segment_number);
-        if (!active_page.has_value()) return "无法查询XCP活动页，拒绝写入";
-        const auto page_info =
-            master_.GetPageInfo(segment.segment_number, active_page->page);
-        if (!page_info.has_value())
-            return "无法查询XCP PAGE_PROPERTIES，拒绝写入";
-        const std::string reason =
-            calmcar::xcp::tools::CalibrationPageWriteUnsupportedReason(
-                symbol, active_page->page,
-                page_info->properties.xcp_write_access);
-        if (!reason.empty()) return reason;
-        if (active_page_number != nullptr)
-            *active_page_number = active_page->page;
+            calmcar::xcp::CalPageAccessMode::Xcp, segment_number);
+        if (!active_page.has_value()) {
+            // 有段页事实却查不到活动页属于真问题；无事实时只是"该 ECU 不支持页",
+            // 写入权限仍由 ECU 侧 ERR_WRITE_PROTECTED 兜底。
+            return has_page_facts ? "无法查询XCP活动页，拒绝写入" : std::string{};
+        }
+        if (calibration_page_facts_.declares_get_page_info) {
+            const auto page_info =
+                master_.GetPageInfo(segment_number, active_page->page);
+            if (!page_info.has_value())
+                return has_page_facts ? "无法查询XCP PAGE_PROPERTIES，拒绝写入"
+                                     : std::string{};
+            if (has_page_facts) {
+                const std::string reason =
+                    calmcar::xcp::tools::CalibrationPageWriteUnsupportedReason(
+                        symbol, active_page->page,
+                        page_info->properties.xcp_write_access);
+                if (!reason.empty()) return reason;
+            } else if (page_info->properties.xcp_write_access !=
+                       calmcar::xcp::PageAccessType::DontCare) {
+                return "Slave 当前 PAGE_PROPERTIES 不允许无条件 XCP 写访问";
+            }
+        } else if (active_page->page != 0U) {
+            // 无法查询 PAGE_PROPERTIES 时，只把"活动页 0（工作页约定）"当作放行依据。
+            return "当前活动页为 " + std::to_string(active_page->page) +
+                   "，A2L 未声明 GET_PAGE_INFO，无法确认该页允许写入；请先切回工作页";
+        }
+        if (active_page_number != nullptr) *active_page_number = active_page->page;
         return {};
     }
 
@@ -2364,8 +2654,12 @@ private:
                                                 *element_index, target)
                 : database_.FromPhysical(QualifiedName(symbol), target);
         if (!encoded.HasValue()) {
+            // 把换算层的真实原因（如越出 A2L 限值 B-15）一并写进状态行，
+            // 否则界面只剩一句「无法换算或编码」，用户无从判断该改什么。
             if (from_calibration_view)
-                UpdateCalibrationState(*selection, "目标值无法换算或编码");
+                UpdateCalibrationState(*selection,
+                                       "目标值不可编码：" +
+                                           encoded.ErrorInfo().message);
             Say("目标值不可编码: " + encoded.ErrorInfo().message);
             return;
         }
@@ -2987,11 +3281,51 @@ private:
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
     }
 
+    /**
+     * @brief 记录一帧界面构建耗时：超阈值逐帧告警，并按固定窗口汇总一次。
+     *
+     * 只在界面线程调用（渲染器内），因此聚合状态无需加锁。
+     * 逐帧写日志本身会显著拖慢界面，故低于阈值的帧只累加计数。
+     * @param elapsed_ms 本帧元素构建耗时（毫秒）。
+     * @param candidate_count 当前候选符号数量。
+     * @param row_count 当前展开后的预览行数。
+     */
+    void NoteFrameRendered(double elapsed_ms, std::size_t candidate_count,
+                           std::size_t row_count) {
+        ++frame_perf_frames_;
+        frame_perf_total_ms_ += elapsed_ms;
+        if (elapsed_ms > frame_perf_max_ms_) frame_perf_max_ms_ = elapsed_ms;
+        if (elapsed_ms >= kFramePerfWarnMs) {
+            LIBXCP_LOG_WARNING(
+                "UI 单帧构建耗时 {:.1f} ms（候选 {} 个 / 展开后 {} 行）",
+                elapsed_ms, candidate_count, row_count);
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const double window_seconds =
+            std::chrono::duration<double>(now - frame_perf_window_start_).count();
+        if (window_seconds < kFramePerfWindowSeconds) return;
+        const double average_ms =
+            frame_perf_frames_ == 0U
+                ? 0.0
+                : frame_perf_total_ms_ / static_cast<double>(frame_perf_frames_);
+        LIBXCP_LOG_INFO(
+            "UI 渲染汇总：近 {:.1f} s 共 {} 帧，均值 {:.1f} ms，峰值 {:.1f} ms"
+            "（候选 {} 个 / 展开后 {} 行）",
+            window_seconds, frame_perf_frames_, average_ms, frame_perf_max_ms_,
+            candidate_count, row_count);
+        frame_perf_window_start_ = now;
+        frame_perf_frames_ = 0U;
+        frame_perf_total_ms_ = 0.0;
+        frame_perf_max_ms_ = 0.0;
+    }
+
     const Options& options_;
     const calmcar::xcp::a2l::IA2lDatabase& database_;
     calmcar::xcp::IMeasurementDatabase& measurement_database_;
     MeasurementSession& measurement_session_;
     XcpMaster& master_;
+    /** @brief A2L 声明的标定页命令能力（决定运行时是否查询 GET_CAL_PAGE/GET_PAGE_INFO）。 */
+    calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts_;
     std::vector<A2lEventMetadata> events_;
     mutable std::mutex output_mutex_;
     std::mutex command_mutex_;
@@ -3000,6 +3334,15 @@ private:
     std::condition_variable wait_cv_;
     std::atomic<bool> watching_{false};
     std::atomic<bool> daq_running_{false};
+    /** @brief 单帧渲染耗时汇总窗口的起点（仅界面线程访问）。 */
+    std::chrono::steady_clock::time_point frame_perf_window_start_ =
+        std::chrono::steady_clock::now();
+    /** @brief 当前汇总窗口内已统计的帧数（仅界面线程访问）。 */
+    std::uint64_t frame_perf_frames_{0U};
+    /** @brief 当前汇总窗口内的帧耗时总和，毫秒（仅界面线程访问）。 */
+    double frame_perf_total_ms_{0.0};
+    /** @brief 当前汇总窗口内的单帧耗时峰值，毫秒（仅界面线程访问）。 */
+    double frame_perf_max_ms_{0.0};
     bool profile_configured_{false};
     std::thread watch_thread_;
     std::mutex frame_mutex_;
@@ -3044,6 +3387,10 @@ private:
     std::unordered_map<std::string, std::size_t>
         preview_visible_index_;            /**< 规范名到父预览菜单行号。 */
     std::vector<PreviewRow> preview_rows_; /**< 菜单行到符号/元素的映射。 */
+    calmcar::xcp::tools::WindowedMenu*
+        preview_menu_typed_{nullptr}; /**< 虚拟菜单裸指针，仅界面线程使用。 */
+    calmcar::xcp::tools::PreviewRowIndex
+        preview_row_index_; /**< 规范名到其全部分行行号的索引，用于增量刷新。 */
     std::unordered_set<std::string>
         expanded_preview_names_; /**< 当前原位展开的符号规范名。 */
     /** @brief 变量预览菜单文本；空结果也用占位行保持焦点。 */
@@ -3121,6 +3468,8 @@ int main(int argc, char** argv) {
     }
 #endif
 
+    // 性能观测：A2L 解析是启动阶段的一次性大开销，耗时随文件规模线性增长。
+    const PerfStopwatch load_stopwatch;
     auto loaded = A2lBridge::Load(options->a2l_path);
     if (!loaded.HasValue()) {
         std::cerr << "A2L 加载失败: " << loaded.ErrorInfo().message << '\n';
@@ -3139,12 +3488,18 @@ int main(int argc, char** argv) {
     }
     std::cout << "A2L 加载成功: " << options->a2l_path << " | " << count.Value()
               << " 个符号\n";
+    // 性能日志：把解析耗时、符号总数与文件路径记在一起，便于对比不同 A2L。
+    LIBXCP_LOG_INFO("A2L 加载耗时 {:.1f} ms（{} 个符号 / {}）",
+                    load_stopwatch.ElapsedMs(), count.Value(),
+                    options->a2l_path);
     for (const auto& warning : bridge->ListLoadWarnings()) {
         std::cout << "A2L 告警: " << warning.message << '\n';
     }
 
     calmcar::xcp::A2lMeasurementDatabase a2l_measurement_database(*database);
     calmcar::xcp::MeasurementEventBindingCandidates event_bindings;
+    // 性能观测：启动时的一次全库检索（用于 DAQ 事件绑定），同样是 O(符号数)。
+    const PerfStopwatch boot_search_stopwatch;
     auto all_symbols =
         database->Search("*", std::max<std::size_t>(1, count.Value()));
     if (!all_symbols.HasValue()) {
@@ -3152,6 +3507,9 @@ int main(int argc, char** argv) {
                   << all_symbols.ErrorInfo().message << '\n';
         return 1;
     }
+    LIBXCP_LOG_INFO("A2L 启动全库检索耗时 {:.1f} ms（命中 {} 个）",
+                    boot_search_stopwatch.ElapsedMs(),
+                    all_symbols.Value().size());
     for (const auto& symbol : all_symbols.Value()) {
         if (symbol.kind != SymbolKind::Measurement) continue;
         auto& candidates = event_bindings[QualifiedName(symbol)];
@@ -3174,56 +3532,168 @@ int main(int argc, char** argv) {
         }
     }
 
-    calmcar::xcp::UdpTransportConfig config;
-    config.remote_host = options->host;
-    config.remote_port = options->port;
-    // T-05：PACKET_ALIGNMENT 自动贯通。
-    // A2L 的 IF_DATA XCP 以 UDP 传输声明了 PACKET_ALIGNMENT_x（8/16/32 bit）
-    // 时按声明设置；**未声明则保持 8-bit 并明确告知依据**，而不是让用户
-    // 误以为对齐来自 A2L（方案 §1.9A.4：无证据不得假定对齐）。
-    // 注意 a2lbridge 的 packet_alignment 字段为位宽，0 表示未知。
-    {
-        const auto* xcp_info = bridge->XcpInfo();
-        bool aligned_from_a2l = false;
-        if (xcp_info != nullptr && !xcp_info->ambiguous) {
-            for (const auto& endpoint : xcp_info->transports) {
-                if (endpoint.packet_alignment == 0U) continue;
-                const auto parsed = calmcar::xcp::ParsePacketAlignment(
-                    endpoint.packet_alignment);
-                if (parsed == calmcar::xcp::PacketAlignment::Unknown) continue;
-                if (aligned_from_a2l && parsed != config.packet_alignment) {
-                    // 同一 IF_DATA 内多个传输声明冲突：不静默覆盖
-                    std::cerr << "A2L PACKET_ALIGNMENT 声明冲突，"
-                                 "拒绝自动建链。\n";
-                    return 1;
+    // ---- 传输层选择（B-T5 §8.1）------------------------------------------
+    // 把 A2L 事实按本次 `--transport` **过滤后**再交给纯函数解析：
+    // 规则 5 要求端点/对齐/Profile 同属一个 transport kind，因此这里绝不
+    // 把另一类传输的端点或对齐"借"给本次连接。
+    calmcar::xcp::tools::A2lTransportFacts a2l_facts;
+    if (const auto* xcp_info = bridge->XcpInfo();
+        xcp_info != nullptr && !xcp_info->ambiguous) {
+        const auto wanted =
+            options->transport_request.transport ==
+                    calmcar::xcp::tools::TransportKind::Tcp
+                ? calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp
+                : calmcar::xcp::a2l::TransportEndpoint::Kind::UdpIp;
+        const auto other =
+            wanted == calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp
+                ? calmcar::xcp::a2l::TransportEndpoint::Kind::UdpIp
+                : calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp;
+        for (const auto& endpoint : xcp_info->transports) {
+            if (endpoint.kind == other) {
+                a2l_facts.other_kind_declared = true;
+                continue;
+            }
+            if (endpoint.kind != wanted) continue;
+            ++a2l_facts.instance_count;
+            // 逐实例明细交给纯函数层判定多实例冲突（计划 §7.3）：未显式声明
+            // 对齐时按 0 记录，避免把桥接层默认值当成"已声明 8 bit"。
+            a2l_facts.instances.push_back(
+                calmcar::xcp::tools::A2lEndpointInstance{
+                    endpoint.remote_host, endpoint.remote_port,
+                    endpoint.packet_alignment_declared
+                        ? endpoint.packet_alignment
+                        : static_cast<std::uint8_t>(0U),
+                    endpoint.version});
+            if (a2l_facts.declared) continue;  // 标量字段：先到先得
+            a2l_facts.declared = true;
+            a2l_facts.port = endpoint.remote_port;
+            a2l_facts.host = endpoint.remote_host;
+            // 位宽 0 与"未声明"都视为无证据：不得把默认值当成声明
+            if (endpoint.packet_alignment_declared &&
+                endpoint.packet_alignment != 0U) {
+                a2l_facts.packet_alignment_bits = endpoint.packet_alignment;
+                a2l_facts.alignment_declared = true;
+            }
+            if (endpoint.version != 0U) {
+                a2l_facts.transport_version = calmcar::xcp::XcpProtocolVersion{
+                    static_cast<std::uint8_t>(endpoint.version >> 8U),
+                    static_cast<std::uint8_t>(endpoint.version & 0xFFU)};
+            }
+            if (wanted == calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp) {
+                // 仅诊断用途：把 A2L 声明的 TL 版本渲染成可读提示。
+                // 它**不参与** Profile 选择（§1.2：A2L 不得推断 wire profile）。
+                a2l_facts.profile_hint = "XCP_ON_TCP_IP(TL ";
+                if (endpoint.version != 0U) {
+                    a2l_facts.profile_hint +=
+                        calmcar::xcp::XcpProtocolVersion{
+                            static_cast<std::uint8_t>(endpoint.version >> 8U),
+                            static_cast<std::uint8_t>(endpoint.version & 0xFFU)}
+                            .ToString();
+                } else {
+                    a2l_facts.profile_hint += "未声明";
                 }
-                config.packet_alignment = parsed;
-                aligned_from_a2l = true;
+                a2l_facts.profile_hint += ")";
             }
         }
-        if (aligned_from_a2l) {
-            std::cout << "PACKET_ALIGNMENT 取自 A2L: "
-                      << static_cast<int>(calmcar::xcp::AlignmentBytes(
-                             config.packet_alignment))
-                      << " 字节\n";
-        } else {
-            std::cout << "A2L 未声明 PACKET_ALIGNMENT，使用默认 8-bit 对齐；"
-                         "如对端使用 16/32-bit 请在 A2L 中声明。\n";
+        if (xcp_info->protocol_layer.version != 0U) {
+            a2l_facts.protocol_version = calmcar::xcp::XcpProtocolVersion{
+                static_cast<std::uint8_t>(xcp_info->protocol_layer.version >>
+                                          8U),
+                static_cast<std::uint8_t>(xcp_info->protocol_layer.version &
+                                          0xFFU)};
         }
     }
+
+    std::string selection_error;
+    const auto selection = calmcar::xcp::tools::ResolveTransportSelection(
+        options->transport_request, a2l_facts, &selection_error);
+    if (!selection.has_value()) {
+        std::cerr << "传输层配置错误: " << selection_error << '\n';
+        return 1;
+    }
+    // 端点可能来自 A2L：把生效值回写到 Options，供 TUI 标题与日志展示，
+    // 避免界面显示一个"用户没给因此为空"的端点。
+    options->host = selection->host;
+    options->port = selection->port;
+    std::cout << calmcar::xcp::tools::FormatSelectionSummary(*selection) << '\n';
+    for (const auto& note : selection->notes) {
+        std::cout << "  · " << note << '\n';
+    }
+
     try {
-        auto transport =
-            std::make_unique<calmcar::xcp::UdpTransport>(std::move(config));
+        // 按解析结果构造传输层；UDP/TCP 的差异只体现在这一处，
+        // 其后的命令流、DAQ、标定路径完全共用。
+        std::unique_ptr<calmcar::xcp::IXcpTransport> transport;
+        if (selection->transport == calmcar::xcp::tools::TransportKind::Tcp) {
+            calmcar::xcp::TcpTransportConfig tcp_config;
+            tcp_config.role = calmcar::xcp::TcpRole::Master;
+            tcp_config.remote_host = selection->host;
+            tcp_config.remote_port = selection->port;
+            tcp_config.packet_alignment = selection->alignment;
+            tcp_config.wire_profile = selection->wire_profile;
+            transport =
+                std::make_unique<calmcar::xcp::TcpTransport>(tcp_config);
+        } else {
+            calmcar::xcp::UdpTransportConfig udp_config;
+            udp_config.remote_host = selection->host;
+            udp_config.remote_port = selection->port;
+            udp_config.packet_alignment = selection->alignment;
+            transport =
+                std::make_unique<calmcar::xcp::UdpTransport>(udp_config);
+        }
         // 注意：外层已有名为 options 的 CLI 参数指针，此处变量名须避让
         calmcar::xcp::XcpMasterOptions master_options;
         master_options.event_listener = &measurement_session;
+        // 规则 6：PL/TL 作为独立先验下发，绝不因 Profile 自动声称版本。
+        master_options.version_policy.protocol_version =
+            selection->protocol_version;
+        master_options.version_policy.transport_version =
+            selection->transport_version;
         XcpMaster master(std::move(transport), master_options);
         master.Connect();
         measurement_session.Bind(master);
-        std::cout << "XCP on UDP 已连接: " << options->host << ':'
-                  << options->port << '\n';
+        {
+            // 运行期版本证据：reported 与 effective 必须并排展示（§8.1）
+            const auto pl = master.GetProtocolVersionSnapshot();
+            const auto tl = master.GetTransportVersionSnapshot();
+            calmcar::xcp::tools::RuntimeVersionStatus version_status;
+            version_status.pl_reported = pl.evidence.reported;
+            version_status.pl_effective = pl.effective;
+            version_status.tl_reported = tl.evidence.reported;
+            version_status.tl_effective = tl.effective;
+            version_status.pl_conservative = pl.conservative;
+            version_status.tl_conservative = tl.conservative;
+            version_status.get_version_outcome =
+                pl.evidence.source == calmcar::xcp::VersionSource::GetVersion
+                    ? "可用"
+                    : "不可用（按显式/A2L 证据解析）";
+            std::cout << calmcar::xcp::tools::FormatRuntimeVersionSummary(
+                             version_status)
+                      << '\n';
+            // 版本证据冲突不阻断，但必须可见；降级能力同理。
+            for (const auto& conflict : master.VersionConflicts()) {
+                std::cout << "  · 版本证据冲突: " << conflict << '\n';
+            }
+        }
+        std::cout << "XCP on "
+                  << (selection->transport ==
+                              calmcar::xcp::tools::TransportKind::Tcp
+                          ? "TCP"
+                          : "UDP")
+                  << " 已连接: " << options->host << ':' << options->port
+                  << '\n';
+        // ---- 标定页能力（P2）-------------------------------------------------
+        // 页命令是否可用由 A2L 的 OPTIONAL_CMD 决定：Slave 明确声明不支持的命令
+        // 不该在每次写入时再去试探（那会换回一个 ERR_CMD_UNKNOWN 并拖慢确认流程）。
+        calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts;
+        if (const auto* xcp_info = bridge->XcpInfo(); xcp_info != nullptr) {
+            calibration_page_facts =
+                calmcar::xcp::tools::MakeCalibrationPageFacts(
+                    xcp_info->protocol_layer.optional_commands);
+        }
         CliApp app(*options, *database, event_bound_database,
-                   measurement_session, master, std::move(event_metadata));
+                   measurement_session, master, std::move(event_metadata),
+                   calibration_page_facts);
         app.Run();
         if (measurement_session.Running()) measurement_session.Stop();
         master.Disconnect();
