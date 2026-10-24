@@ -30,7 +30,7 @@ ctest --test-dir build -C Release -R ExampleXcpIntegrationDemo --output-on-failu
 
 ## 一键运行 vendored cpp_demo
 
-程序自动启动 XCPlite `cpp_demo`，上传 A2L，按已核实的 `SigGen1`/`SigGen2`/`mainloop` 事件绑定配置 DAQ，运行后自动停止 Slave。请使用隔离的 `--run-dir`；程序保留其中已有的 `.aml`/持久化文件，不自动删除用户文件：
+程序自动启动 XCPlite `cpp_demo`，上传 A2L，按上传 A2L 中声明的事件与符号绑定（`SigGen1`/`SigGen2`/`mainloop`，事件号不写死）配置 DAQ，运行后自动停止 Slave。请使用隔离的 `--run-dir`；程序保留其中已有的 `.aml`/持久化文件，不自动删除用户文件：
 
 ```powershell
 build\examples\xcp_integration_demo\Release\xcp_integration_demo.exe `
