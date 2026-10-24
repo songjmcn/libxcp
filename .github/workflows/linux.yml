@@ -1,0 +1,65 @@
+# Linux 持续集成（第一阶段仅 master）
+name: Linux
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  BOOST_VERSION: 1.86.0
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装构建工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      # 预编译 Boost（含 locale/filesystem/process，动态库）
+      - name: 安装 Boost ${{ env.BOOST_VERSION }}
+        uses: MarkusJx/install-boost@v2.4.5
+        id: install-boost
+        with:
+          boost_version: ${{ env.BOOST_VERSION }}
+          platform_version: 22.04
+          toolset: gcc
+          boost_install_dir: ${{ runner.temp }}/boost
+
+      # RUNPATH 不传递：构建期 gtest 发现测试与 ctest 运行时都需要找到 Boost 动态库
+      - name: 配置运行时库路径
+        run: echo "LD_LIBRARY_PATH=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib" >> "$GITHUB_ENV"
+
+      # POSITION_INDEPENDENT_CODE：静态库 liba2l 需链接进共享库 libliba2l.so
+      # 示例目录暂关闭：xcp_master_udp.cpp 缺少 <cstring>，GCC 13 下编译失败
+      - name: Configure
+        run: >
+          cmake -B build -S . -G Ninja
+          -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          -DLIBXCP_BUILD_TESTS=ON
+          -DLIBXCP_BUILD_TOOLS=ON
+          -DLIBXCP_BUILD_EXAMPLES=ON
+          -DLIBXCP_ENABLE_LOG=ON
+          "-DBoost_DIR=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib/cmake/Boost-${{ env.BOOST_VERSION }}"
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test
+        working-directory: build
+        run: ctest --output-on-failure --timeout 300
