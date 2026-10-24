@@ -1,4 +1,3 @@
-$ cat .github/workflows/macos.yml
 # macOS 持续集成（第一阶段仅 master；首版只构建不跑 ctest，待编译稳定后再加）
 name: macOS
 
