@@ -344,6 +344,22 @@ if(LIBXCP_BUILD_TOOLS)
   gtest_discover_tests(XcpMasterSymbolPolicyTest DISCOVERY_TIMEOUT 60)
 
   # --------------------------------------------------------------------------
+  # 预览行索引与增量刷新（P1）：纯头文件逻辑，只依赖标准库与 GTest，
+  # 因此不需要 FTXUI，也不需要链接 libxcp 本体。
+  # --------------------------------------------------------------------------
+  add_executable(XcpMasterPreviewRefreshTest xcp_master_preview_refresh_test.cpp
+          xcp_master_preview_window_test.cpp)
+  target_compile_features(XcpMasterPreviewRefreshTest PRIVATE cxx_std_20)
+  target_include_directories(XcpMasterPreviewRefreshTest PRIVATE
+          ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(XcpMasterPreviewRefreshTest PRIVATE
+          GTest::gtest libxcp_test_main)
+  if(MSVC)
+    target_compile_options(XcpMasterPreviewRefreshTest PRIVATE /utf-8)
+  endif()
+  gtest_discover_tests(XcpMasterPreviewRefreshTest DISCOVERY_TIMEOUT 60)
+
+  # --------------------------------------------------------------------------
   # 界面性能基准：headless 渲染（Screen::Create + Render，不需要 TTY）。
   # FTXUI 由 tools/xcp_master/CMakeLists.txt 在 tools 子目录中 FetchContent 引入，
   # 而 tools 先于 tests add_subdirectory，故此处只需判断目标是否已存在。

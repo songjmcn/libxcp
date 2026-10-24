@@ -21,6 +21,7 @@
 #include <format>
 #include <fstream>
 #include <optional>
+#include <utility>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -31,6 +32,7 @@
 #include <ftxui/screen/screen.hpp>
 
 #include "libxcp/a2l/a2l_bridge.hpp"
+#include "tools/xcp_master/windowed_menu.hpp"
 
 namespace {
 
@@ -54,6 +56,15 @@ constexpr double kFilterReferenceMs = 60.0;
 
 /** @brief 候选过滤绝对上限（毫秒）。 */
 constexpr double kFilterHardLimitMs = 1200.0;
+
+/** @brief 虚拟菜单单帧渲染参考值（毫秒）：只构造可视行，预期 <1 ms。 */
+constexpr double kWindowedRenderReferenceMs = 0.5;
+
+/** @brief 虚拟菜单单帧渲染绝对上限（毫秒）。 */
+constexpr double kWindowedRenderHardLimitMs = 20.0;
+
+/** @brief 虚拟菜单可视行数，与 xcp_master 预览面板的固定高度一致。 */
+constexpr std::size_t kWindowVisibleRows = 20U;
 
 /**
  * @brief 按 xcp_master 预览行的真实形态生成一条候选标签。
@@ -157,6 +168,74 @@ TEST(XcpMasterRenderBenchTest, RendersFrameWithFieldSizeCandidateList) {
         << "单帧渲染耗时较参考值劣化超过 3 倍：候选 " << kFieldCandidateCount
         << " 行";
     EXPECT_LT(frame_ms, kFrameRenderHardLimitMs) << "单帧渲染耗时突破绝对上限";
+}
+
+/**
+ * @brief 用只构造可视行的虚拟菜单渲染一帧。
+ * @param labels 菜单条目文本。
+ * @param selected 选中下标。
+ * @param visible_rows 可视行数。
+ * @param width 终端列数。
+ * @param height 终端行数。
+ * @return 单帧耗时（毫秒）与实际构造的行数。
+ */
+std::pair<double, std::size_t> RenderWindowedFrame(
+    const std::vector<std::string>& labels, int selected, std::size_t visible_rows,
+    int width = 120, int height = 40) {
+    auto menu = ftxui::Make<calmcar::xcp::tools::WindowedMenu>(
+        &labels, &selected, calmcar::xcp::tools::WindowedMenuOptions{});
+    menu->SetVisibleRows(visible_rows);
+    auto render = ftxui::Renderer(menu, [&menu] {
+        return menu->Render() | ftxui::frame |
+               ftxui::size(ftxui::HEIGHT, ftxui::LESS_THAN, 20) | ftxui::flex;
+    });
+    auto screen = ftxui::Screen::Create(ftxui::Dimension::Fixed(width),
+                                        ftxui::Dimension::Fixed(height));
+    const auto started = std::chrono::steady_clock::now();
+    ftxui::Render(screen, render->Render());
+    const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - started)
+                                  .count();
+    return {elapsed_ms, menu->LastRenderedRows()};
+}
+
+/**
+ * @brief 虚拟化后单帧只能构造可视行，行数与候选总数无关。
+ */
+TEST(XcpMasterRenderBenchTest, RendersOnlyVisibleRows) {
+    std::vector<std::string> labels;
+    labels.reserve(kFieldCandidateCount);
+    for (std::size_t index = 0; index < kFieldCandidateCount; ++index)
+        labels.push_back(MakePreviewLabel(index));
+
+    const auto result = RenderWindowedFrame(labels, 0, kWindowVisibleRows);
+    std::printf("[PERF] 虚拟菜单渲染 198556 行中的 %zu 行，实际构造 %zu 行\n",
+                kWindowVisibleRows, result.second);
+    EXPECT_EQ(result.second, kWindowVisibleRows);
+}
+
+/**
+ * @brief 198 556 行规模下单帧渲染必须落在虚拟化预算内（参考 0.5 ms）。
+ */
+TEST(XcpMasterRenderBenchTest, WindowedMenuRendersFieldSizeListWithinBudget) {
+    std::vector<std::string> labels;
+    labels.reserve(kFieldCandidateCount);
+    for (std::size_t index = 0; index < kFieldCandidateCount; ++index)
+        labels.push_back(MakePreviewLabel(index));
+
+    // 预热一帧后取三帧平均。
+    static_cast<void>(RenderWindowedFrame(labels, 0, kWindowVisibleRows));
+    double total_ms = 0.0;
+    for (int round = 0; round < 3; ++round)
+        total_ms += RenderWindowedFrame(labels, 0, kWindowVisibleRows).first;
+    const double frame_ms = total_ms / 3.0;
+    const double reference_limit = kWindowedRenderReferenceMs * 3.0;
+    std::printf(
+        "[PERF] 虚拟菜单单帧 = %.2f ms（预算 参考=%.1f ms 硬上限=%.0f ms）\n",
+        frame_ms, reference_limit, kWindowedRenderHardLimitMs);
+    EXPECT_LT(frame_ms, reference_limit)
+        << "虚拟菜单单帧耗时较参考值劣化超过 3 倍";
+    EXPECT_LT(frame_ms, kWindowedRenderHardLimitMs) << "虚拟菜单单帧耗时突破绝对上限";
 }
 
 /**

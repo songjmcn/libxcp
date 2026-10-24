@@ -45,6 +45,8 @@
 #include <ftxui/dom/elements.hpp>
 
 #include "calibration_policy.hpp"
+#include "preview_refresh.hpp"
+#include "windowed_menu.hpp"
 #include "symbol_display.hpp"
 #include "transport_selection.hpp"
 #include "tui_model.hpp"
@@ -483,10 +485,15 @@ public:
         scope_options.on_change = [this] { OnPreviewScopeChanged(); };
         auto scope_menu = Menu(&preview_scope_labels_, &preview_scope_selected_,
                                scope_options);
-        MenuOption preview_options;
-        preview_options.on_enter = [this] { ActivatePreviewRow(); };
-        auto preview_menu =
-            Menu(&preview_labels_, &preview_selected_, preview_options);
+        // 预览列表可能是 198k 行，FTXUI Menu 会为每一行构造元素，
+        // 单帧耗时约 170 ms；改用只构造可视行的虚拟菜单。
+        auto windowed_preview_menu =
+            std::make_shared<calmcar::xcp::tools::WindowedMenu>(
+                &preview_labels_, &preview_selected_,
+                calmcar::xcp::tools::WindowedMenuOptions{
+                    [this] { ActivatePreviewRow(); }});
+        preview_menu_typed_ = windowed_preview_menu.get();
+        ftxui::Component preview_menu = windowed_preview_menu;
         auto preview_view =
             Container::Vertical({search_input, scope_menu, preview_menu});
 
@@ -815,14 +822,34 @@ public:
                                  std::to_string(preview_symbols_.size()) +
                                  "  |  采样集合 " +
                                  std::to_string(watched_count))})});
+            // 虚拟菜单需要每帧知道可视行数；窗口位置在此处提前算好，
+            // 供状态行显示"第 a–b / N 行"（虚拟化后滚动条已无意义）。
+            const std::size_t preview_visible_rows =
+                std::max<std::size_t>(1U, current_layout_.preview_rows);
+            if (preview_menu_typed_ != nullptr)
+                preview_menu_typed_->SetVisibleRows(preview_visible_rows);
+            const auto preview_window = calmcar::xcp::tools::ComputePreviewWindow(
+                preview_labels_.size(),
+                static_cast<std::size_t>(std::max(0, preview_selected_)),
+                preview_visible_rows,
+                preview_menu_typed_ == nullptr
+                    ? 0U
+                    : preview_menu_typed_->WindowFirstRow());
+            std::string preview_window_text;
+            if (preview_window.count > 0U) {
+                preview_window_text =
+                    "第 " + std::to_string(preview_window.first + 1U) + "–" +
+                    std::to_string(preview_window.first + preview_window.count) +
+                    " / " + std::to_string(preview_labels_.size()) + " 行";
+            }
             const auto preview_panel =
                 vbox({hbox({text("搜索："), search_input->Render(),
                             text("  范围："), scope_menu->Render()}),
                       text(preview_status_),
-                      preview_menu->Render() | vscroll_indicator | frame |
+                      text(preview_window_text),
+                      preview_menu->Render() | frame |
                           size(HEIGHT, LESS_THAN,
-                               static_cast<int>(std::max<std::size_t>(
-                                   1U, current_layout_.preview_rows))) |
+                               static_cast<int>(preview_visible_rows)) |
                           flex});
             const auto main_panel =
                 vbox({view_menu->Render(), separator(),
@@ -1101,6 +1128,53 @@ private:
         return label;
     }
 
+    /**
+     * @brief 按行类型格式化一行预览文本。
+     * @param row 行布局描述（父行/子行/占位行/读取动作行）。
+     * @param symbol 该行所属 A2L 符号；为空表示候选已失效。
+     * @param sample 该符号最新的观测样本快照。
+     * @param watched 该符号是否已加入采样集合。
+     * @param read_reason 一次性读取的拒绝原因，空表示可读。
+     * @return 该行显示文本。
+     * @note 整表重建与增量刷新共用本函数，保证两条路径的文本完全一致；
+     *       调用方必须已经持有 output_mutex_ 与 watched_mutex_。
+     */
+    std::string FormatPreviewRowLabel(
+        const PreviewRow& row, const SymbolInfo* symbol,
+        const std::optional<calmcar::xcp::tools::ObservationSnapshot>& sample,
+        bool watched, const std::string& read_reason) const {
+        if (symbol == nullptr) return row.symbol_name + " | A2L候选已失效";
+        if (!row.is_child) return FormatPreviewLabel(*symbol, sample, watched);
+        if (row.is_read_action)
+            return "  └ [单次读取] 按 Enter 读取完整变量（不加入观测）";
+        if (row.is_placeholder) {
+            std::string status;
+            if (sample.has_value() && !sample->status.empty()) {
+                status = sample->status;
+            } else if (watched && watching_.load()) {
+                status = "等待首次完整样本";
+            } else if (!read_reason.empty()) {
+                status = "读取不可用: " + read_reason;
+            } else if (watched) {
+                status = "观测已停止；尚无样本";
+            } else {
+                status = "尚无样本";
+            }
+            return "  └ " + status;
+        }
+        if (row.element_index.has_value() && sample.has_value() &&
+            sample->has_value && sample->is_array &&
+            *row.element_index < sample->array_values.size()) {
+            return FormatExpandedArrayValue(
+                *symbol, static_cast<std::size_t>(*row.element_index),
+                sample->array_values[*row.element_index],
+                sample->stale || sample->stopped);
+        }
+        if (sample.has_value() && sample->has_value && !sample->is_array)
+            return FormatExpandedScalarValue(*symbol, *sample);
+        return "  └ 尚无可显示的完整样本";
+    }
+
     /** @brief 在界面线程重建父行/动作行/数据行并保留行身份。 */
     void RebuildPreviewLabels() {
         // 性能观测：整表重建是 O(候选数) 的热路径，耗时直接决定界面响应。
@@ -1148,60 +1222,35 @@ private:
         }
 
         preview_rows_ = BuildPreviewRows(row_sources);
+        // 行索引与标签同批生成：索引让观测更新只重算该符号占据的行，
+        // 避免 198k 候选规模下每次采样都重建整表。
+        preview_row_index_.Rebuild(preview_rows_);
         for (const auto& row : preview_rows_) {
             preview_visible_names_.push_back(row.symbol_name);
             const auto symbol_index =
                 preview_symbol_index_.find(row.symbol_name);
-            if (symbol_index == preview_symbol_index_.end()) {
-                preview_labels_.push_back(row.symbol_name + " | A2L候选已失效");
-                continue;
+            const SymbolInfo* symbol =
+                symbol_index == preview_symbol_index_.end()
+                    ? nullptr
+                    : &preview_symbols_[symbol_index->second];
+            if (symbol != nullptr && !row.is_child) {
+                preview_visible_index_.try_emplace(row.symbol_name,
+                                                   preview_labels_.size());
             }
-            const auto& symbol = preview_symbols_[symbol_index->second];
             const auto sample_it = samples_by_name.find(row.symbol_name);
             const auto watched_it = watched_by_name.find(row.symbol_name);
             const auto reason_it = read_reasons_by_name.find(row.symbol_name);
             const std::optional<calmcar::xcp::tools::ObservationSnapshot>
-                sample = sample_it == samples_by_name.end() ? std::nullopt
-                                                            : sample_it->second;
+                sample = sample_it == samples_by_name.end()
+                             ? std::nullopt
+                             : sample_it->second;
             const bool watched =
                 watched_it != watched_by_name.end() && watched_it->second;
-            if (!row.is_child) {
-                preview_visible_index_.try_emplace(row.symbol_name,
-                                                   preview_labels_.size());
-                preview_labels_.push_back(
-                    FormatPreviewLabel(symbol, sample, watched));
-            } else if (row.is_read_action) {
-                preview_labels_.push_back(
-                    "  └ [单次读取] 按 Enter 读取完整变量（不加入观测）");
-            } else if (row.is_placeholder) {
-                std::string status;
-                if (sample.has_value() && !sample->status.empty()) {
-                    status = sample->status;
-                } else if (watched && watching_.load()) {
-                    status = "等待首次完整样本";
-                } else if (reason_it != read_reasons_by_name.end() &&
-                           !reason_it->second.empty()) {
-                    status = "读取不可用: " + reason_it->second;
-                } else if (watched) {
-                    status = "观测已停止；尚无样本";
-                } else {
-                    status = "尚无样本";
-                }
-                preview_labels_.push_back("  └ " + status);
-            } else if (row.element_index.has_value() && sample.has_value() &&
-                       sample->has_value && sample->is_array &&
-                       *row.element_index < sample->array_values.size()) {
-                preview_labels_.push_back(FormatExpandedArrayValue(
-                    symbol, static_cast<std::size_t>(*row.element_index),
-                    sample->array_values[*row.element_index],
-                    sample->stale || sample->stopped));
-            } else if (sample.has_value() && sample->has_value &&
-                       !sample->is_array) {
-                preview_labels_.push_back(
-                    FormatExpandedScalarValue(symbol, *sample));
-            } else {
-                preview_labels_.push_back("  └ 尚无可显示的完整样本");
-            }
+            const std::string read_reason =
+                reason_it == read_reasons_by_name.end() ? std::string()
+                                                        : reason_it->second;
+            preview_labels_.push_back(FormatPreviewRowLabel(
+                row, symbol, sample, watched, read_reason));
         }
 
         // 空搜索结果也留一个不可操作的菜单占位行，保持列表可聚焦。
@@ -1288,28 +1337,28 @@ private:
         RequestPreviewRefresh(name);
     }
 
-    /** @brief 只更新已显示符号的一行，避免高速采样时重建整张表。 */
+    /**
+     * @brief 只刷新某个符号占据的行，避免高速采样时重建整张表。
+     * @param name 符号规范名。
+     * @note 展开符号的父行与全部子值行一起刷新，代价为 O(该符号行数)；
+     *       符号不在当前可见行集合时什么也不做。
+     */
     void UpdatePreviewLabel(const std::string& name) {
-        const auto visible = preview_visible_index_.find(name);
-        if (visible == preview_visible_index_.end()) return;
+        std::lock_guard lock(output_mutex_);
+        std::lock_guard watched_lock(watched_mutex_);
         const auto symbol_index = preview_symbol_index_.find(name);
         if (symbol_index == preview_symbol_index_.end()) return;
-        bool rebuild = false;
-        {
-            std::lock_guard lock(output_mutex_);
-            std::lock_guard watched_lock(watched_mutex_);
-            const bool watched = std::find(watched_.begin(), watched_.end(),
-                                           name) != watched_.end();
-            if ((preview_scope_selected_ == 1 && !watched) ||
-                expanded_preview_names_.contains(name)) {
-                rebuild = true;
-            } else {
-                preview_labels_[visible->second] =
-                    FormatPreviewLabel(preview_symbols_[symbol_index->second],
-                                       observation_model_.Find(name), watched);
-            }
-        }
-        if (rebuild) RebuildPreviewLabels();
+        const auto& symbol = preview_symbols_[symbol_index->second];
+        const bool watched =
+            std::find(watched_.begin(), watched_.end(), name) != watched_.end();
+        const auto sample = observation_model_.Find(name);
+        const auto read_reason = PreviewReadUnsupportedReason(symbol);
+        static_cast<void>(calmcar::xcp::tools::RefreshPreviewRows(
+            preview_labels_, preview_row_index_, name,
+            [&](std::size_t row_index) {
+                return FormatPreviewRowLabel(preview_rows_[row_index], &symbol,
+                                             sample, watched, read_reason);
+            }));
     }
 
     /** @brief 处理“全部/仅采样”范围切换。 */
@@ -3338,6 +3387,10 @@ private:
     std::unordered_map<std::string, std::size_t>
         preview_visible_index_;            /**< 规范名到父预览菜单行号。 */
     std::vector<PreviewRow> preview_rows_; /**< 菜单行到符号/元素的映射。 */
+    calmcar::xcp::tools::WindowedMenu*
+        preview_menu_typed_{nullptr}; /**< 虚拟菜单裸指针，仅界面线程使用。 */
+    calmcar::xcp::tools::PreviewRowIndex
+        preview_row_index_; /**< 规范名到其全部分行行号的索引，用于增量刷新。 */
     std::unordered_set<std::string>
         expanded_preview_names_; /**< 当前原位展开的符号规范名。 */
     /** @brief 变量预览菜单文本；空结果也用占位行保持焦点。 */
