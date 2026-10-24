@@ -1,0 +1,55 @@
+$ cat .github/workflows/macos.yml
+# macOS 持续集成（第一阶段仅 master；首版只构建不跑 ctest，待编译稳定后再加）
+name: macOS
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # 日志需要 C++20 <format>，Apple Clang 不一定提供，改用 Homebrew LLVM（含完整 libc++）
+      - name: 安装构建工具、LLVM 与 Boost
+        run: brew install cmake ninja llvm boost
+
+      # 使用 Homebrew LLVM 自带的 libc++ 头文件与动态库，避免与系统 libc++ 混用
+      # Boost_DIR 由 brew 前缀下的 Boost-* 目录通配得到，不写死版本号
+      - name: Configure
+        run: |
+          LLVM_PREFIX="$(brew --prefix llvm)"
+          BOOST_CMAKE_DIR="$(ls -d "$(brew --prefix boost)"/lib/cmake/Boost-* | head -n 1)"
+          echo "LLVM_PREFIX=$LLVM_PREFIX"
+          echo "BOOST_CMAKE_DIR=$BOOST_CMAKE_DIR"
+          cmake -B build -S . -G Ninja \
+            -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
+            -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
+            -DCMAKE_CXX_FLAGS="-nostdinc++ -isystem $LLVM_PREFIX/include/c++/v1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-L$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/c++" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-L$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/c++" \
+            -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DLIBXCP_BUILD_TESTS=ON \
+            -DLIBXCP_BUILD_TOOLS=ON \
+            -DLIBXCP_BUILD_EXAMPLES=ON \
+            -DLIBXCP_ENABLE_LOG=ON \
+            "-DBoost_DIR=$BOOST_CMAKE_DIR"
+
+      - name: Build
+        run: cmake --build build -j "$(sysctl -n hw.ncpu)"
