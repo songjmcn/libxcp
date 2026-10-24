@@ -274,8 +274,9 @@ public:
     }
 
     int shutdown_socket(SocketHandle handle) override {
-        // 双向关闭：立即让阻塞中的 send/recv 返回，但**不**释放句柄号
-        return ::shutdown(handle, SHUT_RDWR);
+        // 双向关闭：立即让阻塞中的 send/recv 返回，但**不**释放句柄号。
+        // 常量按平台取（POSIX SHUT_RDWR / Winsock SD_BOTH），见 kShutdownBoth。
+        return ::shutdown(handle, kShutdownBoth);
     }
 
     int wait_writable(SocketHandle handle, std::uint32_t timeout_ms) override {
@@ -318,15 +319,7 @@ public:
     }
 
     [[nodiscard]] bool is_connection_lost() const override {
-        const int code = lastSocketErrorCode();
-#if defined(_WIN32)
-        return code == WSAECONNRESET || code == WSAECONNABORTED ||
-               code == WSAENOTCONN || code == WSAESHUTDOWN ||
-               code == WSAEPIPE;
-#else
-        return code == EPIPE || code == ECONNRESET || code == ECONNABORTED ||
-               code == ENOTCONN || code == ESHUTDOWN;
-#endif
+        return IsConnectionLostCode(lastSocketErrorCode());
     }
 
 #if defined(_WIN32)
@@ -343,6 +336,18 @@ private:
 NameResolver g_test_name_resolver = nullptr;
 
 }  // namespace
+
+bool IsConnectionLostCode(int code) noexcept {
+#if defined(_WIN32)
+    // Winsock 无 WSAEPIPE：对端关闭表现为 CONNRESET/CONNABORTED，
+    // 本地已 shutdown 后为 SHUTDOWN，判定集合不因此缺失任何情形。
+    return code == WSAECONNRESET || code == WSAECONNABORTED ||
+           code == WSAENOTCONN || code == WSAESHUTDOWN;
+#else
+    return code == EPIPE || code == ECONNRESET || code == ECONNABORTED ||
+           code == ENOTCONN || code == ESHUTDOWN;
+#endif
+}
 
 SocketOps& RealSocketOps() {
     static RealSocketOpsImpl instance;

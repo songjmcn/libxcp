@@ -209,8 +209,11 @@ void TcpTransport::Open(IPacketListener& listener) {
     // ---- 解码器：构建期即校验，把配置错误挡在连接建立之前 ----
     // max_packet_size 与 max_frame_packet_size 取两者较小值：decoder 的职责是
     // 防止缓冲无界增长，必须遵守调用方给出的**任意一个**更严格上限。
+    // 用括号包住 `std::min` 是刻意的：Windows 头会在未定义 NOMINMAX 时注入
+    // `min` 宏，`std::min(a, b)` 会被预处理成 `std::((a)<(b)?...)` 而报
+    // C2589/C2059；`(std::min)(a, b)` 不满足函数式宏的展开条件，两个平台通吃。
     const std::size_t decoder_limit =
-        std::min(m_config_.max_packet_size, m_config_.max_frame_packet_size);
+        (std::min)(m_config_.max_packet_size, m_config_.max_frame_packet_size);
     m_decoder_ = std::make_unique<TcpStreamDecoder>(
         m_config_.wire_profile, m_config_.packet_alignment, decoder_limit);
 

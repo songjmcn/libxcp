@@ -17,6 +17,12 @@
 
 include(FetchContent)
 
+if(WIN32)
+  # 与 libxcp 本体一致：关闭 Windows 头的 min/max 宏，避免 std::min/std::max
+  # 在含 winsock 头的测试 TU 里被宏展开（MSVC C2589/C2059）。
+  add_compile_definitions(NOMINMAX)
+endif()
+
 set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
 set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 
@@ -80,8 +86,12 @@ target_link_libraries(libxcp_tests PRIVATE
         GTest::gtest
         libxcp_test_main)
 
-# 测试设施头文件目录（mock_transport.hpp 等），仅 tests 内部可见
-target_include_directories(libxcp_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# 测试设施头文件目录（mock_transport.hpp 等），仅 tests 内部可见；
+# 同时把源码根目录加进来，使测试可以用 `#include "src/socket_util.hpp"`
+# 直接覆盖内部平台适配逻辑（如 IsConnectionLostCode / kShutdownBoth）。
+target_include_directories(libxcp_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR})
 
 if(MSVC)
   target_compile_options(libxcp_tests PRIVATE /utf-8)

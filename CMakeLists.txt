@@ -187,6 +187,11 @@ endif()
 
 if(WIN32)
   target_link_libraries(libxcp PUBLIC ws2_32)
+  # Windows 头（经 winsock 头链传递带入的 minwindef.h）默认定义 min/max 宏，
+  # 会把 `std::min(a, b)` 预处理成语法错误（MSVC C2589/C2059）。
+  # 全仓无任何代码依赖这两个宏，故对本目标统一关闭；测试/工具目标在各自的
+  # CMakeLists 里做同样设置，第三方库保持原状以免影响其构建。
+  target_compile_definitions(libxcp PRIVATE NOMINMAX)
 endif()
 
 set_target_properties(libxcp PROPERTIES

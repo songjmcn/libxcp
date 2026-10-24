@@ -858,7 +858,9 @@ bool TcpTestSlave::WriteResponse(BytesView packet) {
                fault.chunk_size_n->second > 0U) {
         const std::size_t chunk = fault.chunk_size_n->second;
         for (std::size_t off = 0; off < frame.size(); off += chunk) {
-            const std::size_t n2 = std::min(chunk, frame.size() - off);
+            // 括号包住 std::min：Windows 头在未定义 NOMINMAX 时会注入 min 宏，
+            // `std::min(a, b)` 会被宏展开成语法错误（C2589/C2059）。
+            const std::size_t n2 = (std::min)(chunk, frame.size() - off);
             if (!write_all(frame_view.subspan(off, n2))) {
                 ok = false;
                 break;

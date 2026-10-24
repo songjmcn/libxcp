@@ -19,7 +19,10 @@
 
 #include "libxcp/tcp_transport.hpp"
 
+#include "src/socket_util.hpp"
+
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
@@ -1075,6 +1078,65 @@ TEST_F(TcpReceiveCtrTest, FirstFrameAfterReopenEstablishesFreshBaseline) {
         << "新连接首帧应重建基线而非与旧基线比对";
     EXPECT_FALSE(listener2.closed());
     transport2->Close();
+}
+
+// ===========================================================================
+// 平台错误码与关闭常量的分类（Windows CI 回归）
+//
+// 背景：`src/socket_util.cpp` 曾经在平台分支之外直接使用 POSIX 的
+// `SHUT_RDWR`，并在 Winsock 分支里写了并不存在的 `WSAEPIPE`，导致 Windows
+// 编译直接失败。POSIX 侧完全合法，因此本地与 Linux CI 都无法发现。
+// 这里把"哪些错误码算连接丢失"和"双向关闭用哪个常量"固化成可测契约。
+// ===========================================================================
+
+#if defined(_WIN32)
+/// @brief 本平台应被判为"连接已丢失"的错误码
+constexpr int kConnectionLostCodes[] = {WSAECONNRESET, WSAECONNABORTED,
+                                        WSAENOTCONN, WSAESHUTDOWN};
+/// @brief 本平台不应被判为"连接已丢失"的错误码
+constexpr int kNotConnectionLostCodes[] = {0, WSAEWOULDBLOCK, WSAEINTR,
+                                           WSAEINPROGRESS};
+// 双向关闭必须是 Winsock 的 SD_BOTH；若误写成 SHUT_RDWR 会连编译都过不去。
+static_assert(detail::kShutdownBoth == SD_BOTH,
+              "kShutdownBoth 在 Windows 上必须是 SD_BOTH");
+#else
+/// @brief 本平台应被判为"连接已丢失"的错误码
+constexpr int kConnectionLostCodes[] = {EPIPE,  ECONNRESET, ECONNABORTED,
+                                        ENOTCONN, ESHUTDOWN};
+/// @brief 本平台不应被判为"连接已丢失"的错误码
+constexpr int kNotConnectionLostCodes[] = {0, EAGAIN, EINTR, EINPROGRESS};
+// 双向关闭必须是 POSIX 的 SHUT_RDWR；若误写成 SD_BOTH 会连编译都过不去。
+static_assert(detail::kShutdownBoth == SHUT_RDWR,
+              "kShutdownBoth 在 POSIX 上必须是 SHUT_RDWR");
+#endif
+
+TEST(SocketPlatformTest, ClassifiesConnectionLostCodes) {
+    // 判定集合必须覆盖"对端关闭"在本平台的**全部**表现，漏一个就会把断链
+    // 误报成一般错误，进而让调用方继续在死连接上收发。
+    for (const int code : kConnectionLostCodes) {
+        EXPECT_TRUE(detail::IsConnectionLostCode(code))
+            << "错误码应判为连接丢失，code=" << code;
+    }
+}
+
+TEST(SocketPlatformTest, KeepsOtherCodesOutOfConnectionLostSet) {
+    // 反向约束：可重试错误（would-block）与"操作被打断"都不属于连接丢失，
+    // 若误判就会把可恢复的瞬时状态升级成断链。
+    for (const int code : kNotConnectionLostCodes) {
+        EXPECT_FALSE(detail::IsConnectionLostCode(code))
+            << "错误码不应判为连接丢失，code=" << code;
+    }
+}
+
+TEST(SocketPlatformTest, ShutdownBothSelectsBothDirections) {
+    // 编译期断言已锁定常量来源；这里再确认它确实是"双向"而不是单向别名。
+#if defined(_WIN32)
+    EXPECT_NE(detail::kShutdownBoth, SD_RECEIVE);
+    EXPECT_NE(detail::kShutdownBoth, SD_SEND);
+#else
+    EXPECT_NE(detail::kShutdownBoth, SHUT_RD);
+    EXPECT_NE(detail::kShutdownBoth, SHUT_WR);
+#endif
 }
 
 }  // namespace calmcar::xcp

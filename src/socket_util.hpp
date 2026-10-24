@@ -49,6 +49,16 @@ using SocketHandle = int;
 inline constexpr SocketHandle kInvalidSocketHandle = -1;
 #endif
 
+/// @brief `shutdown()` 的"双向关闭"平台常量
+/// @details POSIX 取 `SHUT_RDWR`，Windows 取 `SD_BOTH`。两者**不可混用**：
+///          Winsock 头不定义 `SHUT_RDWR`，POSIX 头也不定义 `SD_BOTH`，
+///          写成单个常量会让另一平台直接编译失败（Windows CI 已踩过）。
+#if defined(_WIN32)
+inline constexpr int kShutdownBoth = SD_BOTH;
+#else
+inline constexpr int kShutdownBoth = SHUT_RDWR;
+#endif
+
 /**
  * @brief Socket 操作函数表（生产实现 + 测试替身共用同一接口）
  *
@@ -153,6 +163,22 @@ struct SocketOps {
  * @note 单例无状态，可安全跨线程共享。
  */
 [[nodiscard]] SocketOps& RealSocketOps();
+
+/**
+ * @brief 判断平台错误码是否表示 "连接已丢失/对端已关闭"
+ * @param code 平台错误码（POSIX 为 `errno`，Windows 为 `WSAGetLastError()`）
+ * @return 表示连接不可继续使用返回 true
+ *
+ * @details 抽成独立函数而非埋在 `SocketOps` 里，是为了让**判定集合本身**
+ *          可以在两个平台上被单元测试直接覆盖。历史上这里误用过
+ *          `WSAEPIPE`——Winsock 并没有这个错误码（`EPIPE` 只是 MSVC CRT 的
+ *          `errno`），只有 Windows 编译才会暴露，故必须可测。
+ *
+ * @note Windows 侧没有与 POSIX `EPIPE` 等价的 WSA 码：对端关闭在 Windows 上
+ *       表现为 `WSAECONNRESET` / `WSAECONNABORTED`，本地已 shutdown 时为
+ *       `WSAESHUTDOWN`，均已包含在判定集合内，因此删除 `WSAEPIPE` 不损失判据。
+ */
+[[nodiscard]] bool IsConnectionLostCode(int code) noexcept;
 
 /**
  * @brief 把点分 IPv4 文本解析为网络序地址
