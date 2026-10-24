@@ -19,6 +19,7 @@
  *   - 不因 `--tcp-profile asam-v1.4` 反推协议层版本（§8.1 规则 6）。
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <string>
