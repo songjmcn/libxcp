@@ -101,6 +101,9 @@ std::string formatWsaError(int code) {
     return "WSAErr=" + std::to_string(code) + " " + std::string(buffer);
 }
 
+/// @brief 把错误码格式化为可读文本（平台无关入口，Windows 走 WSA 文本）
+std::string formatSocketError(int code) { return formatWsaError(code); }
+
 /// @brief 取当前线程最近一次 Socket 错误码
 int lastSocketErrorCode() { return static_cast<int>(WSAGetLastError()); }
 
@@ -110,6 +113,9 @@ int lastSocketErrorCode() { return static_cast<int>(WSAGetLastError()); }
 std::string formatErrno(int code) {
     return "errno=" + std::to_string(code) + " " + std::strerror(code);
 }
+
+/// @brief 把错误码格式化为可读文本（平台无关入口）
+std::string formatSocketError(int code) { return formatErrno(code); }
 
 /// @brief 取当前线程最近一次 Socket 错误码
 int lastSocketErrorCode() { return errno; }
@@ -281,7 +287,7 @@ public:
     }
 
     [[nodiscard]] std::string last_error() const override {
-        return formatErrno(lastSocketErrorCode());
+        return formatSocketError(lastSocketErrorCode());
     }
 
     [[nodiscard]] bool is_interrupted() const override {

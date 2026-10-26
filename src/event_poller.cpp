@@ -18,6 +18,14 @@
 #include <cstring>
 
 #if defined(_WIN32)
+// WSAPoll 自 Vista 起提供；SDK 头会按 WINVER/_WIN32_WINNT 决定是否声明，
+// 而本工程其余文件未定义它们（默认可能低于 0x0600），故在此显式抬到 Win7。
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
