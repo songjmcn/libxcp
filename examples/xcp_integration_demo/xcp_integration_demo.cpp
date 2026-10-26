@@ -168,28 +168,53 @@ void ApplyCppDemoProfile(Options& o) {
                      "cpp_demo::counter",        "cpp_demo::sum",
                      "cpp_demo::SigGen1.value_", "cpp_demo::SigGen2.value_"};
     }
-    // 字段顺序：name, short_name, channel, time_cycle, time_unit, type,
-    // max_daq_list。A2L 中三个 EVENT 均声明为 `DAQ`（type=1）且
-    // max_daq_list=0xFF，此处必须如实补齐——max_daq_list 默认 0 会被
-    // 运行时能力校验判为「未声明动态列表容量」而拒绝。
-    o.event_metadata = {{"SigGen1", "SigGen1", 0, 0, 0, 1U, 0xFFU},
-                        {"SigGen2", "SigGen2", 1, 0, 0, 1U, 0xFFU},
-                        {"mainloop", "mainloop", 2, 0, 0, 1U, 0xFFU}};
+    // 事件编号由 cpp_demo 运行时注册顺序决定（SigGen 线程的注册次序不固定），
+    // 因此不在此写死，待 A2L 上传并加载后由 DeriveEventsFromA2l 推导。
+}
+
+/**
+ * @brief 从已加载的 A2L 推导 cpp_demo 的事件元数据与符号事件绑定。
+ * @details 事件元数据取自 IF_DATA XCP 的 EVENT 列表，符号绑定取自该符号
+ *          A2L 中声明的唯一固定 DAQ 事件。命令行已显式给出的通道与绑定优先，
+ *          不会被覆盖。
+ * @param bridge 已加载的 A2L 桥接对象。
+ * @param o 待补全的选项。
+ * @throws std::runtime_error A2L 缺少可用事件信息，或符号没有唯一固定事件。
+ */
+void DeriveEventsFromA2l(const a2l::A2lBridge& bridge, Options& o) {
+    const auto* xcp_info = bridge.XcpInfo();
+    if (xcp_info == nullptr || xcp_info->ambiguous) {
+        throw std::runtime_error("A2L 缺少可用的 IF_DATA XCP，无法推导事件绑定");
+    }
+    for (const auto& event : xcp_info->event_channels) {
+        const bool declared = std::any_of(
+            o.event_metadata.begin(), o.event_metadata.end(),
+            [&event](const A2lEventMetadata& meta) {
+                return meta.channel == event.channel_number;
+            });
+        if (declared) continue;
+        o.event_metadata.push_back(A2lEventMetadata{
+            event.name, event.short_name, event.channel_number,
+            event.time_cycle, event.time_unit, event.type,
+            event.max_daq_list});
+    }
+    const auto* database = bridge.Database();
+    if (database == nullptr) {
+        throw std::runtime_error("A2L 数据库尚未就绪");
+    }
     for (const auto& symbol : o.symbols) {
-        std::uint64_t channel = 2;
-        if (symbol.find("SigGen1") != std::string::npos)
-            channel = 0;
-        else if (symbol.find("SigGen2") != std::string::npos)
-            channel = 1;
-        else if (symbol.find("temperature") == std::string::npos &&
-                 symbol.find("speed") == std::string::npos &&
-                 symbol.find("counter") == std::string::npos &&
-                 symbol.find("sum") == std::string::npos &&
-                 symbol.find("loop_cycle") == std::string::npos &&
-                 symbol.find("loop_histogram") == std::string::npos) {
-            UsageError("cpp_demo profile 无此符号的已知事件绑定");
+        if (o.symbol_events.contains(symbol)) continue;
+        const auto found = database->Find(symbol);
+        if (!found.HasValue()) {
+            throw std::runtime_error("A2L 中找不到符号：" + symbol);
         }
-        o.symbol_events[symbol] = channel;
+        const auto& fixed_events = found.Value().daq_event_fixed;
+        if (fixed_events.size() != 1) {
+            throw std::runtime_error("符号 " + symbol +
+                                     " 在 A2L 中没有唯一的固定 DAQ 事件，"
+                                     "请用 --symbol-event 显式指定");
+        }
+        o.symbol_events[symbol] = fixed_events.front();
     }
 }
 
@@ -452,7 +477,8 @@ Options ParseOptions(int argc, char** argv) {
     if (o.modify_bits.has_value() != o.confirm_modify_bits) {
         UsageError("--modify-bits 必须与 --confirm-modify-bits 一起使用");
     }
-    if (!o.symbols.empty()) {
+    // cpp_demo profile 的绑定在 A2L 加载后推导，此处无法校验
+    if (!o.symbols.empty() && !o.cpp_demo_profile) {
         for (const auto& symbol : o.symbols) {
             if (!o.event_channel_set && !o.symbol_events.contains(symbol)) {
                 UsageError(
@@ -830,7 +856,7 @@ int main(int argc, char** argv) {
     bool logging_initialized = false;
 #endif
     try {
-        const Options options = ParseOptions(argc, argv);
+        Options options = ParseOptions(argc, argv);
 #if LIBXCP_ENABLE_LOG
         std::string log_error;
         if (!logging.Initialize(argv[0], "examples", log_error)) {
@@ -865,6 +891,7 @@ int main(int argc, char** argv) {
             throw std::runtime_error("A2L 数据库尚未就绪");
         }
         A2lMeasurementDatabase a2l_database(*bridge->Database());
+        if (options.cpp_demo_profile) DeriveEventsFromA2l(*bridge, options);
 
         // EventBound DB and session must outlive XcpMaster; create them before
         // it.
