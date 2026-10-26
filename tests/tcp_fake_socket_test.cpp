@@ -41,6 +41,8 @@
 #include "libxcp/tcp_transport.hpp"
 #include "libxcp/xcp_error.hpp"
 
+#include "socket_runtime_guard.hpp"
+
 namespace calmcar::xcp {
 namespace {
 
@@ -120,6 +122,8 @@ private:
 class TcpFakeSocketTest : public ::testing::Test {
 protected:
     void SetUp() override {
+        // Windows 上裸 ::socket 之前必须先 WSAStartup（见 socket_runtime_guard.hpp）
+        test_support::EnsureSocketRuntime();
         m_listen_handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         ASSERT_NE(m_listen_handle, kRawInvalid);
 

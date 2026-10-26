@@ -50,6 +50,8 @@
 #include "libxcp/ethernet_header_codec.hpp"
 #include "libxcp/tcp_stream_decoder.hpp"
 
+#include "socket_runtime_guard.hpp"
+
 namespace calmcar::xcp {
 namespace {
 
@@ -383,6 +385,8 @@ class TcpEndToEndTest : public ::testing::Test {
 protected:
     /// @brief 启动一个监听 Socket 并返回其端口
     std::uint16_t StartRawListener() {
+        // Windows 上裸 ::socket 之前必须先 WSAStartup（见 socket_runtime_guard.hpp）
+        test_support::EnsureSocketRuntime();
         m_listen_handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (m_listen_handle == kRawInvalid) {
             return 0;
