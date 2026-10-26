@@ -70,16 +70,20 @@ jobs:
       # --timeout 180：与 Linux/macOS 对齐，让挂死用例 3 分钟内被点名而不是烧掉 10 分钟。
       # timeout-minutes：整轮若仍被某个用例挂住，20 分钟后由 job 层面截断并进入
       # Annotate failures，避免白占 runner 到 90 分钟的作业上限。
+      # 超时预算（三级，必须 watchdog < ctest < 步骤）：
+      #   看门狗 60 s —— 用例挂死时由测试进程自己点名并 abort；
+      #   ctest 90 s —— 兜底杀掉整个进程（含看门狗没覆盖到的卡死）；
+      #   步骤 60 min —— 即使有二十多个用例各拖 90 s 也能跑完并产出失败清单。
+      # 上一轮因为步骤只有 20 min，整轮被截断，注解里只剩“步骤超时”，看不到用例名。
       - name: Test
         working-directory: build
         shell: pwsh
-        timeout-minutes: 20
+        timeout-minutes: 60
         env:
-          # 用例级看门狗（tests/test_main.cpp）：单用例超过该秒数即打印用例名并中止，
-          # 这样挂死会变成"点名失败"而不是"作业卡住到超时"。
-          LIBXCP_TEST_WATCHDOG_SECONDS: 240
+          # 用例级看门狗（tests/test_main.cpp）：单用例超过该秒数即打印用例名并中止。
+          LIBXCP_TEST_WATCHDOG_SECONDS: 60
         run: >
-          ctest -C $env:BUILD_TYPE --output-on-failure --timeout 180
+          ctest -C $env:BUILD_TYPE --output-on-failure --timeout 90
           -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
 
       # 失败时把 ctest 的失败清单打成 GitHub 注解（annotation）。
