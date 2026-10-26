@@ -36,6 +36,10 @@ jobs:
       # 不到源码构建。不用 brew install boost，因为 formula 的 stable 版本会随上游升级漂移
       # （实测已是 1.92），与 Linux/Windows 固定的 1.86 不一致；locale/filesystem 的
       # ABI 差异只会在运行时以难复现的方式暴露。
+      #
+      # arch 必须显式写 aarch64：action 在未指定 arch 时只接受 manifest 里 arch=x86 的包，
+      # 而 1.86.0 的 macOS 包只有 aarch64（macos-14/macos-15 两档），否则报
+      # "Could not find boost version 1.86.0"（PR #15 首轮即踩到）。
       - name: 安装 Boost 1.86.0
         id: install-boost
         uses: MarkusJx/install-boost@v2.4.5
@@ -43,6 +47,7 @@ jobs:
           boost_version: 1.86.0
           platform_version: 15
           toolset: clang
+          arch: aarch64
           boost_install_dir: ${{ github.workspace }}/boost-install
 
       - name: Configure
