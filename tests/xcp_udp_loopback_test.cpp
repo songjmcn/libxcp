@@ -925,23 +925,29 @@ TEST(UdpLoopbackAlignment, EightBitSessionStillRoundTripsData) {
     RunAlignedSession(PacketAlignment::Bit8);
 }
 
-TEST(UdpLoopbackAlignment, MismatchedAlignmentFailsRatherThanCorrupts) {
-    // 反例：Slave 用 32-bit、Master 用 8-bit。双方对 Tail 的理解不同，
-    // 会话**必须失败**，绝不能悄悄读到错位数据。
+TEST(UdpLoopbackAlignment, MismatchedAlignmentStillRoundTripsData) {
+    // P1 契约变更：双方都不再依赖对齐一致 —— 主站发送恒不补 Tail，从站
+    // （本项目测试 Slave）按数据报边界解码，因此对齐不一致**不再**导致会话
+    // 失败或数据错位。本用例把这一更强的性质固化为回归。
     test::UdpTestSlave slave;
     slave.SetPacketAlignment(PacketAlignment::Bit32);
     slave.Start();
 
-    slave.SetMemory(0x70012500, BytesOf({0xAA, 0xBB, 0xCC}));
+    const Bytes content = BytesOf({0xAA, 0xBB, 0xCC});
+    slave.SetMemory(0x70012500, content);
 
     auto cfg = MakeConfig(slave.Port());
-    cfg.packet_alignment = PacketAlignment::Bit8;  // 故意不一致
+    cfg.packet_alignment = PacketAlignment::Bit8;  // 故意与 Slave 不一致
     XcpMasterOptions options;
     auto master = std::make_unique<XcpMaster>(
         std::make_unique<UdpTransport>(cfg), options);
 
-    // CONNECT 的响应就会因 Tail 错位而无法正确解析
-    EXPECT_THROW(master->Connect(), XcpException);
+    EXPECT_NO_THROW(master->Connect());
+    EXPECT_TRUE(master->IsConnected());
+    // 关键：Tail 处理若错位会表现为读回内容不符，这里必须逐字节一致
+    EXPECT_EQ(master->ReadMemoryBytes(0x70012500, 0x00, 3), content);
+
+    master->Disconnect();
     slave.Stop();
 }
 

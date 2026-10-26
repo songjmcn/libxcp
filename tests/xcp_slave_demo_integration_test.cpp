@@ -34,6 +34,8 @@
 #include "libxcp/measurement/measurement_planner.hpp"
 #include "libxcp/measurement/measurement_session.hpp"
 #include "libxcp/protocol_types.hpp"
+#include "libxcp/tcp_transport.hpp"
+#include "libxcp/tcp_transport_config.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "libxcp/xcp_error.hpp"
 #include "libxcp/xcp_master.hpp"
@@ -584,6 +586,148 @@ std::unique_ptr<XcpMaster> ConnectToDemo(std::uint16_t port,
 }
 
 /**
+ * @brief 占用一个 loopback TCP 端口，用于把已知空闲端口交给从站进程。
+ * @note 与 `UdpPortReservation` 同一策略：先绑定 0 端口拿到具体端口号，
+ *       生成 A2L 后立即释放，再由从站进程去绑定；TCP 与 UDP 的端口空间
+ *       彼此独立，因此两者可以使用同一个端口号。
+ */
+class TcpPortReservation {
+public:
+    /** @brief 释放 socket 并撤销本对象启动的 Winsock 引用。 */
+    ~TcpPortReservation() { Close(); }
+
+    TcpPortReservation() = default;
+    TcpPortReservation(const TcpPortReservation&) =
+        delete;  ///< 禁止复制 socket 所有权。
+    TcpPortReservation& operator=(const TcpPortReservation&) =
+        delete;  ///< 禁止复制赋值。
+
+    /**
+     * @brief 绑定 loopback 上的任意可用 TCP 端口。
+     * @return 端口保留成功时返回 true。
+     */
+    bool BindFree() {
+#ifdef _WIN32
+        WSADATA data{};
+        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+            return false;
+        }
+        winsock_started_ = true;
+#endif
+        socket_ = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (socket_ == kInvalidSocket) {
+            Close();
+            return false;
+        }
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        address.sin_port = 0;
+        if (bind(socket_, reinterpret_cast<const sockaddr*>(&address),
+                 static_cast<int>(sizeof(address))) != 0) {
+            Close();
+            return false;
+        }
+#ifdef _WIN32
+        int address_length = sizeof(address);
+#else
+        socklen_t address_length = sizeof(address);
+#endif
+        if (getsockname(socket_, reinterpret_cast<sockaddr*>(&address),
+                        &address_length) != 0) {
+            Close();
+            return false;
+        }
+        port_ = ntohs(address.sin_port);
+        return port_ != 0U;
+    }
+
+    /** @brief 返回保留的 TCP 端口。 */
+    [[nodiscard]] std::uint16_t Port() const noexcept { return port_; }
+
+    /** @brief 关闭端口保留 socket，允许服务进程随后绑定。 */
+    void Close() noexcept {
+        if (socket_ != kInvalidSocket) {
+            CloseSocket(socket_);
+            socket_ = kInvalidSocket;
+        }
+#ifdef _WIN32
+        if (winsock_started_) {
+            WSACleanup();
+            winsock_started_ = false;
+        }
+#endif
+    }
+
+private:
+    /** @brief 关闭给定平台 socket。 */
+    static void CloseSocket(NativeSocket socket_handle) noexcept {
+#ifdef _WIN32
+        (void)closesocket(socket_handle);
+#else
+        (void)close(socket_handle);
+#endif
+    }
+
+    NativeSocket socket_{kInvalidSocket};  ///< 用于保留端口的 socket。
+    std::uint16_t port_{0U};               ///< 已保留的端口号。
+#ifdef _WIN32
+    bool winsock_started_{false};  ///< 是否需要在本对象析构时调用 WSACleanup。
+#endif
+};
+
+/**
+ * @brief 构造指向 loopback TCP Slave 的 Master。
+ * @param port 目标 Slave TCP 端口。
+ * @param listener 可选的非拥有事件监听器。
+ * @return 使用 AsamV14 帧布局与 8 bit 对齐的 Master。
+ * @note 帧布局必须显式给出：库**不**从版本号或 A2L 推断线路布局
+ *       （见 `tcp_wire_profile.hpp`）；XCPlite 的默认 TCP 路径对应 AsamV14。
+ */
+std::unique_ptr<XcpMaster> MakeDemoTcpMaster(std::uint16_t port,
+                                             IEventListener* listener) {
+    TcpTransportConfig config;
+    config.role = TcpRole::Master;
+    config.remote_host = "127.0.0.1";
+    config.remote_port = port;
+    config.local_host = "127.0.0.1";
+    config.local_port = 0;
+    config.packet_alignment = PacketAlignment::Bit8;
+    config.wire_profile = TcpWireProfile::AsamV14;
+    config.connect_timeout_ms = 1000;
+    XcpMasterOptions options;
+    options.timeouts = CommandTimeouts{std::chrono::milliseconds(300),
+                                       std::chrono::milliseconds(300), 1};
+    options.event_listener = listener;
+    return std::make_unique<XcpMaster>(std::make_unique<TcpTransport>(config),
+                                       options);
+}
+
+/**
+ * @brief 带有限重试地通过 TCP 连接刚启动的示例 Slave。
+ * @param port Slave 监听端口。
+ * @param listener 可选 DTO 监听器。
+ * @return 成功连接的 Master；超时返回空值。
+ */
+std::unique_ptr<XcpMaster> ConnectToDemoOverTcp(std::uint16_t port,
+                                                IEventListener* listener) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto master = MakeDemoTcpMaster(port, listener);
+        try {
+            master->Connect();
+            if (master->IsConnected()) {
+                return master;
+            }
+        } catch (const XcpException&) {
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return nullptr;
+}
+
+/**
  * @brief 从 A2L 中按事件名查找 DAQ 事件通道号。
  * @param info A2L XCP 接口数据。
  * @param event_name 本示例事件全名或短名。
@@ -734,16 +878,19 @@ private:
  * @brief 在已有临时目录中启动生成模式，并校验进程退出码。
  * @param directory 子进程工作目录。
  * @param output_dir A2L/AML 输出目录。
- * @param port 与待验证端点对应的 UDP 端口。
+ * @param port 与待验证端点对应的端口。
  * @param overwrite 是否显式允许覆盖。
+ * @param transport 传输方式（udp 或 tcp），决定 A2L 声明的端点类别。
  * @return 子进程退出码；启动失败或超时返回空值。
  */
 std::optional<int> GenerateA2l(const std::filesystem::path& directory,
                                const std::filesystem::path& output_dir,
-                               std::uint16_t port, bool overwrite) {
+                               std::uint16_t port, bool overwrite,
+                               std::string_view transport = "udp") {
     std::vector<std::string> arguments{
         "--generate-a2l", "--output-dir", output_dir.string(), "--bind",
-        "127.0.0.1",      "--port",       std::to_string(port)};
+        "127.0.0.1",      "--port",       std::to_string(port),
+        "--transport",    std::string(transport)};
     if (overwrite) {
         arguments.emplace_back("--overwrite");
     }
@@ -1609,6 +1756,105 @@ TEST(XcpSlaveDemoIntegrationTest, ServiceEmitsPeriodicHeartbeatLog) {
     EXPECT_TRUE(logs.empty())
         << "LIBXCP_ENABLE_LOG=OFF 时不应写入日志文件：" << logs;
 #endif
+}
+/// @brief TCP 传输端到端：A2L 声明 TCP 端点、按 TCP 连接、POLL 与 DAQ 均可用。
+TEST(XcpSlaveDemoIntegrationTest, GeneratedTcpA2lFeedsLiveSessionOverTcp) {
+    TemporaryDirectory directory("live_tcp_session");
+    const auto output_dir = directory.Path() / "a2l";
+    TcpPortReservation reservation;
+    ASSERT_TRUE(reservation.BindFree());
+    const std::uint16_t port = reservation.Port();
+    const auto generation_exit =
+        GenerateA2l(directory.Path(), output_dir, port, false, "tcp");
+    ASSERT_TRUE(generation_exit.has_value());
+    ASSERT_EQ(*generation_exit, 0);
+    reservation.Close();
+
+    // A2L 必须声明 TCP 端点：主站靠它拿到端口并决定传输类别，
+    // 声明成 UDP 会让 "用 TCP 连接" 变成连一个没人监听的端口。
+    const auto a2l_path = output_dir / "xcp_slave_demo.a2l";
+    {
+        std::ifstream a2l_stream(a2l_path);
+        ASSERT_TRUE(a2l_stream.good()) << "未生成 A2L：" << a2l_path;
+        const std::string text((std::istreambuf_iterator<char>(a2l_stream)),
+                               std::istreambuf_iterator<char>());
+        EXPECT_NE(text.find("/begin XCP_ON_TCP_IP"), std::string::npos)
+            << "A2L 未声明 XCP_ON_TCP_IP";
+        EXPECT_EQ(text.find("/begin XCP_ON_UDP_IP"), std::string::npos)
+            << "TCP 模式下 A2L 不应声明 UDP 端点";
+    }
+
+    auto loaded = a2l::A2lBridge::Load(a2l_path.string());
+    ASSERT_TRUE(loaded.HasValue()) << loaded.ErrorInfo().message;
+    const a2l::IA2lDatabase* database = loaded.Value()->Database();
+    ASSERT_NE(database, nullptr);
+    auto fast_leaf = database->Find("xcp_slave_demo::meas_fast.output");
+    ASSERT_TRUE(fast_leaf.HasValue()) << "A2L 缺少 meas_fast.output";
+    auto slow_leaf =
+        database->Find("xcp_slave_demo::meas_slow.statistics.fast_cycle_count");
+    ASSERT_TRUE(slow_leaf.HasValue())
+        << "A2L 缺少 meas_slow.statistics.fast_cycle_count";
+
+    const auto service_directory = directory.Path() / "service";
+    std::filesystem::create_directories(service_directory);
+    DemoChildProcess slave_process;
+    std::string start_error;
+    ASSERT_TRUE(StartDemoProcess(
+        slave_process, {"--transport", "tcp", "--bind", "127.0.0.1", "--port",
+                        std::to_string(port)},
+        service_directory, &start_error))
+        << start_error;
+
+    DemoDtoCollector collector;
+    auto master = ConnectToDemoOverTcp(port, &collector);
+    ASSERT_NE(master, nullptr)
+        << "TCP 从站未在 8 秒内完成真实 XCP CONNECT（检查 --transport tcp 与端口占用）";
+
+    // POLL：同一叶子连读两次，验证 TCP 上的请求/响应成帧（含长度前缀）。
+    const auto read_output = [&master, &fast_leaf]() {
+        const Bytes raw = master->ReadMemoryBytes(
+            static_cast<Address>(fast_leaf.Value().xcp_address),
+            fast_leaf.Value().address_extension,
+            fast_leaf.Value().element_size_bytes);
+        double value = 0.0;
+        if (raw.size() == sizeof(value)) {
+            std::memcpy(&value, raw.data(), sizeof(value));
+        }
+        return std::make_pair(raw.size(), value);
+    };
+    const auto first = read_output();
+    ASSERT_EQ(first.first, sizeof(double)) << "TCP POLL 未返回 8 字节 double";
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    const auto second = read_output();
+    ASSERT_EQ(second.first, sizeof(double));
+    EXPECT_TRUE(std::isfinite(first.second) && std::isfinite(second.second))
+        << "TCP POLL 读到的测量值不是有限数";
+    // 10 ms 事件驱动的波形在 60 ms 后必然变化；若相等，说明读到的是缓存或
+    // 错位的响应（两类问题在 TCP 上都表现为"值不动"）。
+    EXPECT_NE(first.second, second.second)
+        << "两次 POLL 数值相同，疑似 TCP 响应错位";
+
+    // DAQ：慢速 uint32 叶子经 XCPlite 布局解码后必须出现非零值。
+    // 该布局的 DTO 会把 4 字节补白计入 wire LEN，能解码即证明主站按 ODT
+    // 布局取前缀而非按 LEN 全量复制。
+    DaqEntrySpec slow_entry;
+    slow_entry.address = static_cast<Address>(slow_leaf.Value().xcp_address);
+    slow_entry.extension = slow_leaf.Value().address_extension;
+    slow_entry.size = slow_leaf.Value().element_size_bytes;
+    DaqOdtSpec slow_odt;
+    slow_odt.entries.push_back(slow_entry);
+    DaqListSpec slow_list;
+    slow_list.daq_list = 0U;
+    slow_list.event_channel = slow_leaf.Value().daq_event_fixed.front();
+    slow_list.timestamp = true;
+    slow_list.odts.push_back(slow_odt);
+    ASSERT_NO_THROW(master->ConfigureDaqListsDynamic({slow_list}));
+    ASSERT_NO_THROW(master->StartDaqSync());
+    EXPECT_TRUE(collector.WaitForNonzeroUint32(std::chrono::seconds(3)))
+        << "TCP DAQ DTO 未解码出非零 uint32";
+    ASSERT_NO_THROW(master->StopDaq());
+    master->Disconnect();
+    slave_process.Stop();
 }
 
 }  // namespace

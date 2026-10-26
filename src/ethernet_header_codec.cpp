@@ -87,6 +87,80 @@ EthernetFrame EncodeEthernetFrameUnpadded(BytesView xcp_packet,
     return frame;
 }
 
+std::optional<std::vector<EthernetFrameView>> DecodeEthernetDatagramByBoundary(
+    BytesView datagram, std::uint8_t max_tail) noexcept {
+    // 空 Datagram 或不足一个 Header：无法解析
+    if (datagram.size() < kEthernetHeaderSize) {
+        return std::nullopt;
+    }
+    // 规范上限为 3（对齐最大 32-bit）；超出视为调用方参数错误
+    if (max_tail > 3U) {
+        return std::nullopt;
+    }
+
+    std::vector<EthernetFrameView> frames;
+    std::size_t offset = 0;
+
+    while (offset < datagram.size()) {
+        const std::size_t remaining = datagram.size() - offset;
+        // 剩余字节不足以构成一个 Header -> 截断，整体失败
+        if (remaining < kEthernetHeaderSize) {
+            return std::nullopt;
+        }
+
+        const auto* p = datagram.data() + offset;
+        EthernetHeader header;
+        header.len =
+            static_cast<DatagramLen>(static_cast<std::uint16_t>(p[0]) |
+                                     (static_cast<std::uint16_t>(p[1]) << 8));
+        header.ctr =
+            static_cast<DatagramCtr>(static_cast<std::uint16_t>(p[2]) |
+                                     (static_cast<std::uint16_t>(p[3]) << 8));
+
+        // LEN == 0 非法：每个 Frame 至少携带 1 字节 XCP Packet（PID）
+        if (header.len == 0U) {
+            return std::nullopt;
+        }
+        // LEN 越界：Frame 不得跨 Datagram 边界
+        if (static_cast<std::size_t>(header.len) >
+            remaining - kEthernetHeaderSize) {
+            return std::nullopt;
+        }
+
+        const std::size_t payload_end =
+            offset + kEthernetHeaderSize + static_cast<std::size_t>(header.len);
+        const std::size_t rest = datagram.size() - payload_end;
+
+        // 剩余字节不超过 max_tail 时，本帧即末帧，剩余字节全部是 FILL；
+        // 因为 max_tail <= 3，这些字节不可能构成下一帧的 4 字节 Header，
+        // 故该判定无歧义（不读取 FILL 内容）。
+        std::uint8_t tail = 0;
+        if (rest > 0U) {
+            if (rest > static_cast<std::size_t>(max_tail)) {
+                // 剩余字节多于 max_tail：说明后面还有整帧，中间帧不得有 Tail
+                tail = 0;
+            } else {
+                tail = static_cast<std::uint8_t>(rest);
+            }
+        }
+
+        EthernetFrameView view;
+        view.header = header;
+        view.xcp_packet =
+            datagram.subspan(offset + kEthernetHeaderSize, header.len);
+        view.tail_bytes = tail;
+        frames.push_back(view);
+
+        offset = payload_end + static_cast<std::size_t>(tail);
+    }
+
+    // 正常结束必然精确推进到末尾；防御性再确认一次
+    if (offset != datagram.size() || frames.empty()) {
+        return std::nullopt;
+    }
+    return frames;
+}
+
 std::optional<std::vector<EthernetFrameView>> DecodeEthernetDatagramAligned(
     BytesView datagram, PacketAlignment alignment) noexcept {
     // 空 Datagram 或不足一个 Header：无法解析

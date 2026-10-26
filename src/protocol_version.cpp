@@ -58,6 +58,17 @@ std::string VersionPolicy::Validate() const {
         return "VersionPolicy.transport_version 的主版本不能为 0"
                "（XCP 自 V1.0 起，0.x 不是合法版本声明）";
     }
+    // A2L 静态声明同样是版本声明：主版本 0 或低于支持下限时直接拒绝配置，
+    // 而不是让它在裁决期被静默忽略（静默忽略会让"配了但没生效"无法诊断）。
+    if (a2l_protocol_version.has_value() && !a2l_protocol_version->IsValid()) {
+        return "VersionPolicy.a2l_protocol_version 的主版本不能为 0"
+               "（XCP 自 V1.0 起，0.x 不是合法版本声明）";
+    }
+    if (a2l_transport_version.has_value() &&
+        !a2l_transport_version->IsValid()) {
+        return "VersionPolicy.a2l_transport_version 的主版本不能为 0"
+               "（XCP 自 V1.0 起，0.x 不是合法版本声明）";
+    }
     // 低于支持范围下限的显式声明会让后续能力裁决失去意义，直接拒绝。
     // 下限自 B-T1 §4.3 起为 V1.2：AsamV14 兼容 Profile 的对端
     // （thirdparty/XCPliteV1.2）上报 PL 0x0102，必须被接受。

@@ -574,4 +574,79 @@ TEST(TransportSelection, CliEndpointBypassesMultiInstanceCheck) {
     EXPECT_EQ(resolved.endpoint_source, EndpointSource::Cli);
 }
 
+// ---------------------------------------------------------------------------
+// P3：`--tcp-profile auto` 的前置校验（连接级候选试连的入口条件）
+// ---------------------------------------------------------------------------
+
+/// @brief 构造一个"TCP + auto + CLI 端点"的请求
+TransportSelectionRequest MakeTcpAutoRequest() {
+    TransportSelectionRequest request;
+    request.transport = TransportKind::Tcp;
+    request.tcp_profile_auto = true;
+    request.host = std::string{"127.0.0.1"};
+    request.port = static_cast<std::uint16_t>(5555);
+    return request;
+}
+
+/**
+ * @brief auto 生效时不得填入任何默认线路布局。
+ * @details 这一步是 P3 的安全前提：若此处置成 Unknown 以外的值，调用方就会
+ *          跳过候选试连直接用默认 Profile 建连，`auto` 退化成静默猜测。
+ */
+TEST(TransportSelection, TcpProfileAutoLeavesWireProfileUnresolved) {
+    const auto resolved = Resolve(MakeTcpAutoRequest(), {});
+
+    EXPECT_TRUE(resolved.wire_profile_auto);
+    EXPECT_EQ(resolved.wire_profile, TcpWireProfile::Unknown);
+    EXPECT_EQ(resolved.alignment, PacketAlignment::Unknown);
+    EXPECT_EQ(resolved.wire_profile_source, WireProfileSource::Auto);
+    ASSERT_FALSE(resolved.notes.empty());
+    EXPECT_NE(resolved.notes.front().find("--tcp-profile auto"),
+              std::string::npos);
+}
+
+/**
+ * @brief auto 只对 TCP 有意义：UDP 上给 auto 必须报错而不是忽略。
+ */
+TEST(TransportSelection, TcpProfileAutoRejectsUdpTransport) {
+    auto request = MakeUdpRequest();
+    request.tcp_profile_auto = true;
+
+    const auto error = ResolveExpectFailure(request, {});
+    EXPECT_NE(error.find("只对 --transport tcp 有效"), std::string::npos) << error;
+}
+
+/**
+ * @brief auto 与 preset 互斥：preset 已经把 asam-v1.4 固定下来。
+ */
+TEST(TransportSelection, TcpProfileAutoRejectsPreset) {
+    auto request = MakeTcpAutoRequest();
+    request.preset_xcplite = true;
+
+    const auto error = ResolveExpectFailure(request, {});
+    EXPECT_NE(error.find("--preset xcplite 冲突"), std::string::npos) << error;
+}
+
+/**
+ * @brief auto 与 `--packet-alignment` 互斥：对齐由候选决定。
+ */
+TEST(TransportSelection, TcpProfileAutoRejectsExplicitAlignment) {
+    auto request = MakeTcpAutoRequest();
+    request.packet_alignment_bits = static_cast<std::uint8_t>(16);
+
+    const auto error = ResolveExpectFailure(request, {});
+    EXPECT_NE(error.find("--packet-alignment"), std::string::npos) << error;
+}
+
+/**
+ * @brief auto 与具体 Profile 互斥（同一参数两种模式不可并存）。
+ */
+TEST(TransportSelection, TcpProfileAutoRejectsExplicitProfile) {
+    auto request = MakeTcpAutoRequest();
+    request.tcp_profile = TcpWireProfile::AsamV14;
+
+    const auto error = ResolveExpectFailure(request, {});
+    EXPECT_NE(error.find("不能同时给出 auto"), std::string::npos) << error;
+}
+
 }  // namespace

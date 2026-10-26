@@ -59,8 +59,10 @@ add_executable(libxcp_tests
         udp_header_codec_test.cpp
         ethernet_header_codec_test.cpp
         tcp_stream_decoder_test.cpp
+        tcp_framing_negotiation_test.cpp
         tcp_transport_test.cpp
         udp_transport_test.cpp
+        udp_boundary_framing_test.cpp
         link_budget_test.cpp
         udp_test_slave_test.cpp
         memory_access_test.cpp
@@ -99,6 +101,33 @@ endif()
 
 include(GoogleTest)
 gtest_discover_tests(libxcp_tests DISCOVERY_TIMEOUT 60)
+
+# ----------------------------------------------------------------------------
+# 假 Socket 注入测试（code-plan/历史遗漏项_详细方案.md §1.3 L-A2）
+#
+# 独立可执行文件 + RUN_SERIAL 是刻意的：`SetSocketOpsForTesting()` 的注入是
+# **进程级**的，若与其它用例并行在同一进程内切换实现，会污染它们的 Socket
+# 行为。独立进程 + 串行执行使"全局注入"的副作用被限制在本文件内。
+# ----------------------------------------------------------------------------
+add_executable(TcpFakeSocketTest tcp_fake_socket_test.cpp)
+
+target_link_libraries(TcpFakeSocketTest PRIVATE
+        libxcp::libxcp
+        GTest::gtest
+        libxcp_test_main)
+
+# 需要 `#include "src/socket_util.hpp"`：假实现要派生自内部的 SocketOps
+target_include_directories(TcpFakeSocketTest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR})
+
+if(MSVC)
+  target_compile_options(TcpFakeSocketTest PRIVATE /utf-8)
+endif()
+
+gtest_discover_tests(TcpFakeSocketTest
+        DISCOVERY_TIMEOUT 60
+        PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
 
 # ----------------------------------------------------------------------------
 # XCPlite 协议调试集成测试（code-plan/XCPlite_Slave_协议调试集成计划.md）
@@ -417,6 +446,40 @@ add_custom_command(TARGET A2lCalibrationAccessTest POST_BUILD
                 "$<TARGET_FILE:liba2l::liba2l>"
                 "$<TARGET_FILE_DIR:A2lCalibrationAccessTest>")
 gtest_discover_tests(A2lCalibrationAccessTest DISCOVERY_TIMEOUT 120)
+
+# ----------------------------------------------------------------------------
+# A2lIfDataConflictTest —— XCP vs XCPplus 的对齐"声明状态"差异（历史遗漏项 L-B2）
+# 语料内联在用例里（写到临时目录），不依赖 golden 夹具。
+# ----------------------------------------------------------------------------
+add_executable(A2lIfDataConflictTest a2l_if_data_conflict_test.cpp)
+target_compile_features(A2lIfDataConflictTest PRIVATE cxx_std_20)
+target_link_libraries(A2lIfDataConflictTest PRIVATE
+        libxcp::a2lbridge GTest::gtest libxcp_test_main)
+if(MSVC)
+  target_compile_options(A2lIfDataConflictTest PRIVATE /utf-8)
+endif()
+add_custom_command(TARGET A2lIfDataConflictTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:liba2l::liba2l>"
+                "$<TARGET_FILE_DIR:A2lIfDataConflictTest>")
+gtest_discover_tests(A2lIfDataConflictTest DISCOVERY_TIMEOUT 120)
+
+# ----------------------------------------------------------------------------
+# A2lMultiEndpointTest —— 多实例传输层端点（历史遗漏项 L-C，ABI v10）
+# 语料内联在用例里（写到临时目录），不依赖 golden 夹具。
+# ----------------------------------------------------------------------------
+add_executable(A2lMultiEndpointTest a2l_multi_endpoint_test.cpp)
+target_compile_features(A2lMultiEndpointTest PRIVATE cxx_std_20)
+target_link_libraries(A2lMultiEndpointTest PRIVATE
+        libxcp::a2lbridge GTest::gtest libxcp_test_main)
+if(MSVC)
+  target_compile_options(A2lMultiEndpointTest PRIVATE /utf-8)
+endif()
+add_custom_command(TARGET A2lMultiEndpointTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:liba2l::liba2l>"
+                "$<TARGET_FILE_DIR:A2lMultiEndpointTest>")
+gtest_discover_tests(A2lMultiEndpointTest DISCOVERY_TIMEOUT 120)
 
 # Boost.Locale-backed A2L log timestamp compatibility test.
 add_executable(A2lLogTimestampTest a2l_log_timestamp_test.cpp)

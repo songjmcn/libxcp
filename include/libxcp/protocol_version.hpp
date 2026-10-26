@@ -323,6 +323,23 @@ struct VersionPolicy {
     /// @brief 调用方显式指定的传输层版本（未设置表示不提供先验）
     std::optional<XcpProtocolVersion> transport_version;
 
+    /**
+     * @brief A2L 静态声明的协议层版本（可选先验）
+     * @details 来源标记为 `A2l`，置信度 `StaticEvidence`：优先级**低于**调用方
+     *          配置、**高于** CONNECT 主版本。
+     *
+     *          存在的意义是对端不实现 GET_VERSION 时的精度补位：此时只能拿到
+     *          CONNECT 主版本，裁决会进入 `1.x-conservative`（Minor 未确认，
+     *          能力按交集收缩）。若 A2L 的 `PROTOCOL_LAYER` 已声明 `0x0102`，
+     *          就能把能力裁决抬到真实的 V1.2，而不是假装成 `1.0`。
+     */
+    std::optional<XcpProtocolVersion> a2l_protocol_version;
+
+    /// @brief A2L 静态声明的传输层版本（可选先验，语义同上）
+    /// @details 取自 A2L 端点声明的 XCP 传输层版本（如 `XCP_ON_TCP_IP 0x104`
+    ///          中的 `0x104`）。
+    std::optional<XcpProtocolVersion> a2l_transport_version;
+
     /// @brief 是否在 CONNECT 后自动探测 GET_VERSION
     /// @details 默认 true。命令为 optional，探测失败不构成连接失败。
     bool probe_get_version{true};

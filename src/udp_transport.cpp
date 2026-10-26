@@ -370,13 +370,13 @@ void UdpTransport::Open(IPacketListener& listener) {
         throw detail::MakeInvalidArgument(
             "receive_poll_interval_ms 必须大于 0");
     }
-    // PACKET_ALIGNMENT 必须已知：无 A2L 证据也无显式配置时，报文布局
-    // （是否含 Tail、含几字节）无法确定，静默按 8-bit 处理会与对端不兼容
+    // PACKET_ALIGNMENT 允许为 Unknown（P1 起不再拒绝）：UDP 一个数据报就是
+    // 一个承载单元，Frame 边界可直接观测，接收按边界推导 Tail、发送不补
+    // Tail，因此不依赖对齐证据。给了对齐只用于一致性诊断。
     if (m_config_.packet_alignment == PacketAlignment::Unknown) {
-        LIBXCP_LOG_ERROR("UDP open rejected because packet alignment unknown");
-        throw detail::MakeInvalidArgument(
-            "UdpTransportConfig::packet_alignment 不能为 Unknown："
-            "需要 A2L 的 PACKET_ALIGNMENT 或调用方显式指定 8/16/32");
+        LIBXCP_LOG_INFO(
+            "UDP open without packet alignment: using datagram-boundary "
+            "framing (send unpadded, accept 0..3 tail bytes)");
     }
     // T-06 能力边界：本库只承诺 IPv4 UDP 单播；IPv6 显式报 Unsupported，
     // 不得退化为"地址非法"这类无法区分笔误与能力缺失的报错
@@ -592,10 +592,10 @@ void UdpTransport::Send(BytesView packet) {
 
     UdpFrame frame;
     try {
-        // 按会话协商到的 PACKET_ALIGNMENT 编码：Tail 长度由 LEN 与
-        // alignment 推出，使后继 XCP Packet 满足对齐（TL V1.5 §4.3.2.2）
-        frame = EncodeUdpFrameAligned(packet, ctr,
-                                      m_config_.packet_alignment);
+        // 主站发送**不补 Tail**：TL V1.5 §4.3.2.1 规定单个 XCP 消息独占
+        // Frame 时 Tail 可选；省略后不再依赖对端预期的 PACKET_ALIGNMENT，
+        // 也就无需在配置里强制给出对齐位宽。
+        frame = EncodeUdpFrame(packet, ctr);
     } catch (...) {
         LIBXCP_LOG_ERROR("UDP frame encoding failed ctr={} xcp_bytes={}", ctr,
                          packet.size());
@@ -824,9 +824,10 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
     }
 
     const BytesView view{data, size};
-    // 按会话协商到的 PACKET_ALIGNMENT 解码，跳过每 Frame 尾部的 FILL
-    auto frames =
-        DecodeUdpDatagramAligned(view, m_config_.packet_alignment);
+    // 以数据报边界为准解码：UDP 一个数据报就是一个承载单元，Frame 边界可
+    // 直接观测，因此末帧的 0..3 字节 FILL 无需知道 PACKET_ALIGNMENT 即可
+    // 跳过（纯函数见 DecodeEthernetDatagramByBoundary）。
+    auto frames = DecodeEthernetDatagramByBoundary(view, 3);
     if (!frames) {
         // 原子性策略：任一 Frame 非法则整个 Datagram 不交付（§8.1 第 7 条）
         if (listener != nullptr) {
@@ -834,6 +835,22 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
                 "畸形 UDP Datagram（Header/LEN 越界或残留字节），整体丢弃");
         }
         return true;
+    }
+    // 配置里给了对齐时做一次一致性诊断（不阻断）：Tail 与预期不符说明对端
+    // 用的对齐与协商结果不同，属于需要可见但不致命的偏差。
+    if (m_config_.packet_alignment != PacketAlignment::Unknown) {
+        for (const auto& frame : *frames) {
+            const auto expected = TailBytesForAlignment(
+                m_config_.packet_alignment,
+                kEthernetHeaderSize + static_cast<std::size_t>(frame.header.len));
+            if (frame.tail_bytes != expected && listener != nullptr) {
+                listener->OnTransportWarning(
+                    "UDP Frame 的 Tail 与协商对齐不一致（期望 " +
+                    std::to_string(expected) + " 字节，实得 " +
+                    std::to_string(frame.tail_bytes) +
+                    " 字节）；已按数据报边界接受");
+            }
+        }
     }
 
     for (const auto& frame : *frames) {

@@ -573,6 +573,12 @@ void XcpMaster::ApplyVersionProbe(
     inputs.connect_protocol_major = params.connect.protocol_layer_version;
     inputs.connect_transport_major = params.connect.transport_layer_version;
     inputs.policy = m_options_.version_policy;
+    // A2L 静态证据由调用方通过 VersionPolicy 传入：它是"对端不实现
+    // GET_VERSION 时的精度补位"，优先级低于配置、高于 CONNECT 主版本。
+    inputs.a2l_protocol_version =
+        m_options_.version_policy.a2l_protocol_version;
+    inputs.a2l_transport_version =
+        m_options_.version_policy.a2l_transport_version;
     inputs.probe = probe;
 
     const VersionResolver::Result result = VersionResolver::Resolve(inputs);

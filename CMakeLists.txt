@@ -158,6 +158,7 @@ target_sources(libxcp PRIVATE
         src/tcp_stream_decoder.cpp
         src/socket_util.cpp
         src/tcp_transport.cpp
+        src/tcp_framing_negotiation.cpp
         src/udp_transport.cpp
         src/link_budget.cpp
         src/command_executor.cpp

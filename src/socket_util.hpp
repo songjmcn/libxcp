@@ -165,6 +165,30 @@ struct SocketOps {
 [[nodiscard]] SocketOps& RealSocketOps();
 
 /**
+ * @brief 取当前生效的 Socket 操作函数表
+ * @return 测试注入的实现（若已注入），否则与 `RealSocketOps()` 相同
+ *
+ * @details 生产路径与 `RealSocketOps()` 完全等价；测试通过
+ *          `SetSocketOpsForTesting()` 注入脚本化假实现后，本函数返回假实现，
+ *          从而让 `TcpTransport` 的 partial write / EINTR / EAGAIN 等
+ *          真实 Socket 上不可复现的错误分支可以被确定性驱动。
+ *
+ * @note 读取侧是原子的（注入指针以 `std::atomic` 保存）；但"切换"本身
+ *       不是事务性的 —— 安装/卸载期间不得有其它线程正在使用 TCP 传输，
+ *       测试侧由 `ScopedFakeSocketOps` 守卫保证。
+ */
+[[nodiscard]] SocketOps& CurrentSocketOps() noexcept;
+
+/**
+ * @brief 仅供测试：替换进程内 Socket 操作函数表
+ * @param ops 假实现指针；传 `nullptr` 恢复真实实现
+ *
+ * @warning 只能由测试代码调用。本模块只借用 `ops`（不拥有、不删除），
+ *          调用方必须保证其生命周期长于注入期间的所有传输对象。
+ */
+void SetSocketOpsForTesting(SocketOps* ops) noexcept;
+
+/**
  * @brief 判断平台错误码是否表示 "连接已丢失/对端已关闭"
  * @param code 平台错误码（POSIX 为 `errno`，Windows 为 `WSAGetLastError()`）
  * @return 表示连接不可继续使用返回 true
