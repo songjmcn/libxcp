@@ -63,6 +63,7 @@ add_executable(libxcp_tests
         tcp_transport_test.cpp
         udp_transport_test.cpp
         udp_boundary_framing_test.cpp
+        event_poller_test.cpp
         link_budget_test.cpp
         udp_test_slave_test.cpp
         memory_access_test.cpp

@@ -11,6 +11,8 @@
 
 #include "socket_util.hpp"
 
+#include "event_poller.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -21,12 +23,35 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <fcntl.h>
-#include <poll.h>
 #include <unistd.h>
 #endif
 
 namespace calmcar::xcp::detail {
 namespace {
+
+#if defined(_WIN32)
+/// @brief 平台原生 Socket 句柄类型（Windows 为 `SOCKET`）
+using NativeSocket = SOCKET;
+#else
+/// @brief 平台原生 Socket 句柄类型（POSIX 为 `int`）
+using NativeSocket = int;
+#endif
+
+/// @brief POD 句柄 → 平台原生句柄
+/// @param handle POD 句柄
+/// @return 可直接传给平台 Socket API 的句柄
+/// @note Windows 侧是 `UINT_PTR` 收窄；POSIX 侧是无操作。收窄只发生在这一处，
+///       调用方不再需要知道原生类型。
+[[nodiscard]] NativeSocket ToNative(SocketHandle handle) noexcept {
+    return static_cast<NativeSocket>(handle);
+}
+
+/// @brief 平台原生句柄 → POD 句柄
+/// @param handle 平台 Socket API 返回的句柄
+/// @return POD 句柄；Windows 的 `INVALID_SOCKET`（`~0`）转过来恰为 `-1`
+[[nodiscard]] SocketHandle FromNative(NativeSocket handle) noexcept {
+    return static_cast<SocketHandle>(handle);
+}
 
 #if defined(_WIN32)
 
@@ -76,38 +101,8 @@ std::string formatWsaError(int code) {
     return "WSAErr=" + std::to_string(code) + " " + std::string(buffer);
 }
 
-/// @brief 把 POSIX errno 格式化为可读文本
-std::string formatErrno(int code) {
-    return "errno=" + std::to_string(code) + " " + std::strerror(code);
-}
-
 /// @brief 取当前线程最近一次 Socket 错误码
 int lastSocketErrorCode() { return static_cast<int>(WSAGetLastError()); }
-
-/**
- * @brief 等待句柄进入指定状态
- * @param handle 目标句柄
- * @param writable true 等可写、false 等可读
- * @param timeout_ms 超时（毫秒）
- * @return 1 就绪、0 超时、-1 错误
- */
-int waitFor(SocketHandle handle, bool writable, std::uint32_t timeout_ms) {
-    fd_set set;
-    FD_ZERO(&set);
-    FD_SET(handle, &set);
-
-    timeval tv{};
-    tv.tv_sec = static_cast<long>(timeout_ms / 1000U);
-    tv.tv_usec = static_cast<long>((timeout_ms % 1000U) * 1000U);
-
-    // select 的第一个参数在 Windows 上被忽略，传 0 即可
-    const int ready = ::select(0, writable ? nullptr : &set,
-                               writable ? &set : nullptr, nullptr, &tv);
-    if (ready < 0) {
-        return -1;
-    }
-    return ready == 0 ? 0 : 1;
-}
 
 #else  // POSIX
 
@@ -119,30 +114,24 @@ std::string formatErrno(int code) {
 /// @brief 取当前线程最近一次 Socket 错误码
 int lastSocketErrorCode() { return errno; }
 
-/**
- * @brief 等待句柄进入指定状态（poll 版本，避免 fd_set 的 FD_SETSIZE 上限）
- * @return 1 就绪、0 超时、-1 错误
- */
-int waitFor(SocketHandle handle, bool writable, std::uint32_t timeout_ms) {
-    pollfd pfd{};
-    pfd.fd = handle;
-    pfd.events = static_cast<short>(writable ? POLLOUT : POLLIN);
-
-    // poll 的 timeout 是 int；上限钳制到 24 天，足以覆盖任何合理配置
-    const auto clamped = std::min<std::uint32_t>(timeout_ms, 0x7FFFFFFFU);
-    const int ready = ::poll(&pfd, 1, static_cast<int>(clamped));
-    if (ready < 0) {
-        return -1;
-    }
-    if (ready == 0) {
-        return 0;
-    }
-    // POLLERR/POLLHUP 也算"就绪"：由调用方的 SO_ERROR / recv 读取真实结果，
-    // 这样断链不会被误报成"超时"。
-    return 1;
-}
-
 #endif
+
+/**
+ * @brief 等待单个句柄进入关注状态（经 `EventPoller`）
+ * @param handle 目标句柄
+ * @param writable true 等可写、false 等可读
+ * @param timeout_ms 超时（毫秒）
+ * @return 1 就绪、0 超时、-1 失败
+ *
+ * @details 三态返回值与改造前一致；实现已收敛到 `EventPoller`，
+ *          因此 Windows 侧不再受 `select` 的 `FD_SETSIZE` 限制。
+ */
+int WaitSingle(SocketHandle handle, bool writable, std::uint32_t timeout_ms) {
+    const WaitItem item{handle, !writable, writable};
+    std::vector<WaitStatus> status;
+    std::string error;
+    return CurrentEventPoller().Wait({&item, 1}, timeout_ms, status, &error);
+}
 
 /**
  * @brief 真实平台 SocketOps 实现
@@ -164,25 +153,26 @@ public:
 #endif
 
     SocketHandle create(int domain, int type, int protocol) override {
-        return ::socket(domain, type, protocol);
+        return FromNative(::socket(domain, type, protocol));
     }
 
     void close(SocketHandle handle) override {
 #if defined(_WIN32)
-        ::closesocket(handle);
+        ::closesocket(ToNative(handle));
 #else
-        ::close(handle);
+        ::close(ToNative(handle));
 #endif
     }
 
     int bind(SocketHandle handle, const sockaddr* addr,
              socklen_t addr_len) override {
-        return ::bind(handle, addr, static_cast<socklen_t>(addr_len));
+        return ::bind(ToNative(handle), addr,
+                      static_cast<socklen_t>(addr_len));
     }
 
     int getsockname(SocketHandle handle, sockaddr* addr,
                     socklen_t* addr_len) override {
-        return ::getsockname(handle, addr, addr_len);
+        return ::getsockname(ToNative(handle), addr, addr_len);
     }
 
     int getaddrinfo(const char* node, const char* service,
@@ -195,48 +185,50 @@ public:
     int set_non_blocking(SocketHandle handle) override {
 #if defined(_WIN32)
         u_long non_blocking = 1;
-        return ::ioctlsocket(handle, FIONBIO, &non_blocking);
+        return ::ioctlsocket(ToNative(handle), FIONBIO, &non_blocking);
 #else
-        const int flags = ::fcntl(handle, F_GETFL, 0);
+        const int flags = ::fcntl(ToNative(handle), F_GETFL, 0);
         if (flags < 0) {
             return -1;
         }
-        return ::fcntl(handle, F_SETFL, flags | O_NONBLOCK);
+        return ::fcntl(ToNative(handle), F_SETFL, flags | O_NONBLOCK);
 #endif
     }
 
     int set_blocking(SocketHandle handle) override {
 #if defined(_WIN32)
         u_long non_blocking = 0;
-        return ::ioctlsocket(handle, FIONBIO, &non_blocking);
+        return ::ioctlsocket(ToNative(handle), FIONBIO, &non_blocking);
 #else
-        const int flags = ::fcntl(handle, F_GETFL, 0);
+        const int flags = ::fcntl(ToNative(handle), F_GETFL, 0);
         if (flags < 0) {
             return -1;
         }
-        return ::fcntl(handle, F_SETFL, flags & ~O_NONBLOCK);
+        return ::fcntl(ToNative(handle), F_SETFL, flags & ~O_NONBLOCK);
 #endif
     }
 
     int listen(SocketHandle handle, int backlog) override {
-        return ::listen(handle, backlog);
+        return ::listen(ToNative(handle), backlog);
     }
 
     SocketHandle accept(SocketHandle handle, sockaddr* addr,
                         socklen_t* addr_len) override {
-        return ::accept(handle, addr, addr_len);
+        return FromNative(::accept(ToNative(handle), addr, addr_len));
     }
 
     int connect(SocketHandle handle, const sockaddr* addr,
                 socklen_t addr_len) override {
-        return ::connect(handle, addr, static_cast<socklen_t>(addr_len));
+        return ::connect(ToNative(handle), addr,
+                         static_cast<socklen_t>(addr_len));
     }
 
     int get_so_error(SocketHandle handle, int* error_out) override {
         int value = 0;
         socklen_t len = sizeof(value);
         const int rc = ::getsockopt(
-            handle, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&value),
+            ToNative(handle), SOL_SOCKET, SO_ERROR,
+            reinterpret_cast<char*>(&value),
             &len);
         if (rc == 0 && error_out != nullptr) {
             *error_out = value;
@@ -246,7 +238,7 @@ public:
 
     int set_int_option(SocketHandle handle, int level, int option,
                        int value) override {
-        return ::setsockopt(handle, level, option,
+        return ::setsockopt(ToNative(handle), level, option,
                             reinterpret_cast<const char*>(&value),
                             sizeof(value));
     }
@@ -263,13 +255,13 @@ public:
         (void)no_signal;  // Windows 的 send 本身不产生 SIGPIPE
 #endif
         return static_cast<int>(
-            ::send(handle, reinterpret_cast<const char*>(data),
+            ::send(ToNative(handle), reinterpret_cast<const char*>(data),
                    static_cast<int>(size), flags));
     }
 
     int recv(SocketHandle handle, std::uint8_t* data,
              std::size_t size) override {
-        return static_cast<int>(::recv(handle,
+        return static_cast<int>(::recv(ToNative(handle),
                                        reinterpret_cast<char*>(data),
                                        static_cast<int>(size), 0));
     }
@@ -277,15 +269,15 @@ public:
     int shutdown_socket(SocketHandle handle) override {
         // 双向关闭：立即让阻塞中的 send/recv 返回，但**不**释放句柄号。
         // 常量按平台取（POSIX SHUT_RDWR / Winsock SD_BOTH），见 kShutdownBoth。
-        return ::shutdown(handle, kShutdownBoth);
+        return ::shutdown(ToNative(handle), kShutdownBoth);
     }
 
     int wait_writable(SocketHandle handle, std::uint32_t timeout_ms) override {
-        return waitFor(handle, true, timeout_ms);
+        return WaitSingle(handle, true, timeout_ms);
     }
 
     int wait_readable(SocketHandle handle, std::uint32_t timeout_ms) override {
-        return waitFor(handle, false, timeout_ms);
+        return WaitSingle(handle, false, timeout_ms);
     }
 
     [[nodiscard]] std::string last_error() const override {

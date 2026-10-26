@@ -38,16 +38,18 @@
 
 namespace calmcar::xcp::detail {
 
-#if defined(_WIN32)
-/// @brief 平台 Socket 句柄类型（Windows 为 `SOCKET`，POSIX 为 `int`）
-using SocketHandle = SOCKET;
+/// @brief 平台无关的 Socket 句柄
+/// @details 用有符号 `std::intptr_t` 而非各平台的 `SOCKET` / `int`，是为了让
+///          "无效句柄"在三个平台上都是同一个值 `-1`：Windows 的
+///          `INVALID_SOCKET` 等于 `(SOCKET)(~0)`，转成 `std::intptr_t` 恰为 `-1`。
+///          平台原生类型的收窄/扩展只发生在与系统调用交界处的
+///          `ToNative()` / `FromNative()` 内（`socket_util.cpp` 与
+///          `udp_transport.cpp` 各一份），调用方不再出现
+///          `INVALID_SOCKET` 与 `handle < 0` 两种写法。
+using SocketHandle = std::intptr_t;
 
-/// @brief 无效 Socket 句柄哨兵
-inline constexpr SocketHandle kInvalidSocketHandle = INVALID_SOCKET;
-#else
-using SocketHandle = int;
+/// @brief 无效 Socket 句柄哨兵（三平台统一为 `-1`）
 inline constexpr SocketHandle kInvalidSocketHandle = -1;
-#endif
 
 /// @brief `shutdown()` 的"双向关闭"平台常量
 /// @details POSIX 取 `SHUT_RDWR`，Windows 取 `SD_BOTH`。两者**不可混用**：
