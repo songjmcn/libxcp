@@ -68,9 +68,25 @@ jobs:
       # 必须带 -C：VS 是多配置生成器，缺省会报 "Test not available without configuration"。
       # 耗时类用例只在本地做门禁（计划文档 §8.3.4）；串行执行避免 Examples 抢端口 5555。
       # --timeout 180：与 Linux/macOS 对齐，让挂死用例 3 分钟内被点名而不是烧掉 10 分钟。
+      # 冒烟：先只跑三个"起裸对端"的 TCP 套件（并行 4），把最常见的失败形态
+      # 在几分钟内暴露出来——整轮 ctest 一旦挂住，日志要等到 job 结束才看得到。
+      - name: Test (TCP suites)
+        working-directory: build
+        shell: pwsh
+        timeout-minutes: 10
+        run: >
+          ctest -C $env:BUILD_TYPE -j 4 --output-on-failure --timeout 60
+          -R "TcpEndToEndTest|TcpReceiveCtrTest|TcpFakeSocketTest"
+
+      # 必须带 -C：VS 是多配置生成器，缺省会报 "Test not available without configuration"。
+      # 耗时类用例只在本地做门禁（计划文档 §8.3.4）；串行执行避免 Examples 抢端口 5555。
+      # --timeout 180：与 Linux/macOS 对齐，让挂死用例 3 分钟内被点名而不是烧掉 10 分钟。
+      # timeout-minutes：整轮若仍被某个用例挂住，20 分钟后由 job 层面截断并进入
+      # Annotate failures，避免白占 runner 到 90 分钟的作业上限。
       - name: Test
         working-directory: build
         shell: pwsh
+        timeout-minutes: 20
         run: >
           ctest -C $env:BUILD_TYPE --output-on-failure --timeout 180
           -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
