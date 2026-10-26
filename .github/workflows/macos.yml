@@ -77,3 +77,19 @@ jobs:
         run: >
           ctest --output-on-failure --timeout 180
           -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
+
+      # 失败时把 ctest 的失败清单打成 GitHub 注解（annotation）。
+      # 注解可由匿名 API 读取（/repos/.../check-runs/{id}/annotations），
+      # 因此即使没有仓库权限也能定位到底哪些用例红了。
+      - name: Annotate failures
+        if: failure()
+        working-directory: build
+        run: |
+          log=Testing/Temporary/LastTestsFailed.log
+          if [ -f "$log" ]; then
+            while IFS= read -r line; do
+              if [ -n "$line" ]; then
+                echo "::error title=ctest failure::$line"
+              fi
+            done < "$log"
+          fi

@@ -22,12 +22,14 @@
 #include "libxcp/tcp_transport.hpp"
 
 #include "src/socket_util.hpp"
+#include "src/event_poller.hpp"
 
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -412,8 +414,26 @@ protected:
         return ntohs(addr.sin_port);
     }
 
-    /// @brief 接受一个入站连接（阻塞），成功后 m_peer_handle 有效
+    /// @brief 等待一个裸句柄可读，最多等 timeout_ms 毫秒
+    /// @param handle 裸 Socket 句柄
+    /// @param timeout_ms 等待上限（毫秒）
+    /// @return 就绪返回 true；超时或等待失败返回 false
+    /// @details 给后面的阻塞 `::accept` / `::recv` 一个明确期限：Transport 侧
+    ///          `Open()` 失败时若直接阻塞，用例会挂到 ctest 的单用例超时
+    ///          （Windows CI 上实际出现过），既看不到原因又白烧时间。
+    static bool WaitReadableRaw(RawSocket handle, std::uint32_t timeout_ms) {
+        const detail::WaitItem item{static_cast<detail::SocketHandle>(handle),
+                                    true, false};
+        std::vector<detail::WaitStatus> statuses;
+        return detail::WaitAnySocket(std::span<const detail::WaitItem>(&item, 1),
+                                     timeout_ms, statuses) > 0;
+    }
+
+    /// @brief 接受一个入站连接（最多等 5 秒），成功后 m_peer_handle 有效
     bool AcceptPeer() {
+        if (!WaitReadableRaw(m_listen_handle, 5000U)) {
+            return false;
+        }
         sockaddr_in peer{};
         socklen_t len = sizeof(peer);
         m_peer_handle = ::accept(m_listen_handle,
@@ -427,6 +447,9 @@ protected:
         out.reserve(expected);
         std::uint8_t chunk[1024];
         while (out.size() < expected) {
+            if (!WaitReadableRaw(m_peer_handle, 5000U)) {
+                break;
+            }
             const int n = ::recv(m_peer_handle,
                                  reinterpret_cast<char*>(chunk), sizeof(chunk),
                                  0);
