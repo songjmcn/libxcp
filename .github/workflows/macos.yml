@@ -36,6 +36,8 @@ jobs:
           BOOST_CMAKE_DIR="$(ls -d "$(brew --prefix boost)"/lib/cmake/Boost-* | head -n 1)"
           echo "LLVM_PREFIX=$LLVM_PREFIX"
           echo "BOOST_CMAKE_DIR=$BOOST_CMAKE_DIR"
+          # 与 Linux 同理：构建期 gtest 发现与 ctest 运行时都要能找到 brew 安装的 Boost 动态库
+          echo "BOOST_LIB_DIR=$(brew --prefix boost)/lib" >> "$GITHUB_ENV"
           cmake -B build -S . -G Ninja \
             -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
             -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
@@ -52,3 +54,15 @@ jobs:
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
+
+      # 耗时类用例只在本地做门禁（计划文档 §8.3.4）：渲染基准与两处 A2L 规模/耗时断言不进 CI。
+      # 串行执行：Examples 并行会抢默认端口 5555，产生假失败。
+      # 首轮 continue-on-error：此前该 job 只编译不测试，既有失败需先分类；基线稳定后移除，转为硬门。
+      - name: Test
+        continue-on-error: true
+        working-directory: build
+        env:
+          DYLD_LIBRARY_PATH: ${{ env.BOOST_LIB_DIR }}
+        run: >
+          ctest --output-on-failure --timeout 600
+          -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
