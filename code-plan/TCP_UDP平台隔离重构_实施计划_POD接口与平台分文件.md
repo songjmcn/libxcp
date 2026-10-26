@@ -409,8 +409,8 @@ ctest --output-on-failure --timeout 600 \
 | 文件 | 改动 |
 | --- | --- |
 | `linux.yml` | 排除清单由 1 项补全为 4 项；`--timeout 300 → 600`；注释写明排除原因与串行理由 |
-| `macos.yml` | **新增** `Test` 步骤（首轮 `continue-on-error: true`）；`Configure` 中导出 `BOOST_LIB_DIR`，`Test` 用 `DYLD_LIBRARY_PATH` 指向 brew Boost 动态库 |
-| `msbuild.yml` | **新增** `Test` 步骤（首轮 `continue-on-error: true`），带 `-C $env:BUILD_TYPE` 与 `shell: pwsh` |
+| `macos.yml` | **新增** `Test` 步骤（已是硬门）；Boost 改由 `install-boost@v2.4.5` 装 **1.86.0**，`Configure` 导出 `BOOST_LIB_DIR`，`Test` 用 `DYLD_LIBRARY_PATH` 指向该 Boost 动态库 |
+| `msbuild.yml` | **新增** `Test` 步骤（已是硬门），带 `-C $env:BUILD_TYPE` 与 `shell: pwsh`；Boost 保持源码编译 1.86.0 |
 
 三处统一命令：
 
@@ -433,7 +433,7 @@ ctest -C Release --output-on-failure --timeout 600 \
 1. **不要给 ctest 加 `-j`**：`Example*` 系列并行会抢默认端口 5555 造成假失败（本地已复现 4 例，串行全过）；
 2. Windows runner 较慢，`--timeout` 用 600 而非 300（`XcpliteIntegration` 要起真实子进程）；
 3. Windows 构建不加 `--parallel`（VS 生成器下并行会在 `ZERO_CHECK` 解析阶段失败，已在 `CMakeLists.txt` 头注释记录）；
-4. `continue-on-error: true` 是**过渡措施**：首轮用于把"既有平台失败"与"本次改动引入"分开；基线稳定后必须移除，否则 `Test` 不能作为 G-P2 的验收门。
+4. `continue-on-error: true` 曾是**过渡措施**（首轮用于把"既有平台失败"与"本次改动引入"分开），**已于 2026-10-26 移除**：三平台 `Test` 现在都是硬门（见 §8.3.10）。
 
 #### 8.3.6 触发方式与判据
 
@@ -451,6 +451,17 @@ ctest -C Release --output-on-failure --timeout 600 \
 - 耗时判定一律以本地为准，CI 不承担性能回归职责；
 - `build-windows` 在 Boost 缓存未命中时约 9–10 分钟，命中时约 4 分钟。
 
+**macOS 上 4 个时序敏感的既有用例**（macos-26 首轮 1034 项中仅这 4 项失败，Linux 同版本全绿，故判定为 runner 速度差异而非产品缺陷，待单独治理）：
+
+| 用例 | 位置 | 现象 | 处置建议 |
+| --- | --- | --- | --- |
+| `RecoveryBusy.BusyIsRetriedUntilTotalDeadlineExhausted` | `tests/recovery_test.cpp:606` | `busy_total_timeout=150ms` + `delay=20ms`，期望 `GetStatus` ≥3 次，慢机上只发出 2 次 | 放宽 `busy_total_timeout`（如 500 ms），保留“多次重试”的语义 |
+| `XcpSlaveDemoIntegrationTest.ServiceEmitsPeriodicHeartbeatLog` | `tests/xcp_slave_demo_integration_test.cpp:1745` | 等 9 s 仍无“从站心跳”；日志显示 9 s 墙钟只推进 265 次快事件（≈2.65 s 逻辑时间），而心跳按事件计数（500 次）触发 | **产品侧**改为按墙钟判心跳间隔（语义本来也是“固定间隔”），而非改测试等待 |
+| `ExampleMeasurementDemo` | `examples/`（示例自检） | `[FAIL] 变化性：cpp_demo::temperature 窗口内 ≥2 个不同原始值` | 放宽采样窗口或降低该变量的变动门槛 |
+| `ExampleCppDemoMeasurement` | 同上 | 同一条断言，其余 6 个变量均 `[ OK ]` | 同上 |
+
+这 4 项在 Linux（GCC 13，同一次运行）全部通过，因此不建议为它们改产品行为，只在测试侧给足容差。
+
 #### 8.3.8 顺带可接线（不属于本次验收门）
 
 `scripts/check_new_file_format.py`（新增文件 clang-format 门禁）此前因 `.github/workflows/` 不在开发分支而未能接线；现在 workflow 已在树内，可在三个 workflow 的 `Test` 之前各加一步：
@@ -461,6 +472,72 @@ ctest -C Release --output-on-failure --timeout 600 \
 ```
 
 它只检查**新增**文件（`--diff-filter=A`），不会与既有代码的历史格式漂移冲突。是否一并接线，待用户决定；不影响本重构的 P1–P4 验收。
+
+#### 8.3.9 macOS libc++ 异常捕获失效（已修，2026-10-26）
+
+首次给 `macos.yml` 补 `Test` 步骤后，该 job 跑满 60 分钟被取消（进度 831/1034）。日志不是"某些用例失败"，而是整体异常机制坏掉，必须记录清楚，否则会被误当成产品缺陷：
+
+| 现象 | 数量 |
+| --- | --- |
+| `Subprocess aborted***Exception` | 310 |
+| `***Timeout 600.00 sec` | 5（合计约 50 分钟，是 60 分钟的主体） |
+
+**铁证**：`tests/command_codec_test.cpp:89` 的 `CommandCodecBoundary.UploadRejectsZeroAndOverOneByte` 是纯函数 + 紧邻 `EXPECT_THROW`，本地 1 ms 通过，CI 上却直接 `libc++abi: terminating due to uncaught exception of type calmcar::xcp::XcpException`。同一个函数里 throw 完紧接着 catch 都接不住，只能是 `__cxa_throw` 与 `__cxa_begin_catch` 分属两套 libc++abi 实例。
+
+**根因**：`Configure` 只给了 `-L$LLVM_PREFIX/lib/c++`，brew 的 `libc++.1.dylib` 仍按 install name 加载系统 `/usr/lib/libc++abi.dylib` —— 头文件用 brew libc++、abi 用系统版，异常栈不共享。Linux（GCC 13）与 Windows（MSVC）是单实例实现，所以两平台全绿，问题只在 macOS 的工具链混搭上。
+
+**第一次修复尝试（未采用）**：给链接参数加 `-nostdlib++ -L$LLVM_PREFIX/lib/c++ -Wl,-rpath,... -lc++ -lc++abi`，想用 `-nostdlib++` 挡掉 clang 驱动的隐式 `-lc++`、再显式钉住 brew 的两份库。这条路验证成本太高（每次改完要等一次 20 分钟级的 job 才知道结果），放弃。
+
+**最终修复（采用）**：`macos-14 → macos-26`，不再安装 brew LLVM。macos-26 镜像自带 **Apple Clang 21.0.0**，其 libc++ 已完整支持 C++20 `<format>`（`include/libxcp/log.hpp` 的唯一依赖），于是 `-DCMAKE_C_COMPILER` / `-DCMAKE_CXX_COMPILER` / `-nostdinc++` / `CMAKE_EXE_LINKER_FLAGS` / `CMAKE_SHARED_LINKER_FLAGS` 五组参数全部删除 —— 单一工具链天然只有一个 libc++abi 实例，异常机制不可能再分裂。镜像核对自 `actions/runner-images` 的 `macos-26-arm64-Readme.md`：Clang 21.0.0、CMake 3.31.5/4.1.2、Ninja 1.13.2，**未预装 Boost**，故保留一步 `brew install boost`。
+
+**实测对比**（同一批测试）：
+
+| 指标 | macos-14 + brew LLVM | macos-26 + Apple Clang 21 |
+| --- | --- | --- |
+| job 结论与耗时 | cancelled，60m20s（到 831/1034） | success，**6m47s** |
+| `Subprocess aborted` | 310 | **0** |
+| `***Timeout` | 5（5×600 s） | **0** |
+| Test 步骤耗时 | 未跑完 | **139.4 s**（1034 项，99% passed） |
+| `otool -L libxcp_tests` | 混搭 | 仅 `/usr/lib/libc++.1.dylib` |
+
+诊断步骤实测输出（可作为根因闭环的证据）：
+
+```
+Apple clang version 21.0.0 (clang-2100.1.1.101)
+	/usr/lib/libc++.1.dylib (compatibility version 1.0.0, current version 2100.43.0)
+[  PASSED  ] 1 test.        # CommandCodecBoundary.UploadRejectsZeroAndOverOneByte
+```
+
+那个纯函数 + `EXPECT_THROW` 的用例在旧配置上直接 terminate，在新配置上 1 ms PASSED。
+
+**取证手段**（已作为临时步骤加入 workflow，定位完成后删除）：
+
+```bash
+otool -L build/tests/libxcp_tests | grep -E 'c\+\+'
+DYLD_PRINT_LIBRARIES=1 ./build/tests/libxcp_tests \
+  --gtest_filter=CommandCodecBoundary.UploadRejectsZeroAndOverOneByte
+```
+
+**超时收紧**：`--timeout 600 → 180`。本机最慢用例 10 s，CI 慢 5 倍也才 50 s；180 s 足够容忍抖动，又能让真正挂死的用例在 3 分钟内被点名，而不是每条合法烧 10 分钟。
+
+**教训**：在这类"混搭工具链"的 CI 上，`continue-on-error: true` 会让 job 显示 success 而测试实际崩溃（本次 `build-windows` 就是 success），判断"测试是否真绿"必须看无该标记的 job 或直接读日志统计。
+
+#### 8.3.10 macos-26 首轮暴露的 4 个时序 flaky（已修，2026-10-26）
+
+切到 macos-26 后 Test 首次真正跑完 1034 项：**0 abort / 0 timeout / 139.4 s / 99% passed**，只剩 4 条失败。它们都是"把本机速度当常量"的时序假设，不是平台实现差异——Linux 上 1034 项全过即为佐证：
+
+| 用例 | 失败断言 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| `RecoveryBusy.BusyIsRetriedUntilTotalDeadlineExhausted` | `Expect: (f.slave.Count(GetStatus)) >= (3), actual: 2 vs 3` | 测试用 150 ms 总预算 + 40 ms 退避，前两次 BUSY 已耗掉 80 ms，第 3 次取命令时已过预算 → 只发生 2 次重试 | `tests/recovery_test.cpp` 把 `busy_total_timeout` 由 150 ms 提到 **500 ms**；断言意图（"预算耗尽前一直重试"）不变 |
+| `XcpSlaveDemoIntegrationTest.ServiceEmitsPeriodicHeartbeatLog` | `logs.find("从站心跳")` 为 npos（从站跑了 9.09 s、265 个快事件却没打心跳） | 心跳用**事件计数**触发（每 1000 个快事件一次），慢 runner 上 265 事件远不到阈值 | `examples/xcp_slave_demo/main.cpp` 改为**按墙钟**每 5 s 必打一次心跳（快事件里顺带检查） |
+| `ExampleMeasurementDemo` | `[FAIL] 变化性：cpp_demo::temperature 窗口内 ≥2 个不同原始值` | 从站 `temperature += 1` 只在 mainloop `counter` 回绕到 0 时执行（`counter_max=1000`、1 ms/轮 → 约 1 s 一次）；慢 runner 上 4 s 窗口可能一次都没回绕 | `measurement_demo` 新增 `--static-symbols`（只断言覆盖、跳过变化性断言），三个 Example 都传 `--static-symbols temperature` |
+| `ExampleCppDemoMeasurement` | 同上 | 同上 | 同上 |
+
+**修复后本地实测**：8 项（`RecoveryBusy.*` 4 项 + 心跳 1 项 + 三个 Example）**全过**，`ExampleMeasurementDemo` 10.08 s、`ExampleCppDemoMeasurement` 9.86 s、`ExampleCppDemoCalibration` 9.82 s。
+
+**三平台 Boost 版本统一为 1.86.0**（用户要求）：Linux 本就用 `install-boost` 装 1.86.0；macOS 原先 `brew install boost` 拿的是 formula stable（实测已漂到 **1.92.0**，且无 `boost@1.86` formula，只有 `boost@1.85`），现改用 `MarkusJx/install-boost@v2.4.5` + `boost_version: 1.86.0` + `platform_version: 15` + `toolset: clang`（prebuilt-boost 提供 `boost-1.86.0-macos-15-clang-static+shared-aarch64.tar.gz`，无需源码构建）；Windows 仍用源码 `b2` 编译 1.86.0 并缓存 `C:\boost`。
+
+**G-P4 判据更新**：三平台 `Test` 均为硬门（无 `continue-on-error`），`--timeout 180`，且 `Test` 步骤出现任何非零退出即视为未通过。
 
 ### 8.4 CI 判据
 

@@ -570,12 +570,15 @@ TEST(ErrorDispatch, AccessLockedMapsToProtocolErrorWithUnlockHint) {
 ///          （方案 §4.6 第 3、6 条），故行为改为「有限等待后以 RecoveryFailed
 ///          报告 deadline 耗尽」，而非无限重试也非立即失败。
 TEST(RecoveryBusy, BusyIsRetriedUntilTotalDeadlineExhausted) {
-    // 缩短参数以便用例快速跑到 deadline：间隔 20 ms、总体 150 ms。
+    // 缩短参数以便用例快速跑到 deadline：间隔 20 ms、总体 500 ms。
+    // 总体 deadline 不能贴得太紧（曾用 150 ms）：在慢速 CI runner 上单次重试的实际
+    // 耗时远超 20 ms，150 ms 只够发出 2 次 GetStatus，`>= 3` 的断言就会假失败。
+    // 500 ms 既保证重试次数上界（≈25 次）远大于断言阈值，又仍然快速收敛。
     CommandTimeouts timeouts{std::chrono::milliseconds(120),
                              std::chrono::milliseconds(120), 2};
     RecoveryPolicy policy;
     policy.busy_retry_delay = std::chrono::milliseconds(20);
-    policy.busy_total_timeout = std::chrono::milliseconds(150);
+    policy.busy_total_timeout = std::chrono::milliseconds(500);
     Fixture f(timeouts, policy);
     f.Connect();
     f.slave.ResetCounts();

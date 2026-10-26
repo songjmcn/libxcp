@@ -1,4 +1,4 @@
-# macOS 持续集成（第二阶段：三平台都跑 Test）
+# macOS 持续集成（三平台都跑 Test）
 name: macOS
 
 on:
@@ -32,17 +32,23 @@ jobs:
         with:
           submodules: recursive
 
-      # 镜像自带 CMake 3.31/4.1、Ninja 1.13 与 Apple Clang 21，只缺 Boost
-      - name: 安装 Boost
-        run: brew install boost
+      # 三平台统一 Boost 1.86.0：这里用 prebuilt-boost 的 macOS/arm64/clang 预编译包，
+      # 不到源码构建。不用 brew install boost，因为 formula 的 stable 版本会随上游升级漂移
+      # （实测已是 1.92），与 Linux/Windows 固定的 1.86 不一致；locale/filesystem 的
+      # ABI 差异只会在运行时以难复现的方式暴露。
+      - name: 安装 Boost 1.86.0
+        id: install-boost
+        uses: MarkusJx/install-boost@v2.4.5
+        with:
+          boost_version: 1.86.0
+          platform_version: 15
+          toolset: clang
+          boost_install_dir: ${{ github.workspace }}/boost-install
 
-      # Boost_DIR 由 brew 前缀下的 Boost-* 目录通配得到，不写死版本号
       - name: Configure
         run: |
-          BOOST_CMAKE_DIR="$(ls -d "$(brew --prefix boost)"/lib/cmake/Boost-* | head -n 1)"
-          echo "BOOST_CMAKE_DIR=$BOOST_CMAKE_DIR"
-          # 与 Linux 同理：构建期 gtest 发现与 ctest 运行时都要能找到 brew 安装的 Boost 动态库
-          echo "BOOST_LIB_DIR=$(brew --prefix boost)/lib" >> "$GITHUB_ENV"
+          # 与 Linux 同理：构建期 gtest 发现与 ctest 运行时都要能找到 Boost 动态库
+          echo "BOOST_LIB_DIR=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib" >> "$GITHUB_ENV"
           cmake -B build -S . -G Ninja \
             -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -50,30 +56,16 @@ jobs:
             -DLIBXCP_BUILD_TOOLS=ON \
             -DLIBXCP_BUILD_EXAMPLES=ON \
             -DLIBXCP_ENABLE_LOG=ON \
-            "-DBoost_DIR=$BOOST_CMAKE_DIR"
+            "-DBoost_DIR=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib/cmake/Boost-1.86.0"
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
-
-      # TODO: 定位完成后删除。确认二进制只依赖系统 libc++（不应再出现 brew 的 libc++）。
-      - name: Diagnose libc++ runtime (temporary)
-        continue-on-error: true
-        run: |
-          echo "=== 编译器 ==="
-          c++ --version | head -2
-          echo "=== otool -L build/tests/libxcp_tests ==="
-          otool -L build/tests/libxcp_tests | grep -E 'c\+\+' || echo "(无 c++ 动态依赖)"
-          echo "=== 单个抛异常用例（应 PASSED） ==="
-          ./build/tests/libxcp_tests \
-            --gtest_filter=CommandCodecBoundary.UploadRejectsZeroAndOverOneByte 2>&1 | tail -5
 
       # 耗时类用例只在本地做门禁（计划文档 §8.3.4）：渲染基准与两处 A2L 规模/耗时断言不进 CI。
       # 串行执行：Examples 并行会抢默认端口 5555，产生假失败。
       # --timeout 180：本机最慢用例 10 s，CI 慢 5 倍也才 50 s；留 180 s 足以容忍抖动，又能让真正
       #   挂死的用例在 3 分钟内被点名（此前 600 s，5 个挂死用例就烧掉 50 分钟）。
-      # 首轮 continue-on-error：此前该 job 只编译不测试，既有失败需先分类；基线稳定后移除，转为硬门。
       - name: Test
-        continue-on-error: true
         working-directory: build
         env:
           DYLD_LIBRARY_PATH: ${{ env.BOOST_LIB_DIR }}

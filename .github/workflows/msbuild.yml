@@ -67,12 +67,10 @@ jobs:
 
       # 必须带 -C：VS 是多配置生成器，缺省会报 "Test not available without configuration"。
       # 耗时类用例只在本地做门禁（计划文档 §8.3.4）；串行执行避免 Examples 抢端口 5555。
-      # 首轮 continue-on-error：该 job 此前从未跑过测试，Windows 侧既有失败需先分类；
-      # 基线稳定后移除，转为硬门（P2 的平台实现验收依赖它）。
+      # --timeout 180：与 Linux/macOS 对齐，让挂死用例 3 分钟内被点名而不是烧掉 10 分钟。
       - name: Test
-        continue-on-error: true
         working-directory: build
         shell: pwsh
         run: >
-          ctest -C $env:BUILD_TYPE --output-on-failure --timeout 600
+          ctest -C $env:BUILD_TYPE --output-on-failure --timeout 180
           -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
