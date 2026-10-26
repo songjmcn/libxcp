@@ -75,22 +75,26 @@ jobs:
       #   ctest 90 s —— 兜底杀掉整个进程（含看门狗没覆盖到的卡死）；
       #   步骤 60 min —— 即使有二十多个用例各拖 90 s 也能跑完并产出失败清单。
       # 上一轮因为步骤只有 20 min，整轮被截断，注解里只剩“步骤超时”，看不到用例名。
-      # 诊断步骤：先单独跑"起裸对端"的 TCP 端到端套件，并把失败消息逐行打成注解。
-      # 目的只有一个——在拿不到仓库日志时也能读到 error:/Expected 之类的原文。
+      # 诊断步骤：直接用 gtest 二进制跑两个代表性用例，只把关键行打成注解。
+      # 不用 ctest 是因为整轮太慢；这里单用例十几秒就能拿到 error:/Expected 原文，
+      # 注解可由匿名 API（/repos/.../check-runs/{id}/annotations）读取。
       - name: Diagnose TCP end-to-end failures
         continue-on-error: true
-        working-directory: build
         shell: pwsh
-        timeout-minutes: 15
+        timeout-minutes: 8
         env:
           LIBXCP_TEST_WATCHDOG_SECONDS: 60
         run: |
-          ctest -C $env:BUILD_TYPE -R "TcpEndToEndTest|TcpReceiveCtrTest|TcpFakeSocketTest" --output-on-failure --timeout 90 2>&1 | Tee-Object -FilePath tcp_diag.log | Out-Null
-          Get-Content tcp_diag.log |
-            Where-Object { $_ -match 'error:|Failure|\.cpp\(|Value of|Actual|Expected' } |
-            Select-Object -First 40 |
-            ForEach-Object { Write-Host ("::error::" + $_.Trim()) }
-          Get-Content tcp_diag.log | Select-String -Pattern 'tests passed|tests failed|Timeout|Exception' | ForEach-Object { Write-Host ("::error::" + $_.Line.Trim()) }
+          $exe = (Get-ChildItem -Path build -Recurse -Filter libxcp_tests.exe | Select-Object -First 1).FullName
+          Write-Host "exe=$exe"
+          foreach ($case in @("TcpEndToEndTest.MasterSendsAsamV14FrameWithoutTail",
+                              "TcpEndToEndTest.ReceiveDecodesFrameSentByRawPeer")) {
+            $out = & $exe --gtest_filter=$case 2>&1 | Out-String
+            $out -split "`n" |
+              Where-Object { $_ -match 'Failure|Expected|Actual|what\(\)|FAILED|error:|OK \]' } |
+              Select-Object -First 4 |
+              ForEach-Object { Write-Host ("::error::" + $case + " | " + $_.Trim()) }
+          }
 
       - name: Test
         working-directory: build
