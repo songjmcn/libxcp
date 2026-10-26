@@ -1,6 +1,6 @@
 /**
  * @file main.cpp
- * @brief 独立 XCPlite UDP Slave 与离线 A2L 生成命令行入口。
+ * @brief 独立 XCPlite UDP/TCP Slave 与离线 A2L 生成命令行入口。
  */
 #include <algorithm>
 #include <array>
@@ -42,7 +42,7 @@ namespace {
 constexpr char kProjectName[] = "xcp_slave_demo";
 /// @brief 用于判断 A2L 与运行进程兼容性的 EPK 版本字符串。
 constexpr char kEpkVersion[] = "1.0.0";
-/// @brief 默认 UDP 监听端口。
+/// @brief 默认监听端口（TCP 与 UDP 通用；两者端口空间独立，可用同一端口号）。
 constexpr std::uint16_t kDefaultPort = 5555U;
 /// @brief 默认 XCP 测量消息队列容量，单位为字节。
 constexpr std::uint32_t kMeasurementQueueSize = 32768U;
@@ -64,8 +64,12 @@ struct CommandLineOptions {
     bool overwrite{false};             ///< A2L 生成时是否替换两个约定输出文件。
     bool show_help{false};             ///< 是否输出帮助并成功退出。
     bool output_dir_specified{false};  ///< 用户是否显式指定了输出目录。
+    /// @brief 是否使用 TCP 传输；false 表示 UDP（默认，保持既有脚本兼容）。
+    /// @note XCPlite 的 XcpEthServerInit 是全局单例，传输方式在初始化时定死，
+    /// 同一进程无法同时监听两种传输；需要两种时请启动两个进程并使用不同端口。
+    bool use_tcp{false};
     std::string bind_address{"127.0.0.1"};  ///< IPv4 监听及 A2L XCP 端点地址。
-    std::uint16_t port{kDefaultPort};       ///< UDP 端口。
+    std::uint16_t port{kDefaultPort};       ///< 监听端口（UDP 或 TCP）。
     std::filesystem::path output_dir{"a2l"};  ///< A2L 与 AML 的输出目录。
 };
 
@@ -126,7 +130,7 @@ bool ParseArguments(int argc, char* argv[], CommandLineOptions& options,
             continue;
         }
         if (argument == "--bind" || argument == "--port" ||
-            argument == "--output-dir") {
+            argument == "--output-dir" || argument == "--transport") {
             if (index + 1 >= argc) {
                 error_message = "参数缺少取值：" + std::string(argument);
                 return false;
@@ -139,6 +143,17 @@ bool ParseArguments(int argc, char* argv[], CommandLineOptions& options,
                     return false;
                 }
                 options.bind_address.assign(value);
+            } else if (argument == "--transport") {
+                // 只接受 udp / tcp 两个小写字面量：拼写错误时立刻失败，
+                // 避免"以为切到 TCP 其实还在跑 UDP"这类难以察觉的配置错误。
+                if (value == "udp") {
+                    options.use_tcp = false;
+                } else if (value == "tcp") {
+                    options.use_tcp = true;
+                } else {
+                    error_message = "--transport 必须是 udp 或 tcp";
+                    return false;
+                }
             } else if (argument == "--port") {
                 unsigned int parsed_port = 0;
                 const auto result = std::from_chars(
@@ -187,9 +202,22 @@ void PrintUsage() {
                  "  --generate-a2l          只生成 A2L/AML，成功后退出\n"
                  "  --output-dir <目录>     生成文件目录（默认 ./a2l）\n"
                  "  --bind <IPv4>           绑定地址并写入 A2L 端点\n"
-                 "  --port <端口>           UDP 端口（默认 5555）\n"
+                 "  --port <端口>           监听端口（默认 5555）\n"
+                 "  --transport <udp|tcp>   传输方式（默认 udp）\n"
                  "  --overwrite             仅替换主 A2L 与 XCP_104.aml\n"
-                 "  --help                  显示本帮助\n";
+                 "  --help                  显示本帮助\n"
+                 "\n"
+                 "  XCPlite 的 XCP server 是全局单例，同一进程只能使用一种传输；\n"
+                 "  需要同时提供 UDP 与 TCP 时，请启动两个进程并使用不同端口。\n";
+}
+
+/**
+ * @brief 返回传输方式的英文短名，用于日志与提示。
+ * @param use_tcp 是否使用 TCP。
+ * @return TCP 或 UDP 字面量。
+ */
+std::string_view TransportName(bool use_tcp) {
+    return use_tcp ? std::string_view{"TCP"} : std::string_view{"UDP"};
 }
 
 /**
@@ -676,7 +704,9 @@ int GenerateA2l(const CommandLineOptions& options) {
             return 1;
         }
 
-        if (!A2lInit(address.data(), options.port, false,
+        // 第三参决定 A2L 写出 XCP_ON_TCP_IP 还是 XCP_ON_UDP_IP
+        // （thirdparty/XCPlite/src/a2l_writer.c 的 prot = useTCP ? "TCP" : "UDP"）。
+        if (!A2lInit(address.data(), options.port, options.use_tcp,
                      A2L_MODE_WRITE_ALWAYS | A2L_MODE_AUTO_GROUPS)) {
             error_message = "A2lInit 初始化失败";
             RemoveGeneratedOutputs(paths);
@@ -741,11 +771,18 @@ int GenerateA2l(const CommandLineOptions& options) {
             return 1;
         }
         const auto* xcp_info = loaded.Value()->XcpInfo();
+        // 传输类别必须与 --transport 一致：既校验地址/端口，也校验"这台从站
+        // 到底声明成了 UDP 还是 TCP"，否则会把 UDP 的 A2L 交给 TCP 主站使用。
+        const auto expected_kind =
+            options.use_tcp
+                ? calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp
+                : calmcar::xcp::a2l::TransportEndpoint::Kind::UdpIp;
         if (xcp_info == nullptr || xcp_info->transports.size() != 1U ||
+            xcp_info->transports.front().kind != expected_kind ||
             xcp_info->transports.front().remote_port != options.port ||
             xcp_info->transports.front().remote_host != options.bind_address) {
             RemoveGeneratedOutputs(paths);
-            std::cerr << "A2L 中的 XCP/UDP 端点与 CLI 配置不一致\n";
+            std::cerr << "A2L 中的 XCP 端点（地址/端口/传输类别）与 CLI 配置不一致\n";
             LIBXCP_LOG_ERROR(
                 "A2L 生成失败：A2L 端点与 CLI 配置不一致，期望 {}:{}",
                 options.bind_address, options.port);
@@ -786,7 +823,7 @@ void HandleTerminationSignal(int signal_number) {
 }
 
 /**
- * @brief 启动常驻 UDP Slave，并按两个固定周期更新及触发 DAQ 事件。
+ * @brief 启动常驻 UDP/TCP Slave，并按两个固定周期更新及触发 DAQ 事件。
  * @param options 已解析的命令行配置。
  * @return 成功运行并完成关闭返回 0，否则返回非零。
  */
@@ -809,7 +846,9 @@ int RunSlave(const CommandLineOptions& options) {
     }
 
     const auto address = ToIpv4Bytes(options.bind_address);
-    if (!XcpEthServerInit(address.data(), options.port, false,
+    // XCPlite 的 XCP server 是全局单例：这里传入的传输方式在进程生命周期内
+    // 不可更改，第二次初始化会被 "XCP server already running!" 拒绝。
+    if (!XcpEthServerInit(address.data(), options.port, options.use_tcp,
                           kMeasurementQueueSize)) {
         std::cerr << "XcpEthServerInit 失败，无法监听 " << options.bind_address
                   << ':' << options.port << '\n';
@@ -825,10 +864,12 @@ int RunSlave(const CommandLineOptions& options) {
     std::signal(SIGTERM, HandleTerminationSignal);
     g_keep_running = 1;
     LIBXCP_LOG_INFO(
-        "从站已启动：UDP {}:{}，快事件 {} ns，慢事件 {} ns，测量队列 {} 字节",
+        "从站已启动：{} {}:{}，快事件 {} ns，慢事件 {} ns，测量队列 {} 字节",
+        TransportName(options.use_tcp),
         options.bind_address, options.port, kFastEventCycleNs, kSlowEventCycleNs,
         kMeasurementQueueSize);
-    std::cout << "XCPlite UDP Slave 正在监听 " << options.bind_address << ':'
+    std::cout << "XCPlite " << TransportName(options.use_tcp) << " Slave 正在监听 "
+              << options.bind_address << ':'
               << options.port << "（快事件 10 ms，慢事件 100 ms）\n"
               << "按 Ctrl+C 退出。\n";
 

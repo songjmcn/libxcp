@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 
+#include "libxcp/ethernet_header_codec.hpp"
 #include "libxcp/udp_header_codec.hpp"
 #include "libxcp/xcp_error.hpp"
 
@@ -909,9 +910,10 @@ void UdpTestSlave::ReceiveLoop() {
         const std::uint16_t src_port = ntohs(src.sin_port);
 
         // 按 XCP 1.1：一个 Datagram 可能包含多个完整 Frame，逐个解析后依序处理
-        const auto frames = DecodeUdpDatagramAligned(
-            BytesView{buffer.data(), static_cast<std::size_t>(received)},
-            m_alignment_);
+        // P1 起以「数据报边界」为准解码：主站发送不补 Tail，ACK 与 CRO 都不再
+        // 依赖双方对 PACKET_ALIGNMENT 的一致理解（末帧容忍 0..3 字节 FILL）。
+        const auto frames = DecodeEthernetDatagramByBoundary(
+            BytesView{buffer.data(), static_cast<std::size_t>(received)}, 3);
         if (!frames) {
             continue;  // 畸形 Datagram：测试 Slave 直接忽略
         }

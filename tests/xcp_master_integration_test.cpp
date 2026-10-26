@@ -1434,6 +1434,71 @@ TEST(XcpMasterVersion, AutodetectDisabledSkipsProbe) {
     EXPECT_TRUE(ps.conservative);
 }
 
+/// @brief A2L 静态声明必须能在 GET_VERSION 不可用时补上 Minor（P2）
+TEST(XcpMasterVersion, A2lEvidenceLiftsVersionWhenGetVersionUnavailable) {
+    auto transport = std::make_unique<test::MockTransport>();
+    MockXcpSlave slave;
+    transport->SetResponse([&slave](BytesView p) { return slave(p); });
+    XcpMasterOptions options;
+    options.autodetect_version = false;  // 等价于对端不实现 GET_VERSION
+    options.version_policy.a2l_protocol_version = XcpProtocolVersion{1, 2};
+    options.version_policy.a2l_transport_version = XcpProtocolVersion{1, 4};
+    XcpMaster master(std::move(transport), options);
+
+    master.Connect();
+
+    const ProtocolVersionSnapshot ps = master.GetProtocolVersionSnapshot();
+    // 关键：不再是 ConnectMajor + conservative，而是 A2L 给出的真实 1.2
+    EXPECT_EQ(ps.evidence.source, VersionSource::A2l);
+    EXPECT_EQ(ps.evidence.confidence, VersionConfidence::StaticEvidence);
+    EXPECT_EQ(ps.evidence.reported, (XcpProtocolVersion{1, 2}));
+    EXPECT_EQ(ps.effective, (XcpProtocolVersion{1, 2}));
+    EXPECT_FALSE(ps.conservative) << "A2L 已给出 Minor，不应再退化为保守交集";
+
+    const TransportVersionSnapshot ts = master.GetTransportVersionSnapshot();
+    EXPECT_EQ(ts.evidence.source, VersionSource::A2l);
+    EXPECT_EQ(ts.effective, (XcpProtocolVersion{1, 4}));
+}
+
+/// @brief 调用方配置优先于 A2L 静态声明（裁决顺序回归）
+TEST(XcpMasterVersion, ConfiguredVersionBeatsA2lEvidence) {
+    auto transport = std::make_unique<test::MockTransport>();
+    MockXcpSlave slave;
+    transport->SetResponse([&slave](BytesView p) { return slave(p); });
+    XcpMasterOptions options;
+    options.autodetect_version = false;
+    options.version_policy.protocol_version = XcpProtocolVersion{1, 5};
+    options.version_policy.a2l_protocol_version = XcpProtocolVersion{1, 2};
+    XcpMaster master(std::move(transport), options);
+
+    master.Connect();
+
+    const ProtocolVersionSnapshot ps = master.GetProtocolVersionSnapshot();
+    EXPECT_EQ(ps.evidence.source, VersionSource::Configured);
+    EXPECT_EQ(ps.evidence.reported, (XcpProtocolVersion{1, 5}));
+}
+
+/// @brief A2L 与 GET_VERSION 不一致时必须记录冲突（不静默）
+TEST(XcpMasterVersion, A2lEvidenceConflictWithProbeIsReported) {
+    auto transport = std::make_unique<test::MockTransport>();
+    MockXcpSlave slave;
+    transport->SetResponse([&slave](BytesView p) { return slave(p); });
+    slave.SetResponse(CommandCode::GetVersion,
+                      BytesOf({0xFF, 0x00, 0x01, 0x05, 0x01, 0x04}));
+    XcpMasterOptions options;
+    options.version_policy.a2l_protocol_version = XcpProtocolVersion{1, 2};
+    XcpMaster master(std::move(transport), options);
+
+    master.Connect();
+
+    const ProtocolVersionSnapshot ps = master.GetProtocolVersionSnapshot();
+    EXPECT_EQ(ps.evidence.source, VersionSource::GetVersion);
+    EXPECT_EQ(ps.evidence.reported, (XcpProtocolVersion{1, 5}));
+    EXPECT_TRUE(ps.conflicts_with_a2l);
+    ASSERT_FALSE(master.VersionConflicts().empty())
+        << "A2L 与运行时不一致必须可见";
+}
+
 /// @brief 超时不得被当作"确认的老版本"（方案 B1 硬约束的集成验证）
 TEST(XcpMasterVersion, ProbeTimeoutIsNotTreatedAsConfirmedOldVersion) {
     Rig rig;

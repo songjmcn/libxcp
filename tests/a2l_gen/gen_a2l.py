@@ -296,6 +296,50 @@ UDP_SUBCMDS = {"GET_DAQ_CLOCK_MULTICAST", "SET_SLAVE_IP_ADDRESS",
                "GET_SLAVE_ID_EXTENDED", "GET_SLAVE_ID"}
 
 
+def emit_endpoint(begin_tag, pl_version, endpoint, kind):
+    """一个传输层端点块（XCP_ON_UDP_IP / XCP_ON_TCP_IP）。
+
+    Args:
+        begin_tag: 端点块标签。
+        pl_version: 所属 IF_DATA 块的 PROTOCOL_LAYER 版本（端点块首字段）。
+        endpoint: 端点字典（port/host/address/ipv6/packet_alignment/sub_commands）。
+        kind: "udp" 或 "tcp"。
+
+    Returns:
+        A2L 文本行列表。
+    """
+    lines = [f'      /begin {begin_tag} {fmt_int(pl_version)} '
+             f'{fmt_int(endpoint["port"])}']
+    host = endpoint.get("host")
+    if host is not None:
+        lines.append(f'        HOST_NAME "{host}"')
+    address = endpoint.get("address")
+    if address is not None:
+        lines.append(f'        ADDRESS "{address}"')
+    ipv6 = endpoint.get("ipv6")
+    if ipv6 is not None:
+        lines.append(f'        IPV6 "{ipv6}"')
+    # 批次12：PACKET_ALIGNMENT / OPTIONAL_TL_SUBCMD 的取值必须是上游词法器认得
+    # 的 IDENT 字面量。超范围值一律报错而非静默跳过——上游对未识别值是
+    # **静默降级**（alignment 保持默认 8、subcmd 直接丢弃），若这里也静默就
+    # 测不到差异。
+    align = endpoint.get("packet_alignment")
+    if align is not None:
+        if align not in UDP_ALIGNMENTS:
+            raise SystemExit(
+                f'非法 packet_alignment: {align!r}（仅接受 '
+                f'{", ".join(sorted(UDP_ALIGNMENTS))}）')
+        lines.append(f'        PACKET_ALIGNMENT {align}')
+    for cmd in endpoint.get("sub_commands", []):
+        if cmd not in UDP_SUBCMDS:
+            raise SystemExit(
+                f'非法 sub_command: {cmd!r}（仅接受 '
+                f'{", ".join(sorted(UDP_SUBCMDS))}）')
+        lines.append(f'        OPTIONAL_TL_SUBCMD {cmd}')
+    lines.append(f'      /end {begin_tag}')
+    return lines
+
+
 def emit_if_data(block):
     """单个 IF_DATA 块（XCP 或 XCPplus；协议名决定子文法首 token）。"""
     proto = block.get("protocol", "XCP")
@@ -352,30 +396,20 @@ def emit_if_data(block):
             lines.append('          /end PREDEFINED')
             lines.append('        /end DAQ_LIST')
         lines.append('      /end DAQ')
-    udp = block.get("udp")
-    if udp:
-        lines.append(
-            f'      /begin XCP_ON_UDP_IP {fmt_int(pl.get("version", "0x100"))} '
-            f'{fmt_int(udp["port"])}')
-        lines.append(f'        HOST_NAME "{udp.get("host", "localhost")}"')
-        # 批次12：PACKET_ALIGNMENT / OPTIONAL_TL_SUBCMD 的取值必须是上游
-        # 词法器认得的 IDENT 字面量（xcpdataflexer.l 表 + XcpOnUdpIp 名称表）。
-        # 超范围值一律报错而非静默跳过——上游对未识别值是**静默降级**
-        # （alignment 保持默认 8、subcmd 直接丢弃），若这里也静默就测不到差异。
-        align = udp.get("packet_alignment")
-        if align is not None:
-            if align not in UDP_ALIGNMENTS:
-                raise SystemExit(
-                    f'非法 packet_alignment: {align!r}（仅接受 '
-                    f'{", ".join(sorted(UDP_ALIGNMENTS))}）')
-            lines.append(f'        PACKET_ALIGNMENT {align}')
-        for cmd in udp.get("sub_commands", []):
-            if cmd not in UDP_SUBCMDS:
-                raise SystemExit(
-                    f'非法 sub_command: {cmd!r}（仅接受 '
-                    f'{", ".join(sorted(UDP_SUBCMDS))}）')
-            lines.append(f'        OPTIONAL_TL_SUBCMD {cmd}')
-        lines.append('      /end XCP_ON_UDP_IP')
+    # 端点：`udp`/`tcp` 是单实例写法（历史用法），`udp_endpoints`/`tcp_endpoints`
+    # 是多实例写法（v10 多实例端点用；见 code-plan/历史遗漏项_详细方案.md §3）。
+    # 多实例是 A2L 允许的：同一个 IF_DATA 块里可以重复出现多个 XCP_ON_*_IP。
+    for kind, single_key, multi_key, begin_tag in (
+            ("udp", "udp", "udp_endpoints", "XCP_ON_UDP_IP"),
+            ("tcp", "tcp", "tcp_endpoints", "XCP_ON_TCP_IP")):
+        endpoints = []
+        if block.get(multi_key):
+            endpoints = list(block[multi_key])
+        elif block.get(single_key):
+            endpoints = [block[single_key]]
+        for endpoint in endpoints:
+            lines += emit_endpoint(begin_tag, pl.get("version", "0x100"),
+                                   endpoint, kind)
     lines.append('    /end IF_DATA')
     return lines
 

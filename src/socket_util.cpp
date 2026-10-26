@@ -12,6 +12,7 @@
 #include "socket_util.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #if defined(_WIN32)
@@ -352,6 +353,30 @@ bool IsConnectionLostCode(int code) noexcept {
 SocketOps& RealSocketOps() {
     static RealSocketOpsImpl instance;
     return instance;
+}
+
+namespace {
+
+/**
+ * @brief 测试注入的替代实现；`nullptr` 表示"未注入，使用真实实现"。
+ * @details 用原子指针而非加锁：读取在每条 Socket 调用路径上发生，
+ *          必须是无等待的；写入只发生在测试的安装/卸载两个时刻。
+ */
+std::atomic<SocketOps*> g_test_socket_ops{nullptr};
+
+}  // namespace
+
+SocketOps& CurrentSocketOps() noexcept {
+    SocketOps* const override_ops =
+        g_test_socket_ops.load(std::memory_order_acquire);
+    if (override_ops != nullptr) {
+        return *override_ops;
+    }
+    return RealSocketOps();
+}
+
+void SetSocketOpsForTesting(SocketOps* ops) noexcept {
+    g_test_socket_ops.store(ops, std::memory_order_release);
 }
 
 bool ParseIpv4Literal(const std::string& text, in_addr* out) {

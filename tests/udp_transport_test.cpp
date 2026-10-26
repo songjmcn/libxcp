@@ -860,20 +860,19 @@ TEST(UdpTransportConfigValidation, ZeroReceivePollIntervalIsRejected) {
 // T-02：PACKET_ALIGNMENT 配置门禁
 // --------------------------------------------------------------------------
 
-TEST(UdpTransportConfigValidation, UnknownPacketAlignmentIsRejected) {
-    auto cfg = MakeConfig(12345U);
+TEST(UdpTransportConfigValidation, UnknownPacketAlignmentIsAccepted) {
+    // P1（数据报边界推导）起 Unknown 不再被拒绝：接收按数据报边界推导 Tail，
+    // 发送恒不补 Tail，因此不依赖对齐证据。
+    test::UdpTestSlave slave;
+    slave.Start();
+    auto cfg = MakeConfig(slave.Port());
     cfg.packet_alignment = PacketAlignment::Unknown;
     UdpTransport transport(cfg);
     RecordingListener listener;
 
-    try {
-        transport.Open(listener);
-        FAIL() << "Alignment 未知时不得静默按 8-bit 打开（方案 §1.9A.4）";
-    } catch (const XcpException& e) {
-        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
-        EXPECT_NE(std::string(e.what()).find("packet_alignment"),
-                  std::string::npos);
-    }
+    EXPECT_NO_THROW(transport.Open(listener));
+    transport.Close();
+    slave.Stop();
 }
 
 TEST(UdpTransportConfigValidation, DefaultAlignmentIsBit8AndAccepted) {

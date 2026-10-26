@@ -156,6 +156,40 @@ void CheckEthernetPacketLen(std::size_t len);
                                                         DatagramCtr ctr);
 
 /**
+ * @brief 以承载单元边界为准，解码一个承载单元中连续打包的全部 XCP Frame
+ * @param datagram 完整承载单元 Payload（UDP Datagram）
+ * @param max_tail 末帧允许的最大 Tail 字节数（0..3，默认 3）
+ * @return 全部 Frame 视图；畸形输入整体返回 `std::nullopt`
+ *
+ * @details 用于**没有 PACKET_ALIGNMENT 证据**的接收路径：UDP 一个数据报就是
+ *          一个承载单元，Frame 边界可直接观测，因此 Tail 长度不必由对齐推出，
+ *          而由剩余字节判定：
+ *          - 末帧（本数据报最后一个 Frame）：`LEN` 之后剩下的 0..max_tail 字节
+ *            一律视为 FILL（规范定为 "do not care"，不读取其内容）；
+ *          - 中间帧：要求 Tail 为 0（紧随其后必须能构成下一帧的 4 字节 Header）。
+ *
+ *          因为 `max_tail <= 3`，剩余字节少于 4 时不可能构成下一帧 Header，
+ *          故"不超过 max_tail 的剩余字节"只能解释为 FILL，判定无歧义。
+ *
+ *          发送侧配套约定：主站发 CRO 时**不补 Tail**（TL V1.5 §4.3.2.1
+ *          允许单个 XCP 消息独占 Frame 时省略 Tail），因此不依赖对端预期的
+ *          对齐位宽。
+ *
+ * @par 整体拒绝（返回 std::nullopt）的畸形情形
+ *   - `datagram` 为空或剩余字节不足以容纳完整 4 字节 Header；
+ *   - `LEN == 0`；
+ *   - `Header + LEN` 超出 Datagram 剩余长度（截断）；
+ *   - 中间帧之后剩余字节多于 `max_tail`（即对端在中间帧上补了 FILL）。
+ *     本函数**不做试探**：同时尝试多种 Tail 长度属于嗅探，会让畸形包被
+ *     静默接受，故一律整体拒绝。
+ *
+ * @warning 返回视图指向 `datagram` 底层存储，生命周期不超过 `datagram`。
+ */
+[[nodiscard]] std::optional<std::vector<EthernetFrameView>>
+DecodeEthernetDatagramByBoundary(BytesView datagram,
+                                 std::uint8_t max_tail = 3) noexcept;
+
+/**
  * @brief 解码一个承载单元中连续打包的全部 XCP Frame（AsamV15 语义）
  * @param datagram 完整承载单元 Payload（UDP Datagram）
  * @param alignment 会话协商到的对齐位宽

@@ -42,6 +42,7 @@ enum class WireProfileSource : std::uint8_t {
     NotApplicable = 0,  ///< UDP 传输：不存在 Wire Profile 概念
     Cli,                ///< 来自 `--tcp-profile`
     Preset,             ///< 来自 `--preset xcplite` 的原子展开
+    Auto,               ///< 来自 `--tcp-profile auto` 的连接级候选试连
 };
 
 /// @brief 端点（host/port）的来源
@@ -63,6 +64,11 @@ struct TransportSelectionRequest {
 
     /// @brief `--tcp-profile`；未给出表示用户没有显式选择
     std::optional<TcpWireProfile> tcp_profile;
+
+    /// @brief `--tcp-profile auto`：要求上层做连接级候选试连（P3）
+    /// @details 与 `tcp_profile` 互斥；与 `--packet-alignment`、`--preset`
+    ///          组合时报错，因为两者都会与"自行枚举候选"的前提冲突。
+    bool tcp_profile_auto = false;
 
     /// @brief `--packet-alignment` 的原始位宽（8/16/32）
     std::optional<std::uint8_t> packet_alignment_bits;
@@ -167,6 +173,12 @@ struct ResolvedTransportSelection {
     PacketAlignment alignment = PacketAlignment::Unknown;  ///< 生效的 PACKET_ALIGNMENT
     AlignmentSource alignment_source = AlignmentSource::ProfileDefault;
 
+    /// @brief 是否需要上层做连接级候选试连（`--tcp-profile auto`）
+    /// @details 为 true 时 `wire_profile` / `alignment` 保持 `Unknown`：
+    ///          它们要等试连结束后才能确定，调用方必须用
+    ///          `DefaultFramingCandidates()` 逐个尝试并回填选中值。
+    bool wire_profile_auto = false;
+
     EndpointSource endpoint_source = EndpointSource::Cli;  ///< 端点来源
     std::string host;                                      ///< 生效远端地址
     std::uint16_t port = 0;                                ///< 生效远端端口
@@ -198,6 +210,8 @@ struct ResolvedTransportSelection {
             return "--tcp-profile";
         case WireProfileSource::Preset:
             return "preset 展开";
+        case WireProfileSource::Auto:
+            return "--tcp-profile auto";
         case WireProfileSource::NotApplicable:
         default:
             return "不适用";
@@ -398,6 +412,36 @@ ResolveTransportSelection(const TransportSelectionRequest& request,
     ResolvedTransportSelection resolved;
     resolved.transport = request.transport;
 
+    // ---- 规则 8（P3）：`--tcp-profile auto` 的前置校验 ---------------------
+    // auto 的含义是"由上层逐个候选新建连接试连"，因此一切预先固定线路布局
+    // 的参数都必须拒绝：否则用户会以为 presets/对齐仍生效，而实际生效的是
+    // 胜出候选。
+    if (request.tcp_profile_auto) {
+        if (request.transport != TransportKind::Tcp) {
+            return fail("--tcp-profile auto 只对 --transport tcp 有效");
+        }
+        if (request.preset_xcplite) {
+            return fail("--tcp-profile auto 与 --preset xcplite 冲突：preset "
+                        "已固定 asam-v1.4 与该部署的版本组合");
+        }
+        if (request.packet_alignment_bits.has_value()) {
+            return fail("--tcp-profile auto 会自行枚举 PACKET_ALIGNMENT（8/16/"
+                        "32 bit），请勿同时指定 --packet-alignment");
+        }
+        if (request.tcp_profile.has_value()) {
+            return fail("--tcp-profile 不能同时给出 auto 与具体 Profile");
+        }
+        resolved.wire_profile_auto = true;
+        resolved.wire_profile = TcpWireProfile::Unknown;
+        resolved.wire_profile_source = WireProfileSource::Auto;
+        // 对齐同样由胜出候选决定：这里保持 Unknown，绝不给默认值，
+        // 否则调用方会误以为可以按 8 bit 直接建连。
+        resolved.alignment = PacketAlignment::Unknown;
+        resolved.notes.push_back(
+            "--tcp-profile auto：按候选顺序逐个新建连接试连（最多 4 次），"
+            "选中结果会覆盖线路布局与 PACKET_ALIGNMENT");
+    }
+
     // ---- 规则 7：preset 原子展开 -------------------------------------------
     // preset 先把"缺省值"填好，随后显式选项逐项覆盖；一旦显式选项与展开值
     // 矛盾就报错。理由是 preset 的意义在于"这一整套是 XCPlite 的部署事实"，
@@ -436,16 +480,21 @@ ResolveTransportSelection(const TransportSelectionRequest& request,
 
     // ---- 规则 1：TCP 必须显式选择 Profile ----------------------------------
     if (request.transport == TransportKind::Tcp) {
-        if (!effective_profile.has_value() ||
-            !IsTcpWireProfileResolved(*effective_profile)) {
+        if (resolved.wire_profile_auto) {
+            // auto 已在规则 8 置位：此处不得再用"必须显式 Profile"拦截，
+            // 也不得填任何默认值——空着由试连结果回填。
+        } else if (!effective_profile.has_value() ||
+                   !IsTcpWireProfileResolved(*effective_profile)) {
             return fail(
-                "TCP 传输必须显式指定 --tcp-profile asam-v1.5|asam-v1.4："
-                "线路布局无法从版本号、A2L 或首帧内容推断");
+                "TCP 传输必须显式指定 --tcp-profile asam-v1.5|asam-v1.4（或 "
+                "auto 让库逐个候选试连）：线路布局无法从版本号、A2L 或首帧"
+                "内容推断");
+        } else {
+            resolved.wire_profile = *effective_profile;
+            resolved.wire_profile_source = request.preset_xcplite
+                                               ? WireProfileSource::Preset
+                                               : WireProfileSource::Cli;
         }
-        resolved.wire_profile = *effective_profile;
-        resolved.wire_profile_source = request.preset_xcplite
-                                           ? WireProfileSource::Preset
-                                           : WireProfileSource::Cli;
     } else if (effective_profile.has_value()) {
         // UDP 上给 TCP Profile 是无意义配置，明确拒绝而不是静默忽略
         return fail("--tcp-profile 只对 --transport tcp 有效");
@@ -563,6 +612,10 @@ ResolveTransportSelection(const TransportSelectionRequest& request,
                 std::to_string(a2l.packet_alignment_bits) +
                 " bit；asam-v1.4 的 framing 不使用该值（无 LEN 外 Tail）");
         }
+    } else if (request.transport == TransportKind::Tcp &&
+               resolved.wire_profile_auto) {
+        // auto：对齐由胜出候选决定（候选本身已携带 8/16/32 bit），
+        // 此处不做任何解析，也不校验 A2L 声明。
     } else if (request.transport == TransportKind::Tcp) {
         // 规则 2：AsamV15 必须有对齐依据
         if (cli_alignment.has_value()) {

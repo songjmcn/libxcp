@@ -7,10 +7,12 @@
  * @par 两类测试，两种手段
  *   1. **端到端测试**用真实回环 TCP：验证角色、连接、双 Profile 收发、
  *      短写补全、EOF 语义、关闭时打断阻塞 recv 等真实行为。
- *   2. **错误分支测试**用 `tests/tcp_fake_socket.hpp` 注入的假 SocketOps：
- *      partial write、EINTR、EAGAIN+可写超时、连接重置这些条件在真实
- *      Socket 上无法确定性复现（内核缓冲大小、信号时序都不可控），只能用
- *      脚本化的假实现精确驱动。
+ *   2. **错误分支测试**在独立目标 `TcpFakeSocketTest`
+ *      （`tests/tcp_fake_socket_test.cpp` + `tests/tcp_fake_socket.hpp`）里，
+ *      通过 `SetSocketOpsForTesting()` 注入脚本化假 SocketOps：partial write、
+ *      EINTR、EAGAIN+可写超时、连接重置这些条件在真实 Socket 上无法确定性
+ *      复现（内核缓冲大小、信号时序都不可控），只能用脚本化实现精确驱动。
+ *      该目标独进程运行（ctest `RUN_SERIAL`），因为注入是进程级的。
  *
  * @par 不依赖固定端口
  *   所有监听端口均用 `local_port = 0` 让 OS 分配，再通过 `LocalPort()` 取回，

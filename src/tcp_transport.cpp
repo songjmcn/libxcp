@@ -131,7 +131,7 @@ TcpTransport::~TcpTransport() {
 void TcpTransport::Open(IPacketListener& listener) {
     Close();  // 幂等：允许在已打开的实例上重新打开
 
-    auto& ops = detail::RealSocketOps();
+    auto& ops = detail::CurrentSocketOps();
 
     // ---- 配置校验（计划 §5.8）----
     // 校验顺序刻意与 UdpTransport 保持一致：先是"必须显式给出"的协议属性，
@@ -281,7 +281,7 @@ void TcpTransport::Open(IPacketListener& listener) {
 }
 
 void TcpTransport::EstablishConnection() {
-    auto& ops = detail::RealSocketOps();
+    auto& ops = detail::CurrentSocketOps();
 
     // ---- 解析本地绑定地址 ----
     sockaddr_in local{};
@@ -373,7 +373,7 @@ void TcpTransport::EstablishConnection() {
 
 void TcpTransport::ConnectWithTimeout(const void* addr,
                                       std::size_t addr_len) {
-    auto& ops = detail::RealSocketOps();
+    auto& ops = detail::CurrentSocketOps();
 
     // 参数经类型擦除传入（见头文件说明），这里恢复回平台类型。
     // 调用方保证指向有效的 sockaddr_in 且长度匹配，故无需再做校验。
@@ -452,7 +452,7 @@ void TcpTransport::ConnectWithTimeout(const void* addr,
 }
 
 void TcpTransport::ListenAndAccept() {
-    auto& ops = detail::RealSocketOps();
+    auto& ops = detail::CurrentSocketOps();
 
     if (ops.set_int_option(m_socket_->handle, SOL_SOCKET, SO_REUSEADDR, 1) !=
         0) {
@@ -515,7 +515,7 @@ void TcpTransport::ListenAndAccept() {
 }
 
 void TcpTransport::Close() {
-    auto& ops = detail::RealSocketOps();
+    auto& ops = detail::CurrentSocketOps();
 
     // 1. 通知接收线程退出
     m_running_.store(false, std::memory_order_release);
@@ -612,7 +612,7 @@ void TcpTransport::WriteFrame(BytesView packet, DatagramCtr ctr) {
 }
 
 void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
-    auto& ops = detail::RealSocketOps();
+    auto& ops = detail::CurrentSocketOps();
     std::size_t written = 0;
 
     while (written < size && m_running_.load(std::memory_order_acquire)) {
@@ -697,7 +697,7 @@ std::uint64_t TcpTransport::DeliveredFrameCount() const noexcept {
 // ---------------------------------------------------------------------------
 
 void TcpTransport::ReceiveLoop() {
-    auto& ops = detail::RealSocketOps();
+    auto& ops = detail::CurrentSocketOps();
     IPacketListener* listener = m_listener_;
     std::string close_reason = "Transport 正常关闭";
     std::vector<std::uint8_t> buffer(m_config_.receive_chunk_size);

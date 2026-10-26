@@ -90,8 +90,11 @@ struct TcpTransportConfig {
      * @details 默认 `TcpWireProfile::AsamV14`：与 XCPlite 默认 TCP 路径互通
      *          （见 `tcp_wire_profile.hpp` 的互操作性说明）。
      * @note `TcpWireProfile` 是 **enum class**，不存在 `v14LengthInDle()` 这类
-     *       工厂函数——Profile 必须由调用方显式择一，本库明令禁止从版本号、
+     *       工厂函数——本字段**默认必须由调用方显式择一**，本库不得从版本号、
      *       A2L 对齐信息或首帧内容自动推断（计划 §1.2）。
+     *       唯一的自动模式是连接级候选试连（`--tcp-profile auto`，见
+     *       `tcp_framing_negotiation.hpp`）：它由上层逐个候选新建连接并填好
+     *       本字段后重试，传输层自身仍然只接受显式值。
      */
     TcpWireProfile wire_profile = TcpWireProfile::AsamV14;
 

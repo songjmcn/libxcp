@@ -127,6 +127,19 @@ VersionResolver::Result VersionResolver::Resolve(const Inputs& inputs) {
     result.protocol.evidence = pl_evidence;
     result.transport.evidence = tl_evidence;
 
+    // A2L 静态声明与最终采用的证据不一致时置标志位（快照消费方据此阻断
+    // 依赖布局的功能）。仅比较"是否可用"的 A2L 值，不参与取值优先级。
+    result.protocol.conflicts_with_a2l =
+        inputs.a2l_protocol_version.has_value() &&
+        inputs.a2l_protocol_version->IsValid() &&
+        pl_evidence.IsAvailable() &&
+        !(pl_evidence.reported == *inputs.a2l_protocol_version);
+    result.transport.conflicts_with_a2l =
+        inputs.a2l_transport_version.has_value() &&
+        inputs.a2l_transport_version->IsValid() &&
+        tl_evidence.IsAvailable() &&
+        !(tl_evidence.reported == *inputs.a2l_transport_version);
+
     // 生效版本：Minor 未确认时进入 1.x-conservative——按 Major.0 作为能力
     // 判据标识，并置 conservative 标志。**这代表"能力集按保守交集执行"，
     // 不代表对端就是该 Minor**（方案 D1 明确定义）。

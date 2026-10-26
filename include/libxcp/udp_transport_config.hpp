@@ -59,15 +59,18 @@ struct UdpTransportConfig {
 
     /**
      * @brief PACKET_ALIGNMENT（TL V1.5 §4.3.2.2）：XCP Packet 起始地址对齐
-     * @details 默认 `PacketAlignment::Bit8`（等价于不填充 Tail），与 XCP 1.1
-     *          Part 3 的"无 Tail"行为一致，因此不改变既有调用方行为。
+     * @details **自 P1（数据报边界推导）起为可选诊断项，不再影响收发正确性**：
+     *          - 发送：恒不补 Tail（TL V1.5 §4.3.2.1 允许单个 XCP 消息独占
+     *            Frame 时省略 Tail）；
+     *          - 接收：以 UDP 数据报边界为准推导末帧的 0..3 字节 FILL
+     *            （`DecodeEthernetDatagramByBoundary`）。
      *
-     *          需要 16/32-bit 对齐时，由 A2L 的 `PACKET_ALIGNMENT_16/32`
-     *          （经 A2L 桥接层的 `IfDataXcpTransport.packet_alignment`）或
-     *          调用方显式设置；**不得由传输层自行推断**。
+     *          因此 `PacketAlignment::Unknown` 不再让 `Open()` 失败；给出
+     *          8/16/32 时只用于一致性诊断——帧的 Tail 与预期不符会通过
+     *          `OnTransportWarning` 报告，但不中断会话。
      *
-     * @note `PacketAlignment::Unknown` 会让 `Open()` 直接失败：既无 A2L 证据
-     *       也无显式配置时，无法确定报文布局（方案 §1.9A.4）。
+     * @note 中间帧（同一数据报内串联多帧）仍要求 Tail 为 0：边界推导无法
+     *       得知中间帧该有多少 FILL，试探属于嗅探，故一律整体拒绝。
      */
     PacketAlignment packet_alignment = PacketAlignment::Bit8;
 };

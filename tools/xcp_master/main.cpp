@@ -55,6 +55,7 @@
 #include "libxcp/measurement/measurement_planner.hpp"
 #include "libxcp/measurement/measurement_session.hpp"
 #include "libxcp/log.hpp"
+#include "libxcp/tcp_framing_negotiation.hpp"
 #include "libxcp/tcp_transport.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "a2l/a2l_measurement_database.hpp"
@@ -180,7 +181,7 @@ void PrintUsage(std::ostream& out) {
     out << "Usage: xcp_master --a2l <path> --host <IPv4> --port <1..65535> "
            "[--module <name>] [--mode poll|daq] [--interval-ms <ms>]\n"
            "                  [--transport udp|tcp] [--tcp-profile "
-           "asam-v1.5|asam-v1.4] [--packet-alignment 8|16|32]\n"
+           "asam-v1.5|asam-v1.4|auto] [--packet-alignment 8|16|32]\n"
            "                  [--protocol-version 1.2|1.3|1.4|1.5] "
            "[--transport-version 1.4|1.5] [--preset xcplite]\n"
            "       xcp_master --help\n"
@@ -191,6 +192,12 @@ void PrintUsage(std::ostream& out) {
            "tcp: --tcp-profile is mandatory and never inferred from the A2L or "
            "from version numbers. asam-v1.5 additionally needs "
            "--packet-alignment (or an explicit A2L PACKET_ALIGNMENT_x).\n"
+           "tcp auto: --tcp-profile auto tries the fixed candidate ladder "
+           "asam-v1.4/8bit, asam-v1.5/8bit, asam-v1.5/16bit, "
+           "asam-v1.5/32bit, each on a NEW connection, and keeps the first "
+           "one that answers CONNECT sanely (at most 4 connections). It "
+           "conflicts with --packet-alignment, --preset xcplite and an "
+           "explicit --tcp-profile.\n"
            "--host/--port may be omitted for tcp when the A2L declares "
            "XCP_ON_TCP_IP.\n";
 }
@@ -268,13 +275,22 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
             options.transport_request.transport = *parsed;
             transport_explicit = true;
         } else if (key == "--tcp-profile") {
-            const auto parsed =
-                calmcar::xcp::tools::ParseTcpWireProfileText(value);
-            if (!parsed.has_value()) {
-                error = "--tcp-profile must be asam-v1.5 or asam-v1.4";
-                return std::nullopt;
+            // `auto` 是开关而非 Profile 值：它要求上层做连接级候选试连
+            // （tcp_framing_negotiation.hpp），而不是让传输层去猜。
+            if (value == "auto") {
+                options.transport_request.tcp_profile_auto = true;
+                options.transport_request.tcp_profile.reset();
+            } else {
+                const auto parsed =
+                    calmcar::xcp::tools::ParseTcpWireProfileText(value);
+                if (!parsed.has_value()) {
+                    error =
+                        "--tcp-profile must be asam-v1.5, asam-v1.4 or auto";
+                    return std::nullopt;
+                }
+                options.transport_request.tcp_profile = *parsed;
+                options.transport_request.tcp_profile_auto = false;
             }
-            options.transport_request.tcp_profile = *parsed;
         } else if (key == "--packet-alignment") {
             const auto parsed =
                 calmcar::xcp::tools::ParseAlignmentBitsText(value);
@@ -3624,7 +3640,82 @@ int main(int argc, char** argv) {
         // 按解析结果构造传输层；UDP/TCP 的差异只体现在这一处，
         // 其后的命令流、DAQ、标定路径完全共用。
         std::unique_ptr<calmcar::xcp::IXcpTransport> transport;
-        if (selection->transport == calmcar::xcp::tools::TransportKind::Tcp) {
+        // 注意：外层已有名为 options 的 CLI 参数指针，此处变量名须避让
+        calmcar::xcp::XcpMasterOptions master_options;
+        master_options.event_listener = &measurement_session;
+        // 规则 6：PL/TL 作为独立先验下发，绝不因 Profile 自动声称版本。
+        // P2 起这两个参数是**可选 override**：未给出时完全依赖运行时证据。
+        master_options.version_policy.protocol_version =
+            selection->protocol_version;
+        master_options.version_policy.transport_version =
+            selection->transport_version;
+        // A2L 的静态声明作为次一档证据（优先于 CONNECT 主版本、低于调用方
+        // 配置）。它只在对端不实现 GET_VERSION 时才真正改变裁决结果，作用是
+        // 避免退化成 `1.x-conservative` 而低估对端能力。
+        master_options.version_policy.a2l_protocol_version =
+            a2l_facts.protocol_version;
+        master_options.version_policy.a2l_transport_version =
+            a2l_facts.transport_version;
+
+        // `--tcp-profile auto`：按固定候选顺序逐个**新建连接**试连（P3）。
+        // 胜出者直接留用，不做二次连接——因此 master 统一用 unique_ptr 持有
+        // （XcpMaster 没有移动构造，无法先构造栈对象再转移）。
+        std::unique_ptr<calmcar::xcp::XcpMaster> master;
+        if (selection->transport == calmcar::xcp::tools::TransportKind::Tcp &&
+            selection->wire_profile_auto) {
+            std::uint8_t accepted_alignment_bits = 8U;
+            auto attempt = [&](const calmcar::xcp::TcpFramingCandidate& candidate,
+                               std::string* reason) -> bool {
+                calmcar::xcp::TcpTransportConfig tcp_config;
+                tcp_config.role = calmcar::xcp::TcpRole::Master;
+                tcp_config.remote_host = selection->host;
+                tcp_config.remote_port = selection->port;
+                tcp_config.packet_alignment = candidate.alignment;
+                tcp_config.wire_profile = candidate.profile;
+                auto candidate_master = std::make_unique<calmcar::xcp::XcpMaster>(
+                    std::make_unique<calmcar::xcp::TcpTransport>(tcp_config),
+                    master_options);
+                candidate_master->Connect();
+                // 域内校验（计划 §6.3）：帧能解析只说明长度自洽，还要证明
+                // 对端确实按 XCP 语义回答了 CONNECT——否则"能收包"会把完全
+                // 无关的服务端也判成成功。
+                const auto session =
+                    candidate_master->GetSessionParameters().connect;
+                if (session.max_cto < 8U) {
+                    *reason = "CONNECT 后的 MAX_CTO 小于 8";
+                    return false;
+                }
+                if (session.max_dto < 8U) {
+                    *reason = "CONNECT 后的 MAX_DTO 小于 8";
+                    return false;
+                }
+                if (session.protocol_layer_version != 1U) {
+                    *reason = "CONNECT 的 PL 主版本不是 1";
+                    return false;
+                }
+                if (session.transport_layer_version != 1U) {
+                    *reason = "CONNECT 的 TL 主版本不是 1";
+                    return false;
+                }
+                accepted_alignment_bits =
+                    static_cast<std::uint8_t>(candidate.alignment);
+                master = std::move(candidate_master);
+                return true;
+            };
+            const auto outcome = calmcar::xcp::NegotiateTcpFraming(
+                calmcar::xcp::DefaultFramingCandidates(), attempt);
+            std::cout << outcome.Summary() << '\n';
+            if (!outcome.selected.has_value() || !master) {
+                std::cerr << "TCP 帧布局自动协商失败：请用 --tcp-profile 显式指定"
+                          << '\n';
+                return 3;
+            }
+            // 胜出配置只用于日志与本地记录：selection 是 Result 视图，
+            // 不就地改写它（改写会让"解析结果"与"实际使用"两处不一致）。
+            options->transport_request.packet_alignment_bits =
+                accepted_alignment_bits;
+        } else if (selection->transport ==
+                   calmcar::xcp::tools::TransportKind::Tcp) {
             calmcar::xcp::TcpTransportConfig tcp_config;
             tcp_config.role = calmcar::xcp::TcpRole::Master;
             tcp_config.remote_host = selection->host;
@@ -3641,21 +3732,17 @@ int main(int argc, char** argv) {
             transport =
                 std::make_unique<calmcar::xcp::UdpTransport>(udp_config);
         }
-        // 注意：外层已有名为 options 的 CLI 参数指针，此处变量名须避让
-        calmcar::xcp::XcpMasterOptions master_options;
-        master_options.event_listener = &measurement_session;
-        // 规则 6：PL/TL 作为独立先验下发，绝不因 Profile 自动声称版本。
-        master_options.version_policy.protocol_version =
-            selection->protocol_version;
-        master_options.version_policy.transport_version =
-            selection->transport_version;
-        XcpMaster master(std::move(transport), master_options);
-        master.Connect();
-        measurement_session.Bind(master);
+        if (!master) {
+            // 非 auto 路径：用解析出的显式 Profile/对齐建一条连接
+            master = std::make_unique<calmcar::xcp::XcpMaster>(
+                std::move(transport), master_options);
+            master->Connect();
+        }
+        measurement_session.Bind(*master);
         {
             // 运行期版本证据：reported 与 effective 必须并排展示（§8.1）
-            const auto pl = master.GetProtocolVersionSnapshot();
-            const auto tl = master.GetTransportVersionSnapshot();
+            const auto pl = master->GetProtocolVersionSnapshot();
+            const auto tl = master->GetTransportVersionSnapshot();
             calmcar::xcp::tools::RuntimeVersionStatus version_status;
             version_status.pl_reported = pl.evidence.reported;
             version_status.pl_effective = pl.effective;
@@ -3671,7 +3758,7 @@ int main(int argc, char** argv) {
                              version_status)
                       << '\n';
             // 版本证据冲突不阻断，但必须可见；降级能力同理。
-            for (const auto& conflict : master.VersionConflicts()) {
+            for (const auto& conflict : master->VersionConflicts()) {
                 std::cout << "  · 版本证据冲突: " << conflict << '\n';
             }
         }
@@ -3692,11 +3779,11 @@ int main(int argc, char** argv) {
                     xcp_info->protocol_layer.optional_commands);
         }
         CliApp app(*options, *database, event_bound_database,
-                   measurement_session, master, std::move(event_metadata),
+                   measurement_session, *master, std::move(event_metadata),
                    calibration_page_facts);
         app.Run();
         if (measurement_session.Running()) measurement_session.Stop();
-        master.Disconnect();
+        master->Disconnect();
     } catch (const std::exception& e) {
         LIBXCP_LOG_ERROR("XCP master connection or run failed");
         std::cerr << "XCP 连接/运行失败: " << e.what() << '\n';

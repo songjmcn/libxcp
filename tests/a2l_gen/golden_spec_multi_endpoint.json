@@ -1,0 +1,70 @@
+{
+  "project": "XcpMultiEndpoint",
+  "project_desc": "multiple XCP_ON_TCP_IP / XCP_ON_UDP_IP instances (L-C, ABI v10)",
+  "modules": [
+    {
+      "name": "MULTI_EP",
+      "comment": "two TCP endpoints and two UDP endpoints",
+      "mod_common": true,
+      "mod_par": false,
+      "compu_methods": [
+        {
+          "name": "CM_IDENT",
+          "type": "IDENTICAL"
+        }
+      ],
+      "measurements": [
+        {
+          "name": "M_EP",
+          "desc": "symbol of multi endpoint module",
+          "datatype": "UWORD",
+          "compu": "CM_IDENT",
+          "address": "0x7000",
+          "ext": "0x0"
+        }
+      ],
+      "if_data": [
+        {
+          "protocol": "XCP",
+          "protocol_layer": {
+            "version": "0x104",
+            "max_cto": "0x10",
+            "max_dto": "0x20"
+          },
+          "tcp_endpoints": [
+            {
+              "port": "0x15B8",
+              "host": "ecu-a.local",
+              "address": "192.168.0.20",
+              "packet_alignment": "PACKET_ALIGNMENT_8",
+              "sub_commands": [
+                "GET_SLAVE_ID_EXTENDED"
+              ]
+            },
+            {
+              "port": "0x15B9",
+              "host": "ecu-b.local",
+              "address": "192.168.0.21",
+              "packet_alignment": "PACKET_ALIGNMENT_16",
+              "sub_commands": [
+                "GET_SLAVE_ID_EXTENDED",
+                "GET_DAQ_CLOCK_MULTICAST"
+              ]
+            }
+          ],
+          "udp_endpoints": [
+            {
+              "port": "0x15BA",
+              "address": "192.168.0.30"
+            },
+            {
+              "port": "0x15BB",
+              "address": "192.168.0.31",
+              "packet_alignment": "PACKET_ALIGNMENT_32"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

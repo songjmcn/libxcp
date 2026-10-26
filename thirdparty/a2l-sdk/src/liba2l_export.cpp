@@ -1283,18 +1283,28 @@ void DiffIfData(const IfDataXcpDto& plain, const IfDataXcpDto& plus,
     // 批次12（§6.3-A）：端点新增两项纳入同参数差异比对。文本按位宽呈现
     // （8/16/32），原始码 0/1/2 不直接示人；越界码显示 UNKNOWN。
     //
-    // 契约（B-T5 收口，明确边界）：本函数只报**数值**差异，绝不比对
-    // `endpoint_alignment_declared`。理由：XCP 侧显式 `PACKET_ALIGNMENT_8` 与
-    // XCPplus 侧未声明（默认 8）在数值上相同、语义上证据强度不同，
-    // 而 `XcpPlusConflict` 只有三个字符串字段，无法表达"值同、声明状态不同"，
-    // 硬塞只会伪造文本。声明状态由 `endpoint_alignment_declared` 独立承担，
-    // 消费方（如 `libxcp::a2l::TransportEndpoint::packet_alignment_declared`）
-    // 自行判别。
+    // 契约（历史遗漏项 L-B2 起）：数值差异由 `PACKET_ALIGNMENT` 一行承担；
+    // **数值相同时**，若两侧"是否显式声明 PACKET_ALIGNMENT"不一致，再单独追加
+    // 一行 `PACKET_ALIGNMENT_DECLARED`。后者的取值是"已声明 / 未声明"，不是
+    // 伪造成某个位宽——XCP 侧未声明表示"ECU 没给对齐证据"，XCPplus 侧显式 8 bit
+    // 表示"明确要求 8 bit"，两者数值相同但证据强度不同，漏报会让消费方误判。
+    // 之所以只在同值时报：值不同时数值行已足以说明差异，再报一行属于噪声。
     const auto align_name = [](std::uint8_t raw) -> std::string {
         return raw <= 2 ? std::to_string(8u << raw) : std::string("UNKNOWN");
     };
     AppendConflict("PACKET_ALIGNMENT", align_name(plain.endpoint_packet_alignment),
                    align_name(plus.endpoint_packet_alignment), out);
+    // 声明状态只在数值相同（即数值行不会触发）时才单独成行：见上方契约。
+    if (plain.endpoint_packet_alignment == plus.endpoint_packet_alignment &&
+        plain.endpoint_alignment_declared !=
+            plus.endpoint_alignment_declared) {
+        const auto declared_name = [](bool declared) -> std::string {
+            return declared ? std::string("已声明") : std::string("未声明");
+        };
+        AppendConflict("PACKET_ALIGNMENT_DECLARED",
+                       declared_name(plain.endpoint_alignment_declared),
+                       declared_name(plus.endpoint_alignment_declared), out);
+    }
     const auto subcmd_name = [](const std::vector<std::uint8_t>& cmds) {
         std::string s;
         for (const std::uint8_t c : cmds) {
@@ -1963,80 +1973,108 @@ private:
             dto->has_ecu_states = !pl->GetEcuStates().empty();
         }
         dto->transport = PickTransport(blk);
-        // ---- v9：统一端点字段（TCP 与 UDP 共用一套填充逻辑）----
+        // ---- v10（历史遗漏项 L-C）：逐实例、逐类别的端点列表 ----
         //
-        // 旧实现只处理 kUdpIp，TCP 端点因此没有任何专属字段（消费方只能去
-        // 读 `udp_host`/`udp_port` 拿 TCP 参数）。此处按 transport 类别取对应
-        // 上游列表，统一填 `endpoint_*`；UDP 额外把同样内容回填旧的 `udp_*`
-        // 以维持一个兼容周期。
+        // v9 只把**首个**实例摊平成 `endpoint_*`，且只导出 `transport` 选中的
+        // 那一个类别，于是两件事同时丢失：
+        //   1. 同类多实例——第二个端点的端口/主机/对齐/版本在 SDK 边界即消失，
+        //      消费方的"多实例 fail closed"因而永远看不到第二个实例；
+        //   2. 跨类并存——同一个 IF_DATA 里既有 XCP_ON_TCP_IP 又有 XCP_ON_UDP_IP
+        //      时，未选中那个类别的端点事实整类丢失（旧实现只看 `transport`）。
+        // v10 起 `endpoints` 收两类端点的全部实例，每个端点自带 `transport`
+        // 类别；旧 `endpoint_*` 继续镜像**首个**端点（也就是 v9 里 `transport`
+        // 选中的那一类），使既有消费方的行为逐位不变。
         //
-        // 端点级版本证据（endpoint_protocol_version）在此后统一填，因为它与
-        // 传输层类别无关。
-        if (dto->transport == XcpTransportDto::kUdpIp) {
-            const auto& udps = blk.GetXcpOnUdpIps();
-            if (!udps.empty()) {
-                // 批次12：首里程碑统一取"首个 XCPonUDP/IP 实例"
-                // （port/host/alignment/sub_cmds 同一实例，多实例建模延后，
-                //  见设计 §6.3；不得出现端口取 front 而子命令取全体的混合口径）
-                const a2l::xcp::XcpOnUdpIp& udp = udps.front();
-                dto->endpoint_instance_count =
-                    static_cast<std::uint32_t>(udps.size());
-                dto->endpoint_port = udp.GetPort();
-                dto->endpoint_host_name = udp.GetHostName();
-                dto->endpoint_ipv4_address = udp.GetAddress();
-                dto->endpoint_ipv6_address = udp.GetIpv6();
-                // 原码透传，不做 8/16/32 换算（换算归桥接层，§4.3）。
-                // declared 位来自上游新增的 IsAlignmentDeclared()：上游对
-                // 未识别字面量静默保持默认 8 bit(0)，故**只有**该标志能区分
-                // "A2L 未声明"（false）与"声明了 8bit 或声明了非法值"（true）。
-                dto->endpoint_packet_alignment =
-                    static_cast<std::uint8_t>(udp.GetPacketAlignment());
-                dto->endpoint_alignment_declared = udp.IsAlignmentDeclared();
-                for (const a2l::xcp::UdpSubCmd sc : udp.GetSubCmds()) {
-                    dto->endpoint_sub_commands.push_back(
-                        static_cast<std::uint8_t>(sc));
-                }
-                dto->endpoint_transport_version =
-                    static_cast<std::uint16_t>(udp.GetVersion());
+        // 上游两类端点的访问器签名一致（GetPort/GetHostName/GetAddress/
+        // GetIpv6/GetPacketAlignment/IsAlignmentDeclared/GetSubCmds/GetVersion），
+        // 仅子命令枚举类型不同，故用泛型 lambda 复用填充逻辑。
+        const auto fill_endpoint = [](IfDataXcpEndpointDto& target,
+                                      const auto& source,
+                                      XcpTransportDto transport) {
+            target.transport = transport;
+            target.port = source.GetPort();
+            target.host_name = source.GetHostName();
+            target.ipv4_address = source.GetAddress();
+            target.ipv6_address = source.GetIpv6();
+            // 原码透传，不做 8/16/32 换算（换算归桥接层，§4.3）。
+            target.packet_alignment =
+                static_cast<std::uint8_t>(source.GetPacketAlignment());
+            // 只有 `IsAlignmentDeclared()` 能区分"A2L 未声明"与"声明了 8bit"：
+            // 上游对未识别字面量静默保持默认值。
+            target.alignment_declared = source.IsAlignmentDeclared();
+            for (const auto sub_cmd : source.GetSubCmds()) {
+                target.sub_commands.push_back(
+                    static_cast<std::uint8_t>(sub_cmd));
+            }
+            target.transport_version =
+                static_cast<std::uint16_t>(source.GetVersion());
+        };
 
-                // 兼容周期：UDP 同时填旧字段（内容与 endpoint_* 一致）。
-                dto->udp_port = dto->endpoint_port;
-                dto->udp_host = udp.GetHostName();
-                if (dto->udp_host.empty()) {
-                    dto->udp_host = udp.GetAddress();
-                }
-                if (dto->udp_host.empty()) {
-                    dto->udp_host = udp.GetIpv6();
-                }
-                dto->udp_packet_alignment = dto->endpoint_packet_alignment;
-                dto->udp_sub_commands = dto->endpoint_sub_commands;
+        // 顺序约定：`transport` 选中的类别在前（保持 v9 下 endpoint_* 的取值），
+        // 另一类别随后；同类内部按 A2L 声明顺序。
+        const auto append_udp_endpoints = [&blk, &fill_endpoint, &dto]() {
+            for (const auto& udp : blk.GetXcpOnUdpIps()) {
+                IfDataXcpEndpointDto endpoint;
+                fill_endpoint(endpoint, udp, XcpTransportDto::kUdpIp);
+                dto->endpoints.push_back(std::move(endpoint));
             }
-        } else if (dto->transport == XcpTransportDto::kTcpIp) {
-            const auto& tcps = blk.GetXcpOnTcpIps();
-            if (!tcps.empty()) {
-                const a2l::xcp::XcpOnTcpIp& tcp = tcps.front();
-                dto->endpoint_instance_count =
-                    static_cast<std::uint32_t>(tcps.size());
-                dto->endpoint_port = tcp.GetPort();
-                dto->endpoint_host_name = tcp.GetHostName();
-                dto->endpoint_ipv4_address = tcp.GetAddress();
-                dto->endpoint_ipv6_address = tcp.GetIpv6();
-                dto->endpoint_packet_alignment =
-                    static_cast<std::uint8_t>(tcp.GetPacketAlignment());
-                dto->endpoint_alignment_declared = tcp.IsAlignmentDeclared();
-                for (const a2l::xcp::TcpSubCmd sc : tcp.GetSubCmds()) {
-                    dto->endpoint_sub_commands.push_back(
-                        static_cast<std::uint8_t>(sc));
-                }
-                dto->endpoint_transport_version =
-                    static_cast<std::uint16_t>(tcp.GetVersion());
-                // TCP **不**填旧 udp_* 字段：那正是本次要修掉的"TCP 端点
-                // 借 UDP 字段对外表达"的错位。
+        };
+        const auto append_tcp_endpoints = [&blk, &fill_endpoint, &dto]() {
+            for (const auto& tcp : blk.GetXcpOnTcpIps()) {
+                IfDataXcpEndpointDto endpoint;
+                fill_endpoint(endpoint, tcp, XcpTransportDto::kTcpIp);
+                dto->endpoints.push_back(std::move(endpoint));
             }
+        };
+        if (dto->transport == XcpTransportDto::kTcpIp) {
+            append_tcp_endpoints();
+            append_udp_endpoints();
+        } else {
+            append_udp_endpoints();
+            append_tcp_endpoints();
+        }
+
+        // 兼容周期：旧 `udp_*` 在存在 UDP 端点时仍填写，内容取**首个 UDP**
+        // 端点（v9 时 UDP 与 TCP 不同时存在，故与旧行为一致）。
+        for (const auto& endpoint : dto->endpoints) {
+            if (endpoint.transport != XcpTransportDto::kUdpIp) {
+                continue;
+            }
+            dto->udp_port = endpoint.port;
+            // 旧字段只有一个 host 字符串，按 主机名 → IPv4 → IPv6 回退，
+            // 与 v9 的取值口径一致。
+            dto->udp_host = endpoint.host_name;
+            if (dto->udp_host.empty()) {
+                dto->udp_host = endpoint.ipv4_address;
+            }
+            if (dto->udp_host.empty()) {
+                dto->udp_host = endpoint.ipv6_address;
+            }
+            dto->udp_packet_alignment = endpoint.packet_alignment;
+            dto->udp_sub_commands = endpoint.sub_commands;
+            break;
+        }
+
+        // 旧 `endpoint_*` 一律镜像首个端点（保持 v9 语义，兼容一个周期）。
+        if (!dto->endpoints.empty()) {
+            const IfDataXcpEndpointDto& first = dto->endpoints.front();
+            dto->endpoint_instance_count =
+                static_cast<std::uint32_t>(dto->endpoints.size());
+            dto->endpoint_port = first.port;
+            dto->endpoint_host_name = first.host_name;
+            dto->endpoint_ipv4_address = first.ipv4_address;
+            dto->endpoint_ipv6_address = first.ipv6_address;
+            dto->endpoint_packet_alignment = first.packet_alignment;
+            dto->endpoint_alignment_declared = first.alignment_declared;
+            dto->endpoint_sub_commands = first.sub_commands;
+            dto->endpoint_transport_version = first.transport_version;
         }
 
         // 端点级版本冗余：无论哪类传输层，都把协议层版本同步一份到端点字段。
         dto->endpoint_protocol_version = dto->protocol_version;
+        for (auto& endpoint : dto->endpoints) {
+            endpoint.protocol_version = dto->protocol_version;
+        }
 
         if (const auto* dq = cp.GetDaq(); dq != nullptr) {
             // DAQ 能力块 + 事件通道（批次10）

@@ -16,7 +16,13 @@
 
 1. 保持 B-T1～B-T5 五批结构；
 2. 同时支持显式 `AsamV15` 与 `AsamV14` TCP Wire Profile，优先保证 `thirdparty/XCPliteV1.2` 互操作；
-3. Profile 必须显式选择；禁止自动探测、按首帧猜测、超时窥探或静默回退；
+3. Profile 必须显式选择；禁止**连接内**自动探测、按首帧猜测、超时窥探或静默回退。
+   > **P3 阶段的措辞收窄**（2026-10-25）：本条禁止的是"同一条连接内按字节内容猜测"，
+   > 不禁止**连接级**候选试连。经批准新增的自动模式 `--tcp-profile auto` 会按固定阶梯
+   > （`AsamV14/8bit → AsamV15/8bit → AsamV15/16bit → AsamV15/32bit`）为每个候选**新建**
+   > 连接试一次，失败即断开，绝不污染已有流；该模式必须由调用方显式开启。
+   > 详见 `code-plan/传输帧布局自动协商_实施计划.md` 与
+   > `code-plan/传输帧布局自动协商_实施记录_P1至P3.md`。
 4. Frame Header codec 由 UDP/TCP 共享，TCP stream framing 按 Profile 分离；
 5. 本期包含 Master TCP 客户端、测试 TCP Slave、CLI 和真实 XCPlite 互操作；
 6. 不做自动重连或 RESUME；

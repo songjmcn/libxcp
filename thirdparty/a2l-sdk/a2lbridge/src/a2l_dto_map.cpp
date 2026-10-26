@@ -4,6 +4,8 @@
 
 #include "a2l_dto_map.hpp"
 
+#include <algorithm>
+#include <optional>
 #include <utility>
 
 namespace calmcar::xcp::a2l::detail {
@@ -478,46 +480,112 @@ void ConvertIfDataXcp(const liba2l::IfDataXcpDto& dto, ProtocolLayerInfo* layer,
                 ep.kind = TransportEndpoint::Kind::UdpIp;
                 break;
         }
-        // v9（批次 B-T4）：端点事实统一从 `endpoint_*` 读取。
-        // 此前这里无条件读 `dto.udp_host/udp_port`，对所有传输层类别都赋值，
-        // 导致 TCP 端点的主机/端口只能借 UDP 命名的字段对外表达（语义错位）。
-        // 现在 UDP 与 TCP 由 SDK 各自填好同一套 `endpoint_*`，桥接层不再关心
-        // 传输层类别即可取到正确端点。`udp_*` 已 deprecated，此处不再引用。
+        // v10（历史遗漏项 L-C）：端点事实以 `endpoints` 列表为准，逐个展开；
+        // 列表为空时回退到 v9 的摊平字段，保证旧版 SDK 仍可用。
+        //
+        // 每个端点自带 `transport` 类别，因此同一份 A2L 里 UDP 与 TCP 端点可以
+        // 同时出现在 `transports` 里（v9 只发布 `dto.transport` 选中的那一类）。
         //
         // 取值优先级：HOST_NAME 优先，回退 ADDRESS，再回退 IPV6
         // （Vector 工具链事实约定：运行时生成器常只写 `ADDRESS "IP"`，
         //  此时 HOST_NAME 为空，必须回退，否则端点主机恒空）。
-        ep.remote_host = dto.endpoint_host_name;
-        if (ep.remote_host.empty()) {
-            ep.remote_host = dto.endpoint_ipv4_address;
+        const auto fill_endpoint = [](TransportEndpoint& ep,
+                                      const liba2l::IfDataXcpEndpointDto& src,
+                                      std::uint32_t instance_count) {
+            ep.remote_host = src.host_name;
+            if (ep.remote_host.empty()) {
+                ep.remote_host = src.ipv4_address;
+            }
+            if (ep.remote_host.empty()) {
+                ep.remote_host = src.ipv6_address;
+            }
+            ep.remote_port = src.port;
+            // Transport Layer 版本（不是 PROTOCOL_LAYER 的版本）：
+            // 0 仍表示「A2L 未声明该段版本」。
+            ep.version = src.transport_version;
+            // alignment / 子命令对 XCPonTCP/IP 与 XCPonUDP/IP 均有意义
+            // （规范 ASAM AE MCD-1 XCP on Ethernet 两类传输层都定义
+            //  PACKET_ALIGNMENT 与 OPTIONAL_TL_SUBCMD）。CAN/FLX/USB/SXI
+            // 不取这两个字段，保持默认值，不臆造。
+            if (ep.kind == TransportEndpoint::Kind::UdpIp ||
+                ep.kind == TransportEndpoint::Kind::TcpIp) {
+                // 上游原码 0/1/2 = 8/16/32 bit；>2 判为未知 → 0（防御分支，
+                // 上游枚举实际只会给 0/1/2）。
+                ep.packet_alignment =
+                    src.packet_alignment <= 2
+                        ? static_cast<std::uint8_t>(8u << src.packet_alignment)
+                        : 0;
+                // alignment 声明位：false 表示 A2L 未写 PACKET_ALIGNMENT，
+                // 此时上面的 packet_alignment 只是 AML 默认值（8 bit），
+                // **不构成** ECU 实际对齐的事实，消费方不得据此推断 Profile。
+                ep.packet_alignment_declared = src.alignment_declared;
+                ep.sub_commands = src.sub_commands;
+                ep.instance_count = instance_count;
+            }
+        };
+
+        // 端点类别到桥接层 Kind 的映射（不含 kNone）。
+        const auto kind_of = [](liba2l::XcpTransportDto transport)
+            -> std::optional<TransportEndpoint::Kind> {
+            switch (transport) {
+                case liba2l::XcpTransportDto::kCan:
+                    return TransportEndpoint::Kind::Can;
+                case liba2l::XcpTransportDto::kFlx:
+                    return TransportEndpoint::Kind::Flx;
+                case liba2l::XcpTransportDto::kUsb:
+                    return TransportEndpoint::Kind::Usb;
+                case liba2l::XcpTransportDto::kSxi:
+                    return TransportEndpoint::Kind::Sxi;
+                case liba2l::XcpTransportDto::kTcpIp:
+                    return TransportEndpoint::Kind::TcpIp;
+                case liba2l::XcpTransportDto::kUdpIp:
+                    return TransportEndpoint::Kind::UdpIp;
+                default:
+                    return std::nullopt;
+            }
+        };
+
+        if (!dto.endpoints.empty()) {
+            // 每个端点报"同类共有几个"，消费方据此判定是否存在多实例歧义。
+            for (const auto& source : dto.endpoints) {
+                const auto kind = kind_of(source.transport);
+                if (!kind.has_value()) {
+                    continue;  // 未知类别不臆造
+                }
+                const auto instance_count = static_cast<std::uint32_t>(
+                    std::count_if(dto.endpoints.begin(), dto.endpoints.end(),
+                                  [&source](const auto& other) {
+                                      return other.transport == source.transport;
+                                  }));
+                TransportEndpoint mapped;
+                mapped.kind = *kind;
+                fill_endpoint(mapped, source, instance_count);
+                transports->push_back(std::move(mapped));
+            }
+        } else {
+            // 兼容路径（v9 数据形态）：只有摊平字段可用。
+            ep.remote_host = dto.endpoint_host_name;
+            if (ep.remote_host.empty()) {
+                ep.remote_host = dto.endpoint_ipv4_address;
+            }
+            if (ep.remote_host.empty()) {
+                ep.remote_host = dto.endpoint_ipv6_address;
+            }
+            ep.remote_port = dto.endpoint_port;
+            ep.version = dto.endpoint_transport_version;
+            if (ep.kind == TransportEndpoint::Kind::UdpIp ||
+                ep.kind == TransportEndpoint::Kind::TcpIp) {
+                ep.packet_alignment =
+                    dto.endpoint_packet_alignment <= 2
+                        ? static_cast<std::uint8_t>(
+                              8u << dto.endpoint_packet_alignment)
+                        : 0;
+                ep.packet_alignment_declared = dto.endpoint_alignment_declared;
+                ep.sub_commands = dto.endpoint_sub_commands;
+                ep.instance_count = dto.endpoint_instance_count;
+            }
+            transports->push_back(std::move(ep));
         }
-        if (ep.remote_host.empty()) {
-            ep.remote_host = dto.endpoint_ipv6_address;
-        }
-        ep.remote_port = dto.endpoint_port;
-        // Transport Layer 版本（不是 PROTOCOL_LAYER 的版本）：v9 起上游
-        // 提供了独立字段，0 仍表示「A2L 未声明该段版本」。
-        ep.version = dto.endpoint_transport_version;
-        // alignment / 子命令对 XCPonTCP/IP 与 XCPonUDP/IP 均有意义
-        // （规范 ASAM AE MCD-1 XCP on Ethernet 两类传输层都定义
-        //  PACKET_ALIGNMENT 与 OPTIONAL_TL_SUBCMD）。CAN/FLX/USB/SXI
-        // 不取这两个字段，保持默认值，不臆造。
-        if (ep.kind == TransportEndpoint::Kind::UdpIp ||
-            ep.kind == TransportEndpoint::Kind::TcpIp) {
-            // 上游原码 0/1/2 = 8/16/32 bit；>2 判为未知 → 0（防御分支，
-            // 上游枚举实际只会给 0/1/2）。
-            ep.packet_alignment =
-                dto.endpoint_packet_alignment <= 2
-                    ? static_cast<std::uint8_t>(8u << dto.endpoint_packet_alignment)
-                    : 0;
-            // alignment 声明位：false 表示 A2L 未写 PACKET_ALIGNMENT，
-            // 此时上面的 packet_alignment 只是 AML 默认值（8 bit），
-            // **不构成** ECU 实际对齐的事实，消费方不得据此推断 Profile。
-            ep.packet_alignment_declared = dto.endpoint_alignment_declared;
-            ep.sub_commands = dto.endpoint_sub_commands;
-            ep.instance_count = dto.endpoint_instance_count;
-        }
-        transports->push_back(std::move(ep));
     }
 }
 

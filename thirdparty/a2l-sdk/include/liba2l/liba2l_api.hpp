@@ -67,8 +67,16 @@ namespace liba2l {
 //     旧的 `udp_*` 字段**保留**一个兼容周期（deprecated，本期不删除）：
 //     UdpIp 同时填新旧两套，TcpIp **只**填新字段，从而不再把 TCP 端点塞进
 //     `udp_host`/`udp_port`（原桥接层无条件把 udp_* 赋给所有传输层类别）。
+// v10（历史遗漏项 L-C）：多实例端点真正进入数据模型。v9 的 `endpoint_*` 只
+//     承载**首个**实例，`endpoint_instance_count` 只能报数量、拿不到第二个
+//     实例的事实，消费方的"多实例 fail closed"因此永远无法被触发。v10 新增
+//     `std::vector<IfDataXcpEndpointDto> IfDataXcpDto::endpoints`（按 A2L 声明
+//     顺序逐实例展开），旧的 `endpoint_*` 继续镜像 `endpoints.front()`，故
+//     既有消费方的行为逐位不变；`endpoint_*` 与 `udp_*` 一并标记 deprecated。
+//     ABI 号提升的实质原因是 `IfDataXcpDto` 增加了 `std::vector` 成员（布局
+//     变化），而非取值语义变化。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 9u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 10u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -400,6 +408,47 @@ struct XcpPlusConflictDto {
 };
 
 /**
+ * @brief 单个传输层端点的完整事实（v10 起逐实例给出）
+ *
+ * @details v9 只有把首个实例摊平到 `IfDataXcpDto::endpoint_*` 的一套字段，
+ *          多实例时第二个端点的事实（端口/主机/对齐/版本）在 SDK 边界即
+ *          丢失。本结构是那些字段的"可重复版本"：`IfDataXcpDto::endpoints`
+ *          按 A2L 声明顺序装 N 个，`endpoint_*` 仍镜像第一个。
+ */
+struct IfDataXcpEndpointDto {
+    /// @brief 该端点所属的传输层类别（每个端点自带，故同一向量可混合）
+    /// @details v10 起 `IfDataXcpDto::endpoints` 会同时给出 UDP 与 TCP 端点：
+    ///          同一个 IF_DATA 块里两种传输层可以并存，若端点不自带类别，
+    ///          消费方只能靠"整块的 transport 字段"猜测，多类别时会错判。
+    XcpTransportDto transport = XcpTransportDto::kNone;
+    /// @brief 端点端口（`XCP_ON_TCP_IP`/`XCP_ON_UDP_IP` 的第二个参数）
+    std::uint16_t port = 0;
+    /// @brief 主机名（`HOST_NAME` 原值；可空）
+    std::string host_name;
+    /// @brief IPv4 地址（`ADDRESS` 原值；可空）
+    std::string ipv4_address;
+    /// @brief IPv6 地址（`IPV6` 原值；可空）
+    std::string ipv6_address;
+    /// @brief `PACKET_ALIGNMENT` 上游**原始码**（0/1/2 = 8/16/32 bit）
+    /// @details 与 `IfDataXcpDto::endpoint_packet_alignment` 同口径：原码透传，
+    ///          位宽换算归桥接层；必须配合 `alignment_declared` 使用。
+    std::uint8_t packet_alignment = 0;
+    /// @brief A2L 是否**显式声明**了 `PACKET_ALIGNMENT`
+    /// @details 为 false 时，`packet_alignment` 只是 AML 默认值，不是证据；
+    ///          消费方不得据此推断 Wire Profile。
+    bool alignment_declared = false;
+    /// @brief `OPTIONAL_TL_SUBCMD` 声明的子命令码（上游已识别项）
+    /// @details 空列表不代表 A2L 未声明：上游对未识别名静默丢弃。
+    std::vector<std::uint8_t> sub_commands;
+    /// @brief 端点所在 IF_DATA 块声明的 `PROTOCOL_LAYER VERSION`（0=未声明）
+    std::uint16_t protocol_version = 0;
+    /// @brief 传输层段自身版本号（`XCP_ON_*` 块首字段；0=未声明）
+    /// @details 这是 Transport Layer 版本，与 `protocol_version`（Protocol
+    ///          Layer）是两个独立事实，不得互相冒充。
+    std::uint16_t transport_version = 0;
+};
+
+/**
  * @brief IF_DATA XCP 公共参数快照（§6.3-A 优先级：XCPplus > XCP）。
  */
 struct IfDataXcpDto {
@@ -438,7 +487,18 @@ struct IfDataXcpDto {
     ///          故本列表只含上游已识别项，空不代表 A2L 未声明。
     std::vector<std::uint8_t> udp_sub_commands;
 
-    // ---- v9：统一端点事实（XCPonTCP/IP 与 XCPonUDP/IP 共用一套字段）----
+    // ---- v10：逐实例端点列表（多实例的权威来源）----
+    /// @brief 该类传输层的**全部**端点实例，按 A2L 声明顺序
+    /// @details v10 起这是端点事实的权威来源：长度即实例数（等价于
+    ///          `endpoint_instance_count`）。下游 `endpoint_*` 一组字段只是
+    ///          `endpoints.front()` 的镜像（兼容 v9 消费方），**多实例场景
+    ///          必须读本列表**，否则会漏掉第二及以后的实例。
+    std::vector<IfDataXcpEndpointDto> endpoints;
+
+    // ---- v9（自 v10 起 deprecated）：首个实例的摊平视图 ----
+    //
+    // 下面这组 `endpoint_*` 字段一律等于 `endpoints.front()` 的对应项，
+    // 仅为兼容尚未迁移的消费方而保留；新代码请直接遍历 `endpoints`。
     //
     // 设计意图（批次 B-T4）：此前 TCP 端点无任何专属字段，`transport` 虽能
     // 报出 kTcpIp，但端口/主机/对齐/子命令全部落在 `udp_*` 名下，消费方只能
