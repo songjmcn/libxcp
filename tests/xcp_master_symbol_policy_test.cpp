@@ -19,10 +19,13 @@ using calmcar::xcp::a2l::SymbolKind;
 using calmcar::xcp::a2l::XcpPageWriteAccess;
 using calmcar::xcp::tools::CalibrationPageWriteUnsupportedReason;
 using calmcar::xcp::tools::CurvePointWriteUnsupportedReason;
+using calmcar::xcp::tools::DaqEventSource;
+using calmcar::xcp::tools::DaqEventSourceName;
 using calmcar::xcp::tools::ElementRangeLayoutUnsupportedReason;
 using calmcar::xcp::tools::MakeElementPageRange;
 using calmcar::xcp::tools::NextElementPageStart;
 using calmcar::xcp::tools::ParseElementIndex;
+using calmcar::xcp::tools::ResolveDaqEventCandidate;
 using calmcar::xcp::tools::SymbolDaqObservationUnsupportedReason;
 using calmcar::xcp::tools::SymbolDetailReadUnsupportedReason;
 using calmcar::xcp::tools::SymbolReadUnsupportedReason;
@@ -93,30 +96,183 @@ TEST(XcpMasterSymbolPolicyTest, DaqRejectsCalibrationAndGenericArrays) {
               std::string::npos);
 }
 
-/// @brief DAQ必须具有唯一固定事件，且A2L中存在对应事件频道。
-TEST(XcpMasterSymbolPolicyTest, DaqRequiresUniqueKnownFixedEvent) {
-    const std::vector<std::uint16_t> event_channels{3};
+/// @brief 造一个可通过读准入的标量 MEASUREMENT，供事件来源用例复用。
+static SymbolInfo MakeMeasuredScalar() {
     SymbolInfo symbol;
     symbol.kind = SymbolKind::Measurement;
     symbol.element_size_bytes = 4;
+    return symbol;
+}
+
+/// @brief 规则 1：fixed 唯一时优先采用 fixed，即使 default 也声明了。
+TEST(XcpMasterSymbolPolicyTest, DaqPrefersUniqueFixedEvent) {
+    const std::vector<std::uint16_t> channels{3, 4};
+    auto symbol = MakeMeasuredScalar();
+    symbol.daq_event_fixed = {3};
+    symbol.daq_event_default = {4};
+
+    EXPECT_TRUE(SymbolDaqObservationUnsupportedReason(symbol, channels).empty());
+    const auto candidate = ResolveDaqEventCandidate(symbol);
+    EXPECT_EQ(candidate.source, DaqEventSource::Fixed);
+    EXPECT_EQ(candidate.channels, (std::vector<std::uint16_t>{3}));
+    EXPECT_TRUE(candidate.error.empty());
+    EXPECT_STREQ(DaqEventSourceName(candidate.source), "fixed");
+}
+
+/// @brief 规则 3：fixed 为空时退到唯一 default（这是本方案的核心行为变更）。
+TEST(XcpMasterSymbolPolicyTest, DaqFallsBackToUniqueDefaultEvent) {
+    const std::vector<std::uint16_t> channels{3};
+    auto symbol = MakeMeasuredScalar();
     symbol.daq_event_default = {3};
-    EXPECT_NE(SymbolDaqObservationUnsupportedReason(symbol, event_channels)
-                  .find("FIXED_EVENT_LIST"),
-              std::string::npos);
+
+    EXPECT_TRUE(SymbolDaqObservationUnsupportedReason(symbol, channels).empty());
+    const auto candidate = ResolveDaqEventCandidate(symbol);
+    EXPECT_EQ(candidate.source, DaqEventSource::Default);
+    EXPECT_EQ(candidate.channels, (std::vector<std::uint16_t>{3}));
+    EXPECT_STREQ(DaqEventSourceName(candidate.source), "default");
+}
+
+/// @brief 规则 2：fixed 多值必须拒绝，且不得退回 default（规则 2 优先于 3）。
+TEST(XcpMasterSymbolPolicyTest, DaqRejectsAmbiguousFixedEvents) {
+    const std::vector<std::uint16_t> channels{3, 4};
+    auto symbol = MakeMeasuredScalar();
     symbol.daq_event_fixed = {3, 4};
-    EXPECT_NE(SymbolDaqObservationUnsupportedReason(symbol, event_channels)
-                  .find("FIXED_EVENT_LIST"),
-              std::string::npos);
-    symbol.daq_event_fixed = {4};
-    EXPECT_NE(SymbolDaqObservationUnsupportedReason(symbol, event_channels)
+    symbol.daq_event_default = {3};
+
+    const auto reason =
+        SymbolDaqObservationUnsupportedReason(symbol, channels);
+    EXPECT_NE(reason.find("FIXED_EVENT_LIST"), std::string::npos);
+    EXPECT_NE(reason.find("多个"), std::string::npos);
+    const auto candidate = ResolveDaqEventCandidate(symbol);
+    EXPECT_EQ(candidate.source, DaqEventSource::None);
+    EXPECT_TRUE(candidate.channels.empty());
+    EXPECT_FALSE(candidate.error.empty());
+}
+
+/// @brief 规则 4：default 多值同样拒绝（不猜）。
+TEST(XcpMasterSymbolPolicyTest, DaqRejectsAmbiguousDefaultEvents) {
+    const std::vector<std::uint16_t> channels{3, 4};
+    auto symbol = MakeMeasuredScalar();
+    symbol.daq_event_default = {3, 4};
+
+    const auto reason =
+        SymbolDaqObservationUnsupportedReason(symbol, channels);
+    EXPECT_NE(reason.find("DEFAULT_EVENT_LIST"), std::string::npos);
+    EXPECT_NE(reason.find("多个"), std::string::npos);
+    EXPECT_TRUE(ResolveDaqEventCandidate(symbol).channels.empty());
+}
+
+/// @brief 规则 5c：三张表皆空 → 拒绝，原因里三张表名都要出现（便于现场自查）。
+TEST(XcpMasterSymbolPolicyTest, DaqRejectsWhenNoEventDeclared) {
+    const std::vector<std::uint16_t> channels{3};
+    const auto symbol = MakeMeasuredScalar();
+
+    const auto reason =
+        SymbolDaqObservationUnsupportedReason(symbol, channels);
+    EXPECT_NE(reason.find("FIXED_EVENT_LIST"), std::string::npos);
+    EXPECT_NE(reason.find("DEFAULT_EVENT_LIST"), std::string::npos);
+    EXPECT_NE(reason.find("CONSISTENCY_EVENT_LIST"), std::string::npos);
+    EXPECT_NE(reason.find("POLL"), std::string::npos);
+}
+
+/// @brief 从站未上报该事件通道时仍要拒绝（运行期 EVENT_CHANNEL 元数据缺失）。
+TEST(XcpMasterSymbolPolicyTest, DaqRejectsEventOutsideEventChannelList) {
+    const std::vector<std::uint16_t> channels{3};
+    auto symbol = MakeMeasuredScalar();
+    symbol.daq_event_fixed = {9};
+
+    // 候选本身合格（A2L 侧无矛盾），失败发生在运行期通道表核对。
+    EXPECT_TRUE(ResolveDaqEventCandidate(symbol).error.empty());
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(symbol, channels)
                   .find("EVENT_CHANNEL"),
               std::string::npos);
+}
+
+/// @brief 同一事件号重复声明只计一个（沿用既有去重口径）。
+TEST(XcpMasterSymbolPolicyTest, ResolveDaqEventCandidateDeduplicates) {
+    auto symbol = MakeMeasuredScalar();
     symbol.daq_event_fixed = {3, 3};
-    EXPECT_TRUE(
-        SymbolDaqObservationUnsupportedReason(symbol, event_channels).empty());
+
+    const auto candidate = ResolveDaqEventCandidate(symbol);
+    EXPECT_EQ(candidate.source, DaqEventSource::Fixed);
+    EXPECT_EQ(candidate.channels, (std::vector<std::uint16_t>{3}));
+}
+
+/// @brief 规则 5：无 default 时按规范用 consistency 兜底。
+TEST(XcpMasterSymbolPolicyTest, DaqFallsBackToConsistencyWhenDefaultAbsent) {
+    const std::vector<std::uint16_t> channels{2};
+    auto symbol = MakeMeasuredScalar();
+    symbol.daq_consistency_event = {2};
+
+    EXPECT_TRUE(SymbolDaqObservationUnsupportedReason(symbol, channels).empty());
+    const auto candidate = ResolveDaqEventCandidate(symbol);
+    EXPECT_EQ(candidate.source, DaqEventSource::Consistency);
+    EXPECT_EQ(candidate.channels, (std::vector<std::uint16_t>{2}));
+    EXPECT_STREQ(DaqEventSourceName(candidate.source), "consistency");
+}
+
+/// @brief 规则 5b：consistency 多值同样无法唯一确定。
+TEST(XcpMasterSymbolPolicyTest, DaqRejectsAmbiguousConsistencyEvents) {
+    const std::vector<std::uint16_t> channels{2, 3};
+    auto symbol = MakeMeasuredScalar();
+    symbol.daq_consistency_event = {2, 3};
+
+    const auto reason =
+        SymbolDaqObservationUnsupportedReason(symbol, channels);
+    EXPECT_NE(reason.find("CONSISTENCY_EVENT_LIST"), std::string::npos);
+    EXPECT_NE(reason.find("多个"), std::string::npos);
+}
+
+/// @brief 规则 0：default 越出 available 视为 A2L 自相矛盾。
+TEST(XcpMasterSymbolPolicyTest, DaqRejectsDefaultOutsideAvailable) {
+    const std::vector<std::uint16_t> channels{4};
+    auto symbol = MakeMeasuredScalar();
+    symbol.daq_event_default = {4};
+    symbol.daq_event_available = {3};
+
+    const auto reason =
+        SymbolDaqObservationUnsupportedReason(symbol, channels);
+    EXPECT_NE(reason.find("自相矛盾"), std::string::npos);
+    EXPECT_NE(reason.find("DEFAULT_EVENT_LIST"), std::string::npos);
+}
+
+/// @brief 规则 0：consistency 越出 available 同样自相矛盾。
+TEST(XcpMasterSymbolPolicyTest, DaqRejectsConsistencyOutsideAvailable) {
+    const std::vector<std::uint16_t> channels{4};
+    auto symbol = MakeMeasuredScalar();
+    symbol.daq_consistency_event = {4};
+    symbol.daq_event_available = {3};
+
+    EXPECT_NE(SymbolDaqObservationUnsupportedReason(symbol, channels)
+                  .find("自相矛盾"),
+              std::string::npos);
+}
+
+/// @brief 规则 0 放行：default 是 available 的子集时合格。
+TEST(XcpMasterSymbolPolicyTest, DaqAcceptsDefaultSubsetOfAvailable) {
+    const std::vector<std::uint16_t> channels{3, 4};
+    auto symbol = MakeMeasuredScalar();
+    symbol.daq_event_default = {3};
+    symbol.daq_event_available = {3, 4};
+
+    EXPECT_TRUE(SymbolDaqObservationUnsupportedReason(symbol, channels).empty());
+    EXPECT_EQ(ResolveDaqEventCandidate(symbol).source, DaqEventSource::Default);
+}
+
+/// @brief 规则 0 无条件生效：即使 fixed 唯一（本次决策不需要 default），
+///        只要 default 越出 available 仍拒绝 —— 基于自相矛盾的 A2L 做出的
+///        任何事件选择都不可信，与多实例 fail closed 同源。
+TEST(XcpMasterSymbolPolicyTest, RejectsInconsistentA2lEvenWhenFixedIsUnique) {
+    const std::vector<std::uint16_t> channels{3};
+    auto symbol = MakeMeasuredScalar();
     symbol.daq_event_fixed = {3};
-    EXPECT_TRUE(
-        SymbolDaqObservationUnsupportedReason(symbol, event_channels).empty());
+    symbol.daq_event_default = {9};
+    symbol.daq_event_available = {3};
+
+    const auto reason =
+        SymbolDaqObservationUnsupportedReason(symbol, channels);
+    EXPECT_NE(reason.find("自相矛盾"), std::string::npos);
+    EXPECT_EQ(ResolveDaqEventCandidate(symbol).source, DaqEventSource::None);
 }
 
 TEST(XcpMasterSymbolPolicyTest, RejectsReadOnlyAndNonValueCharacteristics) {

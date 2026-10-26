@@ -722,9 +722,15 @@ SymbolDto BuildMeasurementSymbol(const a2l::Measurement& m,
             const auto& fixed = event->GetFixedEventList();
             const auto& defaults = event->GetDefaultEventList();
             const auto& available = event->GetAvailableEventList();
+            const auto& consistency = event->GetConsistencyEventList();
             s.daq_event_fixed.assign(fixed.begin(), fixed.end());
             s.daq_event_default.assign(defaults.begin(), defaults.end());
             s.daq_event_available.assign(available.begin(), available.end());
+            // v11：CONSISTENCY 单列一表（XCP §4.1.5 规定无 DEFAULT 时作默认分配），
+            // 不与 default 合并——合并会让"未声明 default"和"声明了同号 default"
+            // 两种 A2L 在 DTO 里无法区分。
+            s.daq_consistency_event.assign(consistency.begin(),
+                                           consistency.end());
         }
     }
     return s;
@@ -850,6 +856,34 @@ SymbolDto BuildCharacteristicSymbol(const a2l::Characteristic& c,
     s.compu_method_name = c.Conversion();
     s.conversion =
         BuildConversion(module.GetCompuMethod(c.Conversion()), module);
+    // v11：CHARACTERISTIC 此前**完全不导出** DAQ_EVENT（本函数直接 return），
+    // 于是任何带 IF_DATA XCP DAQ_EVENT 的 CHARACTERISTIC 在 DTO 里都显示
+    // "未声明事件"。这里按 MEASUREMENT 的同一口径补齐四张表（有效 XCPplus
+    // IF_DATA 优先、无效/缺失回退 plain XCP）。行为中性：CHARACTERISTIC 能否
+    // 进入 DAQ 由上层策略决定（symbol_policy.hpp 只接受 MEASUREMENT）。
+    {
+        const a2l::xcp::XcpDataBlock* plus = c.GetXcpPlusDataBlock();
+        const a2l::xcp::XcpDataBlock* plain = c.GetXcpDataBlock();
+        const a2l::xcp::XcpDataBlock* block =
+            plus != nullptr && plus->IsOk() ? plus
+            : plain != nullptr && plain->IsOk() ? plain
+                                                : nullptr;
+        if (block != nullptr) {
+            if (const auto* event =
+                    block->GetCommonParameters().GetDaqEvent()) {
+                const auto& fixed = event->GetFixedEventList();
+                const auto& defaults = event->GetDefaultEventList();
+                const auto& available = event->GetAvailableEventList();
+                const auto& consistency = event->GetConsistencyEventList();
+                s.daq_event_fixed.assign(fixed.begin(), fixed.end());
+                s.daq_event_default.assign(defaults.begin(), defaults.end());
+                s.daq_event_available.assign(available.begin(),
+                                             available.end());
+                s.daq_consistency_event.assign(consistency.begin(),
+                                               consistency.end());
+            }
+        }
+    }
     return s;
 }
 
@@ -933,8 +967,8 @@ StructInfoDto BuildInstanceInfo(const a2l::Instance& in,
     // 显式接收：src/a2lparser.y:871）。丢失它会让结构体数组实例只剩第 0 个
     // 元素可寻址；逐元素展开与越界门归桥接层 StructureLayoutResolver。
     d.matrix_dim.assign(in.MatrixDim().begin(), in.MatrixDim().end());
-    // 与普通 MEASUREMENT 一致：仅从有效的 XCPplus/plain XCP IF_DATA
-    // 透传固定 DAQ 事件；不能把 DEFAULT/AVAILABLE 当作固定事件。
+    // 与普通 MEASUREMENT 一致：从有效的 XCPplus/plain XCP IF_DATA 逐表透传
+    // DAQ 事件；四表各自独立，绝不互相顶替（DEFAULT 不得冒充固定事件）。
     const a2l::xcp::XcpDataBlock* plus = in.GetXcpPlusDataBlock();
     const a2l::xcp::XcpDataBlock* plain = in.GetXcpDataBlock();
     const a2l::xcp::XcpDataBlock* block = plus != nullptr && plus->IsOk() ? plus
@@ -945,6 +979,17 @@ StructInfoDto BuildInstanceInfo(const a2l::Instance& in,
         if (const auto* event = block->GetCommonParameters().GetDaqEvent()) {
             const auto& fixed = event->GetFixedEventList();
             d.daq_event_fixed.assign(fixed.begin(), fixed.end());
+            // v11：INSTANCE 与 MEASUREMENT 同口径暴露四张表。结构体实例本身
+            // 不参与 DAQ 准入，但它的叶子要继承这些表（结构体形态的 A2L 把
+            // DAQ_EVENT 声明在 INSTANCE 上），缺表会让叶子退化成"没有任何
+            // 可用事件分配"。
+            const auto& defaults = event->GetDefaultEventList();
+            d.daq_event_default.assign(defaults.begin(), defaults.end());
+            const auto& available = event->GetAvailableEventList();
+            d.daq_event_available.assign(available.begin(), available.end());
+            const auto& consistency = event->GetConsistencyEventList();
+            d.daq_consistency_event.assign(consistency.begin(),
+                                           consistency.end());
         }
     }
     return d;

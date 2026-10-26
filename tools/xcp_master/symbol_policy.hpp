@@ -33,6 +33,180 @@ namespace calmcar::xcp::tools {
 [[nodiscard]] inline std::string SymbolDetailReadUnsupportedReason(
     const a2l::SymbolInfo& symbol);
 
+// ---------------------------------------------------------------------------
+// DAQ 事件通道来源判定（规则顺序固定，纯函数、无 IO）
+// ---------------------------------------------------------------------------
+
+/// @brief DAQ 事件来源，顺序即规则优先级。
+/// @details 规范依据（XCP 协议层 §4.1.5 EVENT CHANNELS）：
+///          - `FIXED_EVENT_LIST`：工具**不得**改动分配；
+///          - `DEFAULT_EVENT_LIST`：工具**可以**改成其它分配（本工具不改，但
+///            按计划 §7.2 在界面上标注"未改动"）；
+///          - `AVAILABLE_EVENT_LIST`：若该表不存在，则 ECU 提供的全部事件
+///            通道都可被工具分配；
+///          - `CONSISTENCY_EVENT_LIST`：MEASUREMENT 未声明 DEFAULT 时，
+///            规范要求（shall）以它作为默认事件通道分配。
+enum class DaqEventSource : std::uint8_t {
+    None = 0,         ///< 未能确定（error 非空时恒为 None）
+    Fixed = 1,        ///< 来自 FIXED_EVENT_LIST
+    Default = 2,      ///< 来自 DEFAULT_EVENT_LIST
+    Consistency = 3,  ///< 来自 CONSISTENCY_EVENT_LIST（无 DEFAULT 时的规范性兜底）
+};
+
+/// @brief DAQ 事件来源的稳定短名，用于界面与日志（不要本地化）。
+[[nodiscard]] inline const char* DaqEventSourceName(DaqEventSource source) {
+    switch (source) {
+        case DaqEventSource::Fixed:
+            return "fixed";
+        case DaqEventSource::Default:
+            return "default";
+        case DaqEventSource::Consistency:
+            return "consistency";
+        case DaqEventSource::None:
+            break;
+    }
+    return "none";
+}
+
+/// @brief 事件通道解析结果。
+struct DaqEventCandidate {
+    /// 采用的来源；`error` 非空时恒为 `None`。
+    DaqEventSource source = DaqEventSource::None;
+    /// 去重升序后的事件通道号；合格时恰 1 个，否则为空。
+    std::vector<std::uint16_t> channels;
+    /// 非空表示不可用，内容即面向用户的中文原因。
+    std::string error;
+};
+
+/// @brief 事件号去重并升序，保持"重复声明只计一个"的既有口径。
+[[nodiscard]] inline std::vector<std::uint16_t> NormalizeDaqEventNumbers(
+    const std::vector<std::uint16_t>& events) {
+    auto normalized = events;
+    std::sort(normalized.begin(), normalized.end());
+    normalized.erase(std::unique(normalized.begin(), normalized.end()),
+                     normalized.end());
+    return normalized;
+}
+
+/// @brief 把事件号列表渲染成 `0x1/0x2` 形式，用于错误原因。
+[[nodiscard]] inline std::string FormatDaqEventNumbers(
+    const std::vector<std::uint16_t>& events) {
+    std::string text;
+    for (const auto event : events) {
+        if (!text.empty()) text += "/";
+        text += "0x";
+        constexpr char kHex[] = "0123456789ABCDEF";
+        bool started = false;
+        for (int shift = 12; shift >= 0; shift -= 4) {
+            const auto digit = (event >> shift) & 0xFU;
+            if (digit != 0U || started || shift == 0) {
+                text += kHex[digit];
+                started = true;
+            }
+        }
+    }
+    return text;
+}
+
+/// @brief 判定某个符号应采用哪个事件通道，以及依据来自哪张表。
+/// @param symbol 已解析的 A2L 符号事实。
+/// @return 合格时 `error` 为空且 `channels` 恰 1 个；否则 `error` 为拒绝原因。
+/// @details 规则依次为：
+///          0. **自洽性（无条件先校验）**：`AVAILABLE_EVENT_LIST` 非空时，
+///             `DEFAULT`/`CONSISTENCY` 的每个事件号都必须出现在其中，否则拒绝
+///             —— 依据规范 §4.1.5 的 must 级约束；基于自相矛盾的 A2L 做出的
+///             任何事件选择都不可信。
+///          1. `FIXED` 去重后恰 1 个 → 采用；
+///          2. `FIXED` 多于 1 个 → 拒绝（规范禁止工具改动固定分配，工具无权
+///             在多个固定事件里挑一个）；
+///          3. `FIXED` 为空且 `DEFAULT` 恰 1 个 → 采用（来源 Default）；
+///          4. `FIXED` 为空且 `DEFAULT` 多于 1 个 → 拒绝（多义，不猜）；
+///          5. `FIXED`/`DEFAULT` 皆空且 `CONSISTENCY` 恰 1 个 → 采用（规范兜底）；
+///          5b. `CONSISTENCY` 多于 1 个 → 拒绝；
+///          5c. 三者皆空 → 拒绝（该 A2L 未提供任何可用的事件分配）。
+///          注意规则 2 优先于规则 3：`FIXED` 多值时**不得**退到 `DEFAULT`。
+[[nodiscard]] inline DaqEventCandidate ResolveDaqEventCandidate(
+    const a2l::SymbolInfo& symbol) {
+    const auto fixed = NormalizeDaqEventNumbers(symbol.daq_event_fixed);
+    const auto defaults = NormalizeDaqEventNumbers(symbol.daq_event_default);
+    const auto consistency =
+        NormalizeDaqEventNumbers(symbol.daq_consistency_event);
+    const auto available =
+        NormalizeDaqEventNumbers(symbol.daq_event_available);
+
+    DaqEventCandidate candidate;
+
+    // 规则 0：AVAILABLE 非空时，DEFAULT/CONSISTENCY 必须是它的子集。
+    if (!available.empty()) {
+        for (const auto& [name, events] :
+             {std::pair{"DEFAULT_EVENT_LIST", defaults},
+              std::pair{"CONSISTENCY_EVENT_LIST", consistency}}) {
+            for (const auto event : events) {
+                if (std::find(available.begin(), available.end(), event) ==
+                    available.end()) {
+                    candidate.error =
+                        std::string("A2L 事件声明自相矛盾：") + name + " 声明了 " +
+                        FormatDaqEventNumbers({event}) +
+                        "，但 AVAILABLE_EVENT_LIST 只列出 " +
+                        FormatDaqEventNumbers(available) +
+                        "；请修正 A2L 或改用 POLL 模式。";
+                    return candidate;
+                }
+            }
+        }
+    }
+
+    // 规则 1/2：FIXED 唯一则采用；多值拒绝（不得退到 DEFAULT）。
+    if (!fixed.empty()) {
+        if (fixed.size() != 1U) {
+            candidate.error =
+                "A2L 声明了多个 FIXED_EVENT_LIST 事件号（" +
+                FormatDaqEventNumbers(fixed) +
+                "）；规范禁止工具改动固定事件分配，工具不代为选择；"
+                "请修正 A2L 或改用 POLL 模式。";
+            return candidate;
+        }
+        candidate.source = DaqEventSource::Fixed;
+        candidate.channels = fixed;
+        return candidate;
+    }
+
+    // 规则 3/4：FIXED 为空时用 DEFAULT。
+    if (!defaults.empty()) {
+        if (defaults.size() != 1U) {
+            candidate.error = "A2L 声明了多个 DEFAULT_EVENT_LIST 事件号（" +
+                              FormatDaqEventNumbers(defaults) +
+                              "），无法唯一确定应使用哪一个；"
+                              "请修正 A2L 或改用 POLL 模式。";
+            return candidate;
+        }
+        candidate.source = DaqEventSource::Default;
+        candidate.channels = defaults;
+        return candidate;
+    }
+
+    // 规则 5/5b：无 DEFAULT 时按规范用 CONSISTENCY 兜底。
+    if (!consistency.empty()) {
+        if (consistency.size() != 1U) {
+            candidate.error = "A2L 声明了多个 CONSISTENCY_EVENT_LIST 事件号（" +
+                              FormatDaqEventNumbers(consistency) +
+                              "），无法唯一确定应使用哪一个；"
+                              "请修正 A2L 或改用 POLL 模式。";
+            return candidate;
+        }
+        candidate.source = DaqEventSource::Consistency;
+        candidate.channels = consistency;
+        return candidate;
+    }
+
+    // 规则 5c：三者皆空。
+    candidate.error =
+        "A2L 未声明 FIXED_EVENT_LIST、DEFAULT_EVENT_LIST 或 "
+        "CONSISTENCY_EVENT_LIST（没有任何可用的 DAQ 事件分配）；"
+        "请改用 POLL 模式。";
+    return candidate;
+}
+
 /// @brief 根据A2L静态声明判断变量是否能加入DAQ观测集合。
 /// @param symbol 待观测符号。
 /// @param available_events A2L声明的EVENT_CHANNEL编号集合。
@@ -64,14 +238,12 @@ namespace calmcar::xcp::tools {
         if (!read_reason.empty()) return read_reason;
     }
 
-    // 与启动DAQ时一致：同一固定事件号重复声明只计作一个事件。
-    auto fixed = symbol.daq_event_fixed;
-    std::sort(fixed.begin(), fixed.end());
-    fixed.erase(std::unique(fixed.begin(), fixed.end()), fixed.end());
-    if (fixed.size() != 1U)
-        return "需要唯一 FIXED_EVENT_LIST；不回退到 DEFAULT/AVAILABLE。";
+    // 事件来源统一由 ResolveDaqEventCandidate 判定（fixed → default →
+    // consistency，且先做 AVAILABLE 子集自洽性校验），避免两处规则漂移。
+    const auto candidate = ResolveDaqEventCandidate(symbol);
+    if (!candidate.error.empty()) return candidate.error;
     if (std::find(available_events.begin(), available_events.end(),
-                  fixed.front()) == available_events.end())
+                  candidate.channels.front()) == available_events.end())
         return "A2L 缺少对应 EVENT_CHANNEL 元数据。";
     return {};
 }

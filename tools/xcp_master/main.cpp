@@ -2132,6 +2132,14 @@ private:
             std::ostringstream row;
             row << QualifiedName(symbol) << " | " << KindName(symbol)
                 << " | fixed-event=" << FormatEvents(symbol.daq_event_fixed)
+                << " | default-event="
+                << FormatEvents(symbol.daq_event_default)
+                << " | consistency-event="
+                << FormatEvents(symbol.daq_consistency_event)
+                << " | event-source="
+                << calmcar::xcp::tools::DaqEventSourceName(
+                       calmcar::xcp::tools::ResolveDaqEventCandidate(symbol)
+                           .source)
                 << " | read="
                 << (read_reason.empty() ? "候选"
                                         : "不支持(" + read_reason + ")")
@@ -2175,6 +2183,11 @@ private:
             << " fixed-event=" << FormatEvents(s.daq_event_fixed)
             << " default-event=" << FormatEvents(s.daq_event_default)
             << " available-event=" << FormatEvents(s.daq_event_available)
+            << " consistency-event="
+            << FormatEvents(s.daq_consistency_event)
+            << " event-source="
+            << calmcar::xcp::tools::DaqEventSourceName(
+                   calmcar::xcp::tools::ResolveDaqEventCandidate(s).source)
             << " read="
             << (calmcar::xcp::tools::SymbolReadUnsupportedReason(s).empty()
                     ? "候选"
@@ -2245,7 +2258,25 @@ private:
             RecordObservationPending(canonical);
             RequestPreviewRefresh(canonical, true);
         }
-        Say("已加入观测: " + canonical);
+        // 事件来源标注：FIXED 是 ECU 指定的分配，工具没得选；DEFAULT 规范允许
+        // 工具改动、CONSISTENCY 是"无 DEFAULT 时的默认分配"，两者都必须让现场
+        // 知道"这条观测用的是 ECU/A2L 声明的分配，工具未改动"。
+        const auto event_candidate =
+            calmcar::xcp::tools::ResolveDaqEventCandidate(found.Value());
+        std::string message = "已加入观测: " + canonical;
+        if (event_candidate.source != calmcar::xcp::tools::DaqEventSource::Fixed &&
+            event_candidate.source !=
+                calmcar::xcp::tools::DaqEventSource::None) {
+            const char* origin =
+                event_candidate.source ==
+                        calmcar::xcp::tools::DaqEventSource::Default
+                    ? "A2L 默认事件"
+                    : "A2L 一致性事件";
+            message += "（事件通道 " +
+                       std::to_string(event_candidate.channels.front()) + "，来自 " +
+                       origin + "，工具未改动）";
+        }
+        Say(message);
     }
 
     void Remove(const std::string& name) {
@@ -3041,9 +3072,18 @@ private:
                 Say(name + " | DAQ 不支持: " + reason);
                 return;
             }
+            // 事件来源走统一判定（fixed → default → consistency）；此处
+            // ObservationUnsupportedReason 已保证候选合格，这里的兜底分支
+            // 只防规则漂移，正常不会命中。
+            const auto event_candidate =
+                calmcar::xcp::tools::ResolveDaqEventCandidate(symbol);
+            if (event_candidate.channels.empty()) {
+                Say(name + " | " + event_candidate.error);
+                return;
+            }
             const auto event = std::find_if(
                 events_.begin(), events_.end(), [&](const auto& item) {
-                    return item.channel == symbol.daq_event_fixed.front();
+                    return item.channel == event_candidate.channels.front();
                 });
             if (event == events_.end()) {
                 Say(name + " | A2L 缺少对应 EVENT_CHANNEL 元数据。");
@@ -3529,8 +3569,12 @@ int main(int argc, char** argv) {
     for (const auto& symbol : all_symbols.Value()) {
         if (symbol.kind != SymbolKind::Measurement) continue;
         auto& candidates = event_bindings[QualifiedName(symbol)];
-        candidates.assign(symbol.daq_event_fixed.begin(),
-                          symbol.daq_event_fixed.end());
+        // 与 F6/观测准入共用同一判定：fixed → default → consistency。
+        // 两处若各写一套，会出现"准入放行但绑定为空"的自相矛盾状态。
+        const auto resolved =
+            calmcar::xcp::tools::ResolveDaqEventCandidate(symbol);
+        for (const auto channel : resolved.channels)
+            candidates.push_back(channel);
     }
     calmcar::xcp::EventBoundMeasurementDatabase event_bound_database(
         a2l_measurement_database, std::move(event_bindings));

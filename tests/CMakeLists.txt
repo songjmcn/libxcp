@@ -465,6 +465,23 @@ add_custom_command(TARGET A2lIfDataConflictTest POST_BUILD
 gtest_discover_tests(A2lIfDataConflictTest DISCOVERY_TIMEOUT 120)
 
 # ----------------------------------------------------------------------------
+# A2lDaqEventListsTest —— DAQ_EVENT 四张事件表的导出（ABI v11）
+# 语料内联在用例里（写到临时目录），不依赖 golden 夹具。
+# ----------------------------------------------------------------------------
+add_executable(A2lDaqEventListsTest a2l_daq_event_lists_test.cpp)
+target_compile_features(A2lDaqEventListsTest PRIVATE cxx_std_20)
+target_link_libraries(A2lDaqEventListsTest PRIVATE
+        libxcp::a2lbridge GTest::gtest libxcp_test_main)
+if(MSVC)
+  target_compile_options(A2lDaqEventListsTest PRIVATE /utf-8)
+endif()
+add_custom_command(TARGET A2lDaqEventListsTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:liba2l::liba2l>"
+                "$<TARGET_FILE_DIR:A2lDaqEventListsTest>")
+gtest_discover_tests(A2lDaqEventListsTest DISCOVERY_TIMEOUT 120)
+
+# ----------------------------------------------------------------------------
 # A2lMultiEndpointTest —— 多实例传输层端点（历史遗漏项 L-C，ABI v10）
 # 语料内联在用例里（写到临时目录），不依赖 golden 夹具。
 # ----------------------------------------------------------------------------
