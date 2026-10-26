@@ -25,6 +25,10 @@
 
 #include "src/socket_util.hpp"
 
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
+
 namespace calmcar::xcp::test_support {
 
 /**
@@ -36,6 +40,25 @@ namespace calmcar::xcp::test_support {
 inline void EnsureSocketRuntime() {
     // 借用函数表单例的构造副作用：它内部持有 WSAStartup/WSACleanup 引用计数。
     static_cast<void>(detail::RealSocketOps());
+}
+
+/**
+ * @brief 关闭一个裸 Socket 句柄（Windows 必须用 `closesocket`）
+ *
+ * @param handle 句柄（`SOCKET` 或文件描述符，统一按整型传入）
+ *
+ * @details Windows 上 CRT 的 `close()` 与 Winsock 的 `closesocket()` 处于两套
+ *          句柄空间：对 `SOCKET` 调用 CRT `close()` 既不会释放
+ * Socket（句柄泄漏）， 又可能**误关同号的标准输入输出描述符**——在 CI
+ * 上表现为测试输出丢失、 ctest 收不到子进程输出而挂住。POSIX
+ * 上两者是同一个东西。
+ */
+inline void CloseRawSocket(std::intptr_t handle) {
+#if defined(_WIN32)
+    ::closesocket(static_cast<SOCKET>(handle));
+#else
+    ::close(static_cast<int>(handle));
+#endif
 }
 
 }  // namespace calmcar::xcp::test_support

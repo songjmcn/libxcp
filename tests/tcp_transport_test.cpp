@@ -166,6 +166,12 @@ using RawSocket = int;
 constexpr RawSocket kRawInvalid = -1;
 #endif
 
+/// @brief 关闭裸 Socket 句柄（Windows 必须 `closesocket`，详见
+/// socket_runtime_guard.hpp）
+void CloseRaw(RawSocket handle) {
+    test_support::CloseRawSocket(static_cast<std::intptr_t>(handle));
+}
+
 /**
  * @brief 手工编一个接收侧的 wire Frame（AsamV14 形态：无 Tail）
  * @param payload XCP Packet 内容
@@ -387,7 +393,8 @@ class TcpEndToEndTest : public ::testing::Test {
 protected:
     /// @brief 启动一个监听 Socket 并返回其端口
     std::uint16_t StartRawListener() {
-        // Windows 上裸 ::socket 之前必须先 WSAStartup（见 socket_runtime_guard.hpp）
+        // Windows 上裸 ::socket 之前必须先 WSAStartup（见
+        // socket_runtime_guard.hpp）
         test_support::EnsureSocketRuntime();
         m_listen_handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         if (m_listen_handle == kRawInvalid) {
@@ -425,8 +432,9 @@ protected:
         const detail::WaitItem item{static_cast<detail::SocketHandle>(handle),
                                     true, false};
         std::vector<detail::WaitStatus> statuses;
-        return detail::WaitAnySocket(std::span<const detail::WaitItem>(&item, 1),
-                                     timeout_ms, statuses) > 0;
+        return detail::WaitAnySocket(
+                   std::span<const detail::WaitItem>(&item, 1), timeout_ms,
+                   statuses) > 0;
     }
 
     /// @brief 接受一个入站连接（最多等 5 秒），成功后 m_peer_handle 有效
@@ -436,8 +444,8 @@ protected:
         }
         sockaddr_in peer{};
         socklen_t len = sizeof(peer);
-        m_peer_handle = ::accept(m_listen_handle,
-                                 reinterpret_cast<sockaddr*>(&peer), &len);
+        m_peer_handle =
+            ::accept(m_listen_handle, reinterpret_cast<sockaddr*>(&peer), &len);
         return m_peer_handle != kRawInvalid;
     }
 
@@ -450,9 +458,8 @@ protected:
             if (!WaitReadableRaw(m_peer_handle, 5000U)) {
                 break;
             }
-            const int n = ::recv(m_peer_handle,
-                                 reinterpret_cast<char*>(chunk), sizeof(chunk),
-                                 0);
+            const int n = ::recv(m_peer_handle, reinterpret_cast<char*>(chunk),
+                                 sizeof(chunk), 0);
             if (n <= 0) {
                 break;
             }
@@ -464,10 +471,10 @@ protected:
     void TearDown() override {
         if (m_peer_handle != kRawInvalid) {
             ::shutdown(m_peer_handle, 2);
-            ::close(m_peer_handle);
+            CloseRaw(m_peer_handle);
         }
         if (m_listen_handle != kRawInvalid) {
-            ::close(m_listen_handle);
+            CloseRaw(m_listen_handle);
         }
     }
 
@@ -527,9 +534,8 @@ TEST_F(TcpEndToEndTest, MasterSendsAsamV15FrameWithAlignmentTail) {
     const Bytes packet{0x01, 0x02, 0x03};
     transport.Send(packet);
 
-    const std::size_t expect_tail =
-        TailBytesForAlignment(PacketAlignment::Bit32,
-                              kEthernetHeaderSize + packet.size());
+    const std::size_t expect_tail = TailBytesForAlignment(
+        PacketAlignment::Bit32, kEthernetHeaderSize + packet.size());
     ASSERT_EQ(expect_tail, 1U);
 
     const Bytes received =
@@ -603,9 +609,9 @@ TEST_F(TcpEndToEndTest, ReceiveHandlesFrameSplitAcrossWrites) {
     // 逐字节写入，附小睡以确保内核把它们当作独立 TCP 段交付。
     // 这验证的正是"recv 边界与 Frame 边界无关"这一 TCP 核心事实。
     for (const std::uint8_t byte : wire) {
-        ASSERT_GT(::send(m_peer_handle,
-                         reinterpret_cast<const char*>(&byte), 1, 0),
-                  0);
+        ASSERT_GT(
+            ::send(m_peer_handle, reinterpret_cast<const char*>(&byte), 1, 0),
+            0);
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
@@ -671,7 +677,7 @@ TEST_F(TcpEndToEndTest, PeerCloseDeliversClosedCallback) {
 
     // 对端关闭连接
     ::shutdown(m_peer_handle, 2);
-    ::close(m_peer_handle);
+    CloseRaw(m_peer_handle);
     m_peer_handle = kRawInvalid;
 
     EXPECT_TRUE(listener.WaitForClose(kWaitLong));
@@ -696,9 +702,9 @@ TEST_F(TcpEndToEndTest, CloseInterruptsBlockingReceive) {
     const auto elapsed = std::chrono::steady_clock::now() - start;
 
     // Close 必须靠 shutdown 立即打断 recv，而不是等某个轮询周期
-    EXPECT_LT(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed)
-                  .count(),
-              1500);
+    EXPECT_LT(
+        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+        1500);
     EXPECT_FALSE(transport.IsOpen());
     EXPECT_TRUE(listener.closed());
 }
@@ -811,7 +817,7 @@ TEST_F(TcpEndToEndTest, SlaveAcceptsConnectionAndReceivesFrame) {
     const std::uint16_t probe_port = StartRawListener();
     ASSERT_NE(probe_port, 0);
     // 释放探测用的监听句柄，让 Slave 去绑定同一端口
-    ::close(m_listen_handle);
+    CloseRaw(m_listen_handle);
     m_listen_handle = kRawInvalid;
 
     cfg.local_port = probe_port;
@@ -835,7 +841,7 @@ TEST_F(TcpEndToEndTest, SlaveAcceptsConnectionAndReceivesFrame) {
         ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
         if (::connect(client, reinterpret_cast<sockaddr*>(&addr),
                       sizeof(addr)) != 0) {
-            ::close(client);
+            CloseRaw(client);
             client = kRawInvalid;
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -866,7 +872,7 @@ TEST_F(TcpEndToEndTest, SlaveAcceptsConnectionAndReceivesFrame) {
     EXPECT_EQ(packets[0], payload);
 
     ::shutdown(client, 2);
-    ::close(client);
+    CloseRaw(client);
     slave.Close();
 }
 
@@ -890,8 +896,8 @@ TEST_F(TcpEndToEndTest, ReopenAfterCloseSucceeds) {
     std::thread accept_thread2([this, &second_peer] {
         sockaddr_in peer{};
         socklen_t len = sizeof(peer);
-        second_peer = ::accept(m_listen_handle,
-                               reinterpret_cast<sockaddr*>(&peer), &len);
+        second_peer =
+            ::accept(m_listen_handle, reinterpret_cast<sockaddr*>(&peer), &len);
     });
     transport.Open(listener);
     accept_thread2.join();
@@ -902,7 +908,7 @@ TEST_F(TcpEndToEndTest, ReopenAfterCloseSucceeds) {
     transport.Close();
     if (second_peer != kRawInvalid) {
         ::shutdown(second_peer, 2);
-        ::close(second_peer);
+        CloseRaw(second_peer);
     }
 }
 
@@ -1130,7 +1136,7 @@ static_assert(detail::kShutdownBoth == SD_BOTH,
               "kShutdownBoth 在 Windows 上必须是 SD_BOTH");
 #else
 /// @brief 本平台应被判为"连接已丢失"的错误码
-constexpr int kConnectionLostCodes[] = {EPIPE,  ECONNRESET, ECONNABORTED,
+constexpr int kConnectionLostCodes[] = {EPIPE, ECONNRESET, ECONNABORTED,
                                         ENOTCONN, ESHUTDOWN};
 /// @brief 本平台不应被判为"连接已丢失"的错误码
 constexpr int kNotConnectionLostCodes[] = {0, EAGAIN, EINTR, EINPROGRESS};

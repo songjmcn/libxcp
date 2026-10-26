@@ -58,6 +58,12 @@ using RawSocket = int;
 constexpr RawSocket kRawInvalid = -1;
 #endif
 
+/// @brief 关闭裸 Socket 句柄（Windows 必须 `closesocket`，详见
+/// socket_runtime_guard.hpp）
+void CloseRaw(RawSocket handle) {
+    test_support::CloseRawSocket(static_cast<std::intptr_t>(handle));
+}
+
 /// @brief 统一等待上限：足够覆盖 CI 抖动，又不至于让失败用例挂死
 constexpr auto kWait = std::chrono::milliseconds(3000);
 
@@ -122,7 +128,8 @@ private:
 class TcpFakeSocketTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        // Windows 上裸 ::socket 之前必须先 WSAStartup（见 socket_runtime_guard.hpp）
+        // Windows 上裸 ::socket 之前必须先 WSAStartup（见
+        // socket_runtime_guard.hpp）
         test_support::EnsureSocketRuntime();
         m_listen_handle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
         ASSERT_NE(m_listen_handle, kRawInvalid);
@@ -146,12 +153,12 @@ protected:
     void TearDown() override {
         if (m_peer_handle != kRawInvalid) {
             ::shutdown(m_peer_handle, 2);
-            ::close(m_peer_handle);
+            CloseRaw(m_peer_handle);
             m_peer_handle = kRawInvalid;
         }
         if (m_listen_handle != kRawInvalid) {
             ::shutdown(m_listen_handle, 2);
-            ::close(m_listen_handle);
+            CloseRaw(m_listen_handle);
             m_listen_handle = kRawInvalid;
         }
     }
