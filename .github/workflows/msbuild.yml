@@ -85,6 +85,7 @@ jobs:
         env:
           LIBXCP_TEST_WATCHDOG_SECONDS: 40
           LIBXCP_TEST_TRACE: 1
+          LIBXCP_TCP_TRACE: 1
         run: |
           $exe = (Get-ChildItem -Path build -Recurse -Filter libxcp_tests.exe | Select-Object -First 1).FullName
           Write-Host ("::error::exe=" + $exe)
