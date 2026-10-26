@@ -75,31 +75,27 @@ jobs:
       #   ctest 90 s —— 兜底杀掉整个进程（含看门狗没覆盖到的卡死）；
       #   步骤 60 min —— 即使有二十多个用例各拖 90 s 也能跑完并产出失败清单。
       # 上一轮因为步骤只有 20 min，整轮被截断，注解里只剩“步骤超时”，看不到用例名。
-      # 诊断步骤：直接用 gtest 二进制跑两个代表性用例，把结果无条件打成注解。
-      # 注解可由匿名 API（/repos/.../check-runs/{id}/annotations）读取，
-      # 所以即使没有仓库写权限也能看到 exe 路径、退出码与失败原文。
+      # 诊断步骤：单跑一个挂死用例，并把最后几条 TRACE 埋点打成注解。
+      # TRACE 由 tests/tcp_transport_test.cpp 的 Trace() 在 LIBXCP_TEST_TRACE
+      # 下输出，用来看清用例卡在 accept/connect/send/recv 的哪一步。
       - name: Diagnose TCP end-to-end failures
         continue-on-error: true
         shell: pwsh
         timeout-minutes: 8
         env:
-          LIBXCP_TEST_WATCHDOG_SECONDS: 60
+          LIBXCP_TEST_WATCHDOG_SECONDS: 40
+          LIBXCP_TEST_TRACE: 1
         run: |
           $exe = (Get-ChildItem -Path build -Recurse -Filter libxcp_tests.exe | Select-Object -First 1).FullName
           Write-Host ("::error::exe=" + $exe)
           if (-not $exe) { exit 1 }
-          foreach ($case in @("TcpEndToEndTest.MasterSendsAsamV14FrameWithoutTail",
-                              "TcpEndToEndTest.ReceiveDecodesFrameSentByRawPeer",
-                              "TcpLoopbackProfileTest.CtrAdvancesMonotonically/AsamV14Bit8")) {
-            $out = & $exe --gtest_filter=$case 2>&1 | Out-String
-            $code = $LASTEXITCODE
-            $lines = ($out -split "`n") | Where-Object { $_.Trim().Length -gt 0 }
-            Write-Host ("::error::" + $case + " exit=" + $code)
-            $lines |
-              Where-Object { $_ -match 'Failure|Expected|Actual|what\(\)|FAILED|WATCHDOG|OK \]|PASSED|Uncaught|terminate' } |
-              Select-Object -First 3 |
-              ForEach-Object { Write-Host ("::error::" + $case + " | " + $_.Trim()) }
-          }
+          $case = "TcpEndToEndTest.MasterSendsAsamV14FrameWithoutTail"
+          $out = & $exe --gtest_filter=$case 2>&1 | Out-String
+          Write-Host ("::error::" + $case + " exit=" + $LASTEXITCODE)
+          ($out -split "`n") |
+            Where-Object { $_ -match 'TRACE|WATCHDOG|Failure|Expected' } |
+            Select-Object -Last 7 |
+            ForEach-Object { Write-Host ("::error::T| " + $_.Trim()) }
 
       - name: Test
         working-directory: build

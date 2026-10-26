@@ -28,6 +28,8 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <span>
 #include <string>
@@ -170,6 +172,18 @@ constexpr RawSocket kRawInvalid = -1;
 /// socket_runtime_guard.hpp）
 void CloseRaw(RawSocket handle) {
     test_support::CloseRawSocket(static_cast<std::intptr_t>(handle));
+}
+
+/// @brief 临时诊断埋点：设置 `LIBXCP_TEST_TRACE` 时把执行位置打到 stderr
+/// @param tag 位置标签
+/// @details 只在排查平台挂死时使用（CI 上由诊断步骤把 TRACE 行转成注解），
+///          定位完成后应删除，避免给正常测试路径引入额外 IO。
+void Trace(const char* tag) {
+    if (std::getenv("LIBXCP_TEST_TRACE") == nullptr) {
+        return;
+    }
+    std::fprintf(stderr, "TRACE %s\n", tag);
+    std::fflush(stderr);
 }
 
 /**
@@ -439,25 +453,32 @@ protected:
 
     /// @brief 接受一个入站连接（最多等 5 秒），成功后 m_peer_handle 有效
     bool AcceptPeer() {
+        Trace("accept:wait");
         if (!WaitReadableRaw(m_listen_handle, 5000U)) {
+            Trace("accept:wait-timeout");
             return false;
         }
+        Trace("accept:calling");
         sockaddr_in peer{};
         socklen_t len = sizeof(peer);
         m_peer_handle =
             ::accept(m_listen_handle, reinterpret_cast<sockaddr*>(&peer), &len);
+        Trace("accept:done");
         return m_peer_handle != kRawInvalid;
     }
 
     /// @brief 从对端读取直到凑满 expected 字节（或超时/断开）
     Bytes ReadExact(std::size_t expected) {
+        Trace("read:enter");
         Bytes out;
         out.reserve(expected);
         std::uint8_t chunk[1024];
         while (out.size() < expected) {
             if (!WaitReadableRaw(m_peer_handle, 5000U)) {
+                Trace("read:wait-timeout");
                 break;
             }
+            Trace("read:recv");
             const int n = ::recv(m_peer_handle, reinterpret_cast<char*>(chunk),
                                  sizeof(chunk), 0);
             if (n <= 0) {
@@ -491,17 +512,24 @@ TEST_F(TcpEndToEndTest, MasterSendsAsamV14FrameWithoutTail) {
     TcpTransport transport(cfg);
     RecordingListener listener;
 
+    Trace("case:before-accept-thread");
     std::thread accept_thread([this] { AcceptPeer(); });
+    Trace("case:before-open");
     transport.Open(listener);
+    Trace("case:after-open");
     accept_thread.join();
+    Trace("case:after-accept-join");
 
     ASSERT_TRUE(transport.IsOpen());
 
     // 发一个 CRO（CONNECT 命令：0xFF 0x00）
     const Bytes cro{0xFF, 0x00};
+    Trace("case:before-send");
     transport.Send(cro);
+    Trace("case:after-send");
 
     const Bytes received = ReadExact(kEthernetHeaderSize + cro.size());
+    Trace("case:after-read");
     ASSERT_EQ(received.size(), kEthernetHeaderSize + cro.size());
 
     // AsamV14：LEN 是真实 Packet 长度，且**绝不**附加 LEN 外 Tail
