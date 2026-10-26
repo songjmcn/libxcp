@@ -28,7 +28,14 @@ jobs:
       - name: 安装构建工具、LLVM 与 Boost
         run: brew install cmake ninja llvm boost
 
-      # 使用 Homebrew LLVM 自带的 libc++ 头文件与动态库，避免与系统 libc++ 混用
+      # 使用 Homebrew LLVM 自带的 libc++ 头文件与动态库，避免与系统 libc++ 混用。
+      #
+      # 链接期必须用 -nostdlib++ 挡掉 clang 驱动的隐式 -lc++，再显式钉住 brew 的
+      # libc++/libc++abi：仅给 -L 时，brew 的 libc++.1.dylib 会按 install name 去加载
+      # 系统 /usr/lib/libc++abi.dylib，于是 __cxa_throw 与 __cxa_begin_catch 落在两套
+      # libc++abi 实例上——异常抛得出来却接不住，任何 EXPECT_THROW 都变成
+      # "libc++abi: terminating due to uncaught exception"。
+      # （症状记录：code-plan/TCP_UDP平台隔离重构_实施计划_POD接口与平台分文件.md §8.3）
       # Boost_DIR 由 brew 前缀下的 Boost-* 目录通配得到，不写死版本号
       - name: Configure
         run: |
@@ -42,8 +49,8 @@ jobs:
             -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
             -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
             -DCMAKE_CXX_FLAGS="-nostdinc++ -isystem $LLVM_PREFIX/include/c++/v1" \
-            -DCMAKE_EXE_LINKER_FLAGS="-L$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/c++" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-L$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/c++" \
+            -DCMAKE_EXE_LINKER_FLAGS="-nostdlib++ -L$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/c++ -lc++ -lc++abi" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-nostdlib++ -L$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/c++ -lc++ -lc++abi" \
             -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DLIBXCP_BUILD_TESTS=ON \
@@ -55,8 +62,22 @@ jobs:
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
 
+      # TODO: 定位完成后删除。确认 throw/catch 绑定到哪一份 libc++abi：
+      # 若下面出现 brew 与 /usr/lib 两套 libc++，说明 -nostdlib++ 仍没钉住 abi（异常会接不住）。
+      - name: Diagnose libc++ runtime (temporary)
+        continue-on-error: true
+        run: |
+          echo "=== otool -L build/tests/libxcp_tests ==="
+          otool -L build/tests/libxcp_tests | grep -E 'c\+\+' || echo "(无 c++ 动态依赖)"
+          echo "=== DYLD_PRINT_LIBRARIES 实际加载 ==="
+          DYLD_PRINT_LIBRARIES=1 ./build/tests/libxcp_tests \
+            --gtest_filter=CommandCodecBoundary.UploadRejectsZeroAndOverOneByte 2>&1 \
+            | grep -iE 'libc\+\+|PASSED|FAILED|terminating' | head -20 || true
+
       # 耗时类用例只在本地做门禁（计划文档 §8.3.4）：渲染基准与两处 A2L 规模/耗时断言不进 CI。
       # 串行执行：Examples 并行会抢默认端口 5555，产生假失败。
+      # --timeout 180：本机最慢用例 10 s，CI 慢 5 倍也才 50 s；留 180 s 足以容忍抖动，又能让真正
+      #   挂死的用例在 3 分钟内被点名（此前 600 s，5 个挂死用例就烧掉 50 分钟）。
       # 首轮 continue-on-error：此前该 job 只编译不测试，既有失败需先分类；基线稳定后移除，转为硬门。
       - name: Test
         continue-on-error: true
@@ -64,5 +85,5 @@ jobs:
         env:
           DYLD_LIBRARY_PATH: ${{ env.BOOST_LIB_DIR }}
         run: >
-          ctest --output-on-failure --timeout 600
+          ctest --output-on-failure --timeout 180
           -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
