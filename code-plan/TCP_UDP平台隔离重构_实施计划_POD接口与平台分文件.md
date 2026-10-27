@@ -104,3 +104,25 @@ src/detail/socket/event_poller_posix.cpp        poll 与错误文本
 2. 三平台 CI workflow 是否已包含新增的隔离脚本与测试，需要在 CI 上实际跑一轮后才可宣称 P4 达标。
 3. TCP/UDP `Open()` 的域名连接仍未接入 DNS POD 候选（批准范围即为“保留能力不启用”），属已知且刻意保留的缺口，不算回归。
 4. 已知测试环境问题不影响代码结论但会影响复现：本机沙箱禁止新建可执行文件写用户 `%TEMP%`，跑 CTest 需把 `TMP`/`TEMP` 指到工作区内目录；MSVC 构建必须先进 `vcvars64.bat` 环境；固定 UDP 端口夹具在 `-j 4` 下出现过一次超时。详见阶段实施记录。
+
+## 8. 评审补齐记录（2026-10-27 晚）
+
+对第 7 节“已完成”逐条对照后发现的 7 处用例缺口、4 处流程/门禁缺口与 2 处行为偏差，按“必修 → 偏差”顺序处理，结论如下。
+
+| 分类 | 项 | 结论 |
+| --- | --- | --- |
+| 用例 | `recv_from` 无脚本注入（§3.49 明确要求） | **已补**：`tests/tcp_fake_socket.hpp` 增加 `RecvFromAction`/`SendToAction` 与线程安全脚本队列，`is_timeout`/`is_invalid_socket`/`last_error_text` 注入优先 |
+| 用例 | recvfrom 三类分支、发送失败、错误文本可观测 | **已补**：`UdpTransportRecvFromFault` 7 例 + `UdpTransportSendFault` 1 例 |
+| 用例 | 唤醒句柄创建失败兜底、句柄往返、生命周期三项、poller 带文本失败断言 | **未补**，保留为后续项（见文末） |
+| 用例 | accept 后重复关闭监听句柄无专项测试（批准时点名） | **已补**：`TcpEndToEndTest.AcceptClosesListenHandleExactlyOnce`，用假表统计每个句柄 `close` 次数 |
+| 流程 | README 未记录隔离规则（P4 出口） | **已补**：`README.md` §2.3 |
+| 流程 | 门禁只匹配 `::` 限定调用 | **已补**：`UNQUALIFIED_NATIVE_CALL`，并做负向验证（临时探针文件被报 `sendto(`） |
+| 流程 | 门禁不校验“CMake 各平台仅编入本平台两份实现” | **调整计划措辞**：选源由 `CMakeLists.txt:174-183` 的 `if(WIN32)/else()` + `target_sources` 严格二选一保证，门禁只负责源码边界扫描，不再宣称覆盖构建选源；每平台实际编译即间接证明只编入一份 |
+| 流程 | 三平台 workflow 是否跑同一脚本 | **调整计划措辞**：三平台 workflow 均通过 `ctest` 执行同一 `SocketPlatformBoundary` 用例，不再另起脚本调用链 |
+| 流程 | `bound_local` 可观测性结论未落档 | **已落档**：该字段唯一出口 `BoundLocalPort()` 读 `m_bound_local_port_`，故 `bound_local` 当前不可观测，保持“不顺带修正” |
+| 偏差 | UDP `recvfrom` 中断即退出（与计划“警告后继续”矛盾） | **已改回继续接收**：仅 `invalid`/`connection_lost` 退出；退出与告警文案区分 |
+| 偏差 | 其它错误无退避，持续错误告警忙循环 | **已加**：1 ms 退避 + 首见与每 100 次限频；`PersistentErrorDoesNotFloodWarnings` 断言 120 次错误下告警 ≤3 |
+
+本批次后的验证证据：Release 全量构建成功（23 目标），全量 CTest **1064/1064 通过**（90.02s，`-j 4`，跳过 2 项非失败），门禁脚本通过（29 个非平台文件），`clang-format` 与 `git diff --check` 无告警。用例总数 1055 → 1064，既有断言未放宽。
+
+仍保留的验收缺口：Linux/macOS 真机或 CI 运行；`Open()` 域名连接未接入 DNS 候选（刻意保留）；如需进一步加固，可按顺序补：唤醒句柄创建失败注入 → POD 句柄往返 → 多实例/重复 Open-Close 生命周期 → poller 带文本失败断言 → CMake 选源自动校验。

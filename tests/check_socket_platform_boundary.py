@@ -5,7 +5,26 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
 from pathlib import Path
+
+
+def force_utf8_console() -> None:
+    """把标准输出/错误强制切到 UTF-8。
+
+    Windows 上 Python 默认按 ANSI 代码页（CI 的 GitHub Actions 是 cp1252）
+    编码 `print()`，本脚本的输出含中文，会抛 `UnicodeEncodeError` 让门禁
+    在“全部检查通过”的情况下依然返回非零——曾真实发生过一次。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            # 流已被重定向到不支持重配置的对象时保持原样，不能因此失败。
+            continue
 
 # 对 src/ 只豁免四个明确列出的原生实现，防止日后新增文件绕过门禁。
 PLATFORM_FILES = frozenset(
@@ -28,6 +47,15 @@ NATIVE_TOKEN = re.compile(
     r"inet_ntop|getaddrinfo|freeaddrinfo|closesocket|ioctlsocket|fcntl)\s*\()"
 )
 
+# 未加 `::` 限定的原生调用同样违规（`sendto(...)` 与 `::sendto(...)` 等价）。
+# 只收录公共层**没有**声明同名方法的名字，避免把 `socket_ops.hpp` 里的
+# `virtual int bind/SOCKET` 之类的声明误判成调用；`ops.send_to(` 这类语义调用
+# 由前置字符 `.`/`->`/`::` 排除。
+UNQUALIFIED_NATIVE_CALL = re.compile(
+    r"(?<![\w:.>])(?:socket|sendto|recvfrom|inet_pton|inet_ntop|getaddrinfo|"
+    r"freeaddrinfo|closesocket|ioctlsocket|WSAPoll|WSASocketW|WSASocketA)\s*\("
+)
+
 STRING_LITERAL = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 COMMENT_OR_LITERAL = re.compile(
     r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|//[^\n]*|/\*.*?\*/',
@@ -42,6 +70,7 @@ NATIVE_INCLUDE = re.compile(
 
 def main() -> int:
     """逐个扫描公共文件，打印带行号的违例并返回非零。"""
+    force_utf8_console()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source_root", type=Path)
     args = parser.parse_args()
@@ -71,6 +100,9 @@ def main() -> int:
             lambda match: "\n" * match.group().count("\n"), stripped
         )
         for match in NATIVE_TOKEN.finditer(without_literals):
+            line = without_literals.count("\n", 0, match.start()) + 1
+            violations.append(f"{relative}:{line}: {match.group()}")
+        for match in UNQUALIFIED_NATIVE_CALL.finditer(without_literals):
             line = without_literals.count("\n", 0, match.start()) + 1
             violations.append(f"{relative}:{line}: {match.group()}")
     if violations:

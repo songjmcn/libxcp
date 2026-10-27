@@ -207,11 +207,18 @@ endif()
 # ----------------------------------------------------------------------------
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Windows 上 Python 默认按 ANSI 代码页输出（GitHub Actions 上为 cp1252），
+# 脚本打印中文会抛 UnicodeEncodeError 把门禁判成失败；统一强制 UTF-8。
+# 脚本内部另有 sys.stdout.reconfigure 兜底，这里覆盖以本地直接运行 ctest 也一致。
+set(LIBXCP_PYTHON_UTF8_ENV "PYTHONUTF8=1" "PYTHONIOENCODING=utf-8")
+
 # 公共 TCP/UDP 层禁止原生 Socket API，平台实现仅允许位于 detail/socket/*_{win,posix}.cpp。
 add_test(NAME SocketPlatformBoundary
          COMMAND ${Python3_EXECUTABLE}
                  "${CMAKE_CURRENT_SOURCE_DIR}/check_socket_platform_boundary.py"
                  "${PROJECT_SOURCE_DIR}")
+set_tests_properties(SocketPlatformBoundary PROPERTIES
+        ENVIRONMENT "${LIBXCP_PYTHON_UTF8_ENV}")
 
 set(A2L_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/a2l_gen")
 set(A2L_GOLDEN_FILE "${A2L_GOLDEN_DIR}/golden_basic.a2l")
@@ -222,7 +229,8 @@ add_test(NAME a2l_gen
          COMMAND ${Python3_EXECUTABLE}
                  "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
                  --out "${A2L_GOLDEN_DIR}" --variants)
-set_tests_properties(a2l_gen PROPERTIES FIXTURES_SETUP A2lGolden)
+set_tests_properties(a2l_gen PROPERTIES
+        FIXTURES_SETUP A2lGolden ENVIRONMENT "${LIBXCP_PYTHON_UTF8_ENV}")
 
 add_executable(A2lSmoke a2l_smoke_test.cpp)
 target_compile_features(A2lSmoke PRIVATE cxx_std_20)
@@ -322,7 +330,8 @@ add_test(NAME a2l_perf_gen
                  "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
                  --out "${A2L_GOLDEN_DIR}" --perf 5)
 set_tests_properties(a2l_perf_gen PROPERTIES
-        FIXTURES_SETUP A2lPerf TIMEOUT 300)
+        FIXTURES_SETUP A2lPerf TIMEOUT 300
+        ENVIRONMENT "${LIBXCP_PYTHON_UTF8_ENV}")
 
 # 单独入口：只跑基线用例（避免把 5 MB 解析塞进 A2lGolden 全量运行里重复计次）
 add_test(NAME ParseLargeFileUnderBudget
@@ -340,7 +349,8 @@ add_test(NAME a2l_ui_perf_gen
                  "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
                  --out "${A2L_GOLDEN_DIR}" --perf 40)
 set_tests_properties(a2l_ui_perf_gen PROPERTIES
-        FIXTURES_SETUP A2lUiPerf TIMEOUT 600)
+        FIXTURES_SETUP A2lUiPerf TIMEOUT 600
+        ENVIRONMENT "${LIBXCP_PYTHON_UTF8_ENV}")
 
 # ----------------------------------------------------------------------------
 # T10 隔离自动化（批次13 T13-18）：把 configure 期 P9 扫描变成 ctest 条目。

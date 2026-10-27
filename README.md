@@ -75,6 +75,7 @@ libxcp/
 │       └── measurement_result.hpp     # 结果封装类型
 ├── src/                        # 核心库实现（与 include 一一对应）
 │   ├── daq/                    #   dto_envelope_decoder / dto_payload_decoder / daq_timestamp
+│   ├── detail/socket/          #   平台 Socket 实现（仅 _win/_posix 两份）
 │   └── measurement/            #   measurement_planner / measurement_session
 ├── adapter/a2l/                # A2L 测量适配器（核心↔桥接层唯一接触点）
 │   └── a2l_measurement_database.*   # 包装桥接层 IA2lDatabase → 核心窄接口
@@ -133,6 +134,29 @@ A2L 接入是独立 target（`adapter/a2l/A2lMeasurementDatabase` →
 | [构建系统](docs/modules/构建系统.md) | CMake 目标、安装规则、构建开关与 Boost 硬依赖、已知构建注意事项 |
 | [第三方依赖](docs/modules/第三方依赖.md) | a2llib / a2l-sdk / XCPlite 子模块消费方式与边界纪律 |
 | [文档与工程规范](docs/modules/文档与工程规范.md) | `docs/`、`code-plan/`、`scripts/` 与 AGENTS.md 约定 |
+
+### 2.3 平台 Socket 代码的隔离规则
+
+TCP/UDP 传输层已按平台分文件，公共层不再出现任何原生 Socket 类型或 API：
+
+| 位置 | 内容 | 平台 |
+|------|------|------|
+| `src/detail/socket/socket_ops.hpp` | `SocketOps` 抽象接口 + **纯 POD** 数据类型（`SocketHandle` / `Ipv4Endpoint` / `SocketKind` / `SocketOption`） | 公共 |
+| `src/detail/socket/socket_ops_win.cpp` | Winsock 实现（`WSAPoll`、`WinsockGuard` 生命周期、`SOCKET` ↔ `SocketHandle`） | Windows |
+| `src/detail/socket/socket_ops_posix.cpp` | POSIX 实现（`poll`、`SO_NOSIGPIPE` / `MSG_NOSIGNAL`） | Linux/macOS |
+| `src/detail/socket/event_poller_win.cpp` / `event_poller_posix.cpp` | 等待器实现（各自持有本平台的 Socket 运行库生命周期） | Windows / POSIX |
+
+约定与门禁：
+
+- 公共层（`src/` 下除上述四个文件外的所有源文件与头文件，含公开头 `include/libxcp/`）
+  只允许使用 `SocketOps` 的语义接口，**不得**直接调用 `socket`/`bind`/`poll`/`WSAPoll`，
+  也不得引入 `winsock2.h`、`sys/socket.h`、`netinet/in.h` 等平台头。
+- 新增平台调用时的唯一做法：在 `socket_ops.hpp` 增加语义方法（参数与返回值只含
+  上面列出的 POD 类型），在两个平台实现文件里各实现一份；调用方一律走
+  `detail::CurrentSocketOps()`。
+- 门禁是 ctest 用例 `SocketPlatformBoundary`（`tests/check_socket_platform_boundary.py`），
+  它扫描公共层并报告全部违规行；本地可单独运行：
+  `ctest -R SocketPlatformBoundary --output-on-failure`。
 
 ## 3. 编译方法
 

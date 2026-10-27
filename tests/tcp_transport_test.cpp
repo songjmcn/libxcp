@@ -23,6 +23,7 @@
 
 #include "src/socket_util.hpp"
 #include "src/event_poller.hpp"
+#include "tcp_fake_socket.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -918,6 +919,68 @@ TEST_F(TcpEndToEndTest, SlaveAcceptsConnectionAndReceivesFrame) {
     slave.Close();
 }
 
+TEST_F(TcpEndToEndTest, AcceptClosesListenHandleExactlyOnce) {
+    // 注入统计用假操作表：连接建立语义仍是真实的，只统计 close/listen/accept。
+    // 注入是进程级的；gtest_discover_tests 让每个用例独占进程，因此这里安全。
+    test_support::FakeSocketOps fake;
+    test_support::ScopedFakeSocketOps ops_guard(fake);
+
+    TcpTransportConfig cfg = MakeSlaveConfig();
+    const std::uint16_t probe_port = StartRawListener();
+    ASSERT_NE(probe_port, 0);
+    CloseRaw(m_listen_handle);
+    m_listen_handle = kRawInvalid;
+    cfg.local_port = probe_port;
+
+    TcpTransport slave(cfg);
+    RecordingListener listener;
+    std::thread slave_thread([&] {
+        try {
+            slave.Open(listener);
+        } catch (...) {
+        }
+    });
+
+    RawSocket client = kRawInvalid;
+    for (int attempt = 0; attempt < 100 && client == kRawInvalid; ++attempt) {
+        client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(probe_port);
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(client, reinterpret_cast<sockaddr*>(&addr),
+                      sizeof(addr)) != 0) {
+            CloseRaw(client);
+            client = kRawInvalid;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    ASSERT_NE(client, kRawInvalid) << "无法连上 Slave 监听端口";
+    slave_thread.join();
+    ASSERT_TRUE(slave.IsOpen());
+
+    const detail::SocketHandle listen_handle = fake.LastListenHandle();
+    const detail::SocketHandle accepted_handle = fake.LastAcceptHandle();
+    ASSERT_NE(listen_handle, detail::kInvalidSocketHandle)
+        << "Slave 必须经过注入的 listen()";
+    ASSERT_NE(accepted_handle, detail::kInvalidSocketHandle)
+        << "Slave 必须经过注入的 accept()";
+
+    // accept 成功后监听句柄已释放，Close() 不得再关一次（否则可能误关
+    // OS 复用后的同号句柄，正是本次修复的问题）。
+    EXPECT_EQ(fake.CloseCount(listen_handle), 1)
+        << "监听句柄必须在 accept 成功后只关闭一次";
+
+    slave.Close();
+    EXPECT_EQ(fake.CloseCount(listen_handle), 1)
+        << "Close() 不得再次关闭已释放的监听句柄";
+    EXPECT_EQ(fake.CloseCount(accepted_handle), 1)
+        << "已接受连接必须且只能关闭一次";
+
+    ::shutdown(client, 2);
+    CloseRaw(client);
+}
+
 TEST_F(TcpEndToEndTest, ReopenAfterCloseSucceeds) {
     const std::uint16_t port = StartRawListener();
     ASSERT_NE(port, 0);
@@ -1213,9 +1276,9 @@ TEST(SocketPlatformTest, ClassifiesWindowsUdpShutdownErrors) {
 
 TEST(SocketPlatformTest, ShutdownSocketReportsInvalidHandle) {
     // 关闭常量现仅存在平台实现内；此处验证抽象在无效句柄上的失败语义。
-    EXPECT_NE(detail::RealSocketOps().shutdown_socket(
-                  detail::kInvalidSocketHandle),
-              0);
+    EXPECT_NE(
+        detail::RealSocketOps().shutdown_socket(detail::kInvalidSocketHandle),
+        0);
 }
 
 }  // namespace calmcar::xcp

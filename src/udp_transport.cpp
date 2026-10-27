@@ -8,8 +8,11 @@
 #include "libxcp/udp_transport.hpp"
 
 #include <array>
+#include <chrono>
+#include <cstdint>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "detail/socket/socket_ops.hpp"
@@ -27,6 +30,16 @@ constexpr SocketHandle kInvalidSocket = detail::kInvalidSocketHandle;
 
 /// @brief 接收缓冲区大小（字节）；一次 recvfrom 读取一个完整 Datagram
 constexpr std::size_t kReceiveBufferSize = 65536;
+
+/// @brief 可恢复接收错误后的最小重试间隔（毫秒）
+/// @details 错误持续存在时（例如 ENOBUFS）Socket 会一直保持可读，若立即重试
+///          就会形成"错误—告警—立即重试"的忙循环；留出极短间隔把重试频率
+///          限制在千赫兹量级，同时不改变"警告后继续接收"的既有语义。
+constexpr std::uint32_t kTransientRetryDelayMs = 1;
+
+/// @brief 连续可恢复错误的告警步长：首次告警，此后每 N 次再告警一次
+/// @details 目的是避免错误洪泛时日志被同一句话刷满，而不是吞掉告警。
+constexpr std::uint32_t kTransientWarnStride = 100;
 
 /**
  * @brief 模 65536 的前向距离：从 base 前进多少步到达 value
@@ -470,6 +483,8 @@ void UdpTransport::ReceiveLoop() {
     IPacketListener* listener = m_listener_;
     std::vector<std::uint8_t> buffer(kReceiveBufferSize);
     std::string close_reason = "Transport 正常关闭";
+    // 连续可恢复接收错误的计数：用于告警限频与重试退避；成功收包后清零。
+    std::uint32_t transient_failures = 0;
 
     while (m_running_.load(std::memory_order_acquire)) {
         // ---- 用 EventPoller 同时等待数据 Socket 与唤醒 Socket ----
@@ -552,6 +567,7 @@ void UdpTransport::ReceiveLoop() {
             buffer.size(), &src);
 
         if (received > 0) {
+            transient_failures = 0;
             const std::string ip_text = detail::FormatIpv4(src.address);
             LIBXCP_LOG_INFO("UDP RX datagram_bytes={} peer={}:{}", received,
                             ip_text, src.port);
@@ -587,14 +603,25 @@ void UdpTransport::ReceiveLoop() {
         if (timed_out) {
             continue;  // 轮询周期到，检查关闭标记
         }
-        if (invalid || interrupted || connection_lost) {
+        if (invalid || connection_lost) {
+            // 句柄失效或连接已断：不再可恢复，交付关闭原因后退出
             close_reason = "Socket 已关闭或失效，接收线程退出";
             break;
         }
-        // 其它错误：报告警告并继续（避免瞬时错误终止会话）
-        if (listener != nullptr) {
-            listener->OnTransportWarning("recvfrom 失败: " + error);
+        // 可恢复错误（含 EINTR 与瞬时错误）：按既有语义"警告后继续"，
+        // 但要限频并退避，避免错误持续时出现告警/重试忙循环。
+        ++transient_failures;
+        if (listener != nullptr &&
+            (transient_failures == 1 ||
+             transient_failures % kTransientWarnStride == 0)) {
+            listener->OnTransportWarning(
+                "recvfrom 失败(" + std::to_string(transient_failures) +
+                "): " + error +
+                (interrupted ? "（被信号打断，继续接收）" : "（继续接收）"));
         }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kTransientRetryDelayMs));
+        continue;
     }
 
     m_running_.store(false, std::memory_order_release);

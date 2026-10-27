@@ -15,8 +15,11 @@
  * @par 设计取舍：默认转发，只脚本化必要的方法
  *   本假实现**不**重写整套 Socket 生命周期（那会让测试失去"真实连接"这一
  *   前提），而是默认把每次调用转发给 `RealSocketOps()`，仅对测试显式脚本化
- *   的方法（`send` / `recv` / `wait_writable` / `wait_readable`）按脚本行事。
+ *   的方法（`send` / `recv` / `send_to` / `recv_from` / `wait_writable` /
+ *   `wait_readable`）按脚本行事。
  *   于是连接建立、端口分配、关闭语义仍然是真实的，被替换的只有错误注入点。
+ *   除错误注入外，本实现还统计每个句柄的 `close()` 次数与最近一次
+ *   `listen()`/`accept()` 的句柄，用于验证"监听句柄只关闭一次"。
  *
  * @warning 注入是**进程级**的（见 `SetSocketOpsForTesting()`）：使用本头文件的
  *          测试必须独占进程，对应 ctest 用例已设置 `RUN_SERIAL`。
@@ -26,9 +29,12 @@
 #define CALMCAR_XCP_TESTS_TCP_FAKE_SOCKET_HPP_
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
@@ -58,6 +64,26 @@ public:
         PassThrough,         ///< 原样转发给真实实现
         FailInterrupted,     ///< 返回 -1 且判定为 EINTR
         FailConnectionLost,  ///< 返回 -1 且判定为连接已断
+    };
+
+    /// @brief `recv_from` 的一次脚本动作
+    /// @details UDP 接收分支按"超时 / 中断 / 失效 / 其它"分类，其中前两类与
+    ///          "其它"的判定来自平台错误码。真实 Socket 上无法稳定制造这些
+    ///          错误码，因此脚本动作同时决定返回值与分类判定。
+    enum class RecvFromAction : std::uint8_t {
+        PassThrough,         ///< 原样转发给真实实现
+        DeliverZeroLength,   ///< 返回 0（空 Datagram）
+        FailTimeout,         ///< 返回 -1 且判定为接收超时
+        FailInterrupted,     ///< 返回 -1 且判定为 EINTR
+        FailInvalidSocket,   ///< 返回 -1 且判定为句柄失效
+        FailConnectionLost,  ///< 返回 -1 且判定为连接已断
+        FailOther,           ///< 返回 -1 且不属于上述任何分类
+    };
+
+    /// @brief `send_to` 的一次脚本动作
+    enum class SendToAction : std::uint8_t {
+        PassThrough,  ///< 原样转发给真实实现
+        FailOther,    ///< 返回 -1 且错误文本可观测
     };
 
     /// @brief 一条 `send` 脚本
@@ -98,6 +124,63 @@ public:
     /// @brief 已发生的 `recv` 调用次数
     [[nodiscard]] std::size_t ReceiveCallCount() const noexcept {
         return m_recv_calls_;
+    }
+
+    /// @brief 依次压入若干 `recv_from` 脚本（脚本耗尽后自动转回转发模式）
+    /// @param actions 脚本动作序列
+    /// @details 接收线程会并发调用 `recv_from`，因此脚本队列用互斥量保护。
+    void ScriptRecvFrom(std::initializer_list<RecvFromAction> actions) {
+        ScriptRecvFrom(std::vector<RecvFromAction>(actions));
+    }
+
+    /// @brief 依次压入若干 `recv_from` 脚本（容器重载）
+    /// @param actions 脚本动作序列
+    void ScriptRecvFrom(const std::vector<RecvFromAction>& actions) {
+        const std::lock_guard<std::mutex> lock(m_script_mutex_);
+        m_recv_from_script_.insert(m_recv_from_script_.end(), actions.begin(),
+                                   actions.end());
+    }
+
+    /// @brief 依次压入若干 `send_to` 脚本（脚本耗尽后自动转回转发模式）
+    /// @param actions 脚本动作序列
+    void ScriptSendTo(std::initializer_list<SendToAction> actions) {
+        const std::lock_guard<std::mutex> lock(m_script_mutex_);
+        for (const SendToAction action : actions) {
+            m_send_to_script_.push_back(action);
+        }
+    }
+
+    /// @brief 已发生的 `recv_from` 调用次数
+    [[nodiscard]] std::size_t RecvFromCallCount() const noexcept {
+        return m_recv_from_calls_.load(std::memory_order_relaxed);
+    }
+
+    /// @brief 剩余未消费的 `recv_from` 脚本条数
+    [[nodiscard]] std::size_t PendingRecvFromSteps() const {
+        const std::lock_guard<std::mutex> lock(m_script_mutex_);
+        return m_recv_from_script_.size();
+    }
+
+    /// @brief 指定句柄被 `close()` 的次数
+    /// @param handle 目标句柄
+    /// @return 关闭次数（未关闭过则返回 0）
+    /// @details 用于验证"监听句柄在 accept 成功后只关闭一次"。
+    [[nodiscard]] int CloseCount(detail::SocketHandle handle) const {
+        const std::lock_guard<std::mutex> lock(m_script_mutex_);
+        const auto it = m_close_counts_.find(handle);
+        return it == m_close_counts_.end() ? 0 : it->second;
+    }
+
+    /// @brief 最近一次传给 `listen()` 的句柄（无则返回无效句柄）
+    [[nodiscard]] detail::SocketHandle LastListenHandle() const {
+        const std::lock_guard<std::mutex> lock(m_script_mutex_);
+        return m_last_listen_handle_;
+    }
+
+    /// @brief 最近一次 `accept()` 返回的句柄（无则返回无效句柄）
+    [[nodiscard]] detail::SocketHandle LastAcceptHandle() const {
+        const std::lock_guard<std::mutex> lock(m_script_mutex_);
+        return m_last_accept_handle_;
     }
 
     // ---- SocketOps 覆盖：send / recv / wait_writable / wait_readable /
@@ -208,8 +291,12 @@ public:
         return detail::RealSocketOps().create(kind);
     }
 
-    /// @brief 关闭 Socket（转发）
+    /// @brief 关闭 Socket（统计每个句柄的关闭次数后转发）
     void close(detail::SocketHandle handle) override {
+        {
+            const std::lock_guard<std::mutex> lock(m_script_mutex_);
+            ++m_close_counts_[handle];
+        }
         detail::RealSocketOps().close(handle);
     }
 
@@ -244,15 +331,25 @@ public:
         return detail::RealSocketOps().set_blocking(handle);
     }
 
-    /// @brief 监听（转发）
+    /// @brief 监听（记录句柄后转发）
     int listen(detail::SocketHandle handle, int backlog) override {
+        {
+            const std::lock_guard<std::mutex> lock(m_script_mutex_);
+            m_last_listen_handle_ = handle;
+        }
         return detail::RealSocketOps().listen(handle, backlog);
     }
 
-    /// @brief 接受连接（转发）
+    /// @brief 接受连接（记录返回句柄后转发）
     detail::SocketHandle accept(detail::SocketHandle handle,
                                 detail::Ipv4Endpoint* endpoint) override {
-        return detail::RealSocketOps().accept(handle, endpoint);
+        const detail::SocketHandle accepted =
+            detail::RealSocketOps().accept(handle, endpoint);
+        {
+            const std::lock_guard<std::mutex> lock(m_script_mutex_);
+            m_last_accept_handle_ = accepted;
+        }
+        return accepted;
     }
 
     /// @brief 发起连接（转发）
@@ -278,26 +375,81 @@ public:
         return detail::RealSocketOps().set_receive_timeout(handle, timeout_ms);
     }
 
-    /// @brief 发送 UDP 数据报（转发）
+    /// @brief 发送 UDP 数据报：按脚本行事，脚本耗尽后转发真实实现
     int send_to(detail::SocketHandle handle, const std::uint8_t* data,
                 std::size_t size, const detail::Ipv4Endpoint& peer) override {
-        return detail::RealSocketOps().send_to(handle, data, size, peer);
+        SendToAction action = SendToAction::PassThrough;
+        {
+            const std::lock_guard<std::mutex> lock(m_script_mutex_);
+            if (!m_send_to_script_.empty()) {
+                action = m_send_to_script_.front();
+                m_send_to_script_.pop_front();
+            }
+        }
+        switch (action) {
+            case SendToAction::PassThrough:
+                ClearError();
+                return detail::RealSocketOps().send_to(handle, data, size,
+                                                       peer);
+            case SendToAction::FailOther:
+                m_last_error_ = "测试脚本：UDP 发送失败";
+                return -1;
+        }
+        return -1;
     }
 
-    /// @brief 接收 UDP 数据报（转发）
+    /// @brief 接收 UDP 数据报：按脚本行事，脚本耗尽后转发真实实现
+    /// @details 返回值与错误分类同时由脚本决定，因为分类判定读取的是平台
+    ///          最近错误码，注入返回 -1 不足以让上层走进对应分支。
     int recv_from(detail::SocketHandle handle, std::uint8_t* data,
                   std::size_t size, detail::Ipv4Endpoint* peer) override {
-        return detail::RealSocketOps().recv_from(handle, data, size, peer);
+        m_recv_from_calls_.fetch_add(1, std::memory_order_relaxed);
+        RecvFromAction action = RecvFromAction::PassThrough;
+        {
+            const std::lock_guard<std::mutex> lock(m_script_mutex_);
+            if (!m_recv_from_script_.empty()) {
+                action = m_recv_from_script_.front();
+                m_recv_from_script_.pop_front();
+            }
+        }
+        switch (action) {
+            case RecvFromAction::PassThrough:
+                ClearError();
+                return detail::RealSocketOps().recv_from(handle, data, size,
+                                                         peer);
+            case RecvFromAction::DeliverZeroLength:
+                ClearError();
+                if (peer != nullptr) {
+                    *peer = detail::Ipv4Endpoint{};
+                }
+                return 0;
+            case RecvFromAction::FailTimeout:
+                return FailTyped("测试脚本：接收超时",
+                                 RecvFromAction::FailTimeout);
+            case RecvFromAction::FailInterrupted:
+                return FailTyped("测试脚本：接收被信号打断",
+                                 RecvFromAction::FailInterrupted);
+            case RecvFromAction::FailInvalidSocket:
+                return FailTyped("测试脚本：句柄已失效",
+                                 RecvFromAction::FailInvalidSocket);
+            case RecvFromAction::FailConnectionLost:
+                return FailTyped("测试脚本：连接已被重置",
+                                 RecvFromAction::FailConnectionLost);
+            case RecvFromAction::FailOther:
+                return FailTyped("测试脚本：其它接收错误",
+                                 RecvFromAction::FailOther);
+        }
+        return -1;
     }
 
-    /// @brief 判断最近错误是否为 UDP 超时（转发）
+    /// @brief 判断最近错误是否为 UDP 超时（脚本注入优先）
     [[nodiscard]] bool is_timeout() const override {
-        return detail::RealSocketOps().is_timeout();
+        return m_timeout_ ? true : detail::RealSocketOps().is_timeout();
     }
 
-    /// @brief 判断最近错误是否为失效 Socket（转发）
+    /// @brief 判断最近错误是否为失效 Socket（脚本注入优先）
     [[nodiscard]] bool is_invalid_socket() const override {
-        return detail::RealSocketOps().is_invalid_socket();
+        return m_invalid_ ? true : detail::RealSocketOps().is_invalid_socket();
     }
 
     /// @brief 半关闭/关闭方向（转发）
@@ -314,7 +466,12 @@ public:
     ///          立即可读，才能让脚本继续驱动接收分支。
     int wait_readable(detail::SocketHandle handle, std::uint32_t timeout_ms,
                       std::string* error_out) override {
-        if (!m_recv_script_.empty()) {
+        bool has_script = !m_recv_script_.empty();
+        if (!has_script) {
+            const std::lock_guard<std::mutex> lock(m_script_mutex_);
+            has_script = !m_recv_from_script_.empty();
+        }
+        if (has_script) {
             ClearError();
             return 1;
         }
@@ -338,12 +495,26 @@ private:
         return -1;
     }
 
+    /// @brief 按 `recv_from` 分类记录一次注入的失败并返回 -1
+    /// @param error 注入的错误文本
+    /// @param kind 失败分类（决定 `is_timeout`/`is_interrupted`/... 的判定）
+    int FailTyped(std::string error, RecvFromAction kind) {
+        m_last_error_ = std::move(error);
+        m_interrupted_ = (kind == RecvFromAction::FailInterrupted);
+        m_connection_lost_ = (kind == RecvFromAction::FailConnectionLost);
+        m_timeout_ = (kind == RecvFromAction::FailTimeout);
+        m_invalid_ = (kind == RecvFromAction::FailInvalidSocket);
+        return -1;
+    }
+
     /// @brief 清除注入的失败状态（转发前调用，避免污染真实错误判定）
     void ClearError() noexcept {
         m_last_error_.clear();
         m_interrupted_ = false;
         m_would_block_ = false;
         m_connection_lost_ = false;
+        m_timeout_ = false;
+        m_invalid_ = false;
     }
 
     std::deque<SendStep> m_send_script_;           ///< 待消费的 send 脚本
@@ -355,6 +526,19 @@ private:
     bool m_interrupted_{false};                    ///< 注入的 EINTR 判定
     bool m_would_block_{false};                    ///< 注入的 EAGAIN 判定
     bool m_connection_lost_{false};                ///< 注入的连接断开判定
+    bool m_timeout_{false};                        ///< 注入的接收超时判定
+    bool m_invalid_{false};                        ///< 注入的句柄失效判定
+
+    mutable std::mutex m_script_mutex_;  ///< 保护跨线程访问的脚本与计数
+    std::deque<RecvFromAction>
+        m_recv_from_script_;                     ///< 待消费的 recv_from 脚本
+    std::deque<SendToAction> m_send_to_script_;  ///< 待消费的 send_to 脚本
+    std::map<detail::SocketHandle, int> m_close_counts_;  ///< 各句柄关闭次数
+    std::atomic<std::size_t> m_recv_from_calls_{0};  ///< recv_from 调用次数
+    detail::SocketHandle m_last_listen_handle_{
+        detail::kInvalidSocketHandle};  ///< 最近一次 listen 的句柄
+    detail::SocketHandle m_last_accept_handle_{
+        detail::kInvalidSocketHandle};  ///< 最近一次 accept 返回的句柄
 };
 
 /**
