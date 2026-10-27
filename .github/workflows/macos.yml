@@ -1,4 +1,4 @@
-# macOS 持续集成（第一阶段仅 master；首版只构建不跑 ctest，待编译稳定后再加）
+# macOS 持续集成（三平台都跑 Test）
 name: macOS
 
 on:
@@ -17,38 +17,79 @@ env:
 
 jobs:
   build-macos:
-    runs-on: macos-14
+    # macOS 26 镜像自带 Apple Clang 21.0.0，其 libc++ 已完整支持 C++20 <format>
+    # （日志头 include/libxcp/log.hpp 依赖它），因此不再需要 brew 安装 LLVM。
+    #
+    # 历史坑：此前用 macos-14 + brew LLVM，只给 -nostdinc++ 与 -L 会形成
+    # "系统 clang 驱动 + brew libc++ 头 + 按 install name 解析到的系统 libc++abi"
+    # 的混搭，使 __cxa_throw 与 __cxa_begin_catch 落在两套 libc++abi 实例上，
+    # 整个二进制的异常捕获失效（连 EXPECT_THROW 都接不住）。
+    # 详见 code-plan/TCP_UDP平台隔离重构_实施计划_POD接口与平台分文件.md §8.3.9。
+    runs-on: macos-26
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # 日志需要 C++20 <format>，Apple Clang 不一定提供，改用 Homebrew LLVM（含完整 libc++）
-      - name: 安装构建工具、LLVM 与 Boost
-        run: brew install cmake ninja llvm boost
+      # 三平台统一 Boost 1.86.0：这里用 prebuilt-boost 的 macOS/arm64/clang 预编译包，
+      # 不到源码构建。不用 brew install boost，因为 formula 的 stable 版本会随上游升级漂移
+      # （实测已是 1.92），与 Linux/Windows 固定的 1.86 不一致；locale/filesystem 的
+      # ABI 差异只会在运行时以难复现的方式暴露。
+      #
+      # arch 必须显式写 aarch64：action 在未指定 arch 时只接受 manifest 里 arch=x86 的包，
+      # 而 1.86.0 的 macOS 包只有 aarch64（macos-14/macos-15 两档），否则报
+      # "Could not find boost version 1.86.0"（PR #15 首轮即踩到）。
+      - name: 安装 Boost 1.86.0
+        id: install-boost
+        uses: MarkusJx/install-boost@v2.4.5
+        with:
+          boost_version: 1.86.0
+          platform_version: 15
+          toolset: clang
+          arch: aarch64
+          boost_install_dir: ${{ github.workspace }}/boost-install
 
-      # 使用 Homebrew LLVM 自带的 libc++ 头文件与动态库，避免与系统 libc++ 混用
-      # Boost_DIR 由 brew 前缀下的 Boost-* 目录通配得到，不写死版本号
       - name: Configure
         run: |
-          LLVM_PREFIX="$(brew --prefix llvm)"
-          BOOST_CMAKE_DIR="$(ls -d "$(brew --prefix boost)"/lib/cmake/Boost-* | head -n 1)"
-          echo "LLVM_PREFIX=$LLVM_PREFIX"
-          echo "BOOST_CMAKE_DIR=$BOOST_CMAKE_DIR"
+          # 与 Linux 同理：构建期 gtest 发现与 ctest 运行时都要能找到 Boost 动态库
+          echo "BOOST_LIB_DIR=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib" >> "$GITHUB_ENV"
           cmake -B build -S . -G Ninja \
-            -DCMAKE_C_COMPILER="$LLVM_PREFIX/bin/clang" \
-            -DCMAKE_CXX_COMPILER="$LLVM_PREFIX/bin/clang++" \
-            -DCMAKE_CXX_FLAGS="-nostdinc++ -isystem $LLVM_PREFIX/include/c++/v1" \
-            -DCMAKE_EXE_LINKER_FLAGS="-L$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/c++" \
-            -DCMAKE_SHARED_LINKER_FLAGS="-L$LLVM_PREFIX/lib/c++ -Wl,-rpath,$LLVM_PREFIX/lib/c++" \
             -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DLIBXCP_BUILD_TESTS=ON \
             -DLIBXCP_BUILD_TOOLS=ON \
             -DLIBXCP_BUILD_EXAMPLES=ON \
             -DLIBXCP_ENABLE_LOG=ON \
-            "-DBoost_DIR=$BOOST_CMAKE_DIR"
+            "-DBoost_DIR=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib/cmake/Boost-1.86.0"
 
       - name: Build
         run: cmake --build build -j "$(sysctl -n hw.ncpu)"
+
+      # 耗时类用例只在本地做门禁（计划文档 §8.3.4）：渲染基准与两处 A2L 规模/耗时断言不进 CI。
+      # 串行执行：Examples 并行会抢默认端口 5555，产生假失败。
+      # --timeout 180：本机最慢用例 10 s，CI 慢 5 倍也才 50 s；留 180 s 足以容忍抖动，又能让真正
+      #   挂死的用例在 3 分钟内被点名（此前 600 s，5 个挂死用例就烧掉 50 分钟）。
+      - name: Test
+        working-directory: build
+        env:
+          DYLD_LIBRARY_PATH: ${{ env.BOOST_LIB_DIR }}
+        run: >
+          ctest --output-on-failure --timeout 180
+          -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
+
+      # 失败时把 ctest 的失败清单打成 GitHub 注解（annotation）。
+      # 注解可由匿名 API 读取（/repos/.../check-runs/{id}/annotations），
+      # 因此即使没有仓库权限也能定位到底哪些用例红了。
+      - name: Annotate failures
+        if: failure()
+        working-directory: build
+        run: |
+          log=Testing/Temporary/LastTestsFailed.log
+          if [ -f "$log" ]; then
+            while IFS= read -r line; do
+              if [ -n "$line" ]; then
+                echo "::error title=ctest failure::$line"
+              fi
+            done < "$log"
+          fi

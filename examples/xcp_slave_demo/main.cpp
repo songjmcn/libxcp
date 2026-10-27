@@ -46,9 +46,12 @@ constexpr char kEpkVersion[] = "1.0.0";
 constexpr std::uint16_t kDefaultPort = 5555U;
 /// @brief 默认 XCP 测量消息队列容量，单位为字节。
 constexpr std::uint32_t kMeasurementQueueSize = 32768U;
-/// @brief 心跳日志间隔，单位为快速循环次数（10 ms × 500 = 5 秒）。
-/// @note 采用 tick 计数而非墙钟，避免与实时循环的时钟补偿逻辑相互干扰。
-constexpr std::uint32_t kHeartbeatFastTickInterval = 500U;
+/// @brief 心跳日志间隔，单位为墙钟时间。
+/// @note 早期按 tick 计数（10 ms × 500 = 5 秒），但慢机上事件循环被调度拖慢时逻辑
+///       时间跟不上墙钟：CI 实测 9 秒墙钟只推进 265 次事件，心跳因此迟迟不出现。
+///       改用墙钟后语义仍是「固定间隔心跳」，且不受事件推进速度影响；心跳判断只读
+///       当前时间、不参与 next_fast/next_slow 的补偿计算，故不会干扰实时循环。
+constexpr std::chrono::seconds kHeartbeatInterval{5};
 /// @brief 快速循环周期，单位为纳秒。
 constexpr std::chrono::nanoseconds kFastPeriod{kFastEventCycleNs};
 /// @brief 慢速循环周期，单位为纳秒。
@@ -876,6 +879,7 @@ int RunSlave(const CommandLineOptions& options) {
     using Clock = std::chrono::steady_clock;
     auto next_fast = Clock::now();
     auto next_slow = next_fast + kSlowPeriod;
+    auto next_heartbeat = next_fast + kHeartbeatInterval;
     std::uint32_t tick = 0U;
     bool runtime_failure = false;
     while (g_keep_running != 0) {
@@ -914,11 +918,15 @@ int RunSlave(const CommandLineOptions& options) {
         ObserveSlaveProtocolState();
 
         // 降频心跳：确认从站在无主站连接时仍持续运行；与边沿日志相互独立。
-        if (kHeartbeatFastTickInterval != 0U &&
-            tick != 0U && tick % kHeartbeatFastTickInterval == 0U) {
+        if (now >= next_heartbeat) {
             LIBXCP_LOG_INFO(
                 "从站心跳：累计快事件次数={}，已连接={}，DAQ 运行中={}",
                 tick, XcpIsConnected(), XcpIsDaqRunning());
+            next_heartbeat += kHeartbeatInterval;
+            if (now - next_heartbeat > kHeartbeatInterval) {
+                // 落后超过一个间隔说明进程被长时间挂起，从当前时间重新起算，避免连发。
+                next_heartbeat = now + kHeartbeatInterval;
+            }
         }
         std::this_thread::sleep_until(std::min(next_fast, next_slow));
     }

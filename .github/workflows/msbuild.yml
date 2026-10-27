@@ -64,3 +64,39 @@ jobs:
       - name: Build
         shell: pwsh
         run: cmake --build build --config $env:BUILD_TYPE
+
+      # 必须带 -C：VS 是多配置生成器，缺省会报 "Test not available without configuration"。
+      # 耗时类用例只在本地做门禁（计划文档 §8.3.4）；串行执行避免 Examples 抢端口 5555。
+      # --timeout 180：与 Linux/macOS 对齐，让挂死用例 3 分钟内被点名而不是烧掉 10 分钟。
+      # timeout-minutes：整轮若仍被某个用例挂住，45 分钟后由 job 层面截断并进入
+      # Annotate failures，避免白占 runner 到 90 分钟的作业上限。
+      # 超时预算（三级，必须 watchdog < ctest < 步骤）：
+      #   看门狗 60 s —— 用例挂死时由测试进程自己点名并 abort；
+      #   ctest 90 s —— 兜底杀掉整个进程（含看门狗没覆盖到的卡死）；
+      #   步骤 45 min —— 即使有二十多个用例各拖 90 s 也能跑完并产出失败清单。
+      # 上一轮因为步骤只有 20 min，整轮被截断，注解里只剩“步骤超时”，看不到用例名。
+      - name: Test
+        working-directory: build
+        shell: pwsh
+        timeout-minutes: 45
+        env:
+          # 用例级看门狗（tests/test_main.cpp）：单用例超过该秒数即打印用例名并中止。
+          LIBXCP_TEST_WATCHDOG_SECONDS: 60
+        run: >
+          ctest -C $env:BUILD_TYPE --output-on-failure --timeout 90
+          -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
+
+      # 失败时把 ctest 的失败清单打成 GitHub 注解（annotation）。
+      # 注解可由匿名 API 读取（/repos/.../check-runs/{id}/annotations），
+      # 因此即使没有仓库权限也能定位到底哪些用例红了。
+      - name: Annotate failures
+        if: failure()
+        working-directory: build
+        shell: pwsh
+        run: |
+          $log = 'Testing/Temporary/LastTestsFailed.log'
+          if (Test-Path $log) {
+            Get-Content $log | Where-Object { $_ -match '\S' } | ForEach-Object {
+              Write-Host "::error title=ctest failure::$_"
+            }
+          }

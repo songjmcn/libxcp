@@ -65,7 +65,29 @@ jobs:
       - name: Build
         run: cmake --build build -j "$(nproc)"
 
-            # 渲染性能基准依赖机器算力，共享 runner 上稳定超出参考阈值，CI 上跳过
+      # 耗时类用例只在本地做门禁（计划文档 §8.3.4）：
+      #   XcpMasterRenderBenchTest —— 渲染基准，依赖机器算力，共享 runner 上稳定超阈值
+      #   a2l_perf_gen / a2l_ui_perf_gen —— 只为下面第 4 条生成 5 MB / 40 MB 样本
+      #   ParseLargeFileUnderBudget —— 解析耗时断言（参考 264 ms，硬限 3000 ms）
+      # 串行执行（不加 -j）：Examples 并行会抢默认端口 5555，产生假失败。
       - name: Test
         working-directory: build
-        run: ctest --output-on-failure --timeout 300 -E XcpMasterRenderBenchTest
+        run: >
+          ctest --output-on-failure --timeout 600
+          -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
+
+      # 失败时把 ctest 的失败清单打成 GitHub 注解（annotation）。
+      # 注解可由匿名 API 读取（/repos/.../check-runs/{id}/annotations），
+      # 因此即使没有仓库权限也能定位到底哪些用例红了。
+      - name: Annotate failures
+        if: failure()
+        working-directory: build
+        run: |
+          log=Testing/Temporary/LastTestsFailed.log
+          if [ -f "$log" ]; then
+            while IFS= read -r line; do
+              if [ -n "$line" ]; then
+                echo "::error title=ctest failure::$line"
+              fi
+            done < "$log"
+          fi

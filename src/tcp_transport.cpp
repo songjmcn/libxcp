@@ -55,6 +55,20 @@ XcpException MakeSendTimeoutError(std::size_t pending,
         std::to_string(pending) + " 字节未写出（对端可能已停止读取）");
 }
 
+/**
+ * @brief 接收线程每个轮询片等待可读的最长时间（毫秒）
+ *
+ * @details 阻塞式 `recv()` 在 Windows 上无法被 `shutdown()` 取消：Winsock 的
+ *          `shutdown(SD_BOTH)` 会立即返回成功，但另一线程里已挂起的阻塞
+ *          `recv()` 仍会继续睡下去（POSIX 上则会立刻返回 0）。若接收循环直接
+ *          阻塞在 `recv()` 上，`Close()` 的 `join()` 就会永久等待——Windows CI
+ *          上实测到的挂死正是如此。
+ *          因此接收循环改为"先带超时等可读、再 recv"，最坏退出延迟等于本值。
+ *          该值与 UDP 传输层 `receive_poll_interval_ms` 的兜底语义一致，但只
+ *          影响关闭延迟、不改变收包路径，故不提升为公共配置项。
+ */
+constexpr std::uint32_t kReceivePollSliceMs = 100;
+
 /// @brief 去掉诊断文本中的换行，避免日志按行伪造
 std::string SanitizeReason(std::string reason) {
     if (reason.size() > kMaxCloseReasonBytes) {
@@ -169,7 +183,8 @@ void TcpTransport::Open(IPacketListener& listener) {
         throw detail::MakeInvalidArgument("send_timeout_ms 必须大于 0");
     }
     if (m_config_.receive_chunk_size == 0U) {
-        LIBXCP_LOG_ERROR("TCP open rejected because receive_chunk_size is zero");
+        LIBXCP_LOG_ERROR(
+            "TCP open rejected because receive_chunk_size is zero");
         throw detail::MakeInvalidArgument("receive_chunk_size 必须大于 0");
     }
     if (m_config_.max_frame_packet_size == 0U ||
@@ -196,14 +211,16 @@ void TcpTransport::Open(IPacketListener& listener) {
                          m_config_.remote_host);
         throw detail::MakeUnsupportedFeature(
             "IPv6 TCP 传输尚未实现（本版本基础 Profile 仅承诺 IPv4 TCP "
-            "单播）：remote_host=" + m_config_.remote_host);
+            "单播）：remote_host=" +
+            m_config_.remote_host);
     }
     if (detail::LooksLikeIpv6(m_config_.local_host)) {
         LIBXCP_LOG_ERROR("TCP open rejected: IPv6 local unsupported host={}",
                          m_config_.local_host);
         throw detail::MakeUnsupportedFeature(
             "IPv6 TCP 传输尚未实现（本版本基础 Profile 仅承诺 IPv4 TCP "
-            "单播）：local_host=" + m_config_.local_host);
+            "单播）：local_host=" +
+            m_config_.local_host);
     }
 
     // ---- 解码器：构建期即校验，把配置错误挡在连接建立之前 ----
@@ -302,8 +319,8 @@ void TcpTransport::EstablishConnection() {
     // Master 角色若不要求固定源端口，则不显式 bind——让内核在同一次 connect
     // 中选好源地址与端口，避免额外一次系统调用与潜在的端口冲突。
     // 但若调用方指定了 local_host 或 local_port，则必须显式绑定。
-    const bool needs_explicit_bind =
-        !is_master || m_config_.local_port != 0U || !m_config_.local_host.empty();
+    const bool needs_explicit_bind = !is_master || m_config_.local_port != 0U ||
+                                     !m_config_.local_host.empty();
 
     if (needs_explicit_bind) {
         if (m_config_.reuse_address) {
@@ -314,7 +331,8 @@ void TcpTransport::EstablishConnection() {
                 // 非致命：仅影响 TIME_WAIT 期间的重绑定，继续尝试绑定
             }
         }
-        if (ops.bind(m_socket_->handle, reinterpret_cast<const sockaddr*>(&local),
+        if (ops.bind(m_socket_->handle,
+                     reinterpret_cast<const sockaddr*>(&local),
                      sizeof(local)) != 0) {
             const auto error = ops.last_error();
             LIBXCP_LOG_ERROR("TCP bind failed local={}:{} error={}", local_text,
@@ -344,8 +362,8 @@ void TcpTransport::EstablishConnection() {
                                       &remote.sin_addr)) {
             LIBXCP_LOG_ERROR("TCP invalid remote address='{}'",
                              m_config_.remote_host);
-            throw detail::MakeInvalidArgument(
-                "无法解析远端地址: " + m_config_.remote_host);
+            throw detail::MakeInvalidArgument("无法解析远端地址: " +
+                                              m_config_.remote_host);
         }
         ConnectWithTimeout(&remote, sizeof(remote));
     } else {
@@ -359,20 +377,18 @@ void TcpTransport::EstablishConnection() {
     // 失败仅告警：没有它就变慢，但不影响正确性。
     if (ops.set_int_option(m_socket_->handle, IPPROTO_TCP, TCP_NODELAY, 1) !=
         0) {
-        LIBXCP_LOG_WARNING("TCP_NODELAY setup failed: {}",
-                           ops.last_error());
+        LIBXCP_LOG_WARNING("TCP_NODELAY setup failed: {}", ops.last_error());
     }
     if (m_config_.keep_alive) {
-        if (ops.set_int_option(m_socket_->handle, SOL_SOCKET, SO_KEEPALIVE, 1) !=
-            0) {
+        if (ops.set_int_option(m_socket_->handle, SOL_SOCKET, SO_KEEPALIVE,
+                               1) != 0) {
             LIBXCP_LOG_WARNING("TCP SO_KEEPALIVE setup failed: {}",
                                ops.last_error());
         }
     }
 }
 
-void TcpTransport::ConnectWithTimeout(const void* addr,
-                                      std::size_t addr_len) {
+void TcpTransport::ConnectWithTimeout(const void* addr, std::size_t addr_len) {
     auto& ops = detail::CurrentSocketOps();
 
     // 参数经类型擦除传入（见头文件说明），这里恢复回平台类型。
@@ -417,8 +433,8 @@ void TcpTransport::ConnectWithTimeout(const void* addr,
                              m_config_.connect_timeout_ms);
             throw detail::MakeTransportError(
                 "连接远端超时: " + m_config_.remote_host + ":" +
-                    std::to_string(m_config_.remote_port) + "（" +
-                    std::to_string(m_config_.connect_timeout_ms) + " ms）");
+                std::to_string(m_config_.remote_port) + "（" +
+                std::to_string(m_config_.connect_timeout_ms) + " ms）");
         }
         if (ready < 0) {
             const auto error = ops.last_error();
@@ -465,8 +481,7 @@ void TcpTransport::ListenAndAccept() {
         const auto error = ops.last_error();
         LIBXCP_LOG_ERROR("TCP listen failed: {}", error);
         throw detail::MakeTransportError(
-            "监听本地端口失败: " + std::to_string(m_config_.local_port),
-            error);
+            "监听本地端口失败: " + std::to_string(m_config_.local_port), error);
     }
 
     if (ops.set_non_blocking(m_socket_->handle) != 0) {
@@ -481,8 +496,8 @@ void TcpTransport::ListenAndAccept() {
         LIBXCP_LOG_ERROR("TCP accept timeout after {} ms",
                          m_config_.connect_timeout_ms);
         throw detail::MakeTransportError(
-            "等待入站连接超时（" + std::to_string(m_config_.connect_timeout_ms) +
-            " ms）");
+            "等待入站连接超时（" +
+            std::to_string(m_config_.connect_timeout_ms) + " ms）");
     }
     if (ready < 0) {
         const auto error = ops.last_error();
@@ -492,9 +507,8 @@ void TcpTransport::ListenAndAccept() {
 
     sockaddr_in peer{};
     socklen_t peer_len = sizeof(peer);
-    const detail::SocketHandle accepted =
-        ops.accept(m_socket_->handle, reinterpret_cast<sockaddr*>(&peer),
-                   &peer_len);
+    const detail::SocketHandle accepted = ops.accept(
+        m_socket_->handle, reinterpret_cast<sockaddr*>(&peer), &peer_len);
     if (accepted == detail::kInvalidSocketHandle) {
         const auto error = ops.last_error();
         LIBXCP_LOG_ERROR("TCP accept failed: {}", error);
@@ -520,17 +534,19 @@ void TcpTransport::Close() {
     // 1. 通知接收线程退出
     m_running_.store(false, std::memory_order_release);
 
-    // 2. 立即打断阻塞中的 recv()。shutdown 不释放句柄号，因此不存在"句柄被
+    // 2. 让对端尽快观察到 FIN。shutdown 不释放句柄号，因此不存在"句柄被
     //    OS 回收后分配给本进程新建 Socket"的复用风险（对比：直接 close 会有
     //    该风险，而接收线程此刻仍可能在使用这个句柄）。
-    //    对端会因此观察到 FIN——这正是我们想要的：连接确实断了，而不是
-    //    悄悄地不再读取。
+    //    注意：shutdown **不是**接收线程的退出手段。Winsock 上它不会取消
+    //    已挂起的阻塞 recv()（详见 kReceivePollSliceMs 的说明），接收线程的
+    //    退出由 m_running_ + 轮询片保证。
     if (m_socket_ != nullptr &&
         m_socket_->handle != detail::kInvalidSocketHandle) {
         (void)ops.shutdown_socket(m_socket_->handle);
     }
 
-    // 3. 等待接收线程结束（其退出前负责回调 OnTransportClosed）
+    // 3. 等待接收线程结束（其退出前负责回调 OnTransportClosed）。
+    //    最坏退出延迟为一个轮询片，与对端是否发数据无关。
     if (m_receive_thread_.joinable()) {
         m_receive_thread_.join();
     }
@@ -602,8 +618,8 @@ void TcpTransport::WriteFrame(BytesView packet, DatagramCtr ctr) {
     if (m_config_.wire_profile == TcpWireProfile::AsamV14) {
         frame = EncodeEthernetFrameUnpadded(packet, ctr);
     } else {
-        frame = EncodeEthernetFrameAligned(packet, ctr,
-                                           m_config_.packet_alignment);
+        frame =
+            EncodeEthernetFrameAligned(packet, ctr, m_config_.packet_alignment);
     }
 
     WriteAll(frame.data.data(), frame.data.size());
@@ -625,7 +641,8 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
         if (sent == 0) {
             // TCP 的 send 返回 0 不是"对端关闭"的正常表达（那会是 ECONNRESET
             // 或 EPIPE），按异常处理以免死循环。
-            throw detail::MakeTransportError("TCP 发送返回 0 字节，连接状态异常");
+            throw detail::MakeTransportError(
+                "TCP 发送返回 0 字节，连接状态异常");
         }
 
         // sent < 0
@@ -666,9 +683,9 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
         // 并发。这不是对端故障，按"通道已关闭"上报，避免调用方触发恢复。
         LIBXCP_LOG_ERROR("TCP send aborted by close pending_bytes={}",
                          size - written);
-        throw detail::MakeInvalidState(
-            "TCP 发送被 Close() 中断：" + std::to_string(size - written) +
-            " 字节未写出");
+        throw detail::MakeInvalidState("TCP 发送被 Close() 中断：" +
+                                       std::to_string(size - written) +
+                                       " 字节未写出");
     }
 }
 
@@ -703,16 +720,39 @@ void TcpTransport::ReceiveLoop() {
     std::vector<std::uint8_t> buffer(m_config_.receive_chunk_size);
 
     while (m_running_.load(std::memory_order_acquire)) {
-        const int received = ops.recv(m_socket_->handle, buffer.data(),
-                                      buffer.size());
+        // ---- 先带超时等可读，再 recv ----
+        // 不能直接阻塞在 recv() 上：Winsock 的 shutdown() 不会取消已挂起的
+        // 阻塞 recv()，Close() 的 join() 会因此永久等待（kReceivePollSliceMs
+        // 有详细说明）。等待超时即回到 while 顶部重新检查关闭标记，于是退出
+        // 延迟有明确上界，且收包延迟不受影响（数据到达即刻唤醒）。
+        const int ready = ops.wait_readable(m_socket_->handle,
+                                            kReceivePollSliceMs);
+        if (ready == 0) {
+            continue;  // 轮询片超时：回到 while 重判退出条件
+        }
+        if (ready < 0) {
+            if (!m_running_.load(std::memory_order_acquire)) {
+                break;  // Close() 触发，正常退出
+            }
+            if (ops.is_interrupted()) {
+                continue;  // 被信号打断：重试，不计入关闭
+            }
+            const auto error = ops.last_error();
+            LIBXCP_LOG_ERROR("TCP wait readable failed: {}", error);
+            close_reason = SanitizeReason("TCP 等待可读失败：" + error);
+            break;
+        }
+
+        const int received =
+            ops.recv(m_socket_->handle, buffer.data(), buffer.size());
 
         if (received > 0) {
             LIBXCP_LOG_INFO("TCP RX bytes={}", received);
             // 字节流：把本次收到的全部字节交给状态机，由它决定能解出几帧。
-            // Push() 返回的视图指向 decoder 内部缓冲，必须在下次 Push 前消费完。
-            const TcpDecodeResult result =
-                m_decoder_->Push(BytesView{buffer.data(),
-                                           static_cast<std::size_t>(received)});
+            // Push() 返回的视图指向 decoder 内部缓冲，必须在下次 Push
+            // 前消费完。
+            const TcpDecodeResult result = m_decoder_->Push(
+                BytesView{buffer.data(), static_cast<std::size_t>(received)});
             if (!DispatchDecodeResult(result)) {
                 // 失败原因可能是流畸形，也可能是 CTR 违约；两者都属"流已不可
                 // 信"。畸形时 result.malformed_reason 有文本，CTR 违约时为空，
@@ -734,11 +774,10 @@ void TcpTransport::ReceiveLoop() {
             // 而不是被当成"半截帧"丢掉。
             const TcpDecodeResult tail = m_decoder_->Finish();
             if (tail.malformed) {
-                close_reason = SanitizeReason(
-                    "TCP 连接结束时存在截断帧：" +
-                    (tail.malformed_reason.empty()
-                         ? std::string("未提供原因")
-                         : tail.malformed_reason));
+                close_reason = SanitizeReason("TCP 连接结束时存在截断帧：" +
+                                              (tail.malformed_reason.empty()
+                                                   ? std::string("未提供原因")
+                                                   : tail.malformed_reason));
             } else if (listener != nullptr) {
                 for (const auto& frame : tail.frames) {
                     // Finish() 交付的帧同样要通知监听器，否则流末整帧丢失
@@ -818,10 +857,10 @@ bool TcpTransport::CheckReceiveCtr(DatagramCtr ctr, std::string* out_reason) {
         // AsamV15：严格 CTR。任何偏离（缺号/重复/后向/歧义）一律断链——
         // 规范要求精确连续，缺号即意味流已不可信。
         if (out_reason != nullptr) {
-            *out_reason = SanitizeReason(
-                "AsamV15 接收 CTR 不连续：期望 " + CtrToHex(expected) +
-                "，实收 " + CtrToHex(ctr) +
-                "。严格 Profile 下缺号与重复均视为流已失步");
+            *out_reason =
+                SanitizeReason("AsamV15 接收 CTR 不连续：期望 " +
+                               CtrToHex(expected) + "，实收 " + CtrToHex(ctr) +
+                               "。严格 Profile 下缺号与重复均视为流已失步");
         }
         return false;
     }
@@ -872,11 +911,10 @@ bool TcpTransport::DispatchDecodeResult(const TcpDecodeResult& result) {
     if (result.malformed) {
         if (listener != nullptr) {
             try {
-                listener->OnTransportWarning(
-                    "TCP 流失步：" +
-                    (result.malformed_reason.empty()
-                         ? std::string("未提供原因")
-                         : result.malformed_reason));
+                listener->OnTransportWarning("TCP 流失步：" +
+                                             (result.malformed_reason.empty()
+                                                  ? std::string("未提供原因")
+                                                  : result.malformed_reason));
             } catch (...) {
             }
         }

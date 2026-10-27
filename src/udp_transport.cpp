@@ -12,7 +12,12 @@
 #include <string>
 #include <vector>
 
+#include <array>
+#include <span>
+
+#include "event_poller.hpp"
 #include "libxcp/log.hpp"
+#include "socket_util.hpp"
 
 // ---------------------------------------------------------------------------
 // 平台 Socket 适配层
@@ -28,8 +33,6 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <poll.h>
-#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -38,10 +41,23 @@
 namespace calmcar::xcp {
 namespace {
 
-#if defined(_WIN32)
-using SocketHandle = SOCKET;
-constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
 
+/// @brief POD Socket 句柄（与 `socket_util.hpp` 的 `detail::SocketHandle` 同一类型）
+using SocketHandle = detail::SocketHandle;
+
+/// @brief 无效句柄哨兵（三平台统一 `-1`）
+constexpr SocketHandle kInvalidSocket = detail::kInvalidSocketHandle;
+
+#if defined(_WIN32)
+/// @brief POD 句柄 → Windows `SOCKET`
+/// @param handle POD 句柄
+/// @return 可传给 Winsock API 的原生句柄
+SOCKET ToNative(SocketHandle handle) { return static_cast<SOCKET>(handle); }
+
+/// @brief Windows `SOCKET` → POD 句柄
+/// @param handle Winsock API 返回值
+/// @return POD 句柄（`INVALID_SOCKET` 转过来为 `-1`）
+SocketHandle FromNative(SOCKET handle) { return static_cast<SocketHandle>(handle); }
 /// @brief 最后一次平台 Socket 错误的字符串描述
 std::string lastSocketError() {
     const int code = static_cast<int>(WSAGetLastError());
@@ -62,10 +78,17 @@ bool isInterruptedError() {
            code == WSAEINVAL || code == WSAECONNRESET || code == WSAESHUTDOWN;
 }
 
-void closeSocket(SocketHandle handle) { ::closesocket(handle); }
+void closeSocket(SocketHandle handle) { ::closesocket(ToNative(handle)); }
 #else
-using SocketHandle = int;
-constexpr SocketHandle kInvalidSocket = -1;
+/// @brief POD 句柄 → POSIX `int`
+/// @param handle POD 句柄
+/// @return 可传给 POSIX 系统调用的原生句柄
+int ToNative(SocketHandle handle) { return static_cast<int>(handle); }
+
+/// @brief POSIX `int` → POD 句柄
+/// @param handle 系统调用返回值
+/// @return POD 句柄
+SocketHandle FromNative(int handle) { return static_cast<SocketHandle>(handle); }
 
 std::string lastSocketError() {
     return "errno=" + std::to_string(errno) + " " + std::strerror(errno);
@@ -79,7 +102,7 @@ bool isInterruptedError() {
     return errno == EBADF || errno == EINVAL || errno == ENOTCONN;
 }
 
-void closeSocket(SocketHandle handle) { ::close(handle); }
+void closeSocket(SocketHandle handle) { ::close(ToNative(handle)); }
 #endif
 
 /// @brief Windows 进程内 WSAStartup/WSACleanup 引用计数（仅本文件使用）
@@ -207,7 +230,8 @@ struct UdpTransport::WakeupPair {
 std::unique_ptr<UdpTransport::WakeupPair> UdpTransport::CreateWakeupPair() {
     auto pair = std::make_unique<WakeupPair>();
     // 1. 读端：绑定到回环地址的临时端口，供 select 监听与写入触发
-    pair->read_handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    pair->read_handle =
+        FromNative(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     if (pair->read_handle == kInvalidSocket) {
         LIBXCP_LOG_WARNING("UDP wakeup socket create failed: {}",
                            lastSocketError());
@@ -217,7 +241,7 @@ std::unique_ptr<UdpTransport::WakeupPair> UdpTransport::CreateWakeupPair() {
     local.sin_family = AF_INET;
     local.sin_port = htons(0);  // 由 OS 分配临时端口
     ::inet_pton(AF_INET, "127.0.0.1", &local.sin_addr);
-    if (::bind(pair->read_handle, reinterpret_cast<sockaddr*>(&local),
+    if (::bind(ToNative(pair->read_handle), reinterpret_cast<sockaddr*>(&local),
                sizeof(local)) != 0) {
         LIBXCP_LOG_WARNING("UDP wakeup bind failed: {}", lastSocketError());
         closeSocket(pair->read_handle);
@@ -226,7 +250,7 @@ std::unique_ptr<UdpTransport::WakeupPair> UdpTransport::CreateWakeupPair() {
     }
     // 取回实际绑定的端口，写端需要连向它
     socklen_t addr_len = sizeof(local);
-    if (::getsockname(pair->read_handle, reinterpret_cast<sockaddr*>(&local),
+    if (::getsockname(ToNative(pair->read_handle), reinterpret_cast<sockaddr*>(&local),
                       &addr_len) != 0) {
         LIBXCP_LOG_WARNING("UDP wakeup getsockname failed: {}",
                            lastSocketError());
@@ -240,7 +264,7 @@ std::unique_ptr<UdpTransport::WakeupPair> UdpTransport::CreateWakeupPair() {
     //    若保持阻塞会在最后一次 recv 上挂住。
 #if defined(_WIN32)
     u_long non_blocking = 1;
-    if (::ioctlsocket(pair->read_handle, FIONBIO, &non_blocking) != 0) {
+    if (::ioctlsocket(ToNative(pair->read_handle), FIONBIO, &non_blocking) != 0) {
         LIBXCP_LOG_WARNING("UDP wakeup set nonblocking failed: {}",
                            lastSocketError());
         closeSocket(pair->read_handle);
@@ -248,9 +272,9 @@ std::unique_ptr<UdpTransport::WakeupPair> UdpTransport::CreateWakeupPair() {
         return nullptr;
     }
 #else
-    const int flags = ::fcntl(pair->read_handle, F_GETFL, 0);
+    const int flags = ::fcntl(ToNative(pair->read_handle), F_GETFL, 0);
     if (flags < 0 ||
-        ::fcntl(pair->read_handle, F_SETFL, flags | O_NONBLOCK) != 0) {
+        ::fcntl(ToNative(pair->read_handle), F_SETFL, flags | O_NONBLOCK) != 0) {
         LIBXCP_LOG_WARNING("UDP wakeup set nonblocking failed: {}",
                            lastSocketError());
         closeSocket(pair->read_handle);
@@ -260,7 +284,8 @@ std::unique_ptr<UdpTransport::WakeupPair> UdpTransport::CreateWakeupPair() {
 #endif
 
     // 4. 写端：连向读端，之后可直接 send 唤醒字节
-    pair->write_handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    pair->write_handle =
+        FromNative(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     if (pair->write_handle == kInvalidSocket) {
         LIBXCP_LOG_WARNING("UDP wakeup writer create failed: {}",
                            lastSocketError());
@@ -268,7 +293,7 @@ std::unique_ptr<UdpTransport::WakeupPair> UdpTransport::CreateWakeupPair() {
         pair->read_handle = kInvalidSocket;
         return nullptr;
     }
-    if (::connect(pair->write_handle, reinterpret_cast<sockaddr*>(&local),
+    if (::connect(ToNative(pair->write_handle), reinterpret_cast<sockaddr*>(&local),
                   sizeof(local)) != 0) {
         LIBXCP_LOG_WARNING("UDP wakeup connect failed: {}", lastSocketError());
         closeSocket(pair->write_handle);
@@ -288,9 +313,9 @@ void UdpTransport::SignalWakeup(WakeupPair* pair) noexcept {
     // （ReceiveLoop 仍有 SO_RCVTIMEO 轮询兜底），故显式忽略返回值。
     const char token = '\0';
 #if defined(_WIN32)
-    (void)::send(pair->write_handle, &token, 1, 0);
+    (void)::send(ToNative(pair->write_handle), &token, 1, 0);
 #else
-    (void)::send(pair->write_handle, &token, 1, MSG_NOSIGNAL);
+    (void)::send(ToNative(pair->write_handle), &token, 1, MSG_NOSIGNAL);
 #endif
 }
 
@@ -303,13 +328,13 @@ void UdpTransport::DrainWakeup(WakeupPair* pair) noexcept {
     for (;;) {
 #if defined(_WIN32)
         const int received =
-            ::recv(pair->read_handle, buffer, sizeof(buffer), 0);
+            ::recv(ToNative(pair->read_handle), buffer, sizeof(buffer), 0);
         if (received <= 0) {
             break;
         }
 #else
         const ssize_t received =
-            ::recv(pair->read_handle, buffer, sizeof(buffer), 0);
+            ::recv(ToNative(pair->read_handle), buffer, sizeof(buffer), 0);
         if (received <= 0) {
             break;
         }
@@ -404,7 +429,8 @@ void UdpTransport::Open(IPacketListener& listener) {
     }
 #endif
 
-    impl->handle = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    impl->handle =
+        FromNative(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
     if (impl->handle == kInvalidSocket) {
         const auto error = lastSocketError();
         LIBXCP_LOG_ERROR("UDP socket creation failed: {}", error);
@@ -424,7 +450,7 @@ void UdpTransport::Open(IPacketListener& listener) {
         throw detail::MakeInvalidArgument("无法解析本地绑定地址: " +
                                           m_config_.local_host);
     }
-    if (::bind(impl->handle, reinterpret_cast<sockaddr*>(&local),
+    if (::bind(ToNative(impl->handle), reinterpret_cast<sockaddr*>(&local),
                sizeof(local)) != 0) {
         const auto error = lastSocketError();
         LIBXCP_LOG_ERROR("UDP bind failed local={}:{} error={}",
@@ -440,7 +466,7 @@ void UdpTransport::Open(IPacketListener& listener) {
     // ---- 记录实际绑定的本地端口（OS 分配临时端口时需回填，供诊断）----
     sockaddr_in actual_local{};
     socklen_t actual_len = sizeof(actual_local);
-    if (::getsockname(impl->handle, reinterpret_cast<sockaddr*>(&actual_local),
+    if (::getsockname(ToNative(impl->handle), reinterpret_cast<sockaddr*>(&actual_local),
                       &actual_len) == 0) {
         if (m_config_.local_port == 0U) {
             m_config_.local_port = ntohs(actual_local.sin_port);
@@ -464,14 +490,14 @@ void UdpTransport::Open(IPacketListener& listener) {
 #if defined(_WIN32)
     DWORD tv_ms = m_config_.receive_poll_interval_ms;
     timeout_result =
-        ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO,
+        ::setsockopt(ToNative(impl->handle), SOL_SOCKET, SO_RCVTIMEO,
                      reinterpret_cast<const char*>(&tv_ms), sizeof(tv_ms));
 #else
     timeval tv{};
     tv.tv_sec = m_config_.receive_poll_interval_ms / 1000U;
     tv.tv_usec = (m_config_.receive_poll_interval_ms % 1000U) * 1000U;
     timeout_result =
-        ::setsockopt(impl->handle, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        ::setsockopt(ToNative(impl->handle), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
     if (timeout_result != 0) {
         // 先取平台错误文本；closeSocket 可能覆盖 errno / WSAGetLastError。
@@ -614,7 +640,8 @@ void UdpTransport::Send(BytesView packet) {
     }
 
     const int sent = ::sendto(
-        m_socket_->handle, reinterpret_cast<const char*>(frame.data.data()),
+        ToNative(m_socket_->handle),
+        reinterpret_cast<const char*>(frame.data.data()),
         static_cast<int>(frame.data.size()), 0,
         reinterpret_cast<const sockaddr*>(&m_socket_->remote),
         sizeof(m_socket_->remote));
@@ -658,38 +685,39 @@ void UdpTransport::ReceiveLoop() {
     std::string close_reason = "Transport 正常关闭";
 
     while (m_running_.load(std::memory_order_acquire)) {
-        // ---- 用 select 同时等待数据 Socket 与唤醒 Socket ----
+        // ---- 用 EventPoller 同时等待数据 Socket 与唤醒 Socket ----
         // 唤醒 Socket 可读即表示 Close() 已请求退出，可立即返回；
         // 数据 Socket 可读则进入 recvfrom 取包。
         // 超时仍用 receive_poll_interval_ms 作为**兜底轮询**：万一唤醒字节
         // 丢失（极端资源耗尽下 send 失败），退出延迟仍有一个明确上界。
-        fd_set read_set;
-        FD_ZERO(&read_set);
         const SocketHandle data_handle =
             (m_socket_ ? m_socket_->handle : kInvalidSocket);
-        if (data_handle != kInvalidSocket) {
-            FD_SET(data_handle, &read_set);
-        }
         const SocketHandle wake_handle =
             (m_wakeup_ ? m_wakeup_->read_handle : kInvalidSocket);
-        if (wake_handle != kInvalidSocket) {
-            FD_SET(wake_handle, &read_set);
-        }
-        if (data_handle == kInvalidSocket && wake_handle == kInvalidSocket) {
+        const bool has_data = data_handle != kInvalidSocket;
+        const bool has_wake = wake_handle != kInvalidSocket;
+        if (!has_data && !has_wake) {
             break;  // 无可用句柄，无从等待
         }
 
-        timeval wait{};
-        wait.tv_sec =
-            static_cast<long>(m_config_.receive_poll_interval_ms / 1000U);
-        wait.tv_usec = static_cast<long>(
-            (m_config_.receive_poll_interval_ms % 1000U) * 1000U);
-#if defined(_WIN32)
-        const int ready = ::select(0, &read_set, nullptr, nullptr, &wait);
-#else
-        const int ready =
-            ::select(FD_SETSIZE, &read_set, nullptr, nullptr, &wait);
-#endif
+        // 按需组装等待项：两个句柄都可能缺失，索引必须动态确定
+        std::array<detail::WaitItem, 2> items{};
+        std::size_t item_count = 0;
+        std::size_t data_index = 0;
+        std::size_t wake_index = 0;
+        if (has_data) {
+            data_index = item_count;
+            items[item_count++] = detail::WaitItem{data_handle, true, false};
+        }
+        if (has_wake) {
+            wake_index = item_count;
+            items[item_count++] = detail::WaitItem{wake_handle, true, false};
+        }
+
+        std::vector<detail::WaitStatus> status(item_count);
+        const int ready = detail::WaitAnySocket(
+            std::span<const detail::WaitItem>(items.data(), item_count),
+            m_config_.receive_poll_interval_ms, status);
         if (ready < 0) {
             if (isInterruptedError()) {
                 break;
@@ -697,10 +725,10 @@ void UdpTransport::ReceiveLoop() {
             if (!m_running_.load(std::memory_order_acquire)) {
                 break;  // Close() 触发，正常退出
             }
-            // 其它 select 错误（含超时以外的瞬态失败）：警告后继续
+            // 其它等待错误（含超时以外的瞬态失败）：警告后继续
             const auto error = lastSocketError();
             if (listener != nullptr) {
-                listener->OnTransportWarning("select 失败: " + error);
+                listener->OnTransportWarning("等待数据 Socket 失败: " + error);
             }
             continue;
         }
@@ -710,7 +738,7 @@ void UdpTransport::ReceiveLoop() {
         }
 
         // 唤醒 Socket 可读：排空并检查关闭标记
-        if (wake_handle != kInvalidSocket && FD_ISSET(wake_handle, &read_set)) {
+        if (has_wake && status[wake_index].Ready()) {
             DrainWakeup(m_wakeup_.get());
             if (!m_running_.load(std::memory_order_acquire)) {
                 break;  // Close() 触发，正常退出
@@ -718,7 +746,7 @@ void UdpTransport::ReceiveLoop() {
             // 非关闭场景的意外唤醒：继续等待（不视为错误）
             continue;
         }
-        if (!FD_ISSET(data_handle, &read_set)) {
+        if (!has_data || !status[data_index].Ready()) {
             continue;  // 无数据可读（理论上不可达），回到等待
         }
 
@@ -726,7 +754,8 @@ void UdpTransport::ReceiveLoop() {
         sockaddr_in src{};
         socklen_t src_len = sizeof(src);
         const int received =
-            ::recvfrom(m_socket_ ? m_socket_->handle : kInvalidSocket,
+            ::recvfrom(ToNative(m_socket_ ? m_socket_->handle
+                                           : kInvalidSocket),
                        reinterpret_cast<char*>(buffer.data()),
                        static_cast<int>(buffer.size()), 0,
                        reinterpret_cast<sockaddr*>(&src), &src_len);

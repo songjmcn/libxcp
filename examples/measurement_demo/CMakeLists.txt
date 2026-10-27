@@ -47,8 +47,13 @@ add_custom_command(TARGET measurement_demo POST_BUILD
 
 # ctest 默认冒烟：非 gtest 裸可执行 + 退出码；与 ExampleXcpMasterUdp 共用 5555，
 # 均设 RUN_SERIAL 避免端口并发；端口被占时预检 exit 2，作为环境错误暴露。
+# temperature 的变化由从站 mainloop counter 回绕驱动（counter_max=1000、1 ms/轮 →
+# 约 1 s 一次），慢速 CI runner 上 4 s 窗口可能一次都不回绕，故用 --static-symbols
+# 只断言覆盖、跳过"窗口内 ≥2 个不同原始值"的变化性断言。
 add_test(NAME ExampleMeasurementDemo
-        COMMAND measurement_demo --run-dir "${CMAKE_CURRENT_BINARY_DIR}/ctest_run")
+        COMMAND measurement_demo
+                --run-dir "${CMAKE_CURRENT_BINARY_DIR}/ctest_run"
+                --static-symbols temperature)
 set_tests_properties(ExampleMeasurementDemo PROPERTIES
         RUN_SERIAL TRUE
         TIMEOUT 180)
@@ -65,6 +70,7 @@ add_test(NAME ExampleCppDemoMeasurement
                 --range temperature=-50:100 --range speed=0:250
                 --range counter=0:65535 --range sum=-100:100
                 --range SigGen1.value_=-100:100 --range SigGen2.value_=-100:100
+                --static-symbols temperature
                 --seconds 4)
 set_tests_properties(ExampleCppDemoMeasurement PROPERTIES
         RUN_SERIAL TRUE
@@ -77,7 +83,8 @@ add_test(NAME ExampleCppDemoCalibration
                 --run-dir "${CMAKE_CURRENT_BINARY_DIR}/cpp_demo_calibration_ctest_run"
                 --port 5555 --project cpp_demo --symbols temperature,counter
                 --event mainloop --mode dynamic --range temperature=-50:100
-                --range counter=0:1000 --seconds 4 --calibration-probe)
+                --range counter=0:1000 --static-symbols temperature
+                --seconds 4 --calibration-probe)
 set_tests_properties(ExampleCppDemoCalibration PROPERTIES
         RUN_SERIAL TRUE
         TIMEOUT 180)

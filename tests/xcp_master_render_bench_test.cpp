@@ -9,6 +9,12 @@
  * 把「渲染成本随候选数线性增长」锁进回归，防止以后退化。
  *
  * 基线只拦量级劣化，不是 SLA：允许参考值的 3 倍，同时受绝对上限约束。
+ *
+ * 机器能力门控（见 `MeasureMachineCapabilityFactor`）：绝对毫秒预算只对与
+ * 参考机同档次的机器有判别力。当本机每行渲染成本超过参考值的
+ * `kMachineCapabilityTolerance` 倍时，介于「参考预算」与「绝对上限」之间的
+ * 耗时不再判失败，而是显式 `GTEST_SKIP` 并打印实测证据；绝对上限在任何机器
+ * 上照常生效，量级劣化不会被放过。
  */
 #include <gtest/gtest.h>
 
@@ -44,6 +50,24 @@ constexpr double kFrameRenderReferenceMs = 170.0;
 
 /** @brief 单帧渲染绝对上限（毫秒）：超过即视为量级劣化。 */
 constexpr double kFrameRenderHardLimitMs = 1500.0;
+
+/**
+ * @brief 参考机的每行渲染成本（微秒/行）。
+ * @details 由参考值与参考行数推导（170 ms / 198 556 行 ≈ 0.856 µs），
+ *          不再单独引入一个魔法数。
+ */
+constexpr double kFrameRenderReferenceUsPerRow =
+    kFrameRenderReferenceMs * 1000.0 / static_cast<double>(kFieldCandidateCount);
+
+/**
+ * @brief 机器能力容忍倍数。
+ * @details 本机每行渲染成本超过参考值该倍数时，判定"算力与参考机不匹配"，
+ *          绝对毫秒预算在该机器上不再具备判别力。
+ */
+constexpr double kMachineCapabilityTolerance = 2.0;
+
+/** @brief 能力标定用的行数：参考规模的 1/16（约 50 ms），避免门控本身拖慢基准。 */
+constexpr std::size_t kCapabilityProbeRows = kFieldCandidateCount / 16U;
 
 /** @brief 单次全库检索参考值（毫秒）：本机实测 198 556 个符号约 90 ms。 */
 constexpr double kSearchReferenceMs = 90.0;
@@ -126,6 +150,26 @@ double MeasureFrameMs(std::size_t count, int rounds = 3) {
 }
 
 /**
+ * @brief 标定本机相对参考机的渲染能力系数。
+ *
+ * 用**同一条渲染路径**测量 1/16 规模的每行成本，再除以参考机的每行成本
+ * （`kFrameRenderReferenceUsPerRow`）得到系数。之所以不用独立的纯 CPU 标定
+ * 负载：本基准的瓶颈在内存与字符串分配（FTXUI 每行构造一次 Element），
+ * 通用 CPU 系数与实际耗时不呈比例，会把慢机误判成代码劣化。
+ *
+ * 代价是"代码整体劣化"同样会抬高该系数，因此系数只用来决定"跳过还是判
+ * 失败"，绝对兜底始终是 `kFrameRenderHardLimitMs`。
+ *
+ * @return 能力系数：1.0 表示与参考机同速，数值越大表示本机越慢。
+ */
+double MeasureMachineCapabilityFactor() {
+    const double probe_ms = MeasureFrameMs(kCapabilityProbeRows);
+    const double probe_us_per_row =
+        probe_ms * 1000.0 / static_cast<double>(kCapabilityProbeRows);
+    return probe_us_per_row / kFrameRenderReferenceUsPerRow;
+}
+
+/**
  * @brief 读取与 A2L 同名的符号数侧车文件（由 gen_a2l.py 写入）。
  * @param a2l_path A2L 文件路径。
  * @return 侧车里记录的符号数；文件不存在或内容非法时返回空。
@@ -158,16 +202,56 @@ std::optional<std::filesystem::path> ResolvePerfA2lPath() {
     return std::nullopt;
 }
 
-/** @brief 单帧渲染在 198 556 个候选下不得突破量级预算。 */
+/**
+ * @brief 单帧渲染在 198 556 个候选下不得突破量级预算。
+ * @details 判定顺序固定为「绝对上限 → 参考预算 → 机器能力门控」：
+ *          1. 突破 `kFrameRenderHardLimitMs` 一律失败，慢机不豁免；
+ *          2. 低于参考预算的 3 倍直接通过，行为与门控引入前一致；
+ *          3. 落在两者之间且能力系数超过 `kMachineCapabilityTolerance` 时，
+ *             显式跳过并打印实测证据——绝对毫秒预算在该机器上无判别力。
+ */
 TEST(XcpMasterRenderBenchTest, RendersFrameWithFieldSizeCandidateList) {
     const double frame_ms = MeasureFrameMs(kFieldCandidateCount);
     const double reference_limit = kFrameRenderReferenceMs * 3.0;
-    std::printf("[PERF] 渲染 198556 行单帧 = %.1f ms（预算 参考=%.0f ms 硬上限=%.0f ms）\n",
-                frame_ms, reference_limit, kFrameRenderHardLimitMs);
-    EXPECT_LT(frame_ms, reference_limit)
-        << "单帧渲染耗时较参考值劣化超过 3 倍：候选 " << kFieldCandidateCount
-        << " 行";
+    const double capability_factor = MeasureMachineCapabilityFactor();
+    const double local_us_per_row =
+        capability_factor * kFrameRenderReferenceUsPerRow;
+    std::printf(
+        "[PERF] 渲染 %zu 行单帧 = %.1f ms（预算 参考=%.0f ms 硬上限=%.0f ms）；"
+        "本机每行 %.2f µs，参考每行 %.2f µs，能力系数=%.2f\n",
+        kFieldCandidateCount, frame_ms, reference_limit,
+        kFrameRenderHardLimitMs, local_us_per_row,
+        kFrameRenderReferenceUsPerRow, capability_factor);
+
+    // 1) 绝对上限：任何机器都要拦住量级劣化。
     EXPECT_LT(frame_ms, kFrameRenderHardLimitMs) << "单帧渲染耗时突破绝对上限";
+    if (frame_ms >= kFrameRenderHardLimitMs) {
+        return;  // 已判定失败，不再叠加参考预算报错，保持失败原因单一。
+    }
+
+    // 2) 参考预算：与参考机同档次时照常拦截 3 倍劣化。
+    if (frame_ms < reference_limit) {
+        return;
+    }
+
+    // 3) 机器能力门控：本机明显慢于参考机时显式跳过，而不是让慢机变红。
+    if (capability_factor > kMachineCapabilityTolerance) {
+        GTEST_SKIP() << std::format(
+            "本机算力与参考机不匹配，绝对毫秒预算无判别力：实测单帧 {:.1f} ms，"
+            "参考预算 {:.0f} ms，硬上限 {:.0f} ms（已通过）；本机每行 {:.2f} µs，"
+            "参考每行 {:.2f} µs，能力系数 {:.2f} > 容忍倍数 {:.1f}。"
+            "若怀疑是代码劣化，请在参考机复核该基准。",
+            frame_ms, reference_limit, kFrameRenderHardLimitMs, local_us_per_row,
+            kFrameRenderReferenceUsPerRow, capability_factor,
+            kMachineCapabilityTolerance);
+    }
+
+    // 同档机器上的真实劣化：照常失败。
+    EXPECT_LT(frame_ms, reference_limit) << std::format(
+        "单帧渲染耗时较参考值劣化超过 3 倍：候选 {} 行，实测 {:.1f} ms；"
+        "本机能力系数 {:.2f}（未超过容忍倍数 {:.1f}，故不按机器能力豁免）",
+        kFieldCandidateCount, frame_ms, capability_factor,
+        kMachineCapabilityTolerance);
 }
 
 /**

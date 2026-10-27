@@ -84,6 +84,31 @@ using namespace calmcar::xcp;
 
 namespace {
 
+/// @brief 解析逗号分隔的符号短名列表（去空白、丢空项、保序）。
+/// @param spec 形如 "temperature,counter" 的原始文本。
+/// @return 解析出的短名列表。
+std::vector<std::string> ParseShortNames(const std::string& spec) {
+    std::vector<std::string> out;
+    std::stringstream ss(spec);
+    std::string item;
+    auto trim = [](std::string& s) {
+        const auto b = s.find_first_not_of(" \t");
+        if (b == std::string::npos) {
+            s.clear();
+            return;
+        }
+        const auto e = s.find_last_not_of(" \t");
+        s = s.substr(b, e - b + 1);
+    };
+    while (std::getline(ss, item, ',')) {
+        trim(item);
+        if (!item.empty()) {
+            out.push_back(item);
+        }
+    }
+    return out;
+}
+
 /// @brief 命令行配置（全部有默认值，零参数启动 examples 内的 cpp_demo）。
 struct Options {
     fs::path runDir = "measurement_demo_run";  ///< Slave 工作目录。
@@ -94,6 +119,11 @@ struct Options {
     std::chrono::milliseconds commandTimeout{2000};   ///< 单命令超时。
     std::string project = "cpp_demo";                 ///< MODULE 限定名前缀。
     std::string symbolsSpec = "temperature,counter";  ///< 逗号分隔符号短名。
+    /// 逗号分隔：只断言覆盖、跳过变化性断言的符号短名。
+    /// 用途是排除"变化周期由从站循环速度决定"的符号：cpp_demo 的 temperature 只在
+    /// mainloop counter 回绕到 0 时才 +1（counter_max=1000，1 ms/轮 → 约 1 秒一次），
+    /// 慢速 CI runner 上 4 秒窗口可能一次都没回绕，窗口内自然只有一个原始值。
+    std::string staticSymbolsSpec;
     std::string event = "mainloop";  ///< EVENT 段缺少测量关联时的回退名称。
     std::string a2lName = "uploaded.a2l";  ///< 上传 A2L 落盘文件名。
     bool dynamicMode = true;  ///< cpp_demo 变量随时间变化，默认启用动态断言。
@@ -105,25 +135,12 @@ struct Options {
 
     /// @brief 符号短名列表（逗号分隔，去空白；保序）。
     std::vector<std::string> Symbols() const {
-        std::vector<std::string> out;
-        std::stringstream ss(symbolsSpec);
-        std::string item;
-        auto trim = [](std::string& s) {
-            const auto b = s.find_first_not_of(" \t");
-            if (b == std::string::npos) {
-                s.clear();
-                return;
-            }
-            const auto e = s.find_last_not_of(" \t");
-            s = s.substr(b, e - b + 1);
-        };
-        while (std::getline(ss, item, ',')) {
-            trim(item);
-            if (!item.empty()) {
-                out.push_back(item);
-            }
-        }
-        return out;
+        return ParseShortNames(symbolsSpec);
+    }
+
+    /// @brief 只断言覆盖、跳过变化性断言的符号短名（--static-symbols）。
+    std::vector<std::string> StaticSymbols() const {
+        return ParseShortNames(staticSymbolsSpec);
     }
 };
 
@@ -675,7 +692,7 @@ std::optional<std::vector<std::uint64_t>> ResolveSymbolEventChannels(
 }
 
 /// @brief 解析 --run-dir/--slave/--host/--port/--seconds/--project/--symbols/
-///        --event/--a2l-name/--mode/--expect/--range/--help。
+///        --static-symbols/--event/--a2l-name/--mode/--expect/--range/--help。
 bool ParseArgs(int argc, char** argv, Options& opt) {
     auto needValue = [&](int& i) -> const char* {
         if (i + 1 >= argc) {
@@ -692,6 +709,7 @@ bool ParseArgs(int argc, char** argv, Options& opt) {
                 "          [--host H] [--port N] [--seconds N]\n"
                 "          [--project NAME] [--symbols a,b,...] [--event "
                 "NAME]\n"
+                "          [--static-symbols a,b,...]（只断言覆盖，跳过变化性）\n"
                 "          [--a2l-name FILE] [--mode fixed|dynamic]\n"
                 "          [--expect 0xHEX] [--range NAME=min:max]...\n"
                 "          [--calibration-probe]（仅本地 cpp_demo）\n"
@@ -735,6 +753,10 @@ bool ParseArgs(int argc, char** argv, Options& opt) {
             const char* v = needValue(i);
             if (!v) return false;
             opt.symbolsSpec = v;
+        } else if (arg == "--static-symbols") {
+            const char* v = needValue(i);
+            if (!v) return false;
+            opt.staticSymbolsSpec = v;
         } else if (arg == "--event") {
             const char* v = needValue(i);
             if (!v) return false;
@@ -1324,15 +1346,27 @@ int main(int argc, char** argv) {
         // 改为逐符号覆盖 + 变化性（窗口内 ≥2 个不同原始值）+ 可选值域。
         if (opt.dynamicMode) {
             std::printf("\n==== dynamic 逐符号断言 ====\n");
+            const std::vector<std::string> static_symbols =
+                opt.StaticSymbols();
             for (const auto& sym : symbols) {
                 const std::string q = Qualified(sym);
                 char buf[256];
                 std::snprintf(buf, sizeof(buf), "覆盖：%s 有效样本 ≥1",
                               q.c_str());
                 check.Check(sink.ValidCount(q) >= 1U, buf);
-                std::snprintf(buf, sizeof(buf),
-                              "变化性：%s 窗口内 ≥2 个不同原始值", q.c_str());
-                check.Check(sink.DistinctCount(q) >= 2U, buf);
+                // 变化周期由从站循环速度决定的符号（--static-symbols）只断言覆盖：
+                // 断言"窗口内 ≥2 个不同值"会把从站 CPU 速度当成被测特性。
+                if (std::find(static_symbols.begin(), static_symbols.end(),
+                              sym) != static_symbols.end()) {
+                    std::printf("[skip] 变化性：%s（--static-symbols 指定，"
+                                "只断言覆盖）\n",
+                                q.c_str());
+                } else {
+                    std::snprintf(buf, sizeof(buf),
+                                  "变化性：%s 窗口内 ≥2 个不同原始值",
+                                  q.c_str());
+                    check.Check(sink.DistinctCount(q) >= 2U, buf);
+                }
                 const auto mm = sink.MinMax(q);
                 // 取证：dynamic 模式逐符号转储窗口内实际原始字节（hex）。
                 // 线宽/定标口径争议（如 cpp_demo DYN 区 4 字节对齐）凭此定性。
