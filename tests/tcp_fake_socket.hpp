@@ -15,7 +15,7 @@
  * @par 设计取舍：默认转发，只脚本化必要的方法
  *   本假实现**不**重写整套 Socket 生命周期（那会让测试失去"真实连接"这一
  *   前提），而是默认把每次调用转发给 `RealSocketOps()`，仅对测试显式脚本化
- *   的方法（`send` / `recv` / `wait_writable`）按脚本行事。
+ *   的方法（`send` / `recv` / `wait_writable` / `wait_readable`）按脚本行事。
  *   于是连接建立、端口分配、关闭语义仍然是真实的，被替换的只有错误注入点。
  *
  * @warning 注入是**进程级**的（见 `SetSocketOpsForTesting()`）：使用本头文件的
@@ -100,7 +100,7 @@ public:
         return m_recv_calls_;
     }
 
-    // ---- SocketOps 覆盖：仅 send / recv / wait_writable / 错误分类 ----
+    // ---- SocketOps 覆盖：send / recv / wait_writable / wait_readable / 错误分类 ----
 
     /// @brief 按脚本行事；脚本耗尽后转发真实实现
     int send(detail::SocketHandle handle, const std::uint8_t* data,
@@ -276,9 +276,18 @@ public:
         return detail::RealSocketOps().shutdown_socket(handle);
     }
 
-    /// @brief 等待可读（转发）
+    /// @brief 等待可读：有待消费的 recv 脚本时视为"立即可读"，否则转发真实实现
+    /// @details 生产代码的接收循环按"先等可读、再 recv"推进（Windows 上
+    ///          `shutdown()` 无法取消阻塞 `recv()`，见 `kReceivePollSliceMs`）。
+    ///          若这里一并转发真实实现，脚本注入的错误条件会因为真实 Socket
+    ///          上没有数据而永远等不到 recv 被调用；把"有待消费脚本"当作
+    ///          立即可读，才能让脚本继续驱动接收分支。
     int wait_readable(detail::SocketHandle handle,
                       std::uint32_t timeout_ms) override {
+        if (!m_recv_script_.empty()) {
+            ClearError();
+            return 1;
+        }
         return detail::RealSocketOps().wait_readable(handle, timeout_ms);
     }
 

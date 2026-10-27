@@ -15,8 +15,6 @@
 #include "libxcp/tcp_transport.hpp"
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -57,16 +55,19 @@ XcpException MakeSendTimeoutError(std::size_t pending,
         std::to_string(pending) + " 字节未写出（对端可能已停止读取）");
 }
 
-/// @brief 临时诊断埋点：仅当环境变量 `LIBXCP_TCP_TRACE` 存在时向 stderr 输出
-/// @param tag 埋点位置标签
-/// @details Windows CI 上 `TcpTransport` 收尾卡死时的定位手段；定位完成后删除。
-void DiagTrace(const char* tag) {
-    if (std::getenv("LIBXCP_TCP_TRACE") == nullptr) {
-        return;
-    }
-    std::fprintf(stderr, "TRACE tcp:%s\n", tag);
-    std::fflush(stderr);
-}
+/**
+ * @brief 接收线程每个轮询片等待可读的最长时间（毫秒）
+ *
+ * @details 阻塞式 `recv()` 在 Windows 上无法被 `shutdown()` 取消：Winsock 的
+ *          `shutdown(SD_BOTH)` 会立即返回成功，但另一线程里已挂起的阻塞
+ *          `recv()` 仍会继续睡下去（POSIX 上则会立刻返回 0）。若接收循环直接
+ *          阻塞在 `recv()` 上，`Close()` 的 `join()` 就会永久等待——Windows CI
+ *          上实测到的挂死正是如此。
+ *          因此接收循环改为"先带超时等可读、再 recv"，最坏退出延迟等于本值。
+ *          该值与 UDP 传输层 `receive_poll_interval_ms` 的兜底语义一致，但只
+ *          影响关闭延迟、不改变收包路径，故不提升为公共配置项。
+ */
+constexpr std::uint32_t kReceivePollSliceMs = 100;
 
 /// @brief 去掉诊断文本中的换行，避免日志按行伪造
 std::string SanitizeReason(std::string reason) {
@@ -529,29 +530,26 @@ void TcpTransport::ListenAndAccept() {
 
 void TcpTransport::Close() {
     auto& ops = detail::CurrentSocketOps();
-    DiagTrace("close:enter");
 
     // 1. 通知接收线程退出
     m_running_.store(false, std::memory_order_release);
 
-    // 2. 立即打断阻塞中的 recv()。shutdown 不释放句柄号，因此不存在"句柄被
+    // 2. 让对端尽快观察到 FIN。shutdown 不释放句柄号，因此不存在"句柄被
     //    OS 回收后分配给本进程新建 Socket"的复用风险（对比：直接 close 会有
     //    该风险，而接收线程此刻仍可能在使用这个句柄）。
-    //    对端会因此观察到 FIN——这正是我们想要的：连接确实断了，而不是
-    //    悄悄地不再读取。
-    DiagTrace("close:after-flag");
+    //    注意：shutdown **不是**接收线程的退出手段。Winsock 上它不会取消
+    //    已挂起的阻塞 recv()（详见 kReceivePollSliceMs 的说明），接收线程的
+    //    退出由 m_running_ + 轮询片保证。
     if (m_socket_ != nullptr &&
         m_socket_->handle != detail::kInvalidSocketHandle) {
         (void)ops.shutdown_socket(m_socket_->handle);
     }
-    DiagTrace("close:after-shutdown");
 
-    // 3. 等待接收线程结束（其退出前负责回调 OnTransportClosed）
-    DiagTrace("close:before-join");
+    // 3. 等待接收线程结束（其退出前负责回调 OnTransportClosed）。
+    //    最坏退出延迟为一个轮询片，与对端是否发数据无关。
     if (m_receive_thread_.joinable()) {
         m_receive_thread_.join();
     }
-    DiagTrace("close:after-join");
 
     // 4. 线程已停，此处关闭句柄不再存在竞态
     if (m_socket_ != nullptr) {
@@ -717,14 +715,34 @@ std::uint64_t TcpTransport::DeliveredFrameCount() const noexcept {
 
 void TcpTransport::ReceiveLoop() {
     auto& ops = detail::CurrentSocketOps();
-    DiagTrace("loop:enter");
     IPacketListener* listener = m_listener_;
     std::string close_reason = "Transport 正常关闭";
     std::vector<std::uint8_t> buffer(m_config_.receive_chunk_size);
 
-    DiagTrace("loop:while-enter");
     while (m_running_.load(std::memory_order_acquire)) {
-        DiagTrace("loop:before-recv");
+        // ---- 先带超时等可读，再 recv ----
+        // 不能直接阻塞在 recv() 上：Winsock 的 shutdown() 不会取消已挂起的
+        // 阻塞 recv()，Close() 的 join() 会因此永久等待（kReceivePollSliceMs
+        // 有详细说明）。等待超时即回到 while 顶部重新检查关闭标记，于是退出
+        // 延迟有明确上界，且收包延迟不受影响（数据到达即刻唤醒）。
+        const int ready = ops.wait_readable(m_socket_->handle,
+                                            kReceivePollSliceMs);
+        if (ready == 0) {
+            continue;  // 轮询片超时：回到 while 重判退出条件
+        }
+        if (ready < 0) {
+            if (!m_running_.load(std::memory_order_acquire)) {
+                break;  // Close() 触发，正常退出
+            }
+            if (ops.is_interrupted()) {
+                continue;  // 被信号打断：重试，不计入关闭
+            }
+            const auto error = ops.last_error();
+            LIBXCP_LOG_ERROR("TCP wait readable failed: {}", error);
+            close_reason = SanitizeReason("TCP 等待可读失败：" + error);
+            break;
+        }
+
         const int received =
             ops.recv(m_socket_->handle, buffer.data(), buffer.size());
 

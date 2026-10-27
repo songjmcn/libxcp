@@ -174,18 +174,6 @@ void CloseRaw(RawSocket handle) {
     test_support::CloseRawSocket(static_cast<std::intptr_t>(handle));
 }
 
-/// @brief 临时诊断埋点：设置 `LIBXCP_TEST_TRACE` 时把执行位置打到 stderr
-/// @param tag 位置标签
-/// @details 只在排查平台挂死时使用（CI 上由诊断步骤把 TRACE 行转成注解），
-///          定位完成后应删除，避免给正常测试路径引入额外 IO。
-void Trace(const char* tag) {
-    if (std::getenv("LIBXCP_TEST_TRACE") == nullptr) {
-        return;
-    }
-    std::fprintf(stderr, "TRACE %s\n", tag);
-    std::fflush(stderr);
-}
-
 /**
  * @brief 手工编一个接收侧的 wire Frame（AsamV14 形态：无 Tail）
  * @param payload XCP Packet 内容
@@ -453,32 +441,25 @@ protected:
 
     /// @brief 接受一个入站连接（最多等 5 秒），成功后 m_peer_handle 有效
     bool AcceptPeer() {
-        Trace("accept:wait");
         if (!WaitReadableRaw(m_listen_handle, 5000U)) {
-            Trace("accept:wait-timeout");
             return false;
         }
-        Trace("accept:calling");
         sockaddr_in peer{};
         socklen_t len = sizeof(peer);
         m_peer_handle =
             ::accept(m_listen_handle, reinterpret_cast<sockaddr*>(&peer), &len);
-        Trace("accept:done");
         return m_peer_handle != kRawInvalid;
     }
 
     /// @brief 从对端读取直到凑满 expected 字节（或超时/断开）
     Bytes ReadExact(std::size_t expected) {
-        Trace("read:enter");
         Bytes out;
         out.reserve(expected);
         std::uint8_t chunk[1024];
         while (out.size() < expected) {
             if (!WaitReadableRaw(m_peer_handle, 5000U)) {
-                Trace("read:wait-timeout");
                 break;
             }
-            Trace("read:recv");
             const int n = ::recv(m_peer_handle, reinterpret_cast<char*>(chunk),
                                  sizeof(chunk), 0);
             if (n <= 0) {
@@ -512,24 +493,17 @@ TEST_F(TcpEndToEndTest, MasterSendsAsamV14FrameWithoutTail) {
     TcpTransport transport(cfg);
     RecordingListener listener;
 
-    Trace("case:before-accept-thread");
     std::thread accept_thread([this] { AcceptPeer(); });
-    Trace("case:before-open");
     transport.Open(listener);
-    Trace("case:after-open");
     accept_thread.join();
-    Trace("case:after-accept-join");
 
     ASSERT_TRUE(transport.IsOpen());
 
     // 发一个 CRO（CONNECT 命令：0xFF 0x00）
     const Bytes cro{0xFF, 0x00};
-    Trace("case:before-send");
     transport.Send(cro);
-    Trace("case:after-send");
 
     const Bytes received = ReadExact(kEthernetHeaderSize + cro.size());
-    Trace("case:after-read");
     ASSERT_EQ(received.size(), kEthernetHeaderSize + cro.size());
 
     // AsamV14：LEN 是真实 Packet 长度，且**绝不**附加 LEN 外 Tail
@@ -541,6 +515,46 @@ TEST_F(TcpEndToEndTest, MasterSendsAsamV14FrameWithoutTail) {
     EXPECT_EQ(ctr, 0);  // Open() 后首个 Frame 使用 CTR=0
     EXPECT_EQ(received[4], 0xFF);
     EXPECT_EQ(received[5], 0x00);
+}
+
+/**
+ * @brief 回归用例：对端保持静默时 `Close()` 必须在有限时间内返回
+ *
+ * @details Windows 上 `shutdown(SD_BOTH)` 会返回成功，但**不会**取消另一个
+ *          线程里已挂起的阻塞 `recv()`（POSIX 上则会立刻返回 0）。因此接收
+ *          线程若直接阻塞在 `recv()` 上，`Close()` 的 `join()` 就会永久等待
+ *          —— 这正是 Windows CI 上整轮 ctest 被拖死的根因。
+ *          用例建立连接后有意不发任何数据，直接 `Close()`，要求：
+ *          1. 退出延迟有明确上界（远大于一个轮询片，远小于用例看门狗）；
+ *          2. 接收线程退出前仍交付一次 `OnTransportClosed()`。
+ */
+TEST_F(TcpEndToEndTest, CloseReturnsPromptlyWhilePeerIsSilent) {
+    const std::uint16_t port = StartRawListener();
+    ASSERT_NE(port, 0);
+
+    TcpTransportConfig cfg = MakeMasterConfig(port);
+    TcpTransport transport(cfg);
+    RecordingListener listener;
+
+    std::thread accept_thread([this] { AcceptPeer(); });
+    transport.Open(listener);
+    accept_thread.join();
+    ASSERT_TRUE(transport.IsOpen());
+
+    // 对端一个字节都不发：此刻接收线程在等待可读
+    const auto started = std::chrono::steady_clock::now();
+    transport.Close();
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+
+    EXPECT_LT(elapsed_ms, kWaitShort.count())
+        << "Close() 耗时 " << elapsed_ms << " ms，接收线程疑似未被唤醒";
+    EXPECT_FALSE(transport.IsOpen());
+    // Close() 已 join 接收线程，关闭回调必须在返回前交付完毕
+    EXPECT_TRUE(listener.closed());
+    EXPECT_FALSE(listener.close_reason().empty());
 }
 
 TEST_F(TcpEndToEndTest, MasterSendsAsamV15FrameWithAlignmentTail) {

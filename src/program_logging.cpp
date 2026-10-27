@@ -158,6 +158,11 @@ bool ProgramLogSession::Initialize(std::string_view executable_path,
             error_message = "glog 初始化后仍未进入已初始化状态";
             return false;
         }
+        // 立即冲刷每条日志：文件是本项目唯一的日志通道（stderrthreshold 已
+        // 高于 FATAL），若沿用 glog 默认的 30 秒缓冲，进程被强杀（Windows
+        // 上集成测试用 TerminateProcess 停止常驻从站）或崩溃时，缓冲里的
+        // 诊断信息会整段丢失，心跳等周期性状态日志也无法实时观察。
+        FLAGS_logbufsecs = 0;
 
         // 显式设置稳定的程序名/级别前缀与 .glog 后缀；同时关闭默认软链接，
         // 避免目录中出现不符合文件名约定的无后缀别名。

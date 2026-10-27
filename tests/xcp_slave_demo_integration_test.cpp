@@ -926,10 +926,16 @@ TEST(XcpSlaveDemoIntegrationTest,
     ASSERT_TRUE(std::filesystem::is_regular_file(aml_path));
     ASSERT_TRUE(std::filesystem::file_size(aml_path) > 0U);
 
-    std::ifstream input(a2l_path, std::ios::binary);
-    ASSERT_TRUE(input.is_open());
-    const std::string original((std::istreambuf_iterator<char>(input)),
-                               std::istreambuf_iterator<char>());
+    // 必须在作用域内读完即关闭：Windows 上文件被本进程以读取方式打开时，
+    // 产品侧的 std::filesystem::remove 会因共享冲突失败（POSIX 允许 unlink
+    // 已打开文件，故 Linux/macOS 不受影响），导致后面的 --overwrite 退出码为 2。
+    std::string original;
+    {
+        std::ifstream input(a2l_path, std::ios::binary);
+        ASSERT_TRUE(input.is_open());
+        original.assign((std::istreambuf_iterator<char>(input)),
+                        std::istreambuf_iterator<char>());
+    }
     ASSERT_FALSE(original.empty());
     EXPECT_NE(original.find("FastMeasurementState"), std::string::npos);
     EXPECT_NE(original.find("meas_fast_10ms"), std::string::npos);
@@ -939,10 +945,12 @@ TEST(XcpSlaveDemoIntegrationTest,
         GenerateA2l(directory.Path(), output_dir, reservation.Port(), false);
     ASSERT_TRUE(no_overwrite_exit.has_value());
     EXPECT_EQ(*no_overwrite_exit, 2);
-    std::ifstream unchanged_input(a2l_path, std::ios::binary);
-    const std::string unchanged(
-        (std::istreambuf_iterator<char>(unchanged_input)),
-        std::istreambuf_iterator<char>());
+    std::string unchanged;
+    {
+        std::ifstream unchanged_input(a2l_path, std::ios::binary);
+        unchanged.assign((std::istreambuf_iterator<char>(unchanged_input)),
+                         std::istreambuf_iterator<char>());
+    }
     EXPECT_EQ(unchanged, original);
 
     const auto overwrite_exit =

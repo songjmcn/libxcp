@@ -68,36 +68,13 @@ jobs:
       # 必须带 -C：VS 是多配置生成器，缺省会报 "Test not available without configuration"。
       # 耗时类用例只在本地做门禁（计划文档 §8.3.4）；串行执行避免 Examples 抢端口 5555。
       # --timeout 180：与 Linux/macOS 对齐，让挂死用例 3 分钟内被点名而不是烧掉 10 分钟。
-      # timeout-minutes：整轮若仍被某个用例挂住，20 分钟后由 job 层面截断并进入
+      # timeout-minutes：整轮若仍被某个用例挂住，45 分钟后由 job 层面截断并进入
       # Annotate failures，避免白占 runner 到 90 分钟的作业上限。
       # 超时预算（三级，必须 watchdog < ctest < 步骤）：
       #   看门狗 60 s —— 用例挂死时由测试进程自己点名并 abort；
       #   ctest 90 s —— 兜底杀掉整个进程（含看门狗没覆盖到的卡死）；
-      #   步骤 60 min —— 即使有二十多个用例各拖 90 s 也能跑完并产出失败清单。
+      #   步骤 45 min —— 即使有二十多个用例各拖 90 s 也能跑完并产出失败清单。
       # 上一轮因为步骤只有 20 min，整轮被截断，注解里只剩“步骤超时”，看不到用例名。
-      # 诊断步骤：单跑一个挂死用例，并把最后几条 TRACE 埋点打成注解。
-      # TRACE 由 tests/tcp_transport_test.cpp 的 Trace() 在 LIBXCP_TEST_TRACE
-      # 下输出，用来看清用例卡在 accept/connect/send/recv 的哪一步。
-      - name: Diagnose TCP end-to-end failures
-        continue-on-error: true
-        shell: pwsh
-        timeout-minutes: 8
-        env:
-          LIBXCP_TEST_WATCHDOG_SECONDS: 40
-          LIBXCP_TEST_TRACE: 1
-          LIBXCP_TCP_TRACE: 1
-        run: |
-          $exe = (Get-ChildItem -Path build -Recurse -Filter libxcp_tests.exe | Select-Object -First 1).FullName
-          Write-Host ("::error::exe=" + $exe)
-          if (-not $exe) { exit 1 }
-          $case = "TcpEndToEndTest.MasterSendsAsamV14FrameWithoutTail"
-          $out = & $exe --gtest_filter=$case 2>&1 | Out-String
-          Write-Host ("::error::" + $case + " exit=" + $LASTEXITCODE)
-          ($out -split "`n") |
-            Where-Object { $_ -match 'TRACE|WATCHDOG|Failure|Expected' } |
-            Select-Object -Last 7 |
-            ForEach-Object { Write-Host ("::error::T| " + $_.Trim()) }
-
       - name: Test
         working-directory: build
         shell: pwsh
