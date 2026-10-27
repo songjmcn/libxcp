@@ -102,7 +102,7 @@ CI 验收证据（PR [#16](https://github.com/songjmcn/libxcp/pull/16)，head `0
 
 | 平台 | 结果 | 运行 |
 | --- | --- | --- |
-| Windows | success（1064 用例） | [run 40501180310](https://github.com/songjmcn/libxcp/actions/runs/40501180310) |
+| Windows | success（build + 全量 ctest 通过，含 `SocketPlatformBoundary`） | [run 40501180310](https://github.com/songjmcn/libxcp/actions/runs/40501180310) |
 | Linux | success | [run 40501180316](https://github.com/songjmcn/libxcp/actions/runs/40501180316) |
 | macOS | success | [run 40501180314](https://github.com/songjmcn/libxcp/actions/runs/40501180314) |
 
