@@ -93,17 +93,24 @@ src/detail/socket/event_poller_posix.cpp        poll 与错误文本
 | 阶段 | 状态 | 证据 / 缺口 |
 | --- | --- | --- |
 | P0 接口契约 | 完成 | 用户批准记录见上节；IPv4 字节序、选项语义、注入点按批准实现 |
-| P1 去头泄漏 | 完成（Windows） | `src/socket_util.hpp/.cpp`、`src/event_poller.hpp/.cpp` 已无平台头；POD 与注入用例通过 |
-| P2 平台分文件 | 完成（Windows 已验证，POSIX 未编译） | 四个平台实现文件各一份，CMake 按平台选源；隔离门禁扫描 29 个非平台文件无违例 |
-| P3 UDP 最终复用 | 完成（Windows） | UDP 走 SocketOps/EventPoller，`ctest` 中 UDP 回环、唤醒兜底、关闭延迟、零长包、Xcplite 互操作全部通过 |
-| P4 自动门禁 | 部分完成 | `SocketPlatformBoundary` 已注册为 CTest 并在 Windows 通过；三平台 workflow 与 Linux/macOS 运行尚未取得证据 |
+| P1 去头泄漏 | 完成（三平台） | `src/socket_util.hpp/.cpp`、`src/event_poller.hpp/.cpp` 已无平台头；POD 与注入用例在三平台 CI 全绿 |
+| P2 平台分文件 | 完成（三平台） | 四个平台实现文件各一份，CMake 按平台选源；隔离门禁扫描 29 个非平台文件无违例；Windows/Linux/macOS CI 均编译通过 |
+| P3 UDP 最终复用 | 完成（三平台） | UDP 走 SocketOps/EventPoller，`ctest` 中 UDP 回环、唤醒兜底、关闭延迟、零长包、Xcplite 互操作全部通过 |
+| P4 自动门禁 | 完成 | `SocketPlatformBoundary` 已注册为 CTest，三平台 workflow 经同一 `ctest` 执行并全绿（commit `09e7078`，PR #16） |
 
-验收缺口（阻塞标记“已完成”）：
+CI 验收证据（PR [#16](https://github.com/songjmcn/libxcp/pull/16)，head `09e7078`）：
 
-1. Linux 与 macOS 的 Release 构建 + 全量 CTest 未执行，`event_poller_posix.cpp`、`socket_ops_posix.cpp` 仅经静态阅读，未经过编译器与运行期验证。
-2. 三平台 CI workflow 是否已包含新增的隔离脚本与测试，需要在 CI 上实际跑一轮后才可宣称 P4 达标。
-3. TCP/UDP `Open()` 的域名连接仍未接入 DNS POD 候选（批准范围即为“保留能力不启用”），属已知且刻意保留的缺口，不算回归。
-4. 已知测试环境问题不影响代码结论但会影响复现：本机沙箱禁止新建可执行文件写用户 `%TEMP%`，跑 CTest 需把 `TMP`/`TEMP` 指到工作区内目录；MSVC 构建必须先进 `vcvars64.bat` 环境；固定 UDP 端口夹具在 `-j 4` 下出现过一次超时。详见阶段实施记录。
+| 平台 | 结果 | 运行 |
+| --- | --- | --- |
+| Windows | success（1064 用例） | [run 40501180310](https://github.com/songjmcn/libxcp/actions/runs/40501180310) |
+| Linux | success | [run 40501180316](https://github.com/songjmcn/libxcp/actions/runs/40501180316) |
+| macOS | success | [run 40501180314](https://github.com/songjmcn/libxcp/actions/runs/40501180314) |
+
+现存缺口（不阻塞“平台隔离”目标）：
+
+1. TCP/UDP `Open()` 的域名连接仍未接入 DNS POD 候选（批准范围即为“保留能力不启用”），属已知且刻意保留的缺口，不算回归。
+2. 已知测试环境问题不影响代码结论但会影响本机复现：沙箱禁止新建可执行文件写用户 `%TEMP%`，跑 CTest 需把 `TMP`/`TEMP` 指到工作区内目录；MSVC 构建必须先进 `vcvars64.bat` 环境；固定 UDP 端口夹具在 `-j 4` 下出现过一次超时。详见阶段实施记录。
+3. 更细的健壮性用例（唤醒句柄创建失败注入、POD 句柄往返、多实例/重复 Open-Close 生命周期、poller 带文本失败断言）尚未补，属后续加固项而非本目标的验收条件。
 
 ## 8. 评审补齐记录（2026-10-27 晚）
 
@@ -125,4 +132,4 @@ src/detail/socket/event_poller_posix.cpp        poll 与错误文本
 
 本批次后的验证证据：Release 全量构建成功（23 目标），全量 CTest **1064/1064 通过**（90.02s，`-j 4`，跳过 2 项非失败），门禁脚本通过（29 个非平台文件），`clang-format` 与 `git diff --check` 无告警。用例总数 1055 → 1064，既有断言未放宽。
 
-仍保留的验收缺口：Linux/macOS 真机或 CI 运行；`Open()` 域名连接未接入 DNS 候选（刻意保留）；如需进一步加固，可按顺序补：唤醒句柄创建失败注入 → POD 句柄往返 → 多实例/重复 Open-Close 生命周期 → poller 带文本失败断言 → CMake 选源自动校验。
+仍保留的缺口：`Open()` 域名连接未接入 DNS 候选（刻意保留）；如需进一步加固，可按顺序补：唤醒句柄创建失败注入 → POD 句柄往返 → 多实例/重复 Open-Close 生命周期 → poller 带文本失败断言 → CMake 选源自动校验。三平台验收缺口已于同日晚关闭（见第 7 节 CI 证据表）。
