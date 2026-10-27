@@ -100,7 +100,8 @@ public:
         return m_recv_calls_;
     }
 
-    // ---- SocketOps 覆盖：send / recv / wait_writable / wait_readable / 错误分类 ----
+    // ---- SocketOps 覆盖：send / recv / wait_writable / wait_readable /
+    // 错误分类 ----
 
     /// @brief 按脚本行事；脚本耗尽后转发真实实现
     int send(detail::SocketHandle handle, const std::uint8_t* data,
@@ -163,12 +164,16 @@ public:
     }
 
     /// @brief 若设置了覆盖值则返回它，否则转发真实实现
-    int wait_writable(detail::SocketHandle handle,
-                      std::uint32_t timeout_ms) override {
+    int wait_writable(detail::SocketHandle handle, std::uint32_t timeout_ms,
+                      std::string* error_out) override {
         if (m_wait_writable_override_.has_value()) {
+            if (error_out != nullptr && *m_wait_writable_override_ < 0) {
+                *error_out = "测试脚本：等待可写失败";
+            }
             return *m_wait_writable_override_;
         }
-        return detail::RealSocketOps().wait_writable(handle, timeout_ms);
+        return detail::RealSocketOps().wait_writable(handle, timeout_ms,
+                                                     error_out);
     }
 
     /// @brief 最近一次失败是否为"被信号打断"
@@ -199,8 +204,8 @@ public:
     // ---- 其余方法一律转发真实实现 ----
 
     /// @brief 创建 Socket（转发）
-    detail::SocketHandle create(int domain, int type, int protocol) override {
-        return detail::RealSocketOps().create(domain, type, protocol);
+    detail::SocketHandle create(detail::SocketKind kind) override {
+        return detail::RealSocketOps().create(kind);
     }
 
     /// @brief 关闭 Socket（转发）
@@ -209,27 +214,24 @@ public:
     }
 
     /// @brief 绑定（转发）
-    int bind(detail::SocketHandle handle, const sockaddr* addr,
-             socklen_t addr_len) override {
-        return detail::RealSocketOps().bind(handle, addr, addr_len);
+    int bind(detail::SocketHandle handle,
+             const detail::Ipv4Endpoint& endpoint) override {
+        return detail::RealSocketOps().bind(handle, endpoint);
     }
 
     /// @brief 查询本地地址（转发）
-    int getsockname(detail::SocketHandle handle, sockaddr* addr,
-                    socklen_t* addr_len) override {
-        return detail::RealSocketOps().getsockname(handle, addr, addr_len);
+    int getsockname(detail::SocketHandle handle,
+                    detail::Ipv4Endpoint* endpoint) override {
+        return detail::RealSocketOps().getsockname(handle, endpoint);
     }
 
-    /// @brief 名称解析（转发）
-    int getaddrinfo(const char* node, const char* service,
-                    const addrinfo* hints, addrinfo** result) override {
-        return detail::RealSocketOps().getaddrinfo(node, service, hints,
-                                                   result);
-    }
-
-    /// @brief 释放解析结果（转发）
-    void freeaddrinfo(addrinfo* result) override {
-        detail::RealSocketOps().freeaddrinfo(result);
+    /// @brief POD IPv4 名称解析（转发）
+    int resolve_ipv4(const char* node, const char* service,
+                     detail::SocketKind kind,
+                     std::vector<detail::Ipv4Endpoint>* results,
+                     std::string* error_out) override {
+        return detail::RealSocketOps().resolve_ipv4(node, service, kind,
+                                                    results, error_out);
     }
 
     /// @brief 设为非阻塞（转发）
@@ -248,15 +250,15 @@ public:
     }
 
     /// @brief 接受连接（转发）
-    detail::SocketHandle accept(detail::SocketHandle handle, sockaddr* addr,
-                                socklen_t* addr_len) override {
-        return detail::RealSocketOps().accept(handle, addr, addr_len);
+    detail::SocketHandle accept(detail::SocketHandle handle,
+                                detail::Ipv4Endpoint* endpoint) override {
+        return detail::RealSocketOps().accept(handle, endpoint);
     }
 
     /// @brief 发起连接（转发）
-    int connect(detail::SocketHandle handle, const sockaddr* addr,
-                socklen_t addr_len) override {
-        return detail::RealSocketOps().connect(handle, addr, addr_len);
+    int connect(detail::SocketHandle handle,
+                const detail::Ipv4Endpoint& endpoint) override {
+        return detail::RealSocketOps().connect(handle, endpoint);
     }
 
     /// @brief 读取 SO_ERROR（转发）
@@ -264,11 +266,38 @@ public:
         return detail::RealSocketOps().get_so_error(handle, error_out);
     }
 
-    /// @brief 设置整数选项（转发）
-    int set_int_option(detail::SocketHandle handle, int level, int option,
-                       int value) override {
-        return detail::RealSocketOps().set_int_option(handle, level, option,
-                                                      value);
+    /// @brief 设置语义选项（转发）
+    int set_option(detail::SocketHandle handle, detail::SocketOption option,
+                   bool enabled) override {
+        return detail::RealSocketOps().set_option(handle, option, enabled);
+    }
+
+    /// @brief 设置 UDP 接收轮询超时（转发）
+    int set_receive_timeout(detail::SocketHandle handle,
+                            std::uint32_t timeout_ms) override {
+        return detail::RealSocketOps().set_receive_timeout(handle, timeout_ms);
+    }
+
+    /// @brief 发送 UDP 数据报（转发）
+    int send_to(detail::SocketHandle handle, const std::uint8_t* data,
+                std::size_t size, const detail::Ipv4Endpoint& peer) override {
+        return detail::RealSocketOps().send_to(handle, data, size, peer);
+    }
+
+    /// @brief 接收 UDP 数据报（转发）
+    int recv_from(detail::SocketHandle handle, std::uint8_t* data,
+                  std::size_t size, detail::Ipv4Endpoint* peer) override {
+        return detail::RealSocketOps().recv_from(handle, data, size, peer);
+    }
+
+    /// @brief 判断最近错误是否为 UDP 超时（转发）
+    [[nodiscard]] bool is_timeout() const override {
+        return detail::RealSocketOps().is_timeout();
+    }
+
+    /// @brief 判断最近错误是否为失效 Socket（转发）
+    [[nodiscard]] bool is_invalid_socket() const override {
+        return detail::RealSocketOps().is_invalid_socket();
     }
 
     /// @brief 半关闭/关闭方向（转发）
@@ -278,17 +307,19 @@ public:
 
     /// @brief 等待可读：有待消费的 recv 脚本时视为"立即可读"，否则转发真实实现
     /// @details 生产代码的接收循环按"先等可读、再 recv"推进（Windows 上
-    ///          `shutdown()` 无法取消阻塞 `recv()`，见 `kReceivePollSliceMs`）。
+    ///          `shutdown()` 无法取消阻塞 `recv()`，见
+    ///          `kReceivePollSliceMs`）。
     ///          若这里一并转发真实实现，脚本注入的错误条件会因为真实 Socket
     ///          上没有数据而永远等不到 recv 被调用；把"有待消费脚本"当作
     ///          立即可读，才能让脚本继续驱动接收分支。
-    int wait_readable(detail::SocketHandle handle,
-                      std::uint32_t timeout_ms) override {
+    int wait_readable(detail::SocketHandle handle, std::uint32_t timeout_ms,
+                      std::string* error_out) override {
         if (!m_recv_script_.empty()) {
             ClearError();
             return 1;
         }
-        return detail::RealSocketOps().wait_readable(handle, timeout_ms);
+        return detail::RealSocketOps().wait_readable(handle, timeout_ms,
+                                                     error_out);
     }
 
     /// @brief 是否处于"连接正在建立"（转发）

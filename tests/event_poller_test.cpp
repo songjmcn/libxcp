@@ -17,32 +17,23 @@
 
 #include <array>
 #include <cstdint>
-#include <cstring>
 #include <string>
 #include <vector>
 
 #include "src/event_poller.hpp"
-#include "src/socket_util.hpp"
-
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#endif
+#include "src/detail/socket/socket_ops.hpp"
 
 namespace {
 
+using calmcar::xcp::detail::CurrentEventPoller;
 using calmcar::xcp::detail::EventPoller;
+using calmcar::xcp::detail::Ipv4Endpoint;
 using calmcar::xcp::detail::kInvalidSocketHandle;
+using calmcar::xcp::detail::RealEventPoller;
 using calmcar::xcp::detail::RealSocketOps;
 using calmcar::xcp::detail::SetEventPollerForTesting;
 using calmcar::xcp::detail::SocketHandle;
+using calmcar::xcp::detail::SocketKind;
 using calmcar::xcp::detail::WaitAnySocket;
 using calmcar::xcp::detail::WaitItem;
 using calmcar::xcp::detail::WaitStatus;
@@ -51,7 +42,7 @@ using calmcar::xcp::detail::WaitStatus;
  * @brief 句柄 RAII 守卫：用例结束时关闭 Socket
  *
  * @details 用例中途 `ASSERT_*` 失败会提前 return，裸句柄会泄漏；
- *          用析构保证三条用例的所有分支都关闭。
+ *          用析构保证真实 Socket 用例的所有分支都关闭。
  */
 class SocketGuard {
 public:
@@ -84,29 +75,20 @@ private:
  * @param[out] address 成功时回填实际绑定的地址（含 OS 分配的端口）
  * @return 句柄；失败返回 `kInvalidSocketHandle`
  */
-SocketHandle MakeLoopbackUdp(sockaddr_in* address) {
+SocketHandle MakeLoopbackUdp(Ipv4Endpoint* address) {
     calmcar::xcp::detail::SocketOps& ops = RealSocketOps();
-    const SocketHandle handle = ops.create(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    const SocketHandle handle = ops.create(SocketKind::Udp);
     if (handle == kInvalidSocketHandle) {
         return kInvalidSocketHandle;
     }
-    sockaddr_in local{};
-    local.sin_family = AF_INET;
-    local.sin_port = htons(0);
-#if defined(_WIN32)
-    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-#else
-    local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-#endif
-    if (ops.bind(handle, reinterpret_cast<const sockaddr*>(&local),
-                 static_cast<socklen_t>(sizeof(local))) != 0) {
+    // IPv4 字节按网络顺序存放，端口 0 交由系统动态分配。
+    const Ipv4Endpoint local{{127, 0, 0, 1}, 0};
+    if (ops.bind(handle, local) != 0) {
         ops.close(handle);
         return kInvalidSocketHandle;
     }
-    sockaddr_in actual{};
-    socklen_t actual_len = static_cast<socklen_t>(sizeof(actual));
-    if (ops.getsockname(handle, reinterpret_cast<sockaddr*>(&actual),
-                        &actual_len) != 0) {
+    Ipv4Endpoint actual{};
+    if (ops.getsockname(handle, &actual) != 0) {
         ops.close(handle);
         return kInvalidSocketHandle;
     }
@@ -144,21 +126,25 @@ public:
      * @brief 记录等待入参并返回预设值
      * @param items 等待项
      * @param timeout_ms 超时
-     * @param status_out 结果表（本实现按全就绪填充）
-     * @param error_out 错误文本（本实现不写）
+     * @param status_out 结果表（仅成功时按全就绪填充）
+     * @param error_out 预设失败时写入错误文本（可为空）
      * @return 预设返回值
      */
     int Wait(std::span<const WaitItem> items, std::uint32_t timeout_ms,
              std::vector<WaitStatus>& status_out,
              std::string* error_out) override {
-        static_cast<void>(error_out);
+        if (result < 0 && error_out != nullptr) {
+            *error_out = error_text;
+        }
         ++call_count;
         last_timeout_ms = timeout_ms;
         last_items.assign(items.begin(), items.end());
         status_out.assign(items.size(), WaitStatus{});
-        for (WaitStatus& item : status_out) {
-            item.readable = true;
-            item.writable = true;
+        if (result > 0) {
+            for (WaitStatus& item : status_out) {
+                item.readable = true;
+                item.writable = true;
+            }
         }
         return result;
     }
@@ -167,6 +153,7 @@ public:
     std::uint32_t last_timeout_ms{0};  ///< 最近一次超时入参
     std::vector<WaitItem> last_items;  ///< 最近一次等待项
     int result{1};                     ///< 预设返回值
+    std::string error_text;            ///< 返回失败时写入的错误文本
 };
 
 /**
@@ -203,6 +190,65 @@ TEST(EventPollerTest, EmptyItemSetReturnsTimeout) {
 }
 
 /**
+ * @brief 错误事件也算就绪，以便调用方继续通过 I/O 判定故障。
+ */
+TEST(EventPollerTest, FailedStatusCountsAsReady) {
+    WaitStatus status{};
+    EXPECT_FALSE(status.Ready());
+    status.failed = true;
+    EXPECT_TRUE(status.Ready());
+}
+
+/**
+ * @brief 直接调用真实平台实现时空集合立即超时且不改写错误文本。
+ * @details 不依赖 SocketOps 或测试注入，可单独验证平台源文件的链接与契约。
+ */
+TEST(EventPollerTest, RealPollerKeepsEmptyWaitContract) {
+    std::vector<WaitStatus> status(1);
+    std::string error = "unchanged";
+    EXPECT_EQ(RealEventPoller().Wait({}, 0, status, &error), 0);
+    EXPECT_TRUE(status.empty());
+    EXPECT_EQ(error, "unchanged");
+}
+
+/**
+ * @brief 当前实现跟随注入指针，撤销后重新返回真实平台实现。
+ */
+TEST(EventPollerTest, InjectionRestoresPlatformImplementation) {
+    const EventPollerInjectionGuard injection_guard;
+    EventPoller* const real = &RealEventPoller();
+    EXPECT_EQ(&CurrentEventPoller(), real);
+    RecordingPoller recorder;
+    SetEventPollerForTesting(&recorder);
+    EXPECT_EQ(&CurrentEventPoller(), &recorder);
+    SetEventPollerForTesting(nullptr);
+    EXPECT_EQ(&CurrentEventPoller(), real);
+}
+
+/**
+ * @brief Wait 保留错误文本注入，同时 WaitAnySocket 保留只转发三态的语义。
+ */
+TEST(EventPollerTest, InjectedErrorTextAndWaitAnyFailure) {
+    const EventPollerInjectionGuard injection_guard;
+    RecordingPoller recorder;
+    recorder.result = -1;
+    recorder.error_text = "scripted poll failure";
+    SetEventPollerForTesting(&recorder);
+    const std::array<WaitItem, 1> items{
+        WaitItem{kInvalidSocketHandle, true, false}};
+    std::vector<WaitStatus> status;
+    std::string error;
+    EXPECT_EQ(CurrentEventPoller().Wait(items, 11, status, &error), -1);
+    EXPECT_EQ(error, "scripted poll failure");
+    ASSERT_EQ(status.size(), items.size());
+    EXPECT_FALSE(status[0].Ready());
+    EXPECT_EQ(recorder.last_timeout_ms, 11U);
+    EXPECT_EQ(WaitAnySocket(items, 13, status), -1);
+    EXPECT_EQ(recorder.call_count, 2);
+    EXPECT_EQ(recorder.last_timeout_ms, 13U);
+}
+
+/**
  * @brief 静默 Socket 上等待可读会超时并返回 0
  */
 TEST(EventPollerTest, QuietSocketTimesOut) {
@@ -230,8 +276,8 @@ TEST(EventPollerTest, QuietSocketTimesOut) {
  *          的字节当成数据包，或反之。
  */
 TEST(EventPollerTest, ReportsOnlyTheSignalledSocket) {
-    sockaddr_in first_addr{};
-    sockaddr_in second_addr{};
+    Ipv4Endpoint first_addr{};
+    Ipv4Endpoint second_addr{};
     const SocketHandle first = MakeLoopbackUdp(&first_addr);
     ASSERT_NE(first, kInvalidSocketHandle) << "无法创建第一个回环 UDP Socket";
     const SocketGuard first_guard(first);
@@ -244,10 +290,7 @@ TEST(EventPollerTest, ReportsOnlyTheSignalledSocket) {
     ASSERT_NE(writer, kInvalidSocketHandle) << "无法创建回环 UDP 写端";
     const SocketGuard writer_guard(writer);
     calmcar::xcp::detail::SocketOps& ops = RealSocketOps();
-    ASSERT_EQ(
-        ops.connect(writer, reinterpret_cast<const sockaddr*>(&second_addr),
-                    static_cast<socklen_t>(sizeof(second_addr))),
-        0)
+    ASSERT_EQ(ops.connect(writer, second_addr), 0)
         << "UDP connect 失败: " << ops.last_error();
     const std::uint8_t token = 0x5A;
     ASSERT_EQ(ops.send(writer, &token, 1, true), 1)

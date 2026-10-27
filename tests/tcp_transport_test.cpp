@@ -1158,12 +1158,11 @@ TEST_F(TcpReceiveCtrTest, FirstFrameAfterReopenEstablishesFreshBaseline) {
 }
 
 // ===========================================================================
-// 平台错误码与关闭常量的分类（Windows CI 回归）
+// 平台错误码分类与关闭接口（Windows CI 回归）
 //
-// 背景：`src/socket_util.cpp` 曾经在平台分支之外直接使用 POSIX 的
-// `SHUT_RDWR`，并在 Winsock 分支里写了并不存在的 `WSAEPIPE`，导致 Windows
-// 编译直接失败。POSIX 侧完全合法，因此本地与 Linux CI 都无法发现。
-// 这里把"哪些错误码算连接丢失"和"双向关闭用哪个常量"固化成可测契约。
+// 历史曾将 POSIX 的 SHUT_RDWR 泄漏到 Windows，且在 Winsock 分支误用
+// 不存在的 WSAEPIPE；当前原生关闭常量已仅存在平台实现文件中。
+// 本组测试验证对外的错误集合和无效句柄返回语义。
 // ===========================================================================
 
 #if defined(_WIN32)
@@ -1173,18 +1172,12 @@ constexpr int kConnectionLostCodes[] = {WSAECONNRESET, WSAECONNABORTED,
 /// @brief 本平台不应被判为"连接已丢失"的错误码
 constexpr int kNotConnectionLostCodes[] = {0, WSAEWOULDBLOCK, WSAEINTR,
                                            WSAEINPROGRESS};
-// 双向关闭必须是 Winsock 的 SD_BOTH；若误写成 SHUT_RDWR 会连编译都过不去。
-static_assert(detail::kShutdownBoth == SD_BOTH,
-              "kShutdownBoth 在 Windows 上必须是 SD_BOTH");
 #else
 /// @brief 本平台应被判为"连接已丢失"的错误码
 constexpr int kConnectionLostCodes[] = {EPIPE, ECONNRESET, ECONNABORTED,
                                         ENOTCONN, ESHUTDOWN};
 /// @brief 本平台不应被判为"连接已丢失"的错误码
 constexpr int kNotConnectionLostCodes[] = {0, EAGAIN, EINTR, EINPROGRESS};
-// 双向关闭必须是 POSIX 的 SHUT_RDWR；若误写成 SD_BOTH 会连编译都过不去。
-static_assert(detail::kShutdownBoth == SHUT_RDWR,
-              "kShutdownBoth 在 POSIX 上必须是 SHUT_RDWR");
 #endif
 
 TEST(SocketPlatformTest, ClassifiesConnectionLostCodes) {
@@ -1205,15 +1198,24 @@ TEST(SocketPlatformTest, KeepsOtherCodesOutOfConnectionLostSet) {
     }
 }
 
-TEST(SocketPlatformTest, ShutdownBothSelectsBothDirections) {
-    // 编译期断言已锁定常量来源；这里再确认它确实是"双向"而不是单向别名。
 #if defined(_WIN32)
-    EXPECT_NE(detail::kShutdownBoth, SD_RECEIVE);
-    EXPECT_NE(detail::kShutdownBoth, SD_SEND);
-#else
-    EXPECT_NE(detail::kShutdownBoth, SHUT_RD);
-    EXPECT_NE(detail::kShutdownBoth, SHUT_WR);
+TEST(SocketPlatformTest, ClassifiesWindowsUdpShutdownErrors) {
+    auto& ops = detail::RealSocketOps();
+    // 保持既有 UDP 关闭场景：EINVAL/NOTSOCK 无需重试，断链错误另行分类。
+    ::WSASetLastError(WSAEINVAL);
+    EXPECT_TRUE(ops.is_invalid_socket());
+    ::WSASetLastError(WSAENOTSOCK);
+    EXPECT_TRUE(ops.is_invalid_socket());
+    ::WSASetLastError(WSAECONNRESET);
+    EXPECT_TRUE(ops.is_connection_lost());
+}
 #endif
+
+TEST(SocketPlatformTest, ShutdownSocketReportsInvalidHandle) {
+    // 关闭常量现仅存在平台实现内；此处验证抽象在无效句柄上的失败语义。
+    EXPECT_NE(detail::RealSocketOps().shutdown_socket(
+                  detail::kInvalidSocketHandle),
+              0);
 }
 
 }  // namespace calmcar::xcp

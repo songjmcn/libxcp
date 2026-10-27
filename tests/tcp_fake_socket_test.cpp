@@ -28,6 +28,9 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <winsock2.h>
+// inet_pton/socklen_t 在 Windows 上由 ws2tcpip.h 提供；socket_util.hpp 不再
+// 传递平台头，故这里必须显式包含。
+#include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>

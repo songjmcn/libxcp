@@ -11,7 +11,8 @@
  *   POSIX 用 `poll`。`select` 受 `FD_SETSIZE`（默认 64）限制，且 UDP 接收循环
  *   （`src/udp_transport.cpp`）要同时等"数据句柄 + 唤醒句柄"，POSIX 侧还被写成
  *   `select(FD_SETSIZE, ...)`——首参本应是 `maxfd+1`。把等待收敛到一个抽象后：
- *   - 平台差异只剩本文件 + `event_poller.cpp`；
+ *   - 平台差异分别封装在 `detail/socket/event_poller_win.cpp` 与
+ *     `detail/socket/event_poller_posix.cpp`；
  *   - 多句柄等待成为**一等能力**，不再借用 `fd_set`；
  *   - 等待原语可被测试注入（`SetEventPollerForTesting`）。
  *
@@ -26,7 +27,7 @@
 #include <string>
 #include <vector>
 
-#include "socket_util.hpp"
+#include "detail/socket/socket_ops.hpp"
 
 namespace calmcar::xcp::detail {
 
@@ -63,7 +64,7 @@ public:
 
     /**
      * @brief 等待任意句柄进入关注状态
-     * @param items 等待项列表（不得为空）
+     * @param items 等待项列表（可为空；空集合立即返回 0）
      * @param timeout_ms 超时（毫秒）
      * @param status_out 输出：与 `items` 等长的结果数组（本函数会先 `assign`）
      * @param error_out 失败时的错误文本（可为 `nullptr`）

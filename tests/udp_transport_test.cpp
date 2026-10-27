@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,6 +35,7 @@
 #include <gtest/gtest.h>
 
 #include "libxcp/udp_header_codec.hpp"
+#include "src/event_poller.hpp"
 #include "udp_test_slave.hpp"
 
 namespace calmcar::xcp {
@@ -202,6 +204,35 @@ Bytes BytesOf(std::initializer_list<std::uint8_t> init) {
     return Bytes(init.begin(), init.end());
 }
 
+/** @brief 注入等待失败，验证 UDP 接收线程不会无限警告忙循环。 */
+class FailingUdpPoller final : public detail::EventPoller {
+public:
+    /// @brief 返回可识别的失败文本并记录等待次数。
+    int Wait(std::span<const detail::WaitItem> items, std::uint32_t,
+             std::vector<detail::WaitStatus>& status_out,
+             std::string* error_out) override {
+        ++calls;
+        status_out.assign(items.size(), detail::WaitStatus{});
+        if (error_out != nullptr) *error_out = "注入的等待错误";
+        return -1;
+    }
+
+    std::atomic<int> calls{0};  ///< 接收线程进入等待的次数。
+};
+
+/** @brief 测试结束时恢复真实等待器，避免全局注入悬空。 */
+class ScopedUdpPoller {
+public:
+    /// @brief 注入等待器并由守卫管理其生命周期。
+    explicit ScopedUdpPoller(detail::EventPoller& poller) {
+        detail::SetEventPollerForTesting(&poller);
+    }
+    /// @brief 恢复真实等待器。
+    ~ScopedUdpPoller() { detail::SetEventPollerForTesting(nullptr); }
+    ScopedUdpPoller(const ScopedUdpPoller&) = delete;
+    ScopedUdpPoller& operator=(const ScopedUdpPoller&) = delete;
+};
+
 // --------------------------------------------------------------------------
 // 生命周期与配置校验
 // --------------------------------------------------------------------------
@@ -221,6 +252,27 @@ TEST(UdpTransportLifecycle, OpenThenCloseTransitionsAndNotifies) {
     EXPECT_TRUE(listener.WaitForClose(std::chrono::seconds(2)));
     // close 幂等：二次调用不得再次回调或抛异常
     EXPECT_NO_THROW(transport.Close());
+    slave.Stop();
+}
+
+TEST(UdpTransportLifecycle, PollerFailureReportsErrorAndStopsReceiveLoop) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    auto config = MakeConfig(slave.Port());
+    UdpTransport transport(config);
+    RecordingListener listener;
+    FailingUdpPoller poller;
+    ScopedUdpPoller poller_guard(poller);
+
+    transport.Open(listener);
+    EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    EXPECT_TRUE(listener.WaitForClose(std::chrono::seconds(2)));
+    EXPECT_EQ(poller.calls.load(), 1);
+    ASSERT_FALSE(listener.Warnings().empty());
+    EXPECT_NE(listener.Warnings().front().find("注入的等待错误"),
+              std::string::npos);
+
+    transport.Close();
     slave.Stop();
 }
 

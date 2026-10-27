@@ -91,7 +91,7 @@ target_link_libraries(libxcp_tests PRIVATE
 
 # 测试设施头文件目录（mock_transport.hpp 等），仅 tests 内部可见；
 # 同时把源码根目录加进来，使测试可以用 `#include "src/socket_util.hpp"`
-# 直接覆盖内部平台适配逻辑（如 IsConnectionLostCode / kShutdownBoth）。
+# 直接覆盖内部 POD 与平台错误分类逻辑（如 IsConnectionLostCode）。
 target_include_directories(libxcp_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${PROJECT_SOURCE_DIR})
@@ -110,7 +110,7 @@ gtest_discover_tests(libxcp_tests DISCOVERY_TIMEOUT 60)
 # **进程级**的，若与其它用例并行在同一进程内切换实现，会污染它们的 Socket
 # 行为。独立进程 + 串行执行使"全局注入"的副作用被限制在本文件内。
 # ----------------------------------------------------------------------------
-add_executable(TcpFakeSocketTest tcp_fake_socket_test.cpp)
+add_executable(TcpFakeSocketTest tcp_fake_socket_test.cpp socket_ops_pod_test.cpp)
 
 target_link_libraries(TcpFakeSocketTest PRIVATE
         libxcp::libxcp
@@ -206,6 +206,12 @@ endif()
 # A2lSmoke 不依赖 GoogleTest（独立 main + 退出码）。
 # ----------------------------------------------------------------------------
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+# 公共 TCP/UDP 层禁止原生 Socket API，平台实现仅允许位于 detail/socket/*_{win,posix}.cpp。
+add_test(NAME SocketPlatformBoundary
+         COMMAND ${Python3_EXECUTABLE}
+                 "${CMAKE_CURRENT_SOURCE_DIR}/check_socket_platform_boundary.py"
+                 "${PROJECT_SOURCE_DIR}")
 
 set(A2L_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/a2l_gen")
 set(A2L_GOLDEN_FILE "${A2L_GOLDEN_DIR}/golden_basic.a2l")

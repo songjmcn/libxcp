@@ -171,6 +171,17 @@ target_sources(libxcp PRIVATE
         src/measurement/measurement_planner.cpp
         src/measurement/measurement_session.cpp)
 
+# 平台原生 Socket/轮询实现严格二选一；公共注入/转发 TU 已包含在上方列表。
+if(WIN32)
+  target_sources(libxcp PRIVATE
+    src/detail/socket/socket_ops_win.cpp
+    src/detail/socket/event_poller_win.cpp)
+else()
+  target_sources(libxcp PRIVATE
+    src/detail/socket/socket_ops_posix.cpp
+    src/detail/socket/event_poller_posix.cpp)
+endif()
+
 target_include_directories(libxcp
         PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
