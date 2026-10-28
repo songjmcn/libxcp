@@ -284,6 +284,8 @@ SymbolInfo ConvertSymbol(const liba2l::SymbolDto& dto) {
     info.daq_event_fixed = dto.daq_event_fixed;
     info.daq_event_default = dto.daq_event_default;
     info.daq_event_available = dto.daq_event_available;
+    // v11：CONSISTENCY 单列透传（语义见 a2l_types.hpp 该字段注释）。
+    info.daq_consistency_event = dto.daq_consistency_event;
     return info;
 }
 

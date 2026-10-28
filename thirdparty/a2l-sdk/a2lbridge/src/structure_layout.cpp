@@ -129,6 +129,25 @@ void Reject(LayoutContext& ctx, const std::string& module,
 }
 
 /**
+ * @brief INSTANCE 级 DAQ 事件四表（叶子继承用）
+ *
+ * 方案 A（DAQ 事件来源降级）起，事件来源不再只有 FIXED：DEFAULT 与
+ * CONSISTENCY 都是合法来源，故 INSTANCE 上的四张表必须一并继承到叶子。
+ * 只继承 FIXED 会让 INSTANCE 形态的 A2L 在 DEFAULT/CONSISTENCY 上完全失效
+ * （叶子拿到空表 → 事件候选判定为“没有任何可用分配”）。
+ */
+struct InstanceEventLists {
+    /// 固定事件列表（FIXED_EVENT_LIST）
+    const std::vector<std::uint16_t>& fixed;
+    /// 默认事件列表（DEFAULT_EVENT_LIST）
+    const std::vector<std::uint16_t>& defaults;
+    /// 可用事件列表（AVAILABLE_EVENT_LIST）
+    const std::vector<std::uint16_t>& available;
+    /// 一致性事件列表（CONSISTENCY_EVENT_LIST）
+    const std::vector<std::uint16_t>& consistency;
+};
+
+/**
  * @brief 标量成员 → 叶子 SymbolInfo
  * @param tm 标量类型事实
  * @param inst_module 实例 MODULE
@@ -137,7 +156,7 @@ void Reject(LayoutContext& ctx, const std::string& module,
  * @param member_path 完整路径（instance.member.…）
  * @param byte_offset 相对实例基址的字节偏移
  * @param count 元素数（MATRIX_DIM 乘积；标量=1）
- * @param instance_fixed_events 所属 INSTANCE 原始固定事件列表
+ * @param instance_events 所属 INSTANCE 的事件四表（叶子整体继承）
  * @return 组装好的叶子（宽度/换算/边界取自 tm；寻址取自实例+偏移）
  */
 [[nodiscard]] SymbolInfo MakeScalarLeaf(
@@ -145,8 +164,7 @@ void Reject(LayoutContext& ctx, const std::string& module,
     std::uint64_t base_address, std::uint8_t address_extension,
     bool instance_read_write, const std::string& ref_memory_segment,
     const std::string& member_path, std::uint64_t byte_offset,
-    std::uint64_t count,
-    const std::vector<std::uint16_t>& instance_fixed_events) {
+    std::uint64_t count, const InstanceEventLists& instance_events) {
     SymbolInfo info;
     info.module_name = tm.module_name;
     info.name = member_path;  // 全限定路径（MODULE::instance.member.…）
@@ -189,8 +207,12 @@ void Reject(LayoutContext& ctx, const std::string& module,
     info.have_limit = tm.have_limit;
     info.lower_limit = tm.lower_limit;
     info.upper_limit = tm.upper_limit;
-    // 仅继承当前 INSTANCE 的固定事件；同一号重复声明由策略去重。
-    info.daq_event_fixed = instance_fixed_events;
+    // 继承当前 INSTANCE 的四张事件表（方案 A：DEFAULT/CONSISTENCY 也是合法来源）；
+    // 同一号重复声明由策略去重。
+    info.daq_event_fixed = instance_events.fixed;
+    info.daq_event_default = instance_events.defaults;
+    info.daq_event_available = instance_events.available;
+    info.daq_consistency_event = instance_events.consistency;
     return info;
 }
 
@@ -321,7 +343,7 @@ void Reject(LayoutContext& ctx, const std::string& module,
  * @param depth 当前递归深度
  * @param chain 类型访问链（环检测，含当前 st 的 TypeKey）
  * @param leaf_budget_left 本实例剩余叶子预算（按引用递减）
- * @param instance_fixed_events 所属 INSTANCE 固定 DAQ 事件（递归保持不变）
+ * @param instance_events 所属 INSTANCE 的 DAQ 事件四表（递归保持不变）
  */
 void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                   const std::string& inst_name, std::uint64_t base_address,
@@ -330,7 +352,7 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                   const std::string& prefix, std::uint64_t struct_base,
                   int depth, std::vector<std::string>& chain,
                   std::size_t& leaf_budget_left,
-                  const std::vector<std::uint16_t>& instance_fixed_events) {
+                  const InstanceEventLists& instance_events) {
     if (depth > kMaxDepth) {
         Reject(ctx, st.module_name, prefix,
                "结构递归深度超过上界 " + std::to_string(kMaxDepth) +
@@ -416,7 +438,7 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
             ctx.leaves.push_back(MakeScalarLeaf(
                 tm, inst_name, base_address, address_extension,
                 instance_read_write, ref_memory_segment, path,
-                struct_base + m->address_offset, count, instance_fixed_events));
+                struct_base + m->address_offset, count, instance_events));
             continue;
         }
 
@@ -451,6 +473,11 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                            std::to_string(kInstanceLeafBudget) + "），截断");
                 return;
             }
+            // 标定叶子同样保留实例级原始事件事实，不改变其 DAQ 准入规则。
+            leaf.daq_event_fixed = instance_events.fixed;
+            leaf.daq_event_default = instance_events.defaults;
+            leaf.daq_event_available = instance_events.available;
+            leaf.daq_consistency_event = instance_events.consistency;
             --leaf_budget_left;
             ctx.leaves.push_back(std::move(leaf));
             continue;
@@ -497,7 +524,7 @@ void ExpandStruct(LayoutContext& ctx, const liba2l::StructInfoDto& st,
                     ctx, child, inst_name, base_address, address_extension,
                     instance_read_write, ref_memory_segment, elem_prefix,
                     struct_base + m->address_offset + i * child_size, depth + 1,
-                    chain, leaf_budget_left, instance_fixed_events);
+                    chain, leaf_budget_left, instance_events);
             }
             chain.pop_back();
             continue;
@@ -573,10 +600,13 @@ StructureLayoutResult BuildStructureLeaves(
                 elem_count == 1 ? inst.name
                                 : (inst.name + "[" + std::to_string(i) + "]");
             std::vector<std::string> chain = {ref_key};
+            const InstanceEventLists instance_events{
+                inst.daq_event_fixed, inst.daq_event_default,
+                inst.daq_event_available, inst.daq_consistency_event};
             ExpandStruct(ctx, st, inst.name, inst.address,
                          inst.address_extension, inst.read_write,
                          inst.ref_memory_segment, prefix, i * st.size_bytes, 1,
-                         chain, budget, inst.daq_event_fixed);
+                         chain, budget, instance_events);
         }
     }
     result.leaves = std::move(ctx.leaves);

@@ -238,6 +238,11 @@ struct SymbolInfo {
     std::vector<std::uint16_t> daq_event_default;
     /// @brief 逐 MEASUREMENT DAQ_EVENT available event 号列表
     std::vector<std::uint16_t> daq_event_available;
+    /// @brief 逐 MEASUREMENT DAQ_EVENT consistency event 号列表（v11 起）
+    /// @details XCP 协议层 §4.1.5：未声明 DEFAULT 时该表即默认事件通道分配。
+    ///          单独成表而非并入 `daq_event_default`，否则「未声明 default」
+    ///          与「声明了同号 default」无法区分。
+    std::vector<std::uint16_t> daq_consistency_event;
 };
 
 // ---------------------------------------------------------------------------
