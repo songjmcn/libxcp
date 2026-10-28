@@ -26,6 +26,16 @@
 #include <string_view>
 #include <thread>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "a2l.h"
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "slave_model.hpp"
@@ -512,6 +522,54 @@ bool IsA2lSpace(char c) {
 }
 
 /**
+ * @brief 用当前平台支持覆盖目标文件的语义替换 A2L 临时文件。
+ * @param temporary 同目录临时文件。
+ * @param target 要覆盖的目标 A2L 文件。
+ * @param error 失败时写入系统错误；成功时清空。
+ * @return 替换成功返回 true。
+ * @note POSIX 的 rename() 本身支持同文件系统内原子覆盖；Windows 的
+ *       std::filesystem::rename() 不覆盖已有目标，因此优先使用 MoveFileExW 的
+ *       REPLACE_EXISTING | WRITE_THROUGH 语义，避免先删除目标造成数据丢失。若
+ *       目录 ACL 禁止替换目录项但允许写入已有文件，则退化为 copy_file 覆盖以兼容
+ *       受限工作区；该回退不保证原子性，复制失败时报告错误。
+ */
+bool ReplaceA2lFile(const std::filesystem::path& temporary,
+                    const std::filesystem::path& target,
+                    std::error_code& error) {
+#ifdef _WIN32
+    const std::wstring source = temporary.wstring();
+    const std::wstring destination = target.wstring();
+    if (!MoveFileExW(source.c_str(), destination.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        const DWORD move_error = GetLastError();
+        error = std::error_code(static_cast<int>(move_error),
+                                std::system_category());
+        if (move_error == ERROR_ACCESS_DENIED) {
+            // 某些受限工作区允许写入已有文件，但禁止替换目录项；此时回退覆盖目标。
+            // 该回退不具备原子替换语义，调用方仍会检查错误并清理临时文件。
+            std::error_code copy_error;
+            std::filesystem::copy_file(
+                temporary, target,
+                std::filesystem::copy_options::overwrite_existing, copy_error);
+            if (!copy_error) {
+                std::error_code cleanup_error;
+                std::filesystem::remove(temporary, cleanup_error);
+                error.clear();
+                return true;
+            }
+            error = copy_error;
+        }
+        return false;
+    }
+    error.clear();
+    return true;
+#else
+    std::filesystem::rename(temporary, target, error);
+    return !error;
+#endif
+}
+
+/**
  * @brief 为标定段 INSTANCE 补上 READ_WRITE 写入许可。
  * @param a2l_file 生成后的主 A2L 文件路径。
  * @param error_message 失败时的中文说明。
@@ -618,8 +676,7 @@ bool PatchCalibrationInstanceWriteAccess(const std::filesystem::path& a2l_file,
         }
     }
     std::error_code error;
-    std::filesystem::rename(temporary, a2l_file, error);
-    if (error) {
+    if (!ReplaceA2lFile(temporary, a2l_file, error)) {
         error_message = "替换 A2L 失败：" + error.message();
         std::error_code ignored;
         std::filesystem::remove(temporary, ignored);

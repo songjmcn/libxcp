@@ -79,3 +79,30 @@ add_custom_command(TARGET xcp_slave_demo_v12 POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
                 "$<TARGET_FILE:liba2l::liba2l>"
                 "$<TARGET_FILE_DIR:xcp_slave_demo_v12>")
+
+# C++ Master 通过独立进程启动 V1.2 从站，避免 Python 原始报文探针掩盖
+# Master/A2L 集成问题；从站与测试进程分离，避免 V1.2/V2.2 C 符号冲突。
+if(LIBXCP_BUILD_TESTS)
+  add_executable(XcpliteV12InteropTest
+          "${PROJECT_SOURCE_DIR}/tests/xcp_v12_interop_test.cpp"
+          "${PROJECT_SOURCE_DIR}/tests/xcp_v12_slave_process.cpp")
+  target_compile_features(XcpliteV12InteropTest PRIVATE cxx_std_20)
+  target_include_directories(XcpliteV12InteropTest PRIVATE
+          "${PROJECT_SOURCE_DIR}"
+          "${PROJECT_SOURCE_DIR}/tests"
+          "${PROJECT_SOURCE_DIR}/examples/xcp_slave_demo_v12")
+  target_link_libraries(XcpliteV12InteropTest PRIVATE
+          libxcp::libxcp
+          libxcp::a2lbridge
+          GTest::gtest
+          libxcp_test_main)
+  target_compile_definitions(XcpliteV12InteropTest PRIVATE
+          XCP_V12_SLAVE_EXECUTABLE="$<TARGET_FILE:xcp_slave_demo_v12>"
+          XCP_V12_TEST_ROOT="${PROJECT_BINARY_DIR}/.tmp/xcp_v12_interop")
+  add_dependencies(XcpliteV12InteropTest xcp_slave_demo_v12)
+  if(MSVC)
+    target_compile_options(XcpliteV12InteropTest PRIVATE /utf-8)
+  endif()
+  gtest_discover_tests(XcpliteV12InteropTest DISCOVERY_TIMEOUT 60
+                       PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
+endif()
