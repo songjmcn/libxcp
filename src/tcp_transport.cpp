@@ -4,12 +4,9 @@
  *
  * 依据 code-plan/TCP传输_实施计划_B-T1至B-T5.md 第 5 节实现（B-T2）。
  *
- * @par 平台差异的处理方式（与 `udp_transport.cpp` 不同的选择）
- *   `udp_transport.cpp` 把平台适配直接写在文件顶部（一组自由函数 + `#if`）。
- *   本文件改用 `src/socket_util.hpp` 的 `SocketOps` 抽象，原因见该文件注释：
- *   TCP 的错误分支（短写、EINTR、EAGAIN、发送超时）**必须被确定性测试**，
- *   而真实 Socket 无法稳定制造这些条件。引入一层可替换函数表后，生产路径
- *   仍是零开销的直接调用，测试路径可以精确驱动每一条分支。
+ * @par 平台隔离
+ *   TCP 仅通过内部 IPv4 POD 与可注入 SocketOps 操作系统 Socket；
+ *   平台实现分别位于 Windows/POSIX 源文件，短写与失败分支保持可测试。
  */
 
 #include "libxcp/tcp_transport.hpp"
@@ -22,19 +19,6 @@
 #include "libxcp/log.hpp"
 
 #include "socket_util.hpp"
-
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <winsock2.h>
-#include <ws2tcpip.h>
-#else
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#endif
 
 namespace calmcar::xcp {
 namespace {
@@ -120,7 +104,7 @@ struct TcpTransport::SocketImpl {
     /// @brief 监听 Socket 句柄（仅 Slave 角色使用；accept 后不再需要）
     detail::SocketHandle listen_handle{detail::kInvalidSocketHandle};
     /// @brief 实际绑定的本地端点（用于诊断与 OS 分配端口回填）
-    sockaddr_in bound_local{};
+    detail::Ipv4Endpoint bound_local{};  ///< 绑定端点的 IPv4 值类型
 };
 
 // ---------------------------------------------------------------------------
@@ -236,7 +220,7 @@ void TcpTransport::Open(IPacketListener& listener) {
 
     // ---- 创建 Socket 并建立连接 ----
     auto impl = std::make_unique<SocketImpl>();
-    impl->handle = ops.create(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    impl->handle = ops.create(detail::SocketKind::Tcp);
     if (impl->handle == detail::kInvalidSocketHandle) {
         const auto error = ops.last_error();
         LIBXCP_LOG_ERROR("TCP socket creation failed: {}", error);
@@ -301,13 +285,12 @@ void TcpTransport::EstablishConnection() {
     auto& ops = detail::CurrentSocketOps();
 
     // ---- 解析本地绑定地址 ----
-    sockaddr_in local{};
-    local.sin_family = AF_INET;
-    local.sin_port = htons(m_config_.local_port);
+    detail::Ipv4Endpoint local{};
+    local.port = m_config_.local_port;
     const std::string local_text = m_config_.local_host.empty()
                                        ? std::string("0.0.0.0")
                                        : m_config_.local_host;
-    if (!detail::ParseIpv4Literal(local_text, &local.sin_addr)) {
+    if (!detail::ParseIpv4Literal(local_text, &local.address)) {
         LIBXCP_LOG_ERROR("TCP invalid local bind address='{}'", local_text);
         throw detail::MakeInvalidArgument("无法解析本地绑定地址: " +
                                           m_config_.local_host);
@@ -324,16 +307,14 @@ void TcpTransport::EstablishConnection() {
 
     if (needs_explicit_bind) {
         if (m_config_.reuse_address) {
-            if (ops.set_int_option(m_socket_->handle, SOL_SOCKET, SO_REUSEADDR,
-                                   1) != 0) {
+            if (ops.set_option(m_socket_->handle,
+                               detail::SocketOption::ReuseAddress, true) != 0) {
                 const auto error = ops.last_error();
                 LIBXCP_LOG_WARNING("TCP SO_REUSEADDR setup failed: {}", error);
                 // 非致命：仅影响 TIME_WAIT 期间的重绑定，继续尝试绑定
             }
         }
-        if (ops.bind(m_socket_->handle,
-                     reinterpret_cast<const sockaddr*>(&local),
-                     sizeof(local)) != 0) {
+        if (ops.bind(m_socket_->handle, local) != 0) {
             const auto error = ops.last_error();
             LIBXCP_LOG_ERROR("TCP bind failed local={}:{} error={}", local_text,
                              m_config_.local_port, error);
@@ -345,21 +326,16 @@ void TcpTransport::EstablishConnection() {
     }
 
     // ---- 回填实际绑定的本地端口（local_port == 0 时由 OS 分配）----
-    sockaddr_in actual{};
-    socklen_t actual_len = sizeof(actual);
-    if (ops.getsockname(m_socket_->handle, reinterpret_cast<sockaddr*>(&actual),
-                        &actual_len) == 0) {
+    detail::Ipv4Endpoint actual{};
+    if (ops.getsockname(m_socket_->handle, &actual) == 0) {
         m_socket_->bound_local = actual;
-        m_bound_local_port_.store(ntohs(actual.sin_port),
-                                  std::memory_order_release);
+        m_bound_local_port_.store(actual.port, std::memory_order_release);
     }
 
     if (is_master) {
-        sockaddr_in remote{};
-        remote.sin_family = AF_INET;
-        remote.sin_port = htons(m_config_.remote_port);
-        if (!detail::ParseIpv4Literal(m_config_.remote_host,
-                                      &remote.sin_addr)) {
+        detail::Ipv4Endpoint remote{};
+        remote.port = m_config_.remote_port;
+        if (!detail::ParseIpv4Literal(m_config_.remote_host, &remote.address)) {
             LIBXCP_LOG_ERROR("TCP invalid remote address='{}'",
                              m_config_.remote_host);
             throw detail::MakeInvalidArgument("无法解析远端地址: " +
@@ -370,18 +346,25 @@ void TcpTransport::EstablishConnection() {
         ListenAndAccept();
     }
 
+    // 平台层为支持的平台关闭 SIGPIPE；对主动连接和 accept 句柄均生效。
+    if (ops.set_option(m_socket_->handle, detail::SocketOption::NoSigPipe,
+                       true) != 0) {
+        LIBXCP_LOG_WARNING("TCP SIGPIPE protection setup failed: {}",
+                           ops.last_error());
+    }
+
     // ---- 连接建立后的通用选项 ----
     // TCP_NODELAY：XCP 的命令-响应是"请求-应答"式的小报文交互，Nagle 算法会把
     // 小包攒起来等 ACK，直接给每一条命令增加一个 RTT 的额外延迟。XCP 的 DAQ
     // 上报也不依赖 Nagle 合并（我们会自行按 Frame 组织写入），故关闭它。
     // 失败仅告警：没有它就变慢，但不影响正确性。
-    if (ops.set_int_option(m_socket_->handle, IPPROTO_TCP, TCP_NODELAY, 1) !=
-        0) {
+    if (ops.set_option(m_socket_->handle, detail::SocketOption::NoDelay,
+                       true) != 0) {
         LIBXCP_LOG_WARNING("TCP_NODELAY setup failed: {}", ops.last_error());
     }
     if (m_config_.keep_alive) {
-        if (ops.set_int_option(m_socket_->handle, SOL_SOCKET, SO_KEEPALIVE,
-                               1) != 0) {
+        if (ops.set_option(m_socket_->handle, detail::SocketOption::KeepAlive,
+                           true) != 0) {
             LIBXCP_LOG_WARNING("TCP SO_KEEPALIVE setup failed: {}",
                                ops.last_error());
         }
@@ -391,20 +374,9 @@ void TcpTransport::EstablishConnection() {
 void TcpTransport::ConnectWithTimeout(const void* addr, std::size_t addr_len) {
     auto& ops = detail::CurrentSocketOps();
 
-    // 参数经类型擦除传入（见头文件说明），这里恢复回平台类型。
-    // 调用方保证指向有效的 sockaddr_in 且长度匹配，故无需再做校验。
-    const auto* sa = static_cast<const sockaddr*>(addr);
-    const auto sa_len = static_cast<socklen_t>(addr_len);
-
-#if !defined(_WIN32) && defined(SO_NOSIGPIPE)
-    // macOS/BSD：没有 MSG_NOSIGNAL，改用 SO_NOSIGPIPE 选项。必须在连接前设置，
-    // 否则对端提前关闭时的 send 会向进程投递 SIGPIPE 并默认终止进程。
-    if (ops.set_int_option(m_socket_->handle, SOL_SOCKET, SO_NOSIGPIPE, 1) !=
-        0) {
-        LIBXCP_LOG_WARNING("TCP SO_NOSIGPIPE setup failed: {}",
-                           ops.last_error());
-    }
-#endif
+    // 公共头的私有签名以 void* 传递内部 POD，平台实现独自构造原生地址。
+    const auto* endpoint = static_cast<const detail::Ipv4Endpoint*>(addr);
+    (void)addr_len;
 
     // 非阻塞 connect + 可写等待：这样 connect 的等待上界由我们控制。
     // 直接对阻塞 Socket 调用 connect 的等待时间由内核决定（Linux 上默认约
@@ -415,7 +387,7 @@ void TcpTransport::ConnectWithTimeout(const void* addr, std::size_t addr_len) {
         throw detail::MakeTransportError("设置 TCP 非阻塞失败", error);
     }
 
-    if (ops.connect(m_socket_->handle, sa, sa_len) != 0) {
+    if (ops.connect(m_socket_->handle, *endpoint) != 0) {
         if (!ops.is_in_progress() && !ops.is_would_block()) {
             const auto error = ops.last_error();
             LIBXCP_LOG_ERROR("TCP connect failed: {}", error);
@@ -426,8 +398,9 @@ void TcpTransport::ConnectWithTimeout(const void* addr, std::size_t addr_len) {
         }
 
         // 连接正在建立：等待可写（含超时）
-        const int ready =
-            ops.wait_writable(m_socket_->handle, m_config_.connect_timeout_ms);
+        std::string wait_error;
+        const int ready = ops.wait_writable(
+            m_socket_->handle, m_config_.connect_timeout_ms, &wait_error);
         if (ready == 0) {
             LIBXCP_LOG_ERROR("TCP connect timeout after {} ms",
                              m_config_.connect_timeout_ms);
@@ -437,7 +410,8 @@ void TcpTransport::ConnectWithTimeout(const void* addr, std::size_t addr_len) {
                 std::to_string(m_config_.connect_timeout_ms) + " ms）");
         }
         if (ready < 0) {
-            const auto error = ops.last_error();
+            const auto error =
+                wait_error.empty() ? ops.last_error() : wait_error;
             LIBXCP_LOG_ERROR("TCP connect wait failed: {}", error);
             throw detail::MakeTransportError("等待 TCP 连接建立失败", error);
         }
@@ -470,8 +444,8 @@ void TcpTransport::ConnectWithTimeout(const void* addr, std::size_t addr_len) {
 void TcpTransport::ListenAndAccept() {
     auto& ops = detail::CurrentSocketOps();
 
-    if (ops.set_int_option(m_socket_->handle, SOL_SOCKET, SO_REUSEADDR, 1) !=
-        0) {
+    if (ops.set_option(m_socket_->handle, detail::SocketOption::ReuseAddress,
+                       true) != 0) {
         LIBXCP_LOG_WARNING("TCP listen SO_REUSEADDR setup failed: {}",
                            ops.last_error());
     }
@@ -490,8 +464,9 @@ void TcpTransport::ListenAndAccept() {
         throw detail::MakeTransportError("设置 TCP 非阻塞失败", error);
     }
 
-    const int ready =
-        ops.wait_readable(m_socket_->handle, m_config_.connect_timeout_ms);
+    std::string wait_error;
+    const int ready = ops.wait_readable(
+        m_socket_->handle, m_config_.connect_timeout_ms, &wait_error);
     if (ready == 0) {
         LIBXCP_LOG_ERROR("TCP accept timeout after {} ms",
                          m_config_.connect_timeout_ms);
@@ -500,15 +475,13 @@ void TcpTransport::ListenAndAccept() {
             std::to_string(m_config_.connect_timeout_ms) + " ms）");
     }
     if (ready < 0) {
-        const auto error = ops.last_error();
+        const auto error = wait_error.empty() ? ops.last_error() : wait_error;
         LIBXCP_LOG_ERROR("TCP accept wait failed: {}", error);
         throw detail::MakeTransportError("等待入站连接失败", error);
     }
 
-    sockaddr_in peer{};
-    socklen_t peer_len = sizeof(peer);
-    const detail::SocketHandle accepted = ops.accept(
-        m_socket_->handle, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+    detail::Ipv4Endpoint peer{};
+    const detail::SocketHandle accepted = ops.accept(m_socket_->handle, &peer);
     if (accepted == detail::kInvalidSocketHandle) {
         const auto error = ops.last_error();
         LIBXCP_LOG_ERROR("TCP accept failed: {}", error);
@@ -517,7 +490,8 @@ void TcpTransport::ListenAndAccept() {
 
     // 监听句柄已完成使命：连接已建立，后续收发包一律走 accepted。
     ops.close(m_socket_->handle);
-    m_socket_->listen_handle = m_socket_->handle;
+    // 监听句柄已关闭，不能在 Close() 再关闭同一值（可能被系统复用）。
+    m_socket_->listen_handle = detail::kInvalidSocketHandle;
     m_socket_->handle = accepted;
     m_socket_->bound_local = peer;
 
@@ -657,8 +631,9 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
         if (ops.is_would_block()) {
             // 内核发送缓冲已满（对端停止读取）。等待可写，给出明确超时上界，
             // 而不是让调用线程无限期挂住。
-            const int ready =
-                ops.wait_writable(m_socket_->handle, m_config_.send_timeout_ms);
+            std::string wait_error;
+            const int ready = ops.wait_writable(
+                m_socket_->handle, m_config_.send_timeout_ms, &wait_error);
             if (ready > 0) {
                 continue;
             }
@@ -668,7 +643,8 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
                 throw MakeSendTimeoutError(size - written,
                                            m_config_.send_timeout_ms);
             }
-            const auto error = ops.last_error();
+            const auto error =
+                wait_error.empty() ? ops.last_error() : wait_error;
             LIBXCP_LOG_ERROR("TCP send wait failed: {}", error);
             throw detail::MakeTransportError("等待 TCP 可写失败", error);
         }
@@ -725,8 +701,9 @@ void TcpTransport::ReceiveLoop() {
         // 阻塞 recv()，Close() 的 join() 会因此永久等待（kReceivePollSliceMs
         // 有详细说明）。等待超时即回到 while 顶部重新检查关闭标记，于是退出
         // 延迟有明确上界，且收包延迟不受影响（数据到达即刻唤醒）。
+        std::string wait_error;
         const int ready = ops.wait_readable(m_socket_->handle,
-                                            kReceivePollSliceMs);
+                                            kReceivePollSliceMs, &wait_error);
         if (ready == 0) {
             continue;  // 轮询片超时：回到 while 重判退出条件
         }
@@ -737,7 +714,8 @@ void TcpTransport::ReceiveLoop() {
             if (ops.is_interrupted()) {
                 continue;  // 被信号打断：重试，不计入关闭
             }
-            const auto error = ops.last_error();
+            const auto error =
+                wait_error.empty() ? ops.last_error() : wait_error;
             LIBXCP_LOG_ERROR("TCP wait readable failed: {}", error);
             close_reason = SanitizeReason("TCP 等待可读失败：" + error);
             break;

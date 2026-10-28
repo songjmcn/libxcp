@@ -91,7 +91,7 @@ target_link_libraries(libxcp_tests PRIVATE
 
 # 测试设施头文件目录（mock_transport.hpp 等），仅 tests 内部可见；
 # 同时把源码根目录加进来，使测试可以用 `#include "src/socket_util.hpp"`
-# 直接覆盖内部平台适配逻辑（如 IsConnectionLostCode / kShutdownBoth）。
+# 直接覆盖内部 POD 与平台错误分类逻辑（如 IsConnectionLostCode）。
 target_include_directories(libxcp_tests PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${PROJECT_SOURCE_DIR})
@@ -110,7 +110,7 @@ gtest_discover_tests(libxcp_tests DISCOVERY_TIMEOUT 60)
 # **进程级**的，若与其它用例并行在同一进程内切换实现，会污染它们的 Socket
 # 行为。独立进程 + 串行执行使"全局注入"的副作用被限制在本文件内。
 # ----------------------------------------------------------------------------
-add_executable(TcpFakeSocketTest tcp_fake_socket_test.cpp)
+add_executable(TcpFakeSocketTest tcp_fake_socket_test.cpp socket_ops_pod_test.cpp)
 
 target_link_libraries(TcpFakeSocketTest PRIVATE
         libxcp::libxcp
@@ -207,6 +207,19 @@ endif()
 # ----------------------------------------------------------------------------
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
+# Windows 上 Python 默认按 ANSI 代码页输出（GitHub Actions 上为 cp1252），
+# 脚本打印中文会抛 UnicodeEncodeError 把门禁判成失败；统一强制 UTF-8。
+# 脚本内部另有 sys.stdout.reconfigure 兜底，这里覆盖以本地直接运行 ctest 也一致。
+set(LIBXCP_PYTHON_UTF8_ENV "PYTHONUTF8=1" "PYTHONIOENCODING=utf-8")
+
+# 公共 TCP/UDP 层禁止原生 Socket API，平台实现仅允许位于 detail/socket/*_{win,posix}.cpp。
+add_test(NAME SocketPlatformBoundary
+         COMMAND ${Python3_EXECUTABLE}
+                 "${CMAKE_CURRENT_SOURCE_DIR}/check_socket_platform_boundary.py"
+                 "${PROJECT_SOURCE_DIR}")
+set_tests_properties(SocketPlatformBoundary PROPERTIES
+        ENVIRONMENT "${LIBXCP_PYTHON_UTF8_ENV}")
+
 set(A2L_GOLDEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/a2l_gen")
 set(A2L_GOLDEN_FILE "${A2L_GOLDEN_DIR}/golden_basic.a2l")
 
@@ -216,7 +229,8 @@ add_test(NAME a2l_gen
          COMMAND ${Python3_EXECUTABLE}
                  "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
                  --out "${A2L_GOLDEN_DIR}" --variants)
-set_tests_properties(a2l_gen PROPERTIES FIXTURES_SETUP A2lGolden)
+set_tests_properties(a2l_gen PROPERTIES
+        FIXTURES_SETUP A2lGolden ENVIRONMENT "${LIBXCP_PYTHON_UTF8_ENV}")
 
 add_executable(A2lSmoke a2l_smoke_test.cpp)
 target_compile_features(A2lSmoke PRIVATE cxx_std_20)
@@ -316,7 +330,8 @@ add_test(NAME a2l_perf_gen
                  "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
                  --out "${A2L_GOLDEN_DIR}" --perf 5)
 set_tests_properties(a2l_perf_gen PROPERTIES
-        FIXTURES_SETUP A2lPerf TIMEOUT 300)
+        FIXTURES_SETUP A2lPerf TIMEOUT 300
+        ENVIRONMENT "${LIBXCP_PYTHON_UTF8_ENV}")
 
 # 单独入口：只跑基线用例（避免把 5 MB 解析塞进 A2lGolden 全量运行里重复计次）
 add_test(NAME ParseLargeFileUnderBudget
@@ -334,7 +349,8 @@ add_test(NAME a2l_ui_perf_gen
                  "${CMAKE_CURRENT_SOURCE_DIR}/a2l_gen/gen_a2l.py"
                  --out "${A2L_GOLDEN_DIR}" --perf 40)
 set_tests_properties(a2l_ui_perf_gen PROPERTIES
-        FIXTURES_SETUP A2lUiPerf TIMEOUT 600)
+        FIXTURES_SETUP A2lUiPerf TIMEOUT 600
+        ENVIRONMENT "${LIBXCP_PYTHON_UTF8_ENV}")
 
 # ----------------------------------------------------------------------------
 # T10 隔离自动化（批次13 T13-18）：把 configure 期 P9 扫描变成 ctest 条目。
@@ -464,6 +480,23 @@ add_custom_command(TARGET A2lIfDataConflictTest POST_BUILD
                 "$<TARGET_FILE:liba2l::liba2l>"
                 "$<TARGET_FILE_DIR:A2lIfDataConflictTest>")
 gtest_discover_tests(A2lIfDataConflictTest DISCOVERY_TIMEOUT 120)
+
+# ----------------------------------------------------------------------------
+# A2lDaqEventListsTest —— DAQ_EVENT 四张事件表的导出（ABI v11）
+# 语料内联在用例里（写到临时目录），不依赖 golden 夹具。
+# ----------------------------------------------------------------------------
+add_executable(A2lDaqEventListsTest a2l_daq_event_lists_test.cpp)
+target_compile_features(A2lDaqEventListsTest PRIVATE cxx_std_20)
+target_link_libraries(A2lDaqEventListsTest PRIVATE
+        libxcp::a2lbridge GTest::gtest libxcp_test_main)
+if(MSVC)
+  target_compile_options(A2lDaqEventListsTest PRIVATE /utf-8)
+endif()
+add_custom_command(TARGET A2lDaqEventListsTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:liba2l::liba2l>"
+                "$<TARGET_FILE_DIR:A2lDaqEventListsTest>")
+gtest_discover_tests(A2lDaqEventListsTest DISCOVERY_TIMEOUT 120)
 
 # ----------------------------------------------------------------------------
 # A2lMultiEndpointTest —— 多实例传输层端点（历史遗漏项 L-C，ABI v10）

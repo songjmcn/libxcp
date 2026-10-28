@@ -1094,9 +1094,9 @@ TEST(XcpSlaveDemoIntegrationTest,
     }
 }
 
-/// @brief 真实 A2L 的实例多固定事件和仅有默认事件均不允许 DAQ 加入。
+/// @brief 真实 A2L 的多固定事件被拒绝，默认事件可作为来源。
 TEST(XcpSlaveDemoIntegrationTest,
-     GeneratedA2lRejectsAmbiguousOrMissingFixedEvents) {
+     GeneratedA2lSeparatesInstanceEventLists) {
     TemporaryDirectory directory("instance_daq_rejections");
     const auto output_dir = directory.Path() / "a2l";
     UdpPortReservation reservation;
@@ -1163,12 +1163,16 @@ TEST(XcpSlaveDemoIntegrationTest,
         tools::SymbolDaqObservationUnsupportedReason(duplicate.Value(), events)
             .empty());
 
-    // DEFAULT_EVENT_LIST 即使包含事件 0，也不能补足缺失的固定事件。
+    // DEFAULT_EVENT_LIST 是合法的事件来源：A2L 语法里 FIXED 与 VARIABLE 互斥
+    // （thirdparty/a2llib/src/xcp/xcpdataparser.y:689 `daq_event_union`），
+    // 故把 FIXED 形式整段改写成 VARIABLE + DEFAULT 形式，而不是只替换关键字
+    // ——只换关键字会得到 `DAQ_EVENT DEFAULT_EVENT_LIST EVENT 0x0` 这种非法行。
     std::string default_only = original;
     const auto fixed_begin = default_only.find("FIXED_EVENT_LIST EVENT 0x0");
     ASSERT_NE(fixed_begin, std::string::npos);
-    default_only.replace(fixed_begin, std::string("FIXED_EVENT_LIST").size(),
-                         "DEFAULT_EVENT_LIST");
+    default_only.replace(
+        fixed_begin, std::string("FIXED_EVENT_LIST EVENT 0x0").size(),
+        "VARIABLE /begin DEFAULT_EVENT_LIST EVENT 0x0 /end DEFAULT_EVENT_LIST");
     const auto default_path = output_dir / "default_only.a2l";
     {
         std::ofstream output(default_path, std::ios::binary);
@@ -1183,14 +1187,130 @@ TEST(XcpSlaveDemoIntegrationTest,
         "xcp_slave_demo::meas_fast.input");
     ASSERT_TRUE(missing.HasValue());
     EXPECT_TRUE(missing.Value().daq_event_fixed.empty());
-    EXPECT_FALSE(
+    EXPECT_EQ(missing.Value().daq_event_default,
+              (std::vector<std::uint16_t>{0}));
+    // 契约变更（DAQ 事件来源降级）：仅有 DEFAULT 时**合格**，来源标为 default。
+    EXPECT_TRUE(
         tools::SymbolDaqObservationUnsupportedReason(missing.Value(), events)
             .empty());
+    EXPECT_EQ(tools::ResolveDaqEventCandidate(missing.Value()).source,
+              tools::DaqEventSource::Default);
     // 修改快速实例的声明不能污染另一慢速 INSTANCE。
     auto slow = default_bridge.Value()->Database()->Find(
         "xcp_slave_demo::meas_slow.basic.real_32");
     ASSERT_TRUE(slow.HasValue());
     EXPECT_EQ(slow.Value().daq_event_fixed, (std::vector<std::uint16_t>{1}));
+}
+
+/// @brief 用改写后的事件声明驱动一次真实 DAQ，验证降级来源能真正采样。
+///
+/// INSTANCE 形态的 A2L 把 DAQ_EVENT 声明在 INSTANCE 上，其叶子只能继承到
+/// 这四张表；本函数把 meas_fast 的 `FIXED_EVENT_LIST EVENT 0x0` 整段改写成
+/// `VARIABLE` 形态（A2L 语法里 FIXED 与 VARIABLE 互斥，只换关键字会得到非法
+/// 声明），再断言：叶子拿到的事件来源不是 Fixed，且该事件真的产生非零采样。
+/// @param run_name 临时目录名后缀，用于区分不同用例。
+/// @param variable_body 替换后的 VARIABLE 形态事件声明。
+/// @param expected_source 预期的事件来源。
+static void RunDegradedEventDaqCase(const char* run_name,
+                                    const std::string& variable_body,
+                                    tools::DaqEventSource expected_source) {
+    TemporaryDirectory directory(run_name);
+    const auto output_dir = directory.Path() / "a2l";
+    UdpPortReservation reservation;
+    ASSERT_TRUE(reservation.BindFree());
+    const std::uint16_t port = reservation.Port();
+    const auto generation_exit =
+        GenerateA2l(directory.Path(), output_dir, port, false);
+    ASSERT_TRUE(generation_exit.has_value());
+    ASSERT_EQ(*generation_exit, 0);
+    reservation.Close();
+
+    std::ifstream input(output_dir / "xcp_slave_demo.a2l", std::ios::binary);
+    ASSERT_TRUE(input.is_open());
+    std::string text((std::istreambuf_iterator<char>(input)),
+                     std::istreambuf_iterator<char>());
+    const std::string fixed_decl = "FIXED_EVENT_LIST EVENT 0x0";
+    const auto fixed_pos = text.find(fixed_decl);
+    ASSERT_NE(fixed_pos, std::string::npos) << "A2L 缺少 meas_fast 固定事件声明";
+    text.replace(fixed_pos, fixed_decl.size(), variable_body);
+    // 必须写在 A2L 原目录：文件里有 `/include "XCP_104.aml"`，
+    // 该相对路径按 A2L 所在目录解析，换目录会直接解析失败。
+    const auto patched_path = output_dir / "degraded_events.a2l";
+    {
+        std::ofstream output(patched_path, std::ios::binary);
+        ASSERT_TRUE(output.is_open());
+        output << text;
+        ASSERT_TRUE(output.good());
+    }
+
+    auto loaded = a2l::A2lBridge::Load(patched_path.string());
+    ASSERT_TRUE(loaded.HasValue()) << loaded.ErrorInfo().message;
+    // tick 是 ULONG 采样序号，非零判定稳定，故用它做采样证据。
+    auto leaf = loaded.Value()->Database()->Find("xcp_slave_demo::meas_fast.tick");
+    ASSERT_TRUE(leaf.HasValue());
+    const auto candidate = tools::ResolveDaqEventCandidate(leaf.Value());
+    ASSERT_TRUE(candidate.error.empty()) << candidate.error;
+    ASSERT_EQ(candidate.source, expected_source);
+    ASSERT_EQ(candidate.channels, (std::vector<std::uint16_t>{0}));
+    const std::array<std::uint16_t, 2> events{0, 1};
+    EXPECT_TRUE(tools::SymbolDaqObservationUnsupportedReason(leaf.Value(), events).empty());
+    // 同一 INSTANCE 的嵌套叶子也必须继承对应事件表和合法的零号事件。
+    auto nested = loaded.Value()->Database()->Find(
+        "xcp_slave_demo::meas_fast.state.raw_output");
+    ASSERT_TRUE(nested.HasValue());
+    const auto nested_candidate = tools::ResolveDaqEventCandidate(nested.Value());
+    EXPECT_EQ(nested_candidate.source, expected_source);
+    EXPECT_EQ(nested_candidate.channels, (std::vector<std::uint16_t>{0}));
+    EXPECT_TRUE(tools::SymbolDaqObservationUnsupportedReason(nested.Value(), events).empty());
+    const std::array<std::uint16_t, 1> unregistered{1};
+    EXPECT_NE(tools::SymbolDaqObservationUnsupportedReason(nested.Value(), unregistered)
+                  .find("EVENT_CHANNEL"), std::string::npos);
+
+    const auto service_directory = directory.Path() / "service";
+    std::filesystem::create_directories(service_directory);
+    DemoChildProcess slave_process;
+    std::string start_error;
+    ASSERT_TRUE(StartDemoProcess(
+        slave_process, {"--bind", "127.0.0.1", "--port", std::to_string(port)},
+        service_directory, &start_error))
+        << start_error;
+    DemoDtoCollector collector;
+    auto master = ConnectToDemo(port, &collector);
+    ASSERT_NE(master, nullptr) << "服务进程未在 8 秒内完成真实 XCP CONNECT";
+
+    DaqEntrySpec entry;
+    entry.address = static_cast<Address>(leaf.Value().xcp_address);
+    entry.extension = leaf.Value().address_extension;
+    entry.size = leaf.Value().element_size_bytes;
+    DaqOdtSpec odt;
+    odt.entries.push_back(entry);
+    DaqListSpec daq_list;
+    daq_list.daq_list = 0U;
+    daq_list.event_channel = candidate.channels.front();
+    daq_list.timestamp = true;
+    daq_list.odts.push_back(odt);
+    ASSERT_NO_THROW(master->ConfigureDaqListsDynamic({daq_list}));
+    ASSERT_NO_THROW(master->StartDaqSync());
+    EXPECT_TRUE(collector.WaitForNonzeroUint32(std::chrono::seconds(3)))
+        << "降级事件来源未产生非零采样（source="
+        << tools::DaqEventSourceName(candidate.source) << "）";
+    ASSERT_NO_THROW(master->StopDaq());
+}
+
+/// @brief 仅 DEFAULT_EVENT_LIST 的 A2L 必须能正常 DAQ（方案 A 主场景）。
+TEST(XcpSlaveDemoIntegrationTest, DefaultEventListDrivesLiveDaq) {
+    RunDegradedEventDaqCase(
+        "default_event_daq",
+        "VARIABLE /begin DEFAULT_EVENT_LIST EVENT 0x0 /end DEFAULT_EVENT_LIST",
+        tools::DaqEventSource::Default);
+}
+
+/// @brief 仅 CONSISTENCY_EVENT_LIST 的 A2L 也必须能正常 DAQ（规范 shall）。
+TEST(XcpSlaveDemoIntegrationTest, ConsistencyEventListDrivesLiveDaq) {
+    RunDegradedEventDaqCase(
+        "consistency_event_daq",
+        "VARIABLE /begin CONSISTENCY_EVENT_LIST EVENT 0x0 "
+        "/end CONSISTENCY_EVENT_LIST", tools::DaqEventSource::Consistency);
 }
 
 /// @brief 验证独立服务进程使用同布局相对地址、标定写入及 10 ms DAQ。

@@ -113,8 +113,10 @@ V1.2 的页号约定与常见实现**相反**：
 
 生成后本程序会给标定段 `INSTANCE` 补上 `READ_WRITE`：V1.2 在段相对模式下不输出该标记，
 而 `tools/xcp_master/symbol_policy.hpp` 要求可写符号带 `A2L READ_WRITE`，缺失会导致主站拒绝标定写入。
-补丁只改命中唯一的一条 `INSTANCE` 声明行，先写 `<file>.patch.tmp` 回读比对，再用
-`std::filesystem::rename` 原子替换，失败返回退出码 4。
+补丁只改命中唯一的一条 `INSTANCE` 声明行，先写 `<file>.patch.tmp` 回读比对，再使用平台支持的覆盖替换：
+Windows 优先 `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`；受限工作区
+在该调用因 ACL 被拒绝时回退为 `copy_file` 覆盖（该回退不保证原子性）；POSIX 使用
+`std::filesystem::rename`。失败返回退出码 4。
 
 ## 已知限制
 
@@ -127,14 +129,27 @@ V1.2 的页号约定与常见实现**相反**：
 3. **A2L 中的 MEMORY_SEGMENT 段号**由 V1.2 写出为 `0`；标定页命令的段号需用 `0`（V1.2 的
    段号与索引一致，EPK 段占用保留编号），与 A2L 声明保持一致。
 4. **不支持多实例**：V1.2 以太网服务是进程级单例，同进程只能一种传输、一个端点。
-5. 端到端联调（DAQ/POLL/标定/切页）**没有自动化用例**：按计划 §8 只提供模型层单测
-   （`tests/xcp_slave_demo_v12_model_test.cpp`），端到端由 `libxcp` 主站手工/探针联调。
+5. 端到端联调的覆盖边界：`XcpliteV12InteropTest` 通过 libxcp Master 和独立 V1.2 从站进程，
+   对 TCP/UDP 分别验收 A2L 双次生成/覆盖、CONNECT、A2L 地址测量读取、工作页标定写回/回读、
+   测量数组观察到修正量及 DISCONNECT。该门禁不覆盖 DAQ、全部协议错误边界或跨平台 CI；
+   `XcpliteIntegration` 使用 V2.2 对端，其结果不是 V1.2 兼容性证据。
 
-## 单元测试
+## 测试
+
+模型层单元测试：
 
 ```bash
 ctest --test-dir cmake-build-release -R XcpSlaveV12ModelTest --output-on-failure
 ```
 
-测试目标只编译 `slave_model.cpp`，不链接 `xcplite_v12` 与 libxcp，避免与 `XcpliteIntegration`
-已链接的 V2.2 `xcplite` 产生同名符号冲突。
+V1.2 专项门禁（需要先配置 `-DLIBXCP_BUILD_TESTS=ON`）：
+
+```bash
+ctest --test-dir cmake-build-release -R "XcpliteV12|XcpSlaveV12ModelTest" --output-on-failure
+```
+
+`XcpliteV12InteropTest` 是独立 C++ 主站测试程序，以子进程运行 `xcp_slave_demo_v12`，
+使用 libxcp 的 TCP/UDP Transport、XcpMaster 和 a2lbridge；验证 A2L 覆盖/解析、测量读取、
+标定写回与运行时效果。模型测试只编译 `slave_model.cpp`，不链接 `xcplite_v12`；
+主站测试同样不链接 V1.2 从站库，避免与 `XcpliteIntegration` 的 V2.2 `xcplite` 符号冲突。
+V1.2 的 `0xFC` 是 `SYNCH` 而不是后续版本的 `POLL`；专项门禁不使用 POLL。

@@ -14,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,6 +35,8 @@
 #include <gtest/gtest.h>
 
 #include "libxcp/udp_header_codec.hpp"
+#include "src/event_poller.hpp"
+#include "tcp_fake_socket.hpp"
 #include "udp_test_slave.hpp"
 
 namespace calmcar::xcp {
@@ -107,6 +110,12 @@ public:
     [[nodiscard]] bool closed() const {
         const std::lock_guard<std::mutex> lock(m_mutex_);
         return m_closed_;
+    }
+
+    /// @brief 关闭原因文本（未关闭时为空串）
+    [[nodiscard]] std::string CloseReason() const {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        return m_close_reason_;
     }
 
 private:
@@ -202,6 +211,73 @@ Bytes BytesOf(std::initializer_list<std::uint8_t> init) {
     return Bytes(init.begin(), init.end());
 }
 
+/** @brief 注入等待失败，验证 UDP 接收线程不会无限警告忙循环。 */
+class FailingUdpPoller final : public detail::EventPoller {
+public:
+    /// @brief 返回可识别的失败文本并记录等待次数。
+    int Wait(std::span<const detail::WaitItem> items, std::uint32_t,
+             std::vector<detail::WaitStatus>& status_out,
+             std::string* error_out) override {
+        ++calls;
+        status_out.assign(items.size(), detail::WaitStatus{});
+        if (error_out != nullptr) *error_out = "注入的等待错误";
+        return -1;
+    }
+
+    std::atomic<int> calls{0};  ///< 接收线程进入等待的次数。
+};
+
+/** @brief 测试结束时恢复真实等待器，避免全局注入悬空。 */
+class ScopedUdpPoller {
+public:
+    /// @brief 注入等待器并由守卫管理其生命周期。
+    explicit ScopedUdpPoller(detail::EventPoller& poller) {
+        detail::SetEventPollerForTesting(&poller);
+    }
+    /// @brief 恢复真实等待器。
+    ~ScopedUdpPoller() { detail::SetEventPollerForTesting(nullptr); }
+    ScopedUdpPoller(const ScopedUdpPoller&) = delete;
+    ScopedUdpPoller& operator=(const ScopedUdpPoller&) = delete;
+};
+
+/**
+ * @brief 可控就绪的等待器：按预算报告"数据 Socket 可读"，预算耗尽后超时
+ * @details 接收循环的顺序是"先等可读、再 recvfrom"，脚本化的 recvfrom 生效
+ *          前提是等待能返回数据可读。真实 Socket 上没有数据，因此用本等待器
+ *          制造可控的就绪时机，避免依赖真实报文的到达时间（计划 §3.49 的
+ *          "可控就绪触发"）。
+ */
+class ReadyBudgetPoller final : public detail::EventPoller {
+public:
+    /// @param budget 允许报告"可读"的次数
+    explicit ReadyBudgetPoller(int budget) : m_budget_(budget) {}
+
+    /// @brief 预算内把第 0 项（数据 Socket）标记为可读，否则返回超时
+    int Wait(std::span<const detail::WaitItem> items, std::uint32_t,
+             std::vector<detail::WaitStatus>& status_out,
+             std::string* error_out) override {
+        calls.fetch_add(1);
+        status_out.assign(items.size(), detail::WaitStatus{});
+        if (error_out != nullptr) {
+            error_out->clear();
+        }
+        if (!items.empty() && m_budget_.fetch_sub(1) > 0) {
+            status_out.front().readable = true;
+            return 1;
+        }
+        m_budget_.store(0);
+        // 预算耗尽后按"超时"返回，让接收循环回到关闭标记检查，
+        // 同时给 Close() 留出及时 join 的机会。
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return 0;
+    }
+
+    std::atomic<int> calls{0};  ///< 进入等待的次数（诊断用）
+
+private:
+    std::atomic<int> m_budget_;  ///< 剩余可读次数
+};
+
 // --------------------------------------------------------------------------
 // 生命周期与配置校验
 // --------------------------------------------------------------------------
@@ -221,6 +297,224 @@ TEST(UdpTransportLifecycle, OpenThenCloseTransitionsAndNotifies) {
     EXPECT_TRUE(listener.WaitForClose(std::chrono::seconds(2)));
     // close 幂等：二次调用不得再次回调或抛异常
     EXPECT_NO_THROW(transport.Close());
+    slave.Stop();
+}
+
+TEST(UdpTransportLifecycle, PollerFailureReportsErrorAndStopsReceiveLoop) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    auto config = MakeConfig(slave.Port());
+    UdpTransport transport(config);
+    RecordingListener listener;
+    FailingUdpPoller poller;
+    ScopedUdpPoller poller_guard(poller);
+
+    transport.Open(listener);
+    EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    EXPECT_TRUE(listener.WaitForClose(std::chrono::seconds(2)));
+    EXPECT_EQ(poller.calls.load(), 1);
+    ASSERT_FALSE(listener.Warnings().empty());
+    EXPECT_NE(listener.Warnings().front().find("注入的等待错误"),
+              std::string::npos);
+
+    transport.Close();
+    slave.Stop();
+}
+
+// --------------------------------------------------------------------------
+// recvfrom / sendto 错误分支：脚本化注入（计划 §5 UDP 行）
+//
+// 三条可恢复分支（超时 / 中断 / 其它）必须"不退出会话"，两条不可恢复分支
+// （句柄失效 / 连接断开）必须交付关闭原因后退出。
+// --------------------------------------------------------------------------
+
+namespace {
+
+/// @brief recvfrom 故障用例的公共装配：假 Socket + 可控就绪等待器
+/// @details 两者都是进程级注入，用例内必须保持存活到 Transport 析构之后。
+struct RecvFromFaultHarness {
+    test::UdpTestSlave slave;          ///< 真实对端（仅为构造合法远端配置）
+    test_support::FakeSocketOps fake;  ///< 脚本化 Socket 操作表
+    std::optional<ReadyBudgetPoller> poller;  ///< 可控就绪等待器
+    std::optional<test_support::ScopedFakeSocketOps> ops_guard;  ///< 注入守卫
+    std::optional<ScopedUdpPoller> poller_guard;                 ///< 注入守卫
+    RecordingListener listener;                                  ///< 回调收集器
+    std::optional<UdpTransport> transport;  ///< 被测对象（最后析构）
+
+    /// @param budget 允许"数据可读"的次数
+    /// @param actions recv_from 脚本动作序列
+    void Start(int budget,
+               const std::vector<test_support::FakeSocketOps::RecvFromAction>&
+                   actions) {
+        slave.Start();
+        ops_guard.emplace(fake);
+        poller.emplace(budget);
+        poller_guard.emplace(*poller);
+        fake.ScriptRecvFrom(actions);
+        transport.emplace(MakeConfig(slave.Port()));
+        transport->Open(listener);
+    }
+
+    /// @brief 等待脚本被全部消费（即接收循环确实重试到脚本用尽）
+    /// @return 是否在超时前消费完
+    bool WaitForScriptDrain(std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (fake.PendingRecvFromSteps() != 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return fake.PendingRecvFromSteps() == 0;
+    }
+
+    /// @brief 等待 recv_from 被调用至少 count 次
+    bool WaitForRecvFromCalls(std::size_t count,
+                              std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (fake.RecvFromCallCount() < count &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        return fake.RecvFromCallCount() >= count;
+    }
+};
+
+}  // namespace
+
+TEST(UdpTransportRecvFromFault, TimeoutKeepsReceiveLoopAlive) {
+    RecvFromFaultHarness h;
+    h.Start(2, {test_support::FakeSocketOps::RecvFromAction::FailTimeout,
+                test_support::FakeSocketOps::RecvFromAction::FailTimeout});
+
+    EXPECT_TRUE(h.WaitForScriptDrain(std::chrono::seconds(2)))
+        << "接收超时后必须继续接收，第二次脚本才可能被消费";
+    EXPECT_EQ(h.fake.RecvFromCallCount(), 2U);
+    EXPECT_TRUE(h.listener.Warnings().empty()) << "接收超时不得产生告警";
+    EXPECT_TRUE(h.transport->IsOpen());
+    EXPECT_FALSE(h.listener.closed());
+
+    h.transport->Close();
+    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
+    h.slave.Stop();
+}
+
+TEST(UdpTransportRecvFromFault, InterruptedWarnsAndContinues) {
+    RecvFromFaultHarness h;
+    h.Start(1, {test_support::FakeSocketOps::RecvFromAction::FailInterrupted});
+
+    ASSERT_TRUE(h.listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    const auto warnings = h.listener.Warnings();
+    EXPECT_NE(warnings.front().find("测试脚本：接收被信号打断"),
+              std::string::npos);
+    EXPECT_NE(warnings.front().find("被信号打断，继续接收"), std::string::npos);
+    EXPECT_TRUE(h.transport->IsOpen()) << "EINTR 不得终止会话";
+    EXPECT_FALSE(h.listener.closed());
+
+    h.transport->Close();
+    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
+    h.slave.Stop();
+}
+
+TEST(UdpTransportRecvFromFault, OtherErrorWarnsAndContinues) {
+    RecvFromFaultHarness h;
+    h.Start(1, {test_support::FakeSocketOps::RecvFromAction::FailOther});
+
+    ASSERT_TRUE(h.listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    const auto warnings = h.listener.Warnings();
+    EXPECT_NE(warnings.front().find("测试脚本：其它接收错误"),
+              std::string::npos);
+    EXPECT_NE(warnings.front().find("继续接收"), std::string::npos);
+    EXPECT_TRUE(h.transport->IsOpen()) << "瞬时错误不得终止会话";
+
+    h.transport->Close();
+    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
+    h.slave.Stop();
+}
+
+TEST(UdpTransportRecvFromFault, PersistentErrorDoesNotFloodWarnings) {
+    RecvFromFaultHarness h;
+    // 连续注入 120 次同类错误：告警应被限频，但不能被吞掉
+    std::vector<test_support::FakeSocketOps::RecvFromAction> actions(
+        120, test_support::FakeSocketOps::RecvFromAction::FailOther);
+    h.Start(120, actions);
+
+    ASSERT_TRUE(h.WaitForRecvFromCalls(120, std::chrono::seconds(5)));
+    const auto warnings = h.listener.Warnings();
+    EXPECT_GE(warnings.size(), 1U) << "首次错误必须告警";
+    EXPECT_LE(warnings.size(), 3U) << "持续错误不得刷屏（首次 + 每 100 次）";
+    EXPECT_TRUE(h.transport->IsOpen());
+
+    h.transport->Close();
+    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
+    h.slave.Stop();
+}
+
+TEST(UdpTransportRecvFromFault, InvalidHandleStopsReceiveLoop) {
+    RecvFromFaultHarness h;
+    h.Start(1,
+            {test_support::FakeSocketOps::RecvFromAction::FailInvalidSocket});
+
+    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
+    EXPECT_FALSE(h.transport->IsOpen());
+    EXPECT_NE(h.listener.CloseReason().find("Socket 已关闭或失效"),
+              std::string::npos);
+
+    h.transport->Close();
+    h.slave.Stop();
+}
+
+TEST(UdpTransportRecvFromFault, ConnectionLostStopsReceiveLoop) {
+    RecvFromFaultHarness h;
+    h.Start(1,
+            {test_support::FakeSocketOps::RecvFromAction::FailConnectionLost});
+
+    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
+    EXPECT_FALSE(h.transport->IsOpen());
+    EXPECT_NE(h.listener.CloseReason().find("Socket 已关闭或失效"),
+              std::string::npos);
+
+    h.transport->Close();
+    h.slave.Stop();
+}
+
+TEST(UdpTransportRecvFromFault, ZeroLengthDatagramWarnsAndContinues) {
+    RecvFromFaultHarness h;
+    h.Start(1,
+            {test_support::FakeSocketOps::RecvFromAction::DeliverZeroLength});
+
+    ASSERT_TRUE(h.listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    EXPECT_NE(h.listener.Warnings().front().find("长度为 0"),
+              std::string::npos);
+    EXPECT_TRUE(h.transport->IsOpen());
+
+    h.transport->Close();
+    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
+    h.slave.Stop();
+}
+
+TEST(UdpTransportSendFault, SendToFailureSurfacesErrorText) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    UdpTransport transport(MakeConfig(slave.Port()));
+    RecordingListener listener;
+    test_support::FakeSocketOps fake;
+    test_support::ScopedFakeSocketOps ops_guard(fake);
+    fake.ScriptSendTo({test_support::FakeSocketOps::SendToAction::FailOther});
+
+    transport.Open(listener);
+    const Bytes payload{0xFF, 0x00};
+    try {
+        transport.Send(BytesView{payload});
+        FAIL() << "sendto 失败必须抛出异常";
+    } catch (const XcpException& e) {
+        // 发送失败必须带可辨识的运输层消息前缀；`what()` 由
+        // MakeTransportError 生成，具体系统错误码其后拼接。
+        const std::string text = e.what();
+        EXPECT_NE(text.find("发送 UDP Datagram 失败"), std::string::npos)
+            << "实际: " << text;
+        EXPECT_FALSE(text.empty());
+    }
+
+    transport.Close();
     slave.Stop();
 }
 

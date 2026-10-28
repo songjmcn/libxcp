@@ -75,8 +75,19 @@ namespace liba2l {
 //     既有消费方的行为逐位不变；`endpoint_*` 与 `udp_*` 一并标记 deprecated。
 //     ABI 号提升的实质原因是 `IfDataXcpDto` 增加了 `std::vector` 成员（布局
 //     变化），而非取值语义变化。
+// v11（DAQ 观测事件来源降级）：补 `CONSISTENCY_EVENT_LIST` 的导出。XCP 协议层
+//     §4.1.5 规定「MEASUREMENT 未声明 DEFAULT_EVENT_LIST 时，应以
+//     CONSISTENCY_EVENT_LIST 作为默认事件通道分配」（shall），而 v10 的 DTO
+//     只有 fixed/default/available 三张表，消费方无从得知该兜底分配。
+//     本版在 `SymbolDto` 与 `StructInfoDto` 各增 `daq_consistency_event`；
+//     `StructInfoDto` 另补 `daq_event_default` / `daq_event_available`，
+//     使 INSTANCE 与 MEASUREMENT 同口径暴露四张事件表（叶子继承需要）
+//     （空 = 未声明，与既有三表同风格），并补 CHARACTERISTIC 分支的事件导出
+//     （此前 `BuildCharacteristicSymbol` 完全不导出 DAQ_EVENT，导致
+//     CHARACTERISTIC 恒显示「未声明事件」——属信息缺失，不影响其能否 DAQ）。
+//     ABI 号提升同样因为 DTO 增加了 `std::vector` 成员（布局变化）。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 10u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 11u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -344,6 +355,10 @@ struct SymbolDto {
     std::vector<std::uint16_t> daq_event_default;
     /// @brief DAQ_EVENT available event 号列表（逐 MEASUREMENT 原始顺序透传）
     std::vector<std::uint16_t> daq_event_available;
+    /// @brief DAQ_EVENT consistency event 号列表（v11 起；原始顺序透传）
+    /// @details XCP 协议层 §4.1.5：MEASUREMENT 未声明 DEFAULT_EVENT_LIST 时，
+    ///          该表即默认事件通道分配。空 = A2L 未声明。
+    std::vector<std::uint16_t> daq_consistency_event;
 };
 
 /**
@@ -651,6 +666,21 @@ struct StructInfoDto {
     /// @brief INSTANCE IF_DATA XCP DAQ_EVENT 中原始
     /// FIXED_EVENT_LIST；结构定义恒空
     std::vector<std::uint16_t> daq_event_fixed;
+    /// @brief INSTANCE IF_DATA XCP DAQ_EVENT 中原始
+    /// DEFAULT_EVENT_LIST（v11 起）；结构定义恒空
+    /// @details 与 MEASUREMENT 同口径，仅供上层做事件来源降级
+    ///          （FIXED 缺失时的合法来源），不得当作固定事件使用。
+    std::vector<std::uint16_t> daq_event_default;
+    /// @brief INSTANCE IF_DATA XCP DAQ_EVENT 中原始
+    /// AVAILABLE_EVENT_LIST（v11 起）；结构定义恒空
+    /// @details 仅用于自洽性校验（DEFAULT/CONSISTENCY 必须是它的子集），
+    ///          不参与事件选择。
+    std::vector<std::uint16_t> daq_event_available;
+    /// @brief INSTANCE IF_DATA XCP DAQ_EVENT 中原始
+    /// CONSISTENCY_EVENT_LIST（v11 起）；结构定义恒空
+    /// @details 与 `daq_event_fixed` 同源同口径，仅本表本身；上层需要兜底
+    ///          语义（无 DEFAULT 时用 CONSISTENCY）时自行按规则组合。
+    std::vector<std::uint16_t> daq_consistency_event;
     std::vector<StructMemberDto> members;  ///< 成员元数据（不展开）
 };
 

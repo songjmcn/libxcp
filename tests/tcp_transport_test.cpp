@@ -23,6 +23,7 @@
 
 #include "src/socket_util.hpp"
 #include "src/event_poller.hpp"
+#include "tcp_fake_socket.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -918,6 +919,68 @@ TEST_F(TcpEndToEndTest, SlaveAcceptsConnectionAndReceivesFrame) {
     slave.Close();
 }
 
+TEST_F(TcpEndToEndTest, AcceptClosesListenHandleExactlyOnce) {
+    // 注入统计用假操作表：连接建立语义仍是真实的，只统计 close/listen/accept。
+    // 注入是进程级的；gtest_discover_tests 让每个用例独占进程，因此这里安全。
+    test_support::FakeSocketOps fake;
+    test_support::ScopedFakeSocketOps ops_guard(fake);
+
+    TcpTransportConfig cfg = MakeSlaveConfig();
+    const std::uint16_t probe_port = StartRawListener();
+    ASSERT_NE(probe_port, 0);
+    CloseRaw(m_listen_handle);
+    m_listen_handle = kRawInvalid;
+    cfg.local_port = probe_port;
+
+    TcpTransport slave(cfg);
+    RecordingListener listener;
+    std::thread slave_thread([&] {
+        try {
+            slave.Open(listener);
+        } catch (...) {
+        }
+    });
+
+    RawSocket client = kRawInvalid;
+    for (int attempt = 0; attempt < 100 && client == kRawInvalid; ++attempt) {
+        client = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(probe_port);
+        ::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+        if (::connect(client, reinterpret_cast<sockaddr*>(&addr),
+                      sizeof(addr)) != 0) {
+            CloseRaw(client);
+            client = kRawInvalid;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    ASSERT_NE(client, kRawInvalid) << "无法连上 Slave 监听端口";
+    slave_thread.join();
+    ASSERT_TRUE(slave.IsOpen());
+
+    const detail::SocketHandle listen_handle = fake.LastListenHandle();
+    const detail::SocketHandle accepted_handle = fake.LastAcceptHandle();
+    ASSERT_NE(listen_handle, detail::kInvalidSocketHandle)
+        << "Slave 必须经过注入的 listen()";
+    ASSERT_NE(accepted_handle, detail::kInvalidSocketHandle)
+        << "Slave 必须经过注入的 accept()";
+
+    // accept 成功后监听句柄已释放，Close() 不得再关一次（否则可能误关
+    // OS 复用后的同号句柄，正是本次修复的问题）。
+    EXPECT_EQ(fake.CloseCount(listen_handle), 1)
+        << "监听句柄必须在 accept 成功后只关闭一次";
+
+    slave.Close();
+    EXPECT_EQ(fake.CloseCount(listen_handle), 1)
+        << "Close() 不得再次关闭已释放的监听句柄";
+    EXPECT_EQ(fake.CloseCount(accepted_handle), 1)
+        << "已接受连接必须且只能关闭一次";
+
+    ::shutdown(client, 2);
+    CloseRaw(client);
+}
+
 TEST_F(TcpEndToEndTest, ReopenAfterCloseSucceeds) {
     const std::uint16_t port = StartRawListener();
     ASSERT_NE(port, 0);
@@ -1158,12 +1221,11 @@ TEST_F(TcpReceiveCtrTest, FirstFrameAfterReopenEstablishesFreshBaseline) {
 }
 
 // ===========================================================================
-// 平台错误码与关闭常量的分类（Windows CI 回归）
+// 平台错误码分类与关闭接口（Windows CI 回归）
 //
-// 背景：`src/socket_util.cpp` 曾经在平台分支之外直接使用 POSIX 的
-// `SHUT_RDWR`，并在 Winsock 分支里写了并不存在的 `WSAEPIPE`，导致 Windows
-// 编译直接失败。POSIX 侧完全合法，因此本地与 Linux CI 都无法发现。
-// 这里把"哪些错误码算连接丢失"和"双向关闭用哪个常量"固化成可测契约。
+// 历史曾将 POSIX 的 SHUT_RDWR 泄漏到 Windows，且在 Winsock 分支误用
+// 不存在的 WSAEPIPE；当前原生关闭常量已仅存在平台实现文件中。
+// 本组测试验证对外的错误集合和无效句柄返回语义。
 // ===========================================================================
 
 #if defined(_WIN32)
@@ -1173,18 +1235,12 @@ constexpr int kConnectionLostCodes[] = {WSAECONNRESET, WSAECONNABORTED,
 /// @brief 本平台不应被判为"连接已丢失"的错误码
 constexpr int kNotConnectionLostCodes[] = {0, WSAEWOULDBLOCK, WSAEINTR,
                                            WSAEINPROGRESS};
-// 双向关闭必须是 Winsock 的 SD_BOTH；若误写成 SHUT_RDWR 会连编译都过不去。
-static_assert(detail::kShutdownBoth == SD_BOTH,
-              "kShutdownBoth 在 Windows 上必须是 SD_BOTH");
 #else
 /// @brief 本平台应被判为"连接已丢失"的错误码
 constexpr int kConnectionLostCodes[] = {EPIPE, ECONNRESET, ECONNABORTED,
                                         ENOTCONN, ESHUTDOWN};
 /// @brief 本平台不应被判为"连接已丢失"的错误码
 constexpr int kNotConnectionLostCodes[] = {0, EAGAIN, EINTR, EINPROGRESS};
-// 双向关闭必须是 POSIX 的 SHUT_RDWR；若误写成 SD_BOTH 会连编译都过不去。
-static_assert(detail::kShutdownBoth == SHUT_RDWR,
-              "kShutdownBoth 在 POSIX 上必须是 SHUT_RDWR");
 #endif
 
 TEST(SocketPlatformTest, ClassifiesConnectionLostCodes) {
@@ -1205,15 +1261,24 @@ TEST(SocketPlatformTest, KeepsOtherCodesOutOfConnectionLostSet) {
     }
 }
 
-TEST(SocketPlatformTest, ShutdownBothSelectsBothDirections) {
-    // 编译期断言已锁定常量来源；这里再确认它确实是"双向"而不是单向别名。
 #if defined(_WIN32)
-    EXPECT_NE(detail::kShutdownBoth, SD_RECEIVE);
-    EXPECT_NE(detail::kShutdownBoth, SD_SEND);
-#else
-    EXPECT_NE(detail::kShutdownBoth, SHUT_RD);
-    EXPECT_NE(detail::kShutdownBoth, SHUT_WR);
+TEST(SocketPlatformTest, ClassifiesWindowsUdpShutdownErrors) {
+    auto& ops = detail::RealSocketOps();
+    // 保持既有 UDP 关闭场景：EINVAL/NOTSOCK 无需重试，断链错误另行分类。
+    ::WSASetLastError(WSAEINVAL);
+    EXPECT_TRUE(ops.is_invalid_socket());
+    ::WSASetLastError(WSAENOTSOCK);
+    EXPECT_TRUE(ops.is_invalid_socket());
+    ::WSASetLastError(WSAECONNRESET);
+    EXPECT_TRUE(ops.is_connection_lost());
+}
 #endif
+
+TEST(SocketPlatformTest, ShutdownSocketReportsInvalidHandle) {
+    // 关闭常量现仅存在平台实现内；此处验证抽象在无效句柄上的失败语义。
+    EXPECT_NE(
+        detail::RealSocketOps().shutdown_socket(detail::kInvalidSocketHandle),
+        0);
 }
 
 }  // namespace calmcar::xcp
