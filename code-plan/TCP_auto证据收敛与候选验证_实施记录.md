@@ -93,8 +93,9 @@ ctest -C Release -j 4
 
 ## 4. 未覆盖 / 限制（如实声明）
 
-1. **Auto 未在 POSIX 上实跑**。Linux/macOS 的候选构建与三态分类未在本机验证，
-   需三平台 CI 实跑后才成立。
+1. **Auto 的 POSIX 验证只到 Linux**。Linux（ubuntu-22.04 + GCC 13）已实跑通过；
+   macOS 作业为红（失败用例与本方案无关，见 §5），因此 macOS 上"三态分类可用"
+   尚不能记为已验证。
 2. **CLI 端到端仍需交互终端**。`xcp_master` 的交互界面需要 TTY，自动化验收走
    "库级跨进程用例 + `TcpNegotiationExitCode()` 单测"两段证据，未直接断言进程
    退出码 3/4。
@@ -105,3 +106,27 @@ ctest -C Release -j 4
    指定 `--tcp-profile` + `--packet-alignment`。
 5. **A2L 正向信任仍是保守态**：ACL/重解析无法证明时 A2L 对齐不作配置；本方案
    只把它降级为"排序建议"，未放宽该限制。
+## 5. 三平台 CI 实测（PR #17，提交 `0de843d`）
+
+| 平台 | 工作流 | 结果 | 说明 |
+| --- | --- | --- | --- |
+| Windows | `MSBuild` | 通过 | `cmake-build-vs` 本地全量 1157/1157 与 CI 一致 |
+| Linux | `Linux` (ubuntu-22.04, GCC 13) | 通过 | 方案 A′ 在 POSIX 上首次实跑成立，限制 §4.1 已消除 |
+| macOS | `macOS` (macos-26, arm64) | **失败** | 失败用例 `XcpSlaveDemoIntegrationTest.CrossProcessCalibrationChangesDaqOutput`（exit code 8，Runner 标注 `878:`） |
+
+### 5.1 macOS 失败的定性证据
+
+- 同一用例在本仓库 `master` 上**已出现过相同失败**：
+  run `40449345161`（提交 `b9f49481`）macOS 作业标注同为
+  `XcpSlaveDemoIntegrationTest.CrossProcessCalibrationChangesDaqOutput`；
+  而 run `40693262176`（提交 `f6554dfa`）macOS 通过。
+- 本分支自身历史：`445bab86` macOS **通过** → `ffbb7c0`（只改断言措辞的测试提交）
+  macOS 失败 → `0de843d` macOS 失败。
+- 结论：这是**与本次改动无关的 macOS 侧不稳定用例**（UDP 跨进程标定+DAQ 的
+  `WaitForDouble`/`WaitForNonzeroUint32` 3 秒等待），不是方案 A′ 引入的回归。
+  但它是真实存在的红灯，不能因此把 macOS 记为已验证。
+
+### 5.2 仍然成立的未验证项
+
+- macOS 上 auto 的三态分类“跑过测试”这一结论**尚不成立**：macOS 作业虽在本提交
+  跑到了自动协商用例之后才失败，但整条流水线为红，不能当作通过证据使用。
