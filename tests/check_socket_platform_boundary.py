@@ -26,13 +26,17 @@ def force_utf8_console() -> None:
             # 流已被重定向到不支持重配置的对象时保持原样，不能因此失败。
             continue
 
-# 对 src/ 只豁免四个明确列出的原生实现，防止日后新增文件绕过门禁。
+# 对 src/ 只豁免明确列出的原生实现，防止日后新增文件绕过门禁。
+# Socket/轮询原生实现四个；受控 A2L 快照的 ACL/权限原生实现两个（第二阶段提取
+# 时从 tools/xcp_master 迁入，按平台二选一编译）。
 PLATFORM_FILES = frozenset(
     {
         "src/detail/socket/socket_ops_win.cpp",
         "src/detail/socket/socket_ops_posix.cpp",
         "src/detail/socket/event_poller_win.cpp",
         "src/detail/socket/event_poller_posix.cpp",
+        "src/detail/fs/trusted_snapshot_win.cpp",
+        "src/detail/fs/trusted_snapshot_posix.cpp",
     }
 )
 

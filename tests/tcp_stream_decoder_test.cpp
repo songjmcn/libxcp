@@ -224,6 +224,70 @@ TEST(TcpStreamDecoderFragmentation, SingleByteAtATimeDecodesAll) {
 // 粘包：一次 Push 解出多帧
 // --------------------------------------------------------------------------
 
+TEST(TcpStreamDecoderCoalescing, V15AlignmentsMultipleFramesAndByteFragments) {
+    // 独立列出小端 LEN/CTR 与非零 FILL，不使用生产编码器生成测试数据。
+    // 四帧长度覆盖 32 位对齐的 3、2、1、0 字节填充及 16 位对齐的两种情况。
+    const std::vector<Bytes> packets = {
+        BytesOf({0xA1}), BytesOf({0xB1, 0xB2}),
+        BytesOf({0xC1, 0xC2, 0xC3}), BytesOf({0xD1, 0xD2, 0xD3, 0xD4})};
+    const std::vector<std::uint16_t> counters = {0x1234, 0xABCD, 0x0102, 0xFE80};
+    struct Case {
+        PacketAlignment alignment;
+        Bytes stream;
+        std::vector<std::uint8_t> tails;
+    };
+    const std::vector<Case> cases = {
+        {PacketAlignment::Bit8,
+         BytesOf({0x01, 0x00, 0x34, 0x12, 0xA1,
+                  0x02, 0x00, 0xCD, 0xAB, 0xB1, 0xB2,
+                  0x03, 0x00, 0x02, 0x01, 0xC1, 0xC2, 0xC3,
+                  0x04, 0x00, 0x80, 0xFE, 0xD1, 0xD2, 0xD3, 0xD4}),
+         {0, 0, 0, 0}},
+        {PacketAlignment::Bit16,
+         BytesOf({0x01, 0x00, 0x34, 0x12, 0xA1, 0x91,
+                  0x02, 0x00, 0xCD, 0xAB, 0xB1, 0xB2,
+                  0x03, 0x00, 0x02, 0x01, 0xC1, 0xC2, 0xC3, 0xE7,
+                  0x04, 0x00, 0x80, 0xFE, 0xD1, 0xD2, 0xD3, 0xD4}),
+         {1, 0, 1, 0}},
+        {PacketAlignment::Bit32,
+         BytesOf({0x01, 0x00, 0x34, 0x12, 0xA1, 0x91, 0x82, 0xF3,
+                  0x02, 0x00, 0xCD, 0xAB, 0xB1, 0xB2, 0xD5, 0x76,
+                  0x03, 0x00, 0x02, 0x01, 0xC1, 0xC2, 0xC3, 0xE7,
+                  0x04, 0x00, 0x80, 0xFE, 0xD1, 0xD2, 0xD3, 0xD4}),
+         {3, 2, 1, 0}},
+    };
+
+    for (const auto& test : cases) {
+        for (const bool fragmented : {false, true}) {
+            SCOPED_TRACE(::testing::Message()
+                         << "对齐=" << static_cast<int>(test.alignment)
+                         << " 逐字节=" << fragmented);
+            auto decoder = MakeV15(test.alignment);
+            std::size_t decoded = 0;
+            const auto chunk = fragmented ? 1U : test.stream.size();
+            for (std::size_t offset = 0; offset < test.stream.size(); offset += chunk) {
+                const auto result = decoder.Push(BytesView{test.stream}.subspan(offset, chunk));
+                ASSERT_FALSE(result.malformed) << "字节偏移 " << offset;
+                for (const auto& frame : result.frames) {
+                    ASSERT_LT(decoded, packets.size()) << "解出了多余的帧";
+                    EXPECT_EQ(frame.header.len, packets[decoded].size());
+                    EXPECT_EQ(frame.header.ctr, counters[decoded]);
+                    EXPECT_EQ(frame.tail_bytes, test.tails[decoded]);
+                    // 下一次 Push 或 Finish 前立即消费视图，避免引用失效。
+                    EXPECT_TRUE(ViewEquals(frame.xcp_packet, packets[decoded]));
+                    ++decoded;
+                }
+            }
+            EXPECT_EQ(decoded, packets.size());
+            EXPECT_EQ(decoder.DeliveredFrameCount(), packets.size());
+            const auto finished = decoder.Finish();
+            EXPECT_FALSE(finished.malformed);
+            EXPECT_TRUE(finished.end_of_stream);
+            EXPECT_TRUE(finished.frames.empty());
+        }
+    }
+}
+
 TEST(TcpStreamDecoderCoalescing, TwoFramesInOnePushV15) {
     auto decoder = MakeV15(PacketAlignment::Bit32);
     Bytes stream = RawFrame(0x0001, BytesOf({0xFF, 0x00}), 2);
@@ -308,6 +372,21 @@ TEST(TcpStreamDecoderFinish, HalfHeaderIsTruncated) {
     const auto finished = decoder.Finish();
     EXPECT_TRUE(finished.malformed);
     EXPECT_FALSE(finished.malformed_reason.empty());
+}
+
+// 待单独评审修复：完整 Header 后立即 FIN 仍必须判为截断。
+// 当前实现漏判，暂禁用以免把既有缺陷当成通过；可通过
+// --gtest_also_run_disabled_tests --gtest_filter=TcpStreamDecoderFinish.DISABLED_HeaderOnlyIsTruncated 复现。
+TEST(TcpStreamDecoderFinish, DISABLED_HeaderOnlyIsTruncated) {
+    for (const auto profile : {TcpWireProfile::AsamV14, TcpWireProfile::AsamV15}) {
+        auto decoder = profile == TcpWireProfile::AsamV14 ? MakeV14() : MakeV15(PacketAlignment::Bit8);
+        const auto frame = RawFrame(0x0001, BytesOf({0xFF, 0x00}), 0);
+        const auto pushed = decoder.Push(BytesView{frame}.subspan(0, kEthernetHeaderSize));
+        ASSERT_FALSE(pushed.malformed);
+        EXPECT_TRUE(pushed.frames.empty());
+        const auto finished = decoder.Finish();
+        EXPECT_TRUE(finished.malformed) << "profile=" << static_cast<int>(profile);
+    }
 }
 
 TEST(TcpStreamDecoderFinish, HalfPayloadIsTruncated) {

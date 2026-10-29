@@ -18,11 +18,16 @@
 #include <gtest/gtest.h>
 
 #include "libxcp/a2l/a2l_bridge.hpp"
+#include "libxcp/tcp_framing_candidates.hpp"
+#include "libxcp/tcp_framing_negotiation.hpp"
+#include "libxcp/tcp_framing_verification.hpp"
+#include "libxcp/tcp_framing_verdict.hpp"
 #include "libxcp/tcp_transport.hpp"
 #include "libxcp/tcp_transport_config.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "libxcp/xcp_master.hpp"
 
+#include "libxcp/transport_selection.hpp"
 #include "xcp_v12_slave_process.hpp"
 #include "../examples/xcp_slave_demo_v12/slave_model.hpp"
 
@@ -34,17 +39,18 @@ using xcp_slave_demo_v12::CalibrationParameters;
 using xcp_slave_demo_v12::FastMeasurements;
 
 /** @brief 按协议类型构造指向独立 V1.2 从站的 Master Transport。 */
-std::unique_ptr<IXcpTransport> MakeTransport(const std::string& type,
-                                             std::uint16_t port) {
+std::unique_ptr<IXcpTransport> MakeTransport(
+    const std::string& type, std::uint16_t port,
+    const std::optional<calmcar::xcp::ResolvedTransportSelection>& selection) {
     if (type == "tcp") {
         TcpTransportConfig config;
         config.role = TcpRole::Master;
-        config.remote_host = "127.0.0.1";
-        config.remote_port = port;
+        config.remote_host = selection->host;
+        config.remote_port = selection->port;
         config.local_host = "127.0.0.1";
         config.local_port = 0;
-        config.packet_alignment = PacketAlignment::Bit8;
-        config.wire_profile = TcpWireProfile::AsamV14;
+        config.packet_alignment = selection->alignment;
+        config.wire_profile = selection->wire_profile;
         config.connect_timeout_ms = 1500;
         return std::make_unique<TcpTransport>(config);
     }
@@ -108,11 +114,47 @@ protected:
         bridge_ = std::move(loaded.Value());
         ASSERT_NE(bridge_->Database(), nullptr);
 
+        // Start 已用真实 CONNECT 探测就绪；此处不声称此前零连接。
+        // 仅提取 TCP 端点，显式线路参数不依赖 A2L 对齐推断。
+        std::optional<calmcar::xcp::ResolvedTransportSelection> selection;
+        if (transport_name_ == "tcp") {
+            const auto* info = bridge_->XcpInfo();
+            ASSERT_NE(info, nullptr);
+            ASSERT_FALSE(info->ambiguous);
+            calmcar::xcp::A2lTransportFacts facts;
+            for (const auto& endpoint : info->transports) {
+                if (endpoint.kind != a2l::TransportEndpoint::Kind::TcpIp) continue;
+                if (!facts.declared) {
+                    facts.declared = true;
+                    facts.host = endpoint.remote_host;
+                    facts.port = endpoint.remote_port;
+                }
+                ++facts.instance_count;
+                facts.instances.push_back({endpoint.remote_host, endpoint.remote_port,
+                                           0, endpoint.version});
+            }
+            ASSERT_TRUE(facts.declared) << "A2L 未声明 TCP 端点";
+            ASSERT_EQ(facts.host, "127.0.0.1");
+            ASSERT_EQ(facts.port, slave_->Port());
+            calmcar::xcp::TransportSelectionRequest request;
+            request.transport = calmcar::xcp::TransportKind::Tcp;
+            request.tcp_profile = TcpWireProfile::AsamV14;
+            request.packet_alignment_bits = std::uint8_t{8};
+            std::string error;
+            selection = calmcar::xcp::ResolveTransportSelection(request, facts, &error);
+            ASSERT_TRUE(selection.has_value()) << error;
+            ASSERT_EQ(selection->endpoint_source, calmcar::xcp::EndpointSource::A2l);
+            ASSERT_EQ(selection->host, facts.host);
+            ASSERT_EQ(selection->port, facts.port);
+            ASSERT_EQ(selection->wire_profile, TcpWireProfile::AsamV14);
+            ASSERT_EQ(selection->alignment, PacketAlignment::Bit8);
+        }
+
         XcpMasterOptions options;
         options.timeouts = CommandTimeouts{std::chrono::milliseconds(1800),
                                            std::chrono::milliseconds(1800), 1};
         master_ = std::make_unique<XcpMaster>(
-            MakeTransport(transport_name_, slave_->Port()), options);
+            MakeTransport(transport_name_, slave_->Port(), selection), options);
         ASSERT_NO_THROW(master_->Connect()) << "Master CONNECT 失败";
     }
 
@@ -214,6 +256,43 @@ INSTANTIATE_TEST_SUITE_P(TcpAndUdp, XcpliteV12InteropTest,
                              return std::string(info.param) == "tcp" ? "Tcp"
                                                                      : "Udp";
                          });
+
+/**
+ * @brief `--tcp-profile auto` 在真实第三方 V1.2 从站上必须落到 V1.4/8bit。
+ *
+ * @details 这是自动模式的**真实对端证据**：V1.2 从站由第三方实现
+ *          （`thirdparty/XCPliteV1.2`），不共享本库 framing，因此"候选被接受"
+ *          只能来自线路字节吻合。8 bit 下 V1.4 与 V1.5 字节布局相同，默认
+ *          顺序把 V1.4 排在首位，故一次命中即可。
+ */
+TEST(XcpliteV12AutoProfileTest, ResolvesAsamV14EightBitFromRealV12Slave) {
+    XcpliteV12SlaveProcess slave("tcp");
+    ASSERT_NO_THROW(slave.Start());
+
+    calmcar::xcp::TcpFramingProbeConfig probe;
+    probe.host = "127.0.0.1";
+    probe.port = slave.Port();
+    probe.connect_timeout_ms = 3000U;
+    probe.command_timeout_ms = 1200U;
+
+    const auto candidates = calmcar::xcp::DefaultFramingCandidates();
+    const auto attempt = [&probe](
+                             const calmcar::xcp::TcpFramingCandidate&
+                                 candidate) {
+        return calmcar::xcp::VerifyTcpFramingCandidate(probe, candidate);
+    };
+    const auto outcome = calmcar::xcp::NegotiateTcpFraming(candidates, attempt);
+    slave.Stop();
+
+    ASSERT_TRUE(outcome.selected.has_value()) << outcome.Summary();
+    EXPECT_EQ(outcome.selected->profile, calmcar::xcp::TcpWireProfile::AsamV14)
+        << outcome.Summary();
+    EXPECT_EQ(outcome.selected->alignment, calmcar::xcp::PacketAlignment::Bit8)
+        << outcome.Summary();
+    EXPECT_EQ(outcome.attempts.size(), 1U) << outcome.Summary();
+    EXPECT_EQ(outcome.attempts.front().verdict,
+              calmcar::xcp::FramingVerdict::Accepted);
+}
 
 }  // namespace
 }  // namespace calmcar::xcp::test

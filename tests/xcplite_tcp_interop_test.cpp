@@ -4,7 +4,7 @@
  *
  * @par 为什么必须用真实进程
  *   loopback 只能证明"我方发送与接收自洽"，无法发现"我方假设与 XCPlite 实际
- *   线路布局不符"。本文件让 `xcp_test_slave`（由 `thirdparty/XCPliteV1.2`
+ *   线路布局不符"。本文件让 `xcp_test_slave`（由 `thirdparty/XCPlite`
  *   构建，使用其自己的 `xcpEthTl.c` framing）以 TCP 方式监听，Master 侧走
  *   `TcpTransport` + `AsamV14` Profile，全程真实 socket、真实编解码，不替换
  *   任何一侧的 codec。
@@ -40,13 +40,19 @@
 
 #include <gtest/gtest.h>
 
+#include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/daq/dto_envelope_decoder.hpp"
 #include "libxcp/protocol_types.hpp"
+#include "libxcp/tcp_framing_candidates.hpp"
+#include "libxcp/tcp_framing_negotiation.hpp"
+#include "libxcp/tcp_framing_verification.hpp"
+#include "libxcp/tcp_framing_verdict.hpp"
 #include "libxcp/tcp_transport.hpp"
 #include "libxcp/tcp_transport_config.hpp"
 #include "libxcp/tcp_wire_profile.hpp"
 #include "libxcp/xcp_master.hpp"
 
+#include "libxcp/transport_selection.hpp"
 #include "xcplite_slave_fixture.hpp"
 #include "xcp_test_slave/xcplite_test_types.hpp"
 
@@ -162,6 +168,41 @@ protected:
                          std::istreambuf_iterator<char>());
         ASSERT_NE(text.find("XCP_ON_TCP_IP"), std::string::npos)
             << "A2L 未声明 XCP_ON_TCP_IP，本次并非 TCP 互操作";
+
+        // Start 已用真实 CONNECT 探测就绪，不将其误计为零连接。
+        // 只提取 TCP 端点，显式线路参数不依赖 A2L 对齐推断。
+        auto loaded = a2l::A2lBridge::Load(slave_.A2lPath().string());
+        ASSERT_TRUE(loaded.HasValue()) << loaded.ErrorInfo().message;
+        const auto* info = loaded.Value()->XcpInfo();
+        ASSERT_NE(info, nullptr);
+        ASSERT_FALSE(info->ambiguous);
+        calmcar::xcp::A2lTransportFacts facts;
+        for (const auto& endpoint : info->transports) {
+            if (endpoint.kind != a2l::TransportEndpoint::Kind::TcpIp) continue;
+            if (!facts.declared) {
+                facts.declared = true;
+                facts.host = endpoint.remote_host;
+                facts.port = endpoint.remote_port;
+            }
+            ++facts.instance_count;
+            facts.instances.push_back({endpoint.remote_host, endpoint.remote_port,
+                                       0, endpoint.version});
+        }
+        ASSERT_TRUE(facts.declared) << "A2L 未声明 TCP 端点";
+        ASSERT_EQ(facts.host, "127.0.0.1");
+        ASSERT_EQ(facts.port, slave_.Port());
+        calmcar::xcp::TransportSelectionRequest request;
+        request.transport = calmcar::xcp::TransportKind::Tcp;
+        request.tcp_profile = TcpWireProfile::AsamV14;
+        request.packet_alignment_bits = std::uint8_t{8};
+        std::string error;
+        selection_ = calmcar::xcp::ResolveTransportSelection(request, facts, &error);
+        ASSERT_TRUE(selection_.has_value()) << error;
+        ASSERT_EQ(selection_->endpoint_source, calmcar::xcp::EndpointSource::A2l);
+        ASSERT_EQ(selection_->host, facts.host);
+        ASSERT_EQ(selection_->port, facts.port);
+        ASSERT_EQ(selection_->wire_profile, TcpWireProfile::AsamV14);
+        ASSERT_EQ(selection_->alignment, PacketAlignment::Bit8);
     }
 
     /// @brief 终止 Slave 进程
@@ -178,14 +219,14 @@ protected:
         IEventListener* listener = nullptr) const {
         TcpTransportConfig cfg;
         cfg.role = TcpRole::Master;
-        cfg.remote_host = "127.0.0.1";
-        cfg.remote_port = slave_.Port();
+        cfg.remote_host = selection_->host;
+        cfg.remote_port = selection_->port;
         cfg.local_host = "127.0.0.1";
         cfg.local_port = 0;
         // XCPlite 的 xcptl_cfg.h 为 PACKET_ALIGNMENT 4；在 asam-v1.4 下该
         // 值只影响对端内部的补白，不改变本侧 framing。
-        cfg.packet_alignment = PacketAlignment::Bit8;
-        cfg.wire_profile = TcpWireProfile::AsamV14;
+        cfg.packet_alignment = selection_->alignment;
+        cfg.wire_profile = selection_->wire_profile;
         cfg.connect_timeout_ms = 3000;
         cfg.send_timeout_ms = 3000;
         cfg.keep_alive = true;
@@ -207,6 +248,7 @@ protected:
         return master;
     }
 
+    std::optional<calmcar::xcp::ResolvedTransportSelection> selection_;  ///< 已验证的连接决策。
     /// @brief Slave 进程句柄
     XcpliteSlaveProcess slave_{std::nullopt, 0, /*use_tcp=*/true};
 };
@@ -462,6 +504,35 @@ TEST_F(XcpliteTcpInteropTest, PeerExitFailsCommandWithoutSilentReconnect) {
     }
     EXPECT_TRUE(failed)
         << "对端已退出，命令却成功返回——违反「不得把超时当成功」";
+}
+
+/**
+ * @brief `--tcp-profile auto` 在真实 XCPlite V2.2 从站上必须落到 V1.4/8bit。
+ *
+ * @details 与 V1.2 用例互补：两个版本的 XCPlite 都是第三方 framing 实现，
+ *          共同证明自动模式不是"只对自己家从站有效"。V2.2 的 8 bit 布局与
+ *          V1.4 Profile 一致，因此默认顺序的第一个候选即应被接受。
+ */
+TEST_F(XcpliteTcpInteropTest, AutoProfileResolvesAsamV14EightFromV22Slave) {
+    TcpFramingProbeConfig probe;
+    probe.host = "127.0.0.1";
+    probe.port = slave_.Port();
+    probe.connect_timeout_ms = 3000U;
+    probe.command_timeout_ms = 1200U;
+
+    const auto candidates = DefaultFramingCandidates();
+    const auto attempt =
+        [&probe](const TcpFramingCandidate& candidate) {
+            return VerifyTcpFramingCandidate(probe, candidate);
+        };
+    const auto outcome = NegotiateTcpFraming(candidates, attempt);
+
+    ASSERT_TRUE(outcome.selected.has_value()) << outcome.Summary();
+    EXPECT_EQ(outcome.selected->profile, TcpWireProfile::AsamV14)
+        << outcome.Summary();
+    EXPECT_EQ(outcome.selected->alignment, PacketAlignment::Bit8)
+        << outcome.Summary();
+    EXPECT_EQ(outcome.attempts.size(), 1U) << outcome.Summary();
 }
 
 }  // namespace

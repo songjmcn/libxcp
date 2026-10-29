@@ -60,6 +60,8 @@ add_executable(libxcp_tests
         ethernet_header_codec_test.cpp
         tcp_stream_decoder_test.cpp
         tcp_framing_negotiation_test.cpp
+        tcp_framing_candidates_test.cpp
+        tcp_framing_verification_test.cpp
         tcp_transport_test.cpp
         udp_transport_test.cpp
         udp_boundary_framing_test.cpp
@@ -253,7 +255,7 @@ set_tests_properties(A2lSmoke PROPERTIES FIXTURES_REQUIRED A2lGolden)
 # ----------------------------------------------------------------------------
 # A2lGolden —— 黄金回归套件（设计 §7.2 用例分组 T1~T8，批次10）
 # ----------------------------------------------------------------------------
-add_executable(A2lGolden a2l_golden_test.cpp)
+add_executable(A2lGolden a2l_golden_test.cpp a2l_tcp_alignment_sdk_differential_test.cpp)
 target_compile_features(A2lGolden PRIVATE cxx_std_20)
 target_link_libraries(A2lGolden PRIVATE libxcp::a2lbridge libxcp_test_main
         # T-05：需要 libxcp 的 PacketAlignment 强类型与 XcpFrameBytes()，
@@ -365,6 +367,9 @@ add_test(NAME A2lIsolation
 # XCP Master CLI tool smoke tests (requires LIBXCP_BUILD_TOOLS=ON).
 if(LIBXCP_BUILD_TOOLS)
   add_test(NAME XcpMasterToolHelp COMMAND xcp_master --help)
+  add_test(NAME XcpMasterToolRejectsDuplicateProfile
+           COMMAND ${CMAKE_COMMAND} "-DXCP_MASTER=$<TARGET_FILE:xcp_master>"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/xcp_master_duplicate_profile_test.cmake")
   add_test(NAME XcpMasterToolRejectsMissingArgs COMMAND xcp_master)
   set_tests_properties(XcpMasterToolRejectsMissingArgs PROPERTIES WILL_FAIL TRUE)
   add_test(NAME XcpMasterToolRejectsPollingIntervalInDaq
@@ -384,6 +389,9 @@ if(LIBXCP_BUILD_TOOLS)
           xcp_master_calibration_policy_test.cpp
           xcp_master_tui_model_test.cpp
           xcp_master_symbol_display_test.cpp
+          a2l_tcp_alignment_candidate_test.cpp
+          # 受控 A2L 快照：成功路径与失败关闭路径的用例。
+          a2l_trusted_snapshot_test.cpp
           # B-T5：传输层选择解析层（纯函数）的规则级用例。
           xcp_master_transport_selection_test.cpp)
   target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
@@ -445,6 +453,30 @@ if(LIBXCP_BUILD_TOOLS)
             PROPERTIES FIXTURES_REQUIRED A2lUiPerf TIMEOUT 900)
   endif()
 endif()
+
+# ----------------------------------------------------------------------------
+# 第二阶段提取（`code-plan/TCP_A2L与线路证据联合决策_两阶段计划.md` §5.3）：
+# 独立调用者 + 公共头自足性。
+# 依赖边界本身就是验收点：本目标**只**给出 `include/`，不提供
+# `${PROJECT_SOURCE_DIR}`，因此一旦某个公共头反向依赖 `tools/` 下的头文件，
+# 这里会直接编译失败，而不是等到某天工具被移走才暴露。
+# ----------------------------------------------------------------------------
+add_executable(TransportSelectionStandaloneTest
+        transport_selection_standalone_test.cpp
+        # 下面三个 TU 各自在文件最前面只包含一个公共头（gtest 在其后），
+        # 用来钉住"该头能被单独包含"。
+        public_header_a2l_tcp_alignment_test.cpp
+        public_header_transport_selection_test.cpp
+        public_header_trusted_snapshot_test.cpp)
+target_compile_features(TransportSelectionStandaloneTest PRIVATE cxx_std_20)
+target_include_directories(TransportSelectionStandaloneTest PRIVATE
+        ${PROJECT_SOURCE_DIR}/include)
+target_link_libraries(TransportSelectionStandaloneTest PRIVATE
+        libxcp::libxcp GTest::gtest libxcp_test_main Threads::Threads)
+if(MSVC)
+  target_compile_options(TransportSelectionStandaloneTest PRIVATE /utf-8)
+endif()
+gtest_discover_tests(TransportSelectionStandaloneTest DISCOVERY_TIMEOUT 60)
 
 # ----------------------------------------------------------------------------
 # A2lCalibrationAccessTest —— CALIBRATION_ACCESS 可写性判定（方案 A）
@@ -575,3 +607,51 @@ if(MSVC)
   target_compile_options(XcpSlaveV12ModelTest PRIVATE /utf-8)
 endif()
 gtest_discover_tests(XcpSlaveV12ModelTest DISCOVERY_TIMEOUT 60)
+
+# ----------------------------------------------------------------------------
+# V1.5 对齐矩阵真实进程验收
+#
+# 从站放在**独立进程**里，并且其 framing 由 tests/tcp_test_slave.cpp 独立实现
+# （不复用生产 decoder），避免"Master 与 Slave 用同一份代码所以必然互通"的自
+# 洽式证据。本组用例只覆盖 PACKET_ALIGNMENT = 8/16/32 与三项负向行为，
+# 不声称 V1.5 一致性认证，也不声称与第三方 V1.5 实现互操作。
+#
+# RUN_SERIAL：从站进程与端口独占，避免并行用例互相抢占。
+# ----------------------------------------------------------------------------
+add_executable(xcp_v15_alignment_slave
+        xcp_v15_alignment_slave.cpp
+        tcp_test_slave.cpp)
+target_compile_features(xcp_v15_alignment_slave PRIVATE cxx_std_20)
+target_include_directories(xcp_v15_alignment_slave PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR})
+target_link_libraries(xcp_v15_alignment_slave PRIVATE libxcp::libxcp)
+if(WIN32)
+  target_link_libraries(xcp_v15_alignment_slave PRIVATE ws2_32)
+endif()
+if(MSVC)
+  target_compile_options(xcp_v15_alignment_slave PRIVATE /utf-8)
+endif()
+
+add_executable(XcpV15AlignmentInteropTest
+        xcp_v15_alignment_interop_test.cpp
+        xcp_v15_slave_process.cpp
+        # `--tcp-profile auto` 的真实验证侧：候选逐个新建连接取证（含 8/16/32）。
+        tcp_framing_auto_interop_test.cpp)
+target_compile_features(XcpV15AlignmentInteropTest PRIVATE cxx_std_20)
+target_include_directories(XcpV15AlignmentInteropTest PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${PROJECT_SOURCE_DIR})
+target_link_libraries(XcpV15AlignmentInteropTest PRIVATE
+        libxcp::libxcp
+        GTest::gtest
+        libxcp_test_main)
+target_compile_definitions(XcpV15AlignmentInteropTest PRIVATE
+        XCP_V15_SLAVE_EXECUTABLE="$<TARGET_FILE:xcp_v15_alignment_slave>"
+        XCP_V15_TEST_ROOT="${PROJECT_BINARY_DIR}/.tmp/xcp_v15_alignment")
+add_dependencies(XcpV15AlignmentInteropTest xcp_v15_alignment_slave)
+if(MSVC)
+  target_compile_options(XcpV15AlignmentInteropTest PRIVATE /utf-8)
+endif()
+gtest_discover_tests(XcpV15AlignmentInteropTest DISCOVERY_TIMEOUT 60
+                     PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)

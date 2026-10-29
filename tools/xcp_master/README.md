@@ -1,6 +1,6 @@
 # XCP Master TUI Tool
 
-`xcp_master` is a standalone C++20 terminal UI tool targeting Windows, Linux, and macOS. It browses an A2L database and connects to an explicitly supplied XCP-on-UDP slave. Its display panel and command input are separated; asynchronous polling/DAQ output is routed to the UI rather than printed over active input. It does not launch or depend on XCPlite `cpp_demo` and does not reuse source code from `examples/`. Full platform builds still depend on a Boost/A2L toolchain whose C++ ABI matches the compiler.
+`xcp_master` is a standalone C++20 terminal UI tool targeting Windows, Linux, and macOS. It browses an A2L database and connects to an XCP-on-UDP or XCP-on-TCP slave. Its display panel and command input are separated; asynchronous polling/DAQ output is routed to the UI rather than printed over active input. It does not launch or depend on XCPlite `cpp_demo` and does not reuse source code from `examples/`. Full platform builds still depend on a Boost/A2L toolchain whose C++ ABI matches the compiler.
 
 ## Build
 
@@ -15,10 +15,26 @@ Disable the tool with `-DLIBXCP_BUILD_TOOLS=OFF` (the default). This option is i
 ## Run
 
 ```text
-xcp_master --a2l <path> --host <IPv4> --port <1..65535> [--module <name>] [--mode poll|daq] [--interval-ms <ms>] [--daq-profile generic|xcplite]
+xcp_master --a2l <path> [--host <IPv4> --port <1..65535>] [--transport udp|tcp] [--tcp-profile asam-v1.4|asam-v1.5|auto|auto-legacy] [--packet-alignment 8|16|32] [--module <name>] [--mode poll|daq] [--interval-ms <ms>] [--preset xcplite] [--a2l-trusted-snapshot-root <dir>]
 ```
 
-Required arguments are the local A2L file, slave IPv4 address and UDP port. `--module` filters the symbol listing. The default is `--mode poll`; the poll target interval is 500 ms. `--interval-ms` is rejected in DAQ mode; DAQ timing is controlled by ECU events, not by this option. `--daq-profile` is valid only with DAQ mode and defaults to `generic`. For the repository's `xcp_slave_demo`, use `xcp_master --a2l <generated-a2l> --host 127.0.0.1 --port <slave-port> --mode daq --daq-profile xcplite`; `--mode daq` alone does **not** select the XCPlite DTO layout. Choose the XCPlite profile only when the target ECU is known to use it. Use `--help` for usage.
+The A2L file is required. TCP may use an IPv4 endpoint from command-line options or a matching A2L transport declaration; UDP requires an explicit endpoint. `--module` filters the symbol listing. The default is `--mode poll`; the poll target interval is 500 ms. `--interval-ms` is rejected in DAQ mode; DAQ timing is controlled by ECU events. The DAQ DTO layout is selected from the slave's reported capabilities; there is no `--daq-profile` option. Use `--help` for the current transport options.
+
+TCP `auto` resolves the wire profile from real wire evidence: it builds a candidate list (the A2L TL version and `PACKET_ALIGNMENT` only *reorder* that list, they never decide it), then verifies each candidate on a brand-new connection with the real protocol stack (`VerifyTcpFramingCandidate`). The first `Accepted` candidate wins and the session is re-established on another fresh connection; the verification connections are always closed. Each attempt is reported as `被拒` (the peer answered with a protocol violation), `未决` (no protocol-level reply at all — typically a wrong address/port or a stopped slave) or `接受`. Exit codes: `0` resolved, `3` every candidate was rejected by the peer (fix the layout/alignment), `4` at least one candidate stayed inconclusive (check address, port, peer). `auto-legacy` explicitly opts into the older first-success attempts, which can affect the ECU session and do not establish a unique profile.
+
+For TCP the tool stages the A2L into a private snapshot before the SDK parses it (`--a2l-trusted-snapshot-root`, default `<exe dir>/tmp`) and only trusts the A2L alignment when the restricted raw-text scan and the SDK endpoint facts agree. The snapshot root and every ancestor must be writable only by the current user (plus SYSTEM/Administrators); if that cannot be proven — for example on a tree that grants `Users:(F)` — the tool prints `A2L 受控快照不可信: <reason>` and keeps the A2L alignment untrusted. In that case specify `--packet-alignment` for `asam-v1.5`. This conservative limitation does not change UDP.
+
+### Reusable pieces
+
+The three decisions above are library components, not tool-private code, so other callers can reuse them without the tool's include path:
+
+| Header | What it decides |
+| --- | --- |
+| `include/libxcp/transport_selection.hpp` | Which transport/protocol profile to use, given CLI intent, A2L declarations and current connection state |
+| `include/libxcp/a2l_tcp_alignment.hpp` | Whether the A2L's own TCP endpoint declaration can be trusted as packet-alignment evidence |
+| `include/libxcp/trusted_a2l_snapshot.hpp` | Whether an A2L file can be staged into a directory that other identities cannot modify |
+
+They depend only on other `include/libxcp` headers; `tests/transport_selection_standalone_test.cpp` builds against `include/` alone to keep that true.
 
 ## Interactive commands
 
@@ -51,6 +67,6 @@ Writes still follow the same conservative validation, pre-read, default-cancel c
 
 A2L presence and the A2L `READ_WRITE` flag are metadata, not proof that a connected ECU permits access. Reads/writes are conservatively refused for unknown widths, bit fields, addresses outside the 32-bit XCP range, incompatible address granularity, or A2L/ECU byte-order disagreement. Scalar writes are limited to invertible `CHARACTERISTIC/VALUE`; fixed-axis `CHARACTERISTIC/CURVE` writes are limited to a validated single point. Both require explicit confirmation plus static A2L and runtime XCP page permission. One-dimensional MEASUREMENT arrays can be sampled as complete snapshots in POLL and read once from the expanded preview; each read is transferred in eight-element chunks while the UI displays the entire vector. Details are metadata-only and never issue an ECU request. DAQ arrays are restricted to explicitly selected XCPlite and a validated fixed contiguous one-dimensional MEASUREMENT that fits in one Entry and one DTO; generic-profile arrays and split-ODT arrays remain unsupported. An array DTO is published as a single complete snapshot only after every element converts successfully; failed samples retain the last valid snapshot marked stale. ECU-side protection can still reject writes; the tool does not invent or automatically run a Seed&Key algorithm. The local command mutex cannot prevent the ECU or another XCP master from switching pages between the final permission check and WRITE; post-write checks can detect some changes but cannot undo a write that reached a different page.
 
-DAQ is deliberately not advertised as compatible with arbitrary XCP slaves. Unknown/unverified DTO headers, timestamp modes, missing/ambiguous event declarations, insufficient resources, or mismatched runtime facts are rejected rather than decoded speculatively. The generic profile does not use XCPlite's proprietary DTO marker, first-ODT timestamp convention, or timestamp unit mapping. Contiguous fixed one-dimensional arrays have been verified only in the explicitly selected XCPlite profile with whole-Entry/whole-DTO routing; no generic array support or cross-ODT array reconstruction is implied. Only verified fixed-axis CURVE single points are supported for calibration, not arbitrary curves, MAPs, structures, static PREDEFINED DAQ, page switching, or automatic ECU management. TCP/CAN remain outside this tool's supported scope.
+DAQ is deliberately not advertised as compatible with arbitrary XCP slaves. Unknown/unverified DTO headers, timestamp modes, missing/ambiguous event declarations, insufficient resources, or mismatched runtime facts are rejected rather than decoded speculatively. The generic profile does not use XCPlite's proprietary DTO marker, first-ODT timestamp convention, or timestamp unit mapping. Contiguous fixed one-dimensional arrays have been verified only in the explicitly selected XCPlite profile with whole-Entry/whole-DTO routing; no generic array support or cross-ODT array reconstruction is implied. Only verified fixed-axis CURVE single points are supported for calibration, not arbitrary curves, MAPs, structures, static PREDEFINED DAQ, page switching, or automatic ECU management. CAN remains outside this tool's supported scope.
 
 Only connect to an ECU for which you have authorization. Use a non-critical calibration value for manual write testing and follow the ECU owner's procedure for restoring it. Automated tests do not constitute validation against every ECU; manual Slave validation is optional and was not part of the build/test suite.

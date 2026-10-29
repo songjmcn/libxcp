@@ -12,11 +12,13 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -769,6 +771,28 @@ Bytes EncodeFloat(float value) {
 }
 
 /**
+ * @brief 把字节序列格式化为便于阅读的十六进制文本。
+ * @param bytes 待格式化的字节序列。
+ * @param limit 最多输出的字节数，超出部分以省略号表示。
+ * @return 形如 "00 04 03 02 01 …" 的文本。
+ */
+std::string HexPreview(const Bytes& bytes, std::size_t limit) {
+    const std::size_t count = std::min(bytes.size(), limit);
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0');
+    for (std::size_t index = 0; index < count; ++index) {
+        if (index != 0U) {
+            stream << ' ';
+        }
+        stream << std::setw(2) << static_cast<unsigned int>(bytes[index]);
+    }
+    if (bytes.size() > count) {
+        stream << " …";
+    }
+    return stream.str();
+}
+
+/**
  * @brief 单线程 DTO 到达回调的帧收集器。
  */
 class DemoDtoCollector final : public IEventListener {
@@ -803,6 +827,7 @@ public:
                 try {
                     const auto decoded =
                         decoder_.Decode(BytesView{frame}, layout_);
+                    ++decoded_frames_;
                     if (decoded.payload.size() >= sizeof(double)) {
                         double observed = 0.0;
                         std::memcpy(&observed, decoded.payload.data(),
@@ -811,7 +836,10 @@ public:
                             return true;
                         }
                     }
-                } catch (const XcpException&) {
+                } catch (const XcpException& error) {
+                    // 记录解码失败：区分“未收到帧”与“帧无法按假设布局解码”
+                    ++decode_failures_;
+                    last_decode_error_ = error.what();
                 }
             }
             if (condition_.wait_until(lock, deadline) ==
@@ -835,6 +863,7 @@ public:
                 try {
                     const auto decoded =
                         decoder_.Decode(BytesView{frame}, layout_);
+                    ++decoded_frames_;
                     if (decoded.payload.size() == sizeof(std::uint32_t)) {
                         std::uint32_t observed = 0U;
                         std::memcpy(&observed, decoded.payload.data(),
@@ -843,7 +872,10 @@ public:
                             return true;
                         }
                     }
-                } catch (const XcpException&) {
+                } catch (const XcpException& error) {
+                    // 同样记录解码失败，便于断言消息给出可定位的证据
+                    ++decode_failures_;
+                    last_decode_error_ = error.what();
                 }
             }
             if (condition_.wait_until(lock, deadline) ==
@@ -854,10 +886,77 @@ public:
         return false;
     }
 
+    /**
+     * @brief 返回已接收 DTO 帧总数，含解码失败或未匹配的帧。
+     * @return 帧列表长度。
+     */
+    [[nodiscard]] std::size_t ReceivedFrameCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return frames_.size();
+    }
+
+    /**
+     * @brief 返回按当前布局成功解码的尝试次数。
+     * @return 解码成功计数。
+     */
+    [[nodiscard]] std::size_t DecodedFrameCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return decoded_frames_;
+    }
+
+    /**
+     * @brief 返回按当前布局解码失败的次数。
+     * @return 解码失败计数。
+     */
+    [[nodiscard]] std::size_t DecodeFailureCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return decode_failures_;
+    }
+
+    /**
+     * @brief 返回最后一次解码失败的错误文本。
+     * @return 从未失败时为空字符串。
+     */
+    [[nodiscard]] std::string LastDecodeError() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return last_decode_error_;
+    }
+
+    /**
+     * @brief 生成用于断言消息的现场诊断文本。
+     *
+     * 断言失败时仅凭“没等到期望值”无法区分三种情形：完全没收到帧、帧收到了
+     * 但按假设布局解码失败、帧解码成功但数值不符合预期。该文本把接收帧数、
+     * 解码成功/失败计数、最后一次解码错误和首帧内容一并输出，便于在 CI 日志
+     * 中直接定位原因。
+     *
+     * @return 单行诊断文本。
+     */
+    [[nodiscard]] std::string Diagnostics() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::ostringstream stream;
+        stream << "已收 DTO " << frames_.size() << " 帧，解码成功 "
+               << decoded_frames_ << " 次，解码失败 " << decode_failures_
+               << " 次";
+        if (!last_decode_error_.empty()) {
+            stream << "，最后错误：" << last_decode_error_;
+        }
+        if (frames_.empty()) {
+            stream << "，未收到任何 DTO 帧";
+        } else {
+            stream << "，首帧长度 " << frames_.front().size() << " 字节，内容 "
+                   << HexPreview(frames_.front(), 32U);
+        }
+        return stream.str();
+    }
+
 private:
     mutable std::mutex mutex_;  ///< 保护从 XCP 接收线程写入的 DTO 帧列表。
     std::condition_variable condition_;  ///< 通知等待线程已有新 DTO 到达。
     std::vector<Bytes> frames_;          ///< 已复制保存的原始 DTO 帧。
+    std::size_t decoded_frames_ = 0U;    ///< 按当前布局解码成功的尝试次数。
+    std::size_t decode_failures_ = 0U;   ///< 按当前布局解码失败的尝试次数。
+    std::string last_decode_error_;      ///< 最后一次解码失败的错误文本。
     DtoEnvelopeDecoder decoder_{
         ByteOrder::Intel};  ///< XCPlite DTO 信封解码器。
     DtoFrameLayout layout_ = [] {
@@ -873,6 +972,47 @@ private:
         return layout;
     }();  ///< XCPlite relative-byte DAQ 信封布局。
 };
+
+/**
+ * @brief 收集器诊断计数必须能区分“未收帧”“解码失败”“解码成功但值不匹配”。
+ *
+ * 该用例锁定诊断文本的语义：若统计本身写错，CI 上就再也无法根据消息定位
+ * 真实的 DAQ 失败原因。
+ */
+TEST(XcpSlaveDemoIntegrationTest, DemoDtoCollectorDiagnosticsCounters) {
+    DemoDtoCollector empty_collector;
+    EXPECT_EQ(empty_collector.ReceivedFrameCount(), 0U);
+    EXPECT_EQ(empty_collector.DecodedFrameCount(), 0U);
+    EXPECT_EQ(empty_collector.DecodeFailureCount(), 0U);
+    EXPECT_NE(empty_collector.Diagnostics().find("未收到任何 DTO 帧"),
+              std::string::npos);
+
+    constexpr double kExpected = 42.0;
+    // 与 DemoDtoCollector 的布局一致：[relODT][3B FILL][ts 32bit LE][payload]
+    Bytes frame{0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U, 0x00U};
+    const Bytes payload = EncodeDouble(kExpected);
+    frame.insert(frame.end(), payload.begin(), payload.end());
+
+    DemoDtoCollector matched_collector;
+    matched_collector.OnDto(DtoPacket{0U, frame});
+    EXPECT_TRUE(matched_collector.WaitForDouble(
+        kExpected, std::chrono::milliseconds(200)));
+    EXPECT_EQ(matched_collector.ReceivedFrameCount(), 1U);
+    EXPECT_GE(matched_collector.DecodedFrameCount(), 1U);
+    EXPECT_EQ(matched_collector.DecodeFailureCount(), 0U);
+    EXPECT_NE(matched_collector.Diagnostics().find("首帧长度"), std::string::npos);
+
+    // 截断帧无法按假设布局解码：必须记为解码失败并保留错误文本
+    DemoDtoCollector truncated_collector;
+    truncated_collector.OnDto(DtoPacket{0U, Bytes{0x00U}});
+    EXPECT_FALSE(truncated_collector.WaitForDouble(
+        1.0, std::chrono::milliseconds(100)));
+    EXPECT_EQ(truncated_collector.ReceivedFrameCount(), 1U);
+    EXPECT_GE(truncated_collector.DecodeFailureCount(), 1U);
+    EXPECT_FALSE(truncated_collector.LastDecodeError().empty());
+    EXPECT_NE(truncated_collector.Diagnostics().find("最后错误"),
+              std::string::npos);
+}
 
 /**
  * @brief 在已有临时目录中启动生成模式，并校验进程退出码。
@@ -1374,6 +1514,28 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
         std::filesystem::exists(service_directory / "xcp_slave_demo.a2l"));
 
     constexpr double kCalibratedOffset = 42.0;
+    // 先把增益标定为 0：从站的算法为
+    // output = clamp(gain × (input + corrections[0]) + offset)，
+    // 而 input = static_cast<float>(tick % 100U) / 10.0F（见
+    // examples/xcp_slave_demo/slave_model.cpp:83），只有 tick % 100 == 0 时
+    // 输出才正好等于 offset。真实 UDP 传输偶发丢帧（macOS CI 上曾 3 秒只收到
+    // 89/300 帧）会恰好错过这些极稀疏的样本，因此这里把增益清零，使期望值
+    // 对任意 tick 恒为 42.0，同时仍然证明标定写入经过 CalSeg 快照影响测量输出。
+    constexpr double kZeroedGain = 0.0;
+    const std::uint64_t gain_in_segment =
+        offsetof(CalibrationParameters, model) +
+        offsetof(CalibrationModel, gain);
+    const Address gain_address =
+        static_cast<Address>(cal_symbol->address + gain_in_segment);
+    master->WriteMemoryBytes(gain_address, cal_symbol->extension,
+                             EncodeDouble(kZeroedGain));
+    const Bytes gain_readback = master->ReadMemoryBytes(
+        gain_address, cal_symbol->extension, sizeof(kZeroedGain));
+    ASSERT_EQ(gain_readback.size(), sizeof(kZeroedGain));
+    double observed_gain = 0.0;
+    std::memcpy(&observed_gain, gain_readback.data(), sizeof(observed_gain));
+    EXPECT_DOUBLE_EQ(observed_gain, kZeroedGain);
+
     const std::uint64_t offset_in_segment =
         offsetof(CalibrationParameters, model) +
         offsetof(CalibrationModel, offset);
@@ -1432,8 +1594,10 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     ASSERT_NO_THROW(master->StartDaqSync());
     EXPECT_TRUE(
         collector.WaitForDouble(kCalibratedOffset, std::chrono::seconds(3)))
-        << "10 ms DAQ DTO 未观察到标定偏置 42.0；可能是相对基址或 CalSeg "
-           "快照未生效";
+        << "10 ms DAQ DTO 未观察到标定偏置 42.0（增益已清零，任意采样应恒为 "
+           "42.0）；事件通道 "
+        << *fast_event << "，" << collector.Diagnostics()
+        << "；可能是相对基址、CalSeg 快照未生效或 DAQ 未启动";
     ASSERT_NO_THROW(master->StopDaq());
 
     DaqEntrySpec slow_entry;
@@ -1450,7 +1614,8 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     ASSERT_NO_THROW(master->ConfigureDaqListsDynamic({slow_daq_list}));
     ASSERT_NO_THROW(master->StartDaqSync());
     EXPECT_TRUE(collector.WaitForNonzeroUint32(std::chrono::seconds(3)))
-        << "100 ms DAQ DTO 未到达慢速测量对象";
+        << "100 ms DAQ DTO 未到达慢速测量对象；事件通道 " << *slow_event << "，"
+        << collector.Diagnostics();
     ASSERT_NO_THROW(master->StopDaq());
     master->Disconnect();
     slave_process.Stop();
