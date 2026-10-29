@@ -10,7 +10,10 @@
  *   报错"。任何依赖真实 socket 的验证都放到 `xcplite_tcp_interop_test.cpp`。
  */
 
-#include "tools/xcp_master/transport_selection.hpp"
+#include "libxcp/transport_selection.hpp"
+
+// CLI 文本层（选项解析与摘要渲染）仍留在工具侧，验收时与库层一起钉住。
+#include "tools/xcp_master/cli_selection.hpp"
 
 #include <gtest/gtest.h>
 
@@ -22,15 +25,15 @@ namespace {
 using calmcar::xcp::PacketAlignment;
 using calmcar::xcp::TcpWireProfile;
 using calmcar::xcp::XcpProtocolVersion;
-using calmcar::xcp::tools::A2lEndpointInstance;
-using calmcar::xcp::tools::A2lTransportFacts;
-using calmcar::xcp::tools::AlignmentSource;
-using calmcar::xcp::tools::EndpointSource;
-using calmcar::xcp::tools::ResolveTransportSelection;
-using calmcar::xcp::tools::ResolvedTransportSelection;
-using calmcar::xcp::tools::TransportKind;
-using calmcar::xcp::tools::TransportSelectionRequest;
-using calmcar::xcp::tools::WireProfileSource;
+using calmcar::xcp::A2lEndpointInstance;
+using calmcar::xcp::A2lTransportFacts;
+using calmcar::xcp::AlignmentSource;
+using calmcar::xcp::EndpointSource;
+using calmcar::xcp::ResolveTransportSelection;
+using calmcar::xcp::ResolvedTransportSelection;
+using calmcar::xcp::TransportKind;
+using calmcar::xcp::TransportSelectionRequest;
+using calmcar::xcp::WireProfileSource;
 
 /// @brief 构造一个"UDP + CLI 端点齐全"的基线请求
 TransportSelectionRequest MakeUdpRequest() {
@@ -71,6 +74,48 @@ std::string ResolveExpectFailure(const TransportSelectionRequest& request,
     EXPECT_FALSE(resolved.has_value()) << "本应失败却成功";
     EXPECT_FALSE(error.empty()) << "失败时必须给出可读原因";
     return error;
+}
+
+/** @brief 显式 TCP 端点不匹配或多实例时不得借用首端点证据。 */
+TEST(TransportSelection, DiscardsUnmatchedTcpEndpointEvidence) {
+    auto request = MakeTcpV15Request();
+    A2lTransportFacts facts;
+    facts.declared = true;
+    facts.host = "127.0.0.2";
+    facts.port = 5555;
+    facts.instance_count = 1;
+    facts.instances = {A2lEndpointInstance{facts.host, facts.port, 16, 0x0105}};
+    facts.alignment_declared = true;
+    facts.packet_alignment_bits = 16;
+    facts.transport_version = XcpProtocolVersion{1, 5};
+    facts.profile_hint = "first endpoint";
+    EXPECT_TRUE(calmcar::xcp::DiscardUnmatchedTcpEndpointEvidence(request, facts));
+    EXPECT_FALSE(facts.alignment_declared);
+    EXPECT_FALSE(facts.transport_version);
+    EXPECT_TRUE(facts.profile_hint.empty());
+    EXPECT_NE(ResolveExpectFailure(request, facts).find("--packet-alignment"), std::string::npos);
+
+    facts.host = *request.host;
+    facts.instances = {A2lEndpointInstance{facts.host, facts.port, 8, 0x0104}};
+    facts.transport_version = XcpProtocolVersion{1, 4};
+    EXPECT_FALSE(calmcar::xcp::DiscardUnmatchedTcpEndpointEvidence(request, facts));
+    EXPECT_TRUE(facts.transport_version);
+    facts.instance_count = 2;
+    facts.instances.push_back(facts.instances.front());
+    EXPECT_TRUE(calmcar::xcp::DiscardUnmatchedTcpEndpointEvidence(request, facts));
+    EXPECT_FALSE(facts.transport_version);
+}
+
+/** @brief 不可信 TCP 对齐不能被解析层调用方意外使用。 */
+TEST(TransportSelection, RejectsUnverifiedTcpAlignment) {
+    auto request = MakeTcpV15Request();
+    A2lTransportFacts facts;
+    facts.alignment_declared = true;
+    facts.packet_alignment_bits = 16;
+    facts.instance_alignment_unverified = true;
+    const auto error = ResolveExpectFailure(request, facts);
+    EXPECT_NE(error.find("未核验"), std::string::npos);
+    EXPECT_NE(error.find("--packet-alignment"), std::string::npos);
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +596,23 @@ TEST(TransportSelection, IdenticalDuplicateInstancesAreAccepted) {
     EXPECT_TRUE(mentioned) << "去重必须留下可审计的提示";
 }
 
+/** @brief 不可信对齐不得使多个 TCP 实例看起来等价。 */
+TEST(TransportSelection, UnverifiedAlignmentPreventsDuplicateDeduplication) {
+    auto request = MakeTcpV15Request();
+    request.host.reset();
+    request.port.reset();
+    A2lTransportFacts facts;
+    facts.declared = true;
+    facts.host = "192.168.0.20";
+    facts.port = 6000;
+    facts.instance_alignment_unverified = true;
+    facts.instances = {A2lEndpointInstance{"192.168.0.20", 6000, 0, 0x0104},
+                       A2lEndpointInstance{"192.168.0.20", 6000, 0, 0x0104}};
+    const auto error = ResolveExpectFailure(request, facts);
+    EXPECT_NE(error.find("无法确认"), std::string::npos) << error;
+    EXPECT_NE(error.find("--host/--port"), std::string::npos) << error;
+}
+
 /**
  * @brief CLI 端点已给出时多实例不拦：用户意图明确，实例数无关。
  */
@@ -589,20 +651,34 @@ TransportSelectionRequest MakeTcpAutoRequest() {
 }
 
 /**
- * @brief auto 生效时不得填入任何默认线路布局。
- * @details 这一步是 P3 的安全前提：若此处置成 Unknown 以外的值，调用方就会
- *          跳过候选试连直接用默认 Profile 建连，`auto` 退化成静默猜测。
+ * @brief 严格 auto 在建连前拒绝已知歧义，不将首成功当成唯一证据。
  */
-TEST(TransportSelection, TcpProfileAutoLeavesWireProfileUnresolved) {
-    const auto resolved = Resolve(MakeTcpAutoRequest(), {});
+TEST(TransportSelection, TcpProfileAutoRejectsKnownAmbiguity) {
+    const auto error = ResolveExpectFailure(MakeTcpAutoRequest(), {});
+    EXPECT_NE(error.find("歧义"), std::string::npos);
+    EXPECT_NE(error.find("auto-legacy"), std::string::npos);
+    EXPECT_NE(error.find("显式"), std::string::npos);
+}
+
+/**
+ * @brief 旧模式保留待试连状态，同时明确告知首成功的风险。
+ */
+TEST(TransportSelection, TcpProfileAutoLegacyLeavesWireProfileUnresolved) {
+    auto request = MakeTcpAutoRequest();
+    request.tcp_profile_auto = false;
+    request.tcp_profile_auto_legacy = true;
+    const auto resolved = Resolve(request, {});
 
     EXPECT_TRUE(resolved.wire_profile_auto);
     EXPECT_EQ(resolved.wire_profile, TcpWireProfile::Unknown);
     EXPECT_EQ(resolved.alignment, PacketAlignment::Unknown);
-    EXPECT_EQ(resolved.wire_profile_source, WireProfileSource::Auto);
-    ASSERT_FALSE(resolved.notes.empty());
-    EXPECT_NE(resolved.notes.front().find("--tcp-profile auto"),
+    EXPECT_EQ(resolved.wire_profile_source, WireProfileSource::AutoLegacy);
+    EXPECT_NE(calmcar::xcp::tools::FormatSelectionSummary(resolved).find("对齐=未确定"),
               std::string::npos);
+    ASSERT_FALSE(resolved.notes.empty());
+    EXPECT_NE(resolved.notes.front().find("auto-legacy"), std::string::npos);
+    EXPECT_NE(resolved.notes.front().find("歧义"), std::string::npos);
+    EXPECT_NE(resolved.notes.front().find("超时"), std::string::npos);
 }
 
 /**
@@ -647,6 +723,30 @@ TEST(TransportSelection, TcpProfileAutoRejectsExplicitProfile) {
 
     const auto error = ResolveExpectFailure(request, {});
     EXPECT_NE(error.find("不能同时给出 auto"), std::string::npos) << error;
+}
+
+/**
+ * @brief 旧模式遵守与严格模式相同的参数互斥规则。
+ */
+TEST(TransportSelection, TcpProfileAutoLegacyRejectsConflicts) {
+    auto request = MakeTcpAutoRequest();
+    request.tcp_profile_auto = false;
+    request.tcp_profile_auto_legacy = true;
+    auto conflict = request;
+    conflict.transport = TransportKind::Udp;
+    EXPECT_NE(ResolveExpectFailure(conflict, {}).find("tcp"), std::string::npos);
+    conflict = request;
+    conflict.preset_xcplite = true;
+    EXPECT_NE(ResolveExpectFailure(conflict, {}).find("preset"), std::string::npos);
+    conflict = request;
+    conflict.packet_alignment_bits = 8;
+    EXPECT_NE(ResolveExpectFailure(conflict, {}).find("alignment"), std::string::npos);
+    conflict = request;
+    conflict.tcp_profile = TcpWireProfile::AsamV14;
+    EXPECT_NE(ResolveExpectFailure(conflict, {}).find("Profile"), std::string::npos);
+    conflict = request;
+    conflict.tcp_profile_auto = true;
+    EXPECT_NE(ResolveExpectFailure(conflict, {}).find("auto-legacy"), std::string::npos);
 }
 
 }  // namespace

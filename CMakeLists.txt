@@ -169,17 +169,27 @@ target_sources(libxcp PRIVATE
         src/daq/dto_payload_decoder.cpp
         src/daq/daq_timestamp.cpp
         src/measurement/measurement_planner.cpp
-        src/measurement/measurement_session.cpp)
+        src/measurement/measurement_session.cpp
+        # 第二阶段提取：A2L 对齐证据（受限扫描 + 双源核对）。
+        src/a2l_tcp_alignment.cpp
+        # 第二阶段提取：CLI/A2L 传输层选择解析（§8.1 规则）。
+        src/transport_selection.cpp
+        # 第二阶段提取：受控 A2L 快照（Windows ACL / POSIX 权限校验）。
+        src/trusted_a2l_snapshot.cpp)
 
 # 平台原生 Socket/轮询实现严格二选一；公共注入/转发 TU 已包含在上方列表。
 if(WIN32)
   target_sources(libxcp PRIVATE
     src/detail/socket/socket_ops_win.cpp
-    src/detail/socket/event_poller_win.cpp)
+    src/detail/socket/event_poller_win.cpp
+    # 受控 A2L 快照的 Windows 原生实现（ACL 句柄校验 + 独占创建）。
+    src/detail/fs/trusted_snapshot_win.cpp)
 else()
   target_sources(libxcp PRIVATE
     src/detail/socket/socket_ops_posix.cpp
-    src/detail/socket/event_poller_posix.cpp)
+    src/detail/socket/event_poller_posix.cpp
+    # 受控 A2L 快照的 POSIX 原生实现（stat/fstat 权限校验 + 独占创建）。
+    src/detail/fs/trusted_snapshot_posix.cpp)
 endif()
 
 target_include_directories(libxcp
@@ -199,7 +209,9 @@ if(LIBXCP_ENABLE_LOG)
 endif()
 
 if(WIN32)
-  target_link_libraries(libxcp PUBLIC ws2_32)
+  # advapi32：受控 A2L 快照用 GetNamedSecurityInfoW/SetNamedSecurityInfoW
+  # 等 ACL API 校验快照目录（`src/detail/fs/trusted_snapshot_win.cpp`）。
+  target_link_libraries(libxcp PUBLIC ws2_32 advapi32)
   # Windows 头（经 winsock 头链传递带入的 minwindef.h）默认定义 min/max 宏，
   # 会把 `std::min(a, b)` 预处理成语法错误（MSVC C2589/C2059）。
   # 全仓无任何代码依赖这两个宏，故对本目标统一关闭；测试/工具目标在各自的

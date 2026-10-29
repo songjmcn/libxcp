@@ -23,6 +23,7 @@
 #include "libxcp/udp_transport.hpp"
 #include "libxcp/xcp_master.hpp"
 
+#include "libxcp/transport_selection.hpp"
 #include "xcp_v12_slave_process.hpp"
 #include "../examples/xcp_slave_demo_v12/slave_model.hpp"
 
@@ -34,17 +35,18 @@ using xcp_slave_demo_v12::CalibrationParameters;
 using xcp_slave_demo_v12::FastMeasurements;
 
 /** @brief 按协议类型构造指向独立 V1.2 从站的 Master Transport。 */
-std::unique_ptr<IXcpTransport> MakeTransport(const std::string& type,
-                                             std::uint16_t port) {
+std::unique_ptr<IXcpTransport> MakeTransport(
+    const std::string& type, std::uint16_t port,
+    const std::optional<calmcar::xcp::ResolvedTransportSelection>& selection) {
     if (type == "tcp") {
         TcpTransportConfig config;
         config.role = TcpRole::Master;
-        config.remote_host = "127.0.0.1";
-        config.remote_port = port;
+        config.remote_host = selection->host;
+        config.remote_port = selection->port;
         config.local_host = "127.0.0.1";
         config.local_port = 0;
-        config.packet_alignment = PacketAlignment::Bit8;
-        config.wire_profile = TcpWireProfile::AsamV14;
+        config.packet_alignment = selection->alignment;
+        config.wire_profile = selection->wire_profile;
         config.connect_timeout_ms = 1500;
         return std::make_unique<TcpTransport>(config);
     }
@@ -108,11 +110,47 @@ protected:
         bridge_ = std::move(loaded.Value());
         ASSERT_NE(bridge_->Database(), nullptr);
 
+        // Start 已用真实 CONNECT 探测就绪；此处不声称此前零连接。
+        // 仅提取 TCP 端点，显式线路参数不依赖 A2L 对齐推断。
+        std::optional<calmcar::xcp::ResolvedTransportSelection> selection;
+        if (transport_name_ == "tcp") {
+            const auto* info = bridge_->XcpInfo();
+            ASSERT_NE(info, nullptr);
+            ASSERT_FALSE(info->ambiguous);
+            calmcar::xcp::A2lTransportFacts facts;
+            for (const auto& endpoint : info->transports) {
+                if (endpoint.kind != a2l::TransportEndpoint::Kind::TcpIp) continue;
+                if (!facts.declared) {
+                    facts.declared = true;
+                    facts.host = endpoint.remote_host;
+                    facts.port = endpoint.remote_port;
+                }
+                ++facts.instance_count;
+                facts.instances.push_back({endpoint.remote_host, endpoint.remote_port,
+                                           0, endpoint.version});
+            }
+            ASSERT_TRUE(facts.declared) << "A2L 未声明 TCP 端点";
+            ASSERT_EQ(facts.host, "127.0.0.1");
+            ASSERT_EQ(facts.port, slave_->Port());
+            calmcar::xcp::TransportSelectionRequest request;
+            request.transport = calmcar::xcp::TransportKind::Tcp;
+            request.tcp_profile = TcpWireProfile::AsamV14;
+            request.packet_alignment_bits = std::uint8_t{8};
+            std::string error;
+            selection = calmcar::xcp::ResolveTransportSelection(request, facts, &error);
+            ASSERT_TRUE(selection.has_value()) << error;
+            ASSERT_EQ(selection->endpoint_source, calmcar::xcp::EndpointSource::A2l);
+            ASSERT_EQ(selection->host, facts.host);
+            ASSERT_EQ(selection->port, facts.port);
+            ASSERT_EQ(selection->wire_profile, TcpWireProfile::AsamV14);
+            ASSERT_EQ(selection->alignment, PacketAlignment::Bit8);
+        }
+
         XcpMasterOptions options;
         options.timeouts = CommandTimeouts{std::chrono::milliseconds(1800),
                                            std::chrono::milliseconds(1800), 1};
         master_ = std::make_unique<XcpMaster>(
-            MakeTransport(transport_name_, slave_->Port()), options);
+            MakeTransport(transport_name_, slave_->Port(), selection), options);
         ASSERT_NO_THROW(master_->Connect()) << "Master CONNECT 失败";
     }
 
