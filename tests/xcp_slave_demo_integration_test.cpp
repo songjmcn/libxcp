@@ -1514,6 +1514,28 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
         std::filesystem::exists(service_directory / "xcp_slave_demo.a2l"));
 
     constexpr double kCalibratedOffset = 42.0;
+    // 先把增益标定为 0：从站的算法为
+    // output = clamp(gain × (input + corrections[0]) + offset)，
+    // 而 input = static_cast<float>(tick % 100U) / 10.0F（见
+    // examples/xcp_slave_demo/slave_model.cpp:83），只有 tick % 100 == 0 时
+    // 输出才正好等于 offset。真实 UDP 传输偶发丢帧（macOS CI 上曾 3 秒只收到
+    // 89/300 帧）会恰好错过这些极稀疏的样本，因此这里把增益清零，使期望值
+    // 对任意 tick 恒为 42.0，同时仍然证明标定写入经过 CalSeg 快照影响测量输出。
+    constexpr double kZeroedGain = 0.0;
+    const std::uint64_t gain_in_segment =
+        offsetof(CalibrationParameters, model) +
+        offsetof(CalibrationModel, gain);
+    const Address gain_address =
+        static_cast<Address>(cal_symbol->address + gain_in_segment);
+    master->WriteMemoryBytes(gain_address, cal_symbol->extension,
+                             EncodeDouble(kZeroedGain));
+    const Bytes gain_readback = master->ReadMemoryBytes(
+        gain_address, cal_symbol->extension, sizeof(kZeroedGain));
+    ASSERT_EQ(gain_readback.size(), sizeof(kZeroedGain));
+    double observed_gain = 0.0;
+    std::memcpy(&observed_gain, gain_readback.data(), sizeof(observed_gain));
+    EXPECT_DOUBLE_EQ(observed_gain, kZeroedGain);
+
     const std::uint64_t offset_in_segment =
         offsetof(CalibrationParameters, model) +
         offsetof(CalibrationModel, offset);
@@ -1572,8 +1594,9 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     ASSERT_NO_THROW(master->StartDaqSync());
     EXPECT_TRUE(
         collector.WaitForDouble(kCalibratedOffset, std::chrono::seconds(3)))
-        << "10 ms DAQ DTO 未观察到标定偏置 42.0；事件通道 " << *fast_event
-        << "，" << collector.Diagnostics()
+        << "10 ms DAQ DTO 未观察到标定偏置 42.0（增益已清零，任意采样应恒为 "
+           "42.0）；事件通道 "
+        << *fast_event << "，" << collector.Diagnostics()
         << "；可能是相对基址、CalSeg 快照未生效或 DAQ 未启动";
     ASSERT_NO_THROW(master->StopDaq());
 
