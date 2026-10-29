@@ -209,7 +209,11 @@ TEST_F(SnapshotTest, RejectsRootWritableByOthers) {
     }
     EXPECT_TRUE(result.path.empty());
     EXPECT_FALSE(result.reason.empty());
+    // 拒绝点措辞按平台不同：Windows 走 ACL/重解析点判定，POSIX 走权限位
+    // 判定（"目录对组或其他身份可写"）。这里只断言"给出了可读的拒绝理由"，
+    // 不把某一平台的措辞当作契约，否则同一语义会在另一平台误报失败。
     EXPECT_TRUE(result.reason.find("写权限") != std::string::npos ||
+                result.reason.find("可写") != std::string::npos ||
                 result.reason.find("ACL") != std::string::npos ||
                 result.reason.find("重解析") != std::string::npos)
         << result.reason;
