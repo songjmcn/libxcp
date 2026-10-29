@@ -60,6 +60,8 @@ add_executable(libxcp_tests
         ethernet_header_codec_test.cpp
         tcp_stream_decoder_test.cpp
         tcp_framing_negotiation_test.cpp
+        tcp_framing_candidates_test.cpp
+        tcp_framing_verification_test.cpp
         tcp_transport_test.cpp
         udp_transport_test.cpp
         udp_boundary_framing_test.cpp
@@ -633,7 +635,9 @@ endif()
 
 add_executable(XcpV15AlignmentInteropTest
         xcp_v15_alignment_interop_test.cpp
-        xcp_v15_slave_process.cpp)
+        xcp_v15_slave_process.cpp
+        # `--tcp-profile auto` 的真实验证侧：候选逐个新建连接取证（含 8/16/32）。
+        tcp_framing_auto_interop_test.cpp)
 target_compile_features(XcpV15AlignmentInteropTest PRIVATE cxx_std_20)
 target_include_directories(XcpV15AlignmentInteropTest PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

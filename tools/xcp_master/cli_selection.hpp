@@ -16,6 +16,7 @@
 #include <string_view>
 
 #include "libxcp/protocol_version.hpp"
+#include "libxcp/tcp_framing_negotiation.hpp"
 #include "libxcp/tcp_wire_profile.hpp"
 #include "libxcp/transport_selection.hpp"
 
@@ -254,6 +255,38 @@ struct RuntimeVersionStatus {
         text += "(conservative)";
     }
     return text;
+}
+
+/// @brief auto 协商成功时使用的退出码
+inline constexpr int kAutoNegotiationOk = 0;
+/// @brief auto 协商"全部候选都被对端拒绝"时使用的退出码
+inline constexpr int kAutoNegotiationAllRejected = 3;
+/// @brief auto 协商"存在未决候选（对端无任何协议层回应）"时使用的退出码
+inline constexpr int kAutoNegotiationInconclusive = 4;
+
+/**
+ * @brief 把 auto 协商结果映射为进程退出码
+ * @param outcome 协商结果（含全部尝试记录）
+ * @return `0` 成功；`4` 至少存在一个未决候选；`3` 全部候选被拒
+ *
+ * @details 退出码是自动化脚本唯一可靠的判据，因此必须把两种情况分开：
+ *          - 全部被拒（3）：对端在回话，只是布局不对——用户该改配置；
+ *          - 存在未决（4）：对端根本没回话——用户该查地址/端口/从站是否在跑。
+ *          混为同一码会把"端口写错"误报成"四种布局都不支持"。
+ * @note 只要存在一个未决候选就返回 4：未决意味着"无法排除"，此时断言
+ *       "全部被拒"不成立。
+ */
+[[nodiscard]] inline int TcpNegotiationExitCode(
+    const TcpFramingNegotiationResult& outcome) noexcept {
+    if (outcome.selected.has_value()) {
+        return kAutoNegotiationOk;
+    }
+    for (const auto& item : outcome.attempts) {
+        if (item.verdict == FramingVerdict::Inconclusive) {
+            return kAutoNegotiationInconclusive;
+        }
+    }
+    return kAutoNegotiationAllRejected;
 }
 
 }  // namespace calmcar::xcp::tools

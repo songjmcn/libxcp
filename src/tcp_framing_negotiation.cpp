@@ -75,17 +75,33 @@ std::string TcpFramingNegotiationResult::Summary() const {
         text += " ms）";
         return text;
     }
-    text = "TCP 帧布局协商失败：全部 ";
+    // 定性结论必须区分"对端明确拒绝"与"对端根本没回话"：后者通常是端口写错、
+    // 从站卡死或网络阻断，报"四种布局都不支持"会误导用户去改配置。
+    bool any_inconclusive = false;
+    for (const auto& attempt : attempts) {
+        if (attempt.verdict == FramingVerdict::Inconclusive) {
+            any_inconclusive = true;
+            break;
+        }
+    }
+    text = any_inconclusive
+               ? "TCP 帧布局协商未决：部分候选没有任何协议层证据"
+               : "TCP 帧布局协商失败：全部候选均被对端拒绝";
+    text += "（共 ";
     text += std::to_string(attempts.size());
-    text += " 个候选均不可用";
+    text += " 个候选）";
     for (const auto& attempt : attempts) {
         text += "\n  · profile=";
         text += TcpWireProfileName(attempt.candidate.profile);
         text += " alignment=";
         text += AlignmentName(attempt.candidate.alignment);
         text += "：";
-        text += attempt.failure_reason.empty() ? "未说明原因"
-                                               : attempt.failure_reason;
+        text += FramingVerdictName(attempt.verdict);
+        if (!attempt.failure_reason.empty()) {
+            text += "（";
+            text += attempt.failure_reason;
+            text += "）";
+        }
     }
     return text;
 }
@@ -114,28 +130,30 @@ TcpFramingNegotiationResult NegotiateTcpFraming(
         }
 
         const auto started = std::chrono::steady_clock::now();
-        std::string reason;
-        bool accepted = false;
+        FramingVerificationResult verdict;
         try {
-            accepted = attempt(candidate, &reason);
+            verdict = attempt(candidate);
         } catch (const std::exception& error) {
             // 谓词内部通常直接构造 Master 并 Connect()，异常就是"这个候选
-            // 解析不出合法响应"的主要信号，必须转成失败原因而不是外泄。
-            accepted = false;
-            reason = error.what();
+            // 解析不出合法响应"的主要信号，必须转成结论而不是外泄。
+            verdict = FramingVerificationResult{};
+            verdict.verdict = FramingVerdict::Rejected;
+            verdict.reason = error.what();
         } catch (...) {
-            accepted = false;
-            reason = "尝试过程中抛出未知异常";
+            verdict = FramingVerificationResult{};
+            verdict.verdict = FramingVerdict::Rejected;
+            verdict.reason = "尝试过程中抛出未知异常";
         }
         const auto finished = std::chrono::steady_clock::now();
         outcome.elapsed_ms =
             std::chrono::duration_cast<std::chrono::milliseconds>(finished -
                                                                   started)
                 .count();
-        outcome.accepted = accepted;
+        outcome.verdict = verdict.verdict;
+        const bool accepted = verdict.verdict == FramingVerdict::Accepted;
         if (!accepted) {
             outcome.failure_reason =
-                reason.empty() ? "判定谓词未给出通过结论" : reason;
+                verdict.reason.empty() ? "判定谓词未给出原因" : verdict.reason;
         }
         result.attempts.push_back(std::move(outcome));
 

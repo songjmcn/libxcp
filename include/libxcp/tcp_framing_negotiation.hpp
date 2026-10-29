@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "libxcp/protocol_types.hpp"
+#include "libxcp/tcp_framing_verdict.hpp"
 #include "libxcp/tcp_wire_profile.hpp"
 
 namespace calmcar::xcp {
@@ -72,10 +73,10 @@ struct FramingAttemptOutcome {
     /// @brief 本次尝试的候选
     TcpFramingCandidate candidate{};
 
-    /// @brief 是否被接受
-    bool accepted{false};
+    /// @brief 三态结论（取代原先的 `bool accepted`）
+    FramingVerdict verdict{FramingVerdict::Rejected};
 
-    /// @brief 被拒原因；被接受时为空
+    /// @brief 原因；`Accepted` 时为空
     std::string failure_reason;
 
     /// @brief 本次尝试耗时（毫秒），含建立连接与判定
@@ -86,14 +87,15 @@ struct FramingAttemptOutcome {
  * @brief 判定谓词：对给定候选尝试一次真实连接
  *
  * @param candidate 待尝试的候选
- * @param out_reason 失败时写入中文原因（可为 nullptr）
- * @return true 表示该候选可用
+ * @return 三态结论 + 原因 + 耗时
  *
- * @note 实现方必须在返回 false 前**彻底断开**（关闭 socket），否则下一次
- *       尝试会带着上一条连接的残留状态运行。
+ * @note 实现方必须在返回前**彻底断开**（关闭 socket），否则下一次尝试会带着
+ *       上一条连接的残留状态运行。
+ * @note 区分"被拒"与"未决"是本接口存在的原因：只有拿到协议层违规证据才允许
+ *       返回 `Rejected`，纯超时必须返回 `Inconclusive`。
  */
-using FramingAttemptFn = std::function<bool(
-    const TcpFramingCandidate& candidate, std::string* out_reason)>;
+using FramingAttemptFn =
+    std::function<FramingVerificationResult(const TcpFramingCandidate&)>;
 
 /**
  * @brief 协商结果
@@ -124,9 +126,11 @@ struct TcpFramingNegotiationResult {
  * @details 语义约定：
  *          - **不做重试**：每个候选只尝试一次，失败即进入下一个；
  *          - **不重排**：严格按 `candidates` 给出的顺序；
+ *          - **首个 `Accepted` 胜出**；`Inconclusive` 不终止扫描（后面的候选
+ *            仍可能明确可用），但结果里逐项保留，供调用方区分"被拒"与"未决"；
  *          - 非法候选（`Unknown` Profile / `Unknown` 对齐）不调用谓词，直接
- *            记为拒绝并说明原因，避免把配置错误伪装成"对端不支持"；
- *          - 谓词抛出的异常被视为该候选失败，异常文本进入 `failure_reason`，
+ *            记为 `Rejected` 并说明原因，避免把配置错误伪装成"对端不支持"；
+ *          - 谓词抛出的异常按 `Rejected` 记录，异常文本进入 `failure_reason`，
  *            异常**不会**外泄给调用方。
  */
 [[nodiscard]] TcpFramingNegotiationResult NegotiateTcpFraming(

@@ -110,21 +110,24 @@ ResolveTransportSelection(const TransportSelectionRequest& request,
         if (request.tcp_profile.has_value()) {
             return fail("--tcp-profile 不能同时给出 " + mode + " 与具体 Profile");
         }
-        // 默认候选的首帧存在已知线路歧义；连接成功无法证明布局唯一。
-        // 超时和连接错误也不能作为候选不受支持的证据，因此严格模式不试连。
-        if (request.tcp_profile_auto) {
-            return fail("--tcp-profile auto 存在已知线路歧义，无法安全自动选择；"
-                        "请显式指定 --tcp-profile 和所需对齐，或自行承担风险使用 "
-                        "--tcp-profile auto-legacy");
-        }
+        // 严格 auto 的证据收敛已在 `tcp_framing_candidates.hpp` +
+        // `tcp_framing_verification.hpp` 中实现：候选按证据排序，每个候选
+        // 新建连接做协议层取证，只有"三次握手的字节能被对端正常解释"才接受。
+        // 因此这里不再拒绝，而是交给上层按候选序列验证。
         resolved.wire_profile_auto = true;
         resolved.wire_profile = TcpWireProfile::Unknown;
-        resolved.wire_profile_source = WireProfileSource::AutoLegacy;
-        // 仅旧模式允许调用方逐个试连，试连前不能填写假定值。
         resolved.alignment = PacketAlignment::Unknown;
-        resolved.notes.push_back(
-            "警告：--tcp-profile auto-legacy 使用旧的首成功试连；存在线路歧义，"
-            "成功不证明选择正确，超时等失败也不证明候选不受支持");
+        if (request.tcp_profile_auto) {
+            resolved.wire_profile_source = WireProfileSource::Auto;
+            resolved.notes.push_back(
+                "自动模式（auto）：按证据顺序为每个候选新建连接并验证，首个结论为"
+                "「接受」的候选生效；全部结束时区分「被拒」与「未决」");
+        } else {
+            resolved.wire_profile_source = WireProfileSource::AutoLegacy;
+            resolved.notes.push_back(
+                "警告：--tcp-profile auto-legacy 使用旧的首成功试连；存在线路歧义，"
+                "成功不证明选择正确，超时等失败也不证明候选不受支持");
+        }
     }
 
     // ---- 规则 7：preset 原子展开 -------------------------------------------
@@ -171,9 +174,9 @@ ResolveTransportSelection(const TransportSelectionRequest& request,
         } else if (!effective_profile.has_value() ||
                    !IsTcpWireProfileResolved(*effective_profile)) {
             return fail(
-                "TCP 传输必须显式指定 --tcp-profile asam-v1.5|asam-v1.4；"
-                "线路布局无法从版本号、A2L 或首帧内容推断，auto-legacy "
-                "仅为有风险的旧试连模式");
+                "TCP 传输必须显式指定 --tcp-profile asam-v1.5|asam-v1.4，或用 "
+                "--tcp-profile auto 让工具按候选逐个验证；线路布局不能从版本号、"
+                "A2L 或首帧内容直接推断");
         } else {
             resolved.wire_profile = *effective_profile;
             resolved.wire_profile_source = request.preset_xcplite

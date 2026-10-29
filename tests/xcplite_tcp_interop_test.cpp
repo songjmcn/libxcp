@@ -43,6 +43,10 @@
 #include "libxcp/a2l/a2l_bridge.hpp"
 #include "libxcp/daq/dto_envelope_decoder.hpp"
 #include "libxcp/protocol_types.hpp"
+#include "libxcp/tcp_framing_candidates.hpp"
+#include "libxcp/tcp_framing_negotiation.hpp"
+#include "libxcp/tcp_framing_verification.hpp"
+#include "libxcp/tcp_framing_verdict.hpp"
 #include "libxcp/tcp_transport.hpp"
 #include "libxcp/tcp_transport_config.hpp"
 #include "libxcp/tcp_wire_profile.hpp"
@@ -500,6 +504,35 @@ TEST_F(XcpliteTcpInteropTest, PeerExitFailsCommandWithoutSilentReconnect) {
     }
     EXPECT_TRUE(failed)
         << "对端已退出，命令却成功返回——违反「不得把超时当成功」";
+}
+
+/**
+ * @brief `--tcp-profile auto` 在真实 XCPlite V2.2 从站上必须落到 V1.4/8bit。
+ *
+ * @details 与 V1.2 用例互补：两个版本的 XCPlite 都是第三方 framing 实现，
+ *          共同证明自动模式不是"只对自己家从站有效"。V2.2 的 8 bit 布局与
+ *          V1.4 Profile 一致，因此默认顺序的第一个候选即应被接受。
+ */
+TEST_F(XcpliteTcpInteropTest, AutoProfileResolvesAsamV14EightFromV22Slave) {
+    TcpFramingProbeConfig probe;
+    probe.host = "127.0.0.1";
+    probe.port = slave_.Port();
+    probe.connect_timeout_ms = 3000U;
+    probe.command_timeout_ms = 1200U;
+
+    const auto candidates = DefaultFramingCandidates();
+    const auto attempt =
+        [&probe](const TcpFramingCandidate& candidate) {
+            return VerifyTcpFramingCandidate(probe, candidate);
+        };
+    const auto outcome = NegotiateTcpFraming(candidates, attempt);
+
+    ASSERT_TRUE(outcome.selected.has_value()) << outcome.Summary();
+    EXPECT_EQ(outcome.selected->profile, TcpWireProfile::AsamV14)
+        << outcome.Summary();
+    EXPECT_EQ(outcome.selected->alignment, PacketAlignment::Bit8)
+        << outcome.Summary();
+    EXPECT_EQ(outcome.attempts.size(), 1U) << outcome.Summary();
 }
 
 }  // namespace

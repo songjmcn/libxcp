@@ -19,6 +19,7 @@
 
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -651,13 +652,24 @@ TransportSelectionRequest MakeTcpAutoRequest() {
 }
 
 /**
- * @brief 严格 auto 在建连前拒绝已知歧义，不将首成功当成唯一证据。
+ * @brief 严格 auto 不再在建连前拒绝，而是把布局交给候选验证决定。
+ *
+ * @details 证据收敛（`BuildTcpFramingCandidates`）与协议层取证
+ *          （`VerifyTcpFramingCandidate`）落地后，解析层只负责"允许自动并
+ *          标记待定"，不再以"存在已知歧义"为由阻断用户。
  */
-TEST(TransportSelection, TcpProfileAutoRejectsKnownAmbiguity) {
-    const auto error = ResolveExpectFailure(MakeTcpAutoRequest(), {});
-    EXPECT_NE(error.find("歧义"), std::string::npos);
-    EXPECT_NE(error.find("auto-legacy"), std::string::npos);
-    EXPECT_NE(error.find("显式"), std::string::npos);
+TEST(TransportSelection, TcpProfileAutoDefersLayoutToCandidateVerification) {
+    const auto resolved = Resolve(MakeTcpAutoRequest(), {});
+
+    EXPECT_TRUE(resolved.wire_profile_auto);
+    EXPECT_EQ(resolved.wire_profile, TcpWireProfile::Unknown);
+    EXPECT_EQ(resolved.alignment, PacketAlignment::Unknown);
+    EXPECT_EQ(resolved.wire_profile_source, WireProfileSource::Auto);
+    ASSERT_FALSE(resolved.notes.empty());
+    EXPECT_NE(resolved.notes.front().find("候选"), std::string::npos)
+        << resolved.notes.front();
+    EXPECT_NE(resolved.notes.front().find("未决"), std::string::npos)
+        << resolved.notes.front();
 }
 
 /**
@@ -747,6 +759,60 @@ TEST(TransportSelection, TcpProfileAutoLegacyRejectsConflicts) {
     conflict = request;
     conflict.tcp_profile_auto = true;
     EXPECT_NE(ResolveExpectFailure(conflict, {}).find("auto-legacy"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// P4：auto 协商结果的退出码映射（脚本唯一可靠判据）
+// ---------------------------------------------------------------------------
+
+/// @brief 构造"全部已尝试、均无胜出"的协商结果
+calmcar::xcp::TcpFramingNegotiationResult MakeNegotiation(
+    const std::vector<calmcar::xcp::FramingVerdict>& verdicts) {
+    calmcar::xcp::TcpFramingNegotiationResult outcome;
+    for (const auto verdict : verdicts) {
+        calmcar::xcp::FramingAttemptOutcome item;
+        item.verdict = verdict;
+        item.failure_reason = "测试构造";
+        outcome.attempts.push_back(item);
+    }
+    return outcome;
+}
+
+/**
+ * @brief 全部候选被拒 → 退出码 3（对端在回话，布局不对）
+ */
+TEST(TransportSelection, NegotiationExitCodeIsThreeWhenAllRejected) {
+    const auto outcome = MakeNegotiation(
+        {calmcar::xcp::FramingVerdict::Rejected,
+         calmcar::xcp::FramingVerdict::Rejected});
+    EXPECT_EQ(calmcar::xcp::tools::TcpNegotiationExitCode(outcome),
+              calmcar::xcp::tools::kAutoNegotiationAllRejected);
+}
+
+/**
+ * @brief 只要有一个未决 → 退出码 4（对端没回话，不能断言"布局都不支持"）
+ */
+TEST(TransportSelection, NegotiationExitCodeIsFourWhenAnyInconclusive) {
+    const auto outcome = MakeNegotiation(
+        {calmcar::xcp::FramingVerdict::Rejected,
+         calmcar::xcp::FramingVerdict::Inconclusive,
+         calmcar::xcp::FramingVerdict::Rejected});
+    EXPECT_EQ(calmcar::xcp::tools::TcpNegotiationExitCode(outcome),
+              calmcar::xcp::tools::kAutoNegotiationInconclusive);
+}
+
+/**
+ * @brief 有胜出候选 → 退出码 0，且与"被拒记录"并存时仍视为成功
+ */
+TEST(TransportSelection, NegotiationExitCodeIsZeroWhenSelected) {
+    auto outcome = MakeNegotiation(
+        {calmcar::xcp::FramingVerdict::Rejected,
+         calmcar::xcp::FramingVerdict::Accepted});
+    outcome.selected = calmcar::xcp::TcpFramingCandidate{
+        calmcar::xcp::TcpWireProfile::AsamV15,
+        calmcar::xcp::PacketAlignment::Bit16};
+    EXPECT_EQ(calmcar::xcp::tools::TcpNegotiationExitCode(outcome),
+              calmcar::xcp::tools::kAutoNegotiationOk);
 }
 
 }  // namespace

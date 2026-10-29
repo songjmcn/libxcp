@@ -160,6 +160,8 @@ target_sources(libxcp PRIVATE
         src/socket_util.cpp
         src/tcp_transport.cpp
         src/tcp_framing_negotiation.cpp
+        src/tcp_framing_candidates.cpp
+        src/tcp_framing_verification.cpp
         src/udp_transport.cpp
         src/link_budget.cpp
         src/command_executor.cpp

@@ -58,7 +58,10 @@
 #include "libxcp/transport_selection.hpp"
 #include "libxcp/trusted_a2l_snapshot.hpp"
 #include "libxcp/log.hpp"
+#include "libxcp/tcp_framing_candidates.hpp"
 #include "libxcp/tcp_framing_negotiation.hpp"
+#include "libxcp/tcp_framing_verdict.hpp"
+#include "libxcp/tcp_framing_verification.hpp"
 #include "libxcp/tcp_transport.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "a2l/a2l_measurement_database.hpp"
@@ -199,11 +202,15 @@ void PrintUsage(std::ostream& out) {
            "daq: event-driven; --interval-ms is invalid. The DTO layout is "
            "selected automatically from the slave's reported identification "
            "field type (DAQ_KEY_BYTE); no profile option is needed.\n"
-           "tcp: --tcp-profile is mandatory and never inferred from the A2L or "
-           "from version numbers. asam-v1.5 currently requires an explicit "
-           "--packet-alignment; A2L alignment is not yet trusted.\n"
-           "tcp auto: strict mode stops before connecting when candidates "
-           "cannot be uniquely distinguished. Use an explicit profile.\n"
+           "tcp: --tcp-profile is mandatory for explicit selection and is never "
+           "inferred from the A2L or from version numbers. asam-v1.5 currently "
+           "requires an explicit --packet-alignment; an untrusted A2L alignment "
+           "is not used as configuration.\n"
+           "tcp auto: builds a candidate list (A2L evidence only reorders it), "
+           "then verifies each candidate on a brand-new connection with the real "
+           "protocol stack; the first ACCEPTED candidate wins and the session "
+           "reconnects. Exit codes: 0 resolved, 3 all candidates rejected by the "
+           "peer, 4 no protocol-level reply (address/port/peer check needed).\n"
            "tcp auto-legacy: tries candidates on separate connections and "
            "keeps the first compatible result; this is not unique detection "
            "and may affect the ECU session.\n"
@@ -3802,77 +3809,182 @@ int main(int argc, char** argv) {
         master_options.version_policy.a2l_transport_version =
             a2l_facts.transport_version;
 
-        // `--tcp-profile auto-legacy`：按固定候选顺序逐个新建连接试连。
-        // 胜出者直接留用，不做二次连接——因此 master 统一用 unique_ptr 持有
-        // （XcpMaster 没有移动构造，无法先构造栈对象再转移）。
+        // `--tcp-profile auto|auto-legacy`：按候选逐个新建连接取证。
+        //  - auto（严格）：候选按 A2L 证据排序，每个候选做协议层三态验证；
+        //    胜出后**另建一条**正式连接，绝不复用试连（设计文档 C1）。
+        //  - auto-legacy：保留旧的首成功试连并直接留用该连接（存在线路歧义）。
         std::unique_ptr<calmcar::xcp::XcpMaster> master;
         if (selection->transport == calmcar::xcp::TransportKind::Tcp &&
             selection->wire_profile_auto) {
-            std::cerr << "警告: auto-legacy 采用首个相容候选，并非唯一识别；"
-                         "多次试连可能影响 ECU 会话。\n";
-            std::uint8_t accepted_alignment_bits = 8U;
-            auto attempt = [&](const calmcar::xcp::TcpFramingCandidate& candidate,
-                               std::string* reason) -> bool {
-                calmcar::xcp::TcpTransportConfig tcp_config;
-                tcp_config.role = calmcar::xcp::TcpRole::Master;
-                tcp_config.remote_host = selection->host;
-                tcp_config.remote_port = selection->port;
-                tcp_config.packet_alignment = candidate.alignment;
-                tcp_config.wire_profile = candidate.profile;
-                auto candidate_master = std::make_unique<calmcar::xcp::XcpMaster>(
-                    std::make_unique<calmcar::xcp::TcpTransport>(tcp_config),
-                    master_options);
-                candidate_master->Connect();
-                // 域内校验（计划 §6.3）：帧能解析只说明长度自洽，还要证明
-                // 对端确实按 XCP 语义回答了 CONNECT——否则"能收包"会把完全
-                // 无关的服务端也判成成功。
-                const auto session =
-                    candidate_master->GetSessionParameters().connect;
-                if (session.max_cto < 8U) {
-                    *reason = "CONNECT 后的 MAX_CTO 小于 8";
-                    return false;
+            const bool strict_auto =
+                selection->wire_profile_source ==
+                calmcar::xcp::WireProfileSource::Auto;
+            if (!strict_auto) {
+                std::cerr << "警告: auto-legacy 采用首个相容候选，并非唯一识别；"
+                             "多次试连可能影响 ECU 会话。\n";
+            }
+
+            // 候选序列：严格模式用证据排序（证据只是"优先"，其余候选仍保留），
+            // 旧模式保持固定默认顺序。
+            std::vector<calmcar::xcp::TcpFramingCandidate> candidates;
+            if (strict_auto) {
+                calmcar::xcp::TcpFramingCandidateRequest evidence;
+                if (a2l_facts.transport_version.has_value()) {
+                    evidence.transport_layer_version =
+                        static_cast<std::uint16_t>(
+                            (static_cast<std::uint16_t>(
+                                 a2l_facts.transport_version->major)
+                             << 8U) |
+                            a2l_facts.transport_version->minor);
                 }
-                if (session.max_dto < 8U) {
-                    *reason = "CONNECT 后的 MAX_DTO 小于 8";
-                    return false;
+                if (a2l_facts.alignment_declared) {
+                    // 仅用于排序：该声明是否可信由随后的真实验证决定，
+                    // 因此这里不做"未核验"拦截。
+                    switch (a2l_facts.packet_alignment_bits) {
+                        case 8U:
+                            evidence.alignment =
+                                calmcar::xcp::PacketAlignment::Bit8;
+                            break;
+                        case 16U:
+                            evidence.alignment =
+                                calmcar::xcp::PacketAlignment::Bit16;
+                            break;
+                        case 32U:
+                            evidence.alignment =
+                                calmcar::xcp::PacketAlignment::Bit32;
+                            break;
+                        default:
+                            evidence.alignment =
+                                calmcar::xcp::PacketAlignment::Unknown;
+                            break;
+                    }
                 }
-                if (session.protocol_layer_version != 1U) {
-                    *reason = "CONNECT 的 PL 主版本不是 1";
-                    return false;
-                }
-                if (session.transport_layer_version != 1U) {
-                    *reason = "CONNECT 的 TL 主版本不是 1";
-                    return false;
-                }
-                accepted_alignment_bits =
-                    static_cast<std::uint8_t>(candidate.alignment);
-                master = std::move(candidate_master);
-                return true;
-            };
-            const auto outcome = calmcar::xcp::NegotiateTcpFraming(
-                calmcar::xcp::DefaultFramingCandidates(), attempt);
+                candidates =
+                    calmcar::xcp::BuildTcpFramingCandidates(evidence);
+            } else {
+                candidates = calmcar::xcp::DefaultFramingCandidates();
+            }
+
+            // 判定谓词：严格模式走库内验证组件；旧模式沿用内联的首成功试连。
+            calmcar::xcp::FramingAttemptFn attempt;
+            if (strict_auto) {
+                calmcar::xcp::TcpFramingProbeConfig probe;
+                probe.host = selection->host;
+                probe.port = selection->port;
+                probe.connect_timeout_ms = 3000U;
+                probe.command_timeout_ms = 1000U;
+                attempt = [probe](const calmcar::xcp::TcpFramingCandidate&
+                                      candidate)
+                    -> calmcar::xcp::FramingVerificationResult {
+                    return calmcar::xcp::VerifyTcpFramingCandidate(probe,
+                                                                  candidate);
+                };
+            } else {
+                attempt = [&](const calmcar::xcp::TcpFramingCandidate& candidate)
+                    -> calmcar::xcp::FramingVerificationResult {
+                    calmcar::xcp::FramingVerificationResult verdict;
+                    calmcar::xcp::TcpTransportConfig tcp_config;
+                    tcp_config.role = calmcar::xcp::TcpRole::Master;
+                    tcp_config.remote_host = selection->host;
+                    tcp_config.remote_port = selection->port;
+                    tcp_config.packet_alignment = candidate.alignment;
+                    tcp_config.wire_profile = candidate.profile;
+                    auto candidate_master =
+                        std::make_unique<calmcar::xcp::XcpMaster>(
+                            std::make_unique<calmcar::xcp::TcpTransport>(
+                                tcp_config),
+                            master_options);
+                    try {
+                        candidate_master->Connect();
+                        // 域内校验（计划 §6.3）：帧能解析只说明长度自洽，还要
+                        // 证明对端确实按 XCP 语义回答了 CONNECT——否则"能收包"
+                        // 会把完全无关的服务端也判成成功。
+                        const auto session =
+                            candidate_master->GetSessionParameters().connect;
+                        if (session.max_cto < 8U) {
+                            verdict.reason = "CONNECT 后的 MAX_CTO 小于 8";
+                            return verdict;
+                        }
+                        if (session.max_dto < 8U) {
+                            verdict.reason = "CONNECT 后的 MAX_DTO 小于 8";
+                            return verdict;
+                        }
+                        if (session.protocol_layer_version != 1U) {
+                            verdict.reason = "CONNECT 的 PL 主版本不是 1";
+                            return verdict;
+                        }
+                        if (session.transport_layer_version != 1U) {
+                            verdict.reason = "CONNECT 的 TL 主版本不是 1";
+                            return verdict;
+                        }
+                    } catch (const std::exception& error) {
+                        // 旧模式不做三态区分：它只承诺"首个能连上的候选"
+                        verdict.reason = error.what();
+                        return verdict;
+                    }
+                    verdict.verdict = calmcar::xcp::FramingVerdict::Accepted;
+                    master = std::move(candidate_master);
+                    return verdict;
+                };
+            }
+
+            const auto outcome =
+                calmcar::xcp::NegotiateTcpFraming(candidates, attempt);
             for (const auto& item : outcome.attempts) {
                 std::cout << "  试连 "
                           << calmcar::xcp::FramingCandidateName(item.candidate)
-                          << (item.accepted ? "：本次相容" : "：未成功")
+                          << "："
+                          << calmcar::xcp::FramingVerdictName(item.verdict)
                           << "，耗时 " << item.elapsed_ms << " ms";
                 if (!item.failure_reason.empty()) {
                     std::cout << "，原因：" << item.failure_reason;
                 }
                 std::cout << '\n';
             }
-            if (!outcome.selected.has_value() || !master) {
-                std::cerr << "旧式试连未成功，不能据此断定对端不支持这些布局；"
-                             "请核查网络并显式指定 --tcp-profile。\n";
-                return 3;
+            if (!outcome.selected.has_value()) {
+                // 退出码区分两种失败：3 = 对端明确拒绝全部布局（该改配置），
+                // 4 = 没有任何协议层回应（该查网络/端口/从站是否在运行）。
+                // 映射本身在 `cli_selection.hpp` 中实现并单测，避免这段语义
+                // 只存在于 main 里无法被自动化验收。
+                std::cerr << outcome.Summary() << '\n';
+                const int exit_code =
+                    calmcar::xcp::tools::TcpNegotiationExitCode(outcome);
+                if (exit_code ==
+                    calmcar::xcp::tools::kAutoNegotiationInconclusive) {
+                    std::cerr << "存在未决候选：对端没有给出任何协议层回应，无法"
+                                 "据此排除布局；请核查地址、端口与对端是否在运行。\n";
+                    return exit_code;
+                }
+                std::cerr << "全部候选都被对端拒绝：请核对对端实际使用的帧布局与 "
+                             "PACKET_ALIGNMENT。\n";
+                return exit_code;
             }
-            std::cout << "首个相容配置："
+            std::cout << (strict_auto ? "验证通过的布局：" : "首个相容配置：")
                       << calmcar::xcp::FramingCandidateName(*outcome.selected)
-                      << "；其他候选未被排除。\n";
-            // 胜出配置只用于日志与本地记录：selection 是 Result 视图，
+                      << "；";
+            if (strict_auto) {
+                std::cout << "已用全新连接确认，正式会话将另建连接。\n";
+            } else {
+                std::cout << "其他候选未被排除。\n";
+            }
+            // 胜出布局只用于日志与本地记录：selection 是 Result 视图，
             // 不就地改写它（改写会让"解析结果"与"实际使用"两处不一致）。
             options->transport_request.packet_alignment_bits =
-                accepted_alignment_bits;
+                static_cast<std::uint8_t>(outcome.selected->alignment);
+
+            if (strict_auto) {
+                // 正式会话另建连接：试连连接已由验证组件关闭，绝不复用。
+                calmcar::xcp::TcpTransportConfig tcp_config;
+                tcp_config.role = calmcar::xcp::TcpRole::Master;
+                tcp_config.remote_host = selection->host;
+                tcp_config.remote_port = selection->port;
+                tcp_config.packet_alignment = outcome.selected->alignment;
+                tcp_config.wire_profile = outcome.selected->profile;
+                master = std::make_unique<calmcar::xcp::XcpMaster>(
+                    std::make_unique<calmcar::xcp::TcpTransport>(tcp_config),
+                    master_options);
+                master->Connect();
+            }
         } else if (selection->transport ==
                    calmcar::xcp::TransportKind::Tcp) {
             calmcar::xcp::TcpTransportConfig tcp_config;

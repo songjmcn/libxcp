@@ -63,8 +63,8 @@ std::string MakeA2lWithTcpBlock(const std::string& body) {
            "/end PROJECT\n";
 }
 
-/// @brief 独立调用者必须能直接读到"已知歧义即拒绝"的结论。
-TEST(TransportSelectionStandaloneTest, StrictAutoRejectsKnownAmbiguity) {
+/// @brief 独立调用者必须能看到"严格 auto 把布局判定交给候选验证"的契约。
+TEST(TransportSelectionStandaloneTest, StrictAutoDefersLayoutToVerification) {
     auto request = MakeStrictAutoRequest();
     A2lTransportFacts facts;
     facts.declared = true;
@@ -81,8 +81,14 @@ TEST(TransportSelectionStandaloneTest, StrictAutoRejectsKnownAmbiguity) {
 
     std::string error;
     const auto resolved = ResolveTransportSelection(request, facts, &error);
-    EXPECT_FALSE(resolved.has_value()) << "已知歧义时严格 auto 必须拒绝建连";
-    EXPECT_FALSE(error.empty());
+    ASSERT_TRUE(resolved.has_value()) << error;
+    // 端点由 CLI 显式给出，因此多实例不会触发 fail closed；布局则必须留空，
+    // 由调用方按候选逐个验证后回填。
+    EXPECT_TRUE(resolved->wire_profile_auto);
+    EXPECT_EQ(resolved->wire_profile, TcpWireProfile::Unknown);
+    EXPECT_EQ(resolved->alignment, calmcar::xcp::PacketAlignment::Unknown);
+    EXPECT_EQ(resolved->wire_profile_source,
+              calmcar::xcp::WireProfileSource::Auto);
 }
 
 /// @brief `auto-legacy` 是显式选择的风险路径，必须回填"待试连"标志。
