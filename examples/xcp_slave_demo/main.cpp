@@ -918,10 +918,17 @@ int RunSlave(const CommandLineOptions& options) {
         ObserveSlaveProtocolState();
 
         // 降频心跳：确认从站在无主站连接时仍持续运行；与边沿日志相互独立。
+        // 同时写 stdout：日志默认可能被关闭（LIBXCP_ENABLE_LOG），而 CTest 会把
+        // 子进程 stdout 收进 CI 工件；据此可与主站收帧数对照，判定「从站降频」
+        // 还是「链路丢帧」——两者都表现为帧数偏少，只有事件计数增量能区分。
         if (now >= next_heartbeat) {
             LIBXCP_LOG_INFO(
                 "从站心跳：累计快事件次数={}，已连接={}，DAQ 运行中={}",
                 tick, XcpIsConnected(), XcpIsDaqRunning());
+            std::cout << "[从站心跳] 累计快事件次数=" << tick
+                      << " 已连接=" << (XcpIsConnected() ? 1 : 0)
+                      << " DAQ运行中=" << (XcpIsDaqRunning() ? 1 : 0) << '\n'
+                      << std::flush;
             next_heartbeat += kHeartbeatInterval;
             if (now - next_heartbeat > kHeartbeatInterval) {
                 // 落后超过一个间隔说明进程被长时间挂起，从当前时间重新起算，避免连发。

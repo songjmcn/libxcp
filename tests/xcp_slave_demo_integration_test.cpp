@@ -896,6 +896,27 @@ public:
     }
 
     /**
+     * @brief 在固定时长窗口内统计新到达的 DTO 帧数。
+     *
+     * 帧率回归（例如 macOS CI 上曾出现 3 s 只收 89/300 帧）无法用「等到了期望值」
+     * 这类断言发现，必须显式计量窗口内帧数。该函数阻塞到窗口结束，期间到达的帧
+     * 照常进入缓冲区，调用方随后仍可用 WaitFor* 做数值断言。
+     *
+     * @param window 观察时长。
+     * @return 窗口内新增的 DTO 帧数。
+     */
+    std::size_t CountFramesOver(std::chrono::milliseconds window) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const std::size_t before = frames_.size();
+        const auto deadline = std::chrono::steady_clock::now() + window;
+        while (std::chrono::steady_clock::now() < deadline) {
+            // 有新帧时会被唤醒继续等；超时返回即窗口结束。
+            condition_.wait_until(lock, deadline);
+        }
+        return frames_.size() - before;
+    }
+
+    /**
      * @brief 返回按当前布局成功解码的尝试次数。
      * @return 解码成功计数。
      */
@@ -935,7 +956,7 @@ public:
     [[nodiscard]] std::string Diagnostics() const {
         std::lock_guard<std::mutex> lock(mutex_);
         std::ostringstream stream;
-        stream << "已收 DTO " << frames_.size() << " 帧，解码成功 "
+        stream << "已收 DTO " << frames_.size() << " 帧，等待期解码成功 "
                << decoded_frames_ << " 次，解码失败 " << decode_failures_
                << " 次";
         if (!last_decode_error_.empty()) {
@@ -947,10 +968,69 @@ public:
             stream << "，首帧长度 " << frames_.front().size() << " 字节，内容 "
                    << HexPreview(frames_.front(), 32U);
         }
+        AppendTimestampDeltaSummary(stream);
         return stream.str();
     }
 
 private:
+    /**
+     * @brief 把「相邻 DTO 时间戳差值」统计追加到诊断文本。
+     *
+     * 这是区分两种互斥解释的关键证据：若链路大量丢帧（主站或网络丢弃），剩余帧的
+     * 时间戳差值应恒为事件周期的整数倍；若从站事件循环被拉长（生产者降频），差值
+     * 会抖动且多数不是整数倍。两者在「总帧数偏低」这一现象上完全一样，只有差值
+     * 分布能分开，故失败时必须一并输出。
+     *
+     * 只统计能成功解码且携带时间戳的帧；解码失败已由 decode_failures_ 单独计数。
+     *
+     * @param stream 诊断文本流。
+     */
+    void AppendTimestampDeltaSummary(std::ostringstream& stream) const {
+        std::vector<std::uint64_t> stamps;
+        stamps.reserve(frames_.size());
+        for (const auto& frame : frames_) {
+            try {
+                const auto decoded = decoder_.Decode(BytesView{frame}, layout_);
+                if (decoded.raw_timestamp.has_value()) {
+                    stamps.push_back(*decoded.raw_timestamp);
+                }
+            } catch (const XcpException&) {
+                // 与既定语义一致：解码失败只体现在 decode_failures_ 里。
+            }
+        }
+        if (stamps.size() < 2U) {
+            stream << "，时间戳差值：样本不足（需 ≥2 帧带时间戳，当前 "
+                   << stamps.size() << "）";
+            return;
+        }
+        std::vector<std::uint64_t> deltas;
+        deltas.reserve(stamps.size() - 1U);
+        for (std::size_t index = 1U; index < stamps.size(); ++index) {
+            // 时间戳是定宽计数且会回绕（32 位、单位 ns 时约 4.29 s 一轮）。必须按
+            // 位宽做模减法：直接用无符号相减遇到回绕会得到巨大值，按大小判序又会
+            // 把回绕点记成 0，两者都会把「正常 10 ms 周期」误判成异常。
+            const std::uint64_t delta =
+                layout_.timestamp_size_bits == 32U
+                    ? static_cast<std::uint64_t>(
+                          static_cast<std::uint32_t>(stamps[index]) -
+                          static_cast<std::uint32_t>(stamps[index - 1U]))
+                    : (stamps[index] >= stamps[index - 1U]
+                           ? stamps[index] - stamps[index - 1U]
+                           : 0U);
+            deltas.push_back(delta);
+        }
+        std::vector<std::uint64_t> sorted = deltas;
+        std::sort(sorted.begin(), sorted.end());
+        std::uint64_t total = 0U;
+        for (const auto delta : deltas) {
+            total += delta;
+        }
+        stream << "，时间戳差值 min=" << sorted.front()
+               << " 中位=" << sorted[sorted.size() / 2U]
+               << " 均值=" << (total / static_cast<std::uint64_t>(deltas.size()))
+               << " max=" << sorted.back() << "（" << stamps.size() << " 帧样本）";
+    }
+
     mutable std::mutex mutex_;  ///< 保护从 XCP 接收线程写入的 DTO 帧列表。
     std::condition_variable condition_;  ///< 通知等待线程已有新 DTO 到达。
     std::vector<Bytes> frames_;          ///< 已复制保存的原始 DTO 帧。
@@ -1002,6 +1082,18 @@ TEST(XcpSlaveDemoIntegrationTest, DemoDtoCollectorDiagnosticsCounters) {
     EXPECT_EQ(matched_collector.DecodeFailureCount(), 0U);
     EXPECT_NE(matched_collector.Diagnostics().find("首帧长度"), std::string::npos);
 
+    // 时间戳差值分布是区分「从站事件循环降频」与「链路丢帧」的唯一证据：
+    // 两帧时间戳相差 10000 个计数时，诊断文本必须如实给出该差值统计。
+    Bytes second_frame{0x00U, 0x00U, 0x00U, 0x00U, 0x10U, 0x27U, 0x00U, 0x00U};
+    second_frame.insert(second_frame.end(), payload.begin(), payload.end());
+    matched_collector.OnDto(DtoPacket{0U, second_frame});
+    const std::string matched_diagnostics = matched_collector.Diagnostics();
+    EXPECT_NE(matched_diagnostics.find("时间戳差值 min=10000"),
+              std::string::npos)
+        << matched_diagnostics;
+    EXPECT_NE(matched_diagnostics.find("（2 帧样本）"), std::string::npos)
+        << matched_diagnostics;
+
     // 截断帧无法按假设布局解码：必须记为解码失败并保留错误文本
     DemoDtoCollector truncated_collector;
     truncated_collector.OnDto(DtoPacket{0U, Bytes{0x00U}});
@@ -1012,6 +1104,10 @@ TEST(XcpSlaveDemoIntegrationTest, DemoDtoCollectorDiagnosticsCounters) {
     EXPECT_FALSE(truncated_collector.LastDecodeError().empty());
     EXPECT_NE(truncated_collector.Diagnostics().find("最后错误"),
               std::string::npos);
+    // 无可用时间戳样本时必须显式说明，避免被误读为「差值为 0 = 没有丢帧」。
+    EXPECT_NE(truncated_collector.Diagnostics().find("时间戳差值：样本不足"),
+              std::string::npos)
+        << truncated_collector.Diagnostics();
 }
 
 /**
@@ -1592,8 +1688,18 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     daq_list.odts.push_back(odt);
     ASSERT_NO_THROW(master->ConfigureDaqListsDynamic({daq_list}));
     ASSERT_NO_THROW(master->StartDaqSync());
-    EXPECT_TRUE(
-        collector.WaitForDouble(kCalibratedOffset, std::chrono::seconds(3)))
+    // 10 ms 事件在 3 s 内理论上限 300 帧。这里显式计量帧率：只断言「等到了 42.0」
+    // 无法发现帧率退化（macOS CI 上曾一次只收 89/300 帧而用例仍算通过）。
+    // 阈值取理论值的 50%，既能抓住数量级退化，又给 CI 抖动留余量。
+    constexpr std::size_t kMinFastDaqFrames = 150U;
+    const std::size_t fast_frames =
+        collector.CountFramesOver(std::chrono::seconds(3));
+    EXPECT_GE(fast_frames, kMinFastDaqFrames)
+        << "3 s 窗口只收到 " << fast_frames << " 帧（10 ms 事件理论上限 300，阈值 "
+        << kMinFastDaqFrames << "），DAQ 帧率退化；事件通道 " << *fast_event << "，"
+        << collector.Diagnostics();
+    EXPECT_TRUE(collector.WaitForDouble(kCalibratedOffset,
+                                        std::chrono::milliseconds(500)))
         << "10 ms DAQ DTO 未观察到标定偏置 42.0（增益已清零，任意采样应恒为 "
            "42.0）；事件通道 "
         << *fast_event << "，" << collector.Diagnostics()
@@ -1613,7 +1719,15 @@ TEST(XcpSlaveDemoIntegrationTest, CrossProcessCalibrationChangesDaqOutput) {
     slow_daq_list.odts.push_back(slow_odt);
     ASSERT_NO_THROW(master->ConfigureDaqListsDynamic({slow_daq_list}));
     ASSERT_NO_THROW(master->StartDaqSync());
-    EXPECT_TRUE(collector.WaitForNonzeroUint32(std::chrono::seconds(3)))
+    // 100 ms 事件在 1 s 内理论上限 10 帧，阈值同样取 50%。
+    constexpr std::size_t kMinSlowDaqFrames = 5U;
+    const std::size_t slow_frames =
+        collector.CountFramesOver(std::chrono::seconds(1));
+    EXPECT_GE(slow_frames, kMinSlowDaqFrames)
+        << "1 s 窗口只收到 " << slow_frames << " 帧（100 ms 事件理论上限 10，阈值 "
+        << kMinSlowDaqFrames << "），慢速 DAQ 帧率退化；事件通道 " << *slow_event
+        << "，" << collector.Diagnostics();
+    EXPECT_TRUE(collector.WaitForNonzeroUint32(std::chrono::seconds(2)))
         << "100 ms DAQ DTO 未到达慢速测量对象；事件通道 " << *slow_event << "，"
         << collector.Diagnostics();
     ASSERT_NO_THROW(master->StopDaq());
