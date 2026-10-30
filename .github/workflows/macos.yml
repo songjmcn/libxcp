@@ -25,7 +25,7 @@ jobs:
     # 的混搭，使 __cxa_throw 与 __cxa_begin_catch 落在两套 libc++abi 实例上，
     # 整个二进制的异常捕获失效（连 EXPECT_THROW 都接不住）。
     # 详见 code-plan/TCP_UDP平台隔离重构_实施计划_POD接口与平台分文件.md §8.3.9。
-    runs-on: Mac-Studio
+    runs-on: macos-arm64
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
