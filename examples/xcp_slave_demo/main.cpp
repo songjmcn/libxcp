@@ -51,7 +51,10 @@ constexpr std::uint32_t kMeasurementQueueSize = 32768U;
 ///       时间跟不上墙钟：CI 实测 9 秒墙钟只推进 265 次事件，心跳因此迟迟不出现。
 ///       改用墙钟后语义仍是「固定间隔心跳」，且不受事件推进速度影响；心跳判断只读
 ///       当前时间、不参与 next_fast/next_slow 的补偿计算，故不会干扰实时循环。
-constexpr std::chrono::seconds kHeartbeatInterval{5};
+/// @note 取 1 秒是因为集成用例的子进程通常只活 4~5 秒：5 秒间隔下 CI 日志里往往
+///       一条心跳都没有，无法用「累计快事件次数」自证从站是否被限流。1 秒间隔在
+///       同样的窗口内能留下 3~4 条记录，代价是日志量增加（每条约 60 字节）。
+constexpr std::chrono::seconds kHeartbeatInterval{1};
 /// @brief 快速循环周期，单位为纳秒。
 constexpr std::chrono::nanoseconds kFastPeriod{kFastEventCycleNs};
 /// @brief 慢速循环周期，单位为纳秒。
