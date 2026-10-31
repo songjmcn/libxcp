@@ -14,6 +14,19 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 #include <gtest/gtest.h>
 
@@ -26,6 +39,7 @@
 #include "libxcp/tcp_transport_config.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "libxcp/xcp_master.hpp"
+#include "src/detail/socket/socket_ops.hpp"
 
 #include "libxcp/transport_selection.hpp"
 #include "xcp_v12_slave_process.hpp"
@@ -292,6 +306,106 @@ TEST(XcpliteV12AutoProfileTest, ResolvesAsamV14EightBitFromRealV12Slave) {
     EXPECT_EQ(outcome.attempts.size(), 1U) << outcome.Summary();
     EXPECT_EQ(outcome.attempts.front().verdict,
               calmcar::xcp::FramingVerdict::Accepted);
+}
+
+/// @brief 平台套接字操作别名，供端口占用辅助类使用。
+namespace socket_ops = calmcar::xcp::detail;
+
+/** @brief 获取当前测试进程 ID，复现夹具旧的端口基址公式。 */
+std::uint32_t CurrentProcessId() noexcept {
+#ifdef _WIN32
+    return static_cast<std::uint32_t>(GetCurrentProcessId());
+#else
+    return static_cast<std::uint32_t>(getpid());
+#endif
+}
+
+/**
+ * @brief 持有若干已绑定的回环 UDP 端口，模拟"候选端口整段不可用"。
+ *
+ * @details 用例用它在启动从站前占住旧策略的候选端口；析构时统一释放，保证
+ *          断言失败也不会泄漏句柄。
+ */
+class PortHolder {
+public:
+    PortHolder() = default;
+    ~PortHolder() { Release(); }
+
+    PortHolder(const PortHolder&) = delete;
+    PortHolder& operator=(const PortHolder&) = delete;
+
+    /**
+     * @brief 尝试绑定 127.0.0.1 上的指定 UDP 端口。
+     * @param port 待占用的端口号。
+     * @return 绑定成功返回 true；端口已被占用或位于系统保留段时返回 false。
+     */
+    bool TryBind(std::uint16_t port) {
+        auto& ops = socket_ops::CurrentSocketOps();
+        const auto handle = ops.create(socket_ops::SocketKind::Udp);
+        if (handle == socket_ops::kInvalidSocketHandle) {
+            return false;
+        }
+        socket_ops::Ipv4Endpoint endpoint{};
+        endpoint.port = port;
+        if (!socket_ops::ParseIpv4Literal("127.0.0.1", &endpoint.address) ||
+            ops.bind(handle, endpoint) != 0) {
+            ops.close(handle);
+            return false;
+        }
+        handles_.push_back(handle);
+        ports_.push_back(port);
+        return true;
+    }
+
+    /** @brief 已成功占用的端口列表。 */
+    [[nodiscard]] const std::vector<std::uint16_t>& ports() const noexcept {
+        return ports_;
+    }
+
+    /** @brief 关闭全部占用端口并清空记录。 */
+    void Release() noexcept {
+        auto& ops = socket_ops::CurrentSocketOps();
+        for (const auto handle : handles_) {
+            ops.close(handle);
+        }
+        handles_.clear();
+        ports_.clear();
+    }
+
+private:
+    std::vector<socket_ops::SocketHandle> handles_;  ///< 已绑定的套接字句柄。
+    std::vector<std::uint16_t> ports_;               ///< 已占用的端口号。
+};
+
+/**
+ * @brief 旧固定基址上的候选端口全部不可绑定时，从站仍须就绪。
+ *
+ * @details 回归 Windows CI 上的 `10013` 事故：`44000 + pid % 10000` 起 16 个
+ *          连续端口若整段落在 Hyper-V/WinNAT 保留段（或被其他进程占用），旧实现
+ *          会连续 16 次"从站提前退出"后抛异常。新实现优先由操作系统动态分配端口
+ *          （分配器自动跳过保留段），因此先占住旧候选端口，再断言从站仍能就绪，
+ *          且最终端口不在被占集合内。
+ */
+TEST(XcpliteV12PortAllocationTest, StartsWhenLegacyCandidatePortsOccupied) {
+    const auto base =
+        static_cast<std::uint16_t>(44000U + (CurrentProcessId() % 10000U));
+    PortHolder holder;
+    for (std::uint16_t offset = 0; offset < 16; ++offset) {
+        holder.TryBind(static_cast<std::uint16_t>(base + offset));
+    }
+    if (holder.ports().empty()) {
+        GTEST_SKIP()
+            << "旧候选端口全部无法占用（可能落在系统保留段），前提不成立";
+    }
+
+    XcpliteV12SlaveProcess slave("udp");
+    ASSERT_NO_THROW(slave.Start());
+    EXPECT_GT(slave.Port(), 0U);
+    for (const auto occupied : holder.ports()) {
+        EXPECT_NE(slave.Port(), occupied)
+            << "从站不应使用已被占用的旧候选端口 " << occupied;
+    }
+    slave.Stop();
 }
 
 }  // namespace

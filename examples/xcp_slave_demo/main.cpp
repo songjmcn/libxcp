@@ -51,7 +51,10 @@ constexpr std::uint32_t kMeasurementQueueSize = 32768U;
 ///       时间跟不上墙钟：CI 实测 9 秒墙钟只推进 265 次事件，心跳因此迟迟不出现。
 ///       改用墙钟后语义仍是「固定间隔心跳」，且不受事件推进速度影响；心跳判断只读
 ///       当前时间、不参与 next_fast/next_slow 的补偿计算，故不会干扰实时循环。
-constexpr std::chrono::seconds kHeartbeatInterval{5};
+/// @note 取 1 秒是因为集成用例的子进程通常只活 4~5 秒：5 秒间隔下 CI 日志里往往
+///       一条心跳都没有，无法用「累计快事件次数」自证从站是否被限流。1 秒间隔在
+///       同样的窗口内能留下 3~4 条记录，代价是日志量增加（每条约 60 字节）。
+constexpr std::chrono::seconds kHeartbeatInterval{1};
 /// @brief 快速循环周期，单位为纳秒。
 constexpr std::chrono::nanoseconds kFastPeriod{kFastEventCycleNs};
 /// @brief 慢速循环周期，单位为纳秒。
@@ -918,10 +921,17 @@ int RunSlave(const CommandLineOptions& options) {
         ObserveSlaveProtocolState();
 
         // 降频心跳：确认从站在无主站连接时仍持续运行；与边沿日志相互独立。
+        // 同时写 stdout：日志默认可能被关闭（LIBXCP_ENABLE_LOG），而 CTest 会把
+        // 子进程 stdout 收进 CI 工件；据此可与主站收帧数对照，判定「从站降频」
+        // 还是「链路丢帧」——两者都表现为帧数偏少，只有事件计数增量能区分。
         if (now >= next_heartbeat) {
             LIBXCP_LOG_INFO(
                 "从站心跳：累计快事件次数={}，已连接={}，DAQ 运行中={}",
                 tick, XcpIsConnected(), XcpIsDaqRunning());
+            std::cout << "[从站心跳] 累计快事件次数=" << tick
+                      << " 已连接=" << (XcpIsConnected() ? 1 : 0)
+                      << " DAQ运行中=" << (XcpIsDaqRunning() ? 1 : 0) << '\n'
+                      << std::flush;
             next_heartbeat += kHeartbeatInterval;
             if (now - next_heartbeat > kHeartbeatInterval) {
                 // 落后超过一个间隔说明进程被长时间挂起，从当前时间重新起算，避免连发。
