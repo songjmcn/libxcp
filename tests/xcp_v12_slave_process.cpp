@@ -27,6 +27,7 @@
 #include "libxcp/tcp_transport_config.hpp"
 #include "libxcp/udp_transport.hpp"
 #include "libxcp/xcp_master.hpp"
+#include "src/detail/socket/socket_ops.hpp"
 
 #ifndef XCP_V12_SLAVE_EXECUTABLE
 #error "XCP_V12_SLAVE_EXECUTABLE must be supplied by CMake"
@@ -38,10 +39,14 @@
 namespace calmcar::xcp::test {
 namespace {
 
+/// @brief 低调用的平台套接字操作别名，缩短端口探测代码。
+namespace socket_ops = calmcar::xcp::detail;
+
 constexpr auto kStartupTimeout = std::chrono::seconds(12);  ///< 从站启动探测时限。
 constexpr auto kProbeInterval = std::chrono::milliseconds(100);  ///< 探测间隔。
 constexpr auto kStopTimeout = std::chrono::seconds(2);  ///< POSIX 优雅退出等待时限。
-constexpr std::uint16_t kPortSpan = 16;  ///< 发生端口冲突时尝试的连续端口数。
+/// @brief 端口候选的重试次数（每次尝试都会重新向操作系统申请端口）。
+constexpr std::uint16_t kPortSpan = 16;
 
 /** @brief 获取当前测试父进程 ID，用于隔离端口与临时目录。 */
 std::uint32_t CurrentProcessId() noexcept {
@@ -50,6 +55,44 @@ std::uint32_t CurrentProcessId() noexcept {
 #else
     return static_cast<std::uint32_t>(getpid());
 #endif
+}
+
+/**
+ * @brief 向操作系统申请一个当前可绑定的回环端口。
+ *
+ * @param transport 传输名称（`tcp` 或 `udp`），决定探测使用的套接字类型。
+ * @return 申请到的端口号；申请失败时返回 0，由调用方回退到固定基址策略。
+ *
+ * @details Windows 会在启动时为 Hyper-V/WinNAT 保留连续端口段，绑定落在保留段
+ *          内的端口会以 `WSAEACCES`（10013）失败；而系统动态分配端口时本身就会
+ *          跳过这些保留段。因此先让 OS 分配一个端口，再交给从站使用，可避免
+ *          整段保留导致的偶发失败。探测套接字在返回前立即关闭，仍存在极小的
+ *          竞态窗口，由 `Start()` 的重试循环兜底。
+ */
+std::uint16_t ReserveEphemeralPort(const std::string& transport) noexcept {
+    try {
+        auto& ops = socket_ops::CurrentSocketOps();
+        const auto kind = transport == "tcp" ? socket_ops::SocketKind::Tcp
+                                             : socket_ops::SocketKind::Udp;
+        const auto handle = ops.create(kind);
+        if (handle == socket_ops::kInvalidSocketHandle) {
+            return 0;
+        }
+        socket_ops::Ipv4Endpoint local{};
+        local.port = 0;
+        std::uint16_t port = 0;
+        if (socket_ops::ParseIpv4Literal("127.0.0.1", &local.address) &&
+            ops.bind(handle, local) == 0) {
+            socket_ops::Ipv4Endpoint actual{};
+            if (ops.getsockname(handle, &actual) == 0) {
+                port = actual.port;
+            }
+        }
+        ops.close(handle);
+        return port;
+    } catch (...) {
+        return 0;
+    }
 }
 
 /** @brief 构造用于确认从站就绪的 TCP/UDP Master Transport。 */
@@ -345,11 +388,18 @@ void XcpliteV12SlaveProcess::Start() {
     if (impl_->started) {
         return;
     }
+    // 旧策略在固定基址上顺序试探端口；Windows runner 上 Hyper-V/WinNAT 会保留
+    // 连续端口段，整段落在保留段内时 16 个候选会全部 bind 失败（WSAEACCES）。
+    // 因此每个候选优先请 OS 动态分配（自动跳过保留段），仅在分配失败时回退到
+    // 旧的固定基址公式，保证该平台能力缺失时行为不变。
     const std::uint16_t base = static_cast<std::uint16_t>(
         44000U + (CurrentProcessId() % 10000U));
     std::string last_error = "从站进程无法启动";
     for (std::uint16_t attempt = 0; attempt < kPortSpan; ++attempt) {
-        const auto candidate = static_cast<std::uint16_t>(base + attempt);
+        std::uint16_t candidate = ReserveEphemeralPort(impl_->transport);
+        if (candidate == 0U) {
+            candidate = static_cast<std::uint16_t>(base + attempt);
+        }
         if (!impl_->Spawn(candidate)) {
             last_error = "创建 XCPlite V1.2 从站子进程失败";
             continue;
