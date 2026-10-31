@@ -47,11 +47,29 @@ jobs:
           cmd /c "call `"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat`" && bootstrap.bat vc143 && b2 install --prefix=C:\boost --with-locale --with-filesystem --with-process toolset=msvc-14.3 address-model=64 variant=release link=static runtime-link=shared threading=multi -j4"
           if ($LASTEXITCODE -ne 0) { throw "Boost 编译失败" }
 
+      # 等价于执行 vcvars64.bat：把 VS2022 的 cl/link/INCLUDE/LIB 环境导入后续所有步骤，
+      # Ninja 生成器自身不会定位 MSVC，必须依赖该环境。
+      - name: 加载 VS2022 x64 环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 检查 Ninja
+        shell: pwsh
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) { choco install ninja -y --no-progress }
+          ninja --version
+
+      # Ninja 为单配置生成器：构建类型在配置期通过 CMAKE_BUILD_TYPE 指定，
+      # 且可并行编译到文件级（VS 生成器默认逐文件串行且项目级并行不稳定）。
       - name: Configure
         shell: pwsh
         run: >
           cmake -B build -S .
-          -G "Visual Studio 17 2022" -A x64
+          -G Ninja
+          -DCMAKE_C_COMPILER=cl
+          -DCMAKE_CXX_COMPILER=cl
+          -DCMAKE_BUILD_TYPE=$env:BUILD_TYPE
           -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
           -DLIBXCP_BUILD_TESTS=ON
           -DLIBXCP_BUILD_TOOLS=ON
@@ -60,12 +78,12 @@ jobs:
           -DBoost_USE_STATIC_LIBS=ON
           "-DBoost_DIR=C:/boost/lib/cmake/Boost-${{ env.BOOST_VERSION }}"
 
-      # 不加 -j：VS 生成器下并行构建会在 ZERO_CHECK 解析阶段失败（见 CMakeLists.txt 头注释）
+      # Ninja 默认按 CPU 核数并行；不再使用 VS 生成器，因此不存在 ZERO_CHECK 并行失败问题。
       - name: Build
         shell: pwsh
-        run: cmake --build build --config $env:BUILD_TYPE
+        run: cmake --build build --parallel
 
-      # 必须带 -C：VS 是多配置生成器，缺省会报 "Test not available without configuration"。
+      # Ninja 为单配置生成器，ctest 无需 -C。
       # 耗时类用例只在本地做门禁（计划文档 §8.3.4）；串行执行避免 Examples 抢端口 5555。
       # --timeout 180：与 Linux/macOS 对齐，让挂死用例 3 分钟内被点名而不是烧掉 10 分钟。
       # timeout-minutes：整轮若仍被某个用例挂住，45 分钟后由 job 层面截断并进入
@@ -83,7 +101,7 @@ jobs:
           # 用例级看门狗（tests/test_main.cpp）：单用例超过该秒数即打印用例名并中止。
           LIBXCP_TEST_WATCHDOG_SECONDS: 60
         run: >
-          ctest -C $env:BUILD_TYPE --output-on-failure --timeout 90
+          ctest --output-on-failure --timeout 90
           -E "XcpMasterRenderBenchTest|a2l_ui_perf_gen|a2l_perf_gen|ParseLargeFileUnderBudget"
 
       # 失败时把 ctest 的失败清单打成 GitHub 注解（annotation）。
