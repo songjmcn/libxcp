@@ -91,3 +91,73 @@ jobs:
               fi
             done < "$log"
           fi
+
+  # --------------------------------------------------------------------------
+  # ThreadSanitizer 专项
+  #
+  # 只在 Linux 上跑：MSVC 没有 ThreadSanitizer，Windows 侧无法覆盖数据竞争。
+  # 目的不是替代全量测试，而是给并发路径（Transport 生命周期、事件轮询、Socket
+  # 抽象层）加一层数据竞争检测。全量用例在 TSan 下会被第三方库的既有竞争噪声
+  # 淹没，因此用 gtest_filter 收敛范围。
+  #
+  # LIBXCP_ENABLE_LOG=OFF：glog 自身在 TSan 下有独立竞争报告，开启会掩盖被测
+  # 代码的真实问题，且该 job 不验证日志功能。
+  # --------------------------------------------------------------------------
+  sanitize-thread:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: 安装构建工具与 GCC 13
+        run: |
+          sudo apt-get update
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build gcc-13 g++-13
+
+      - name: 安装 Boost ${{ env.BOOST_VERSION }}
+        uses: MarkusJx/install-boost@v2.4.5
+        id: install-boost
+        with:
+          boost_version: ${{ env.BOOST_VERSION }}
+          platform_version: 22.04
+          toolset: gcc
+          boost_install_dir: ${{ runner.temp }}/boost
+
+      - name: 配置运行时库路径
+        run: echo "LD_LIBRARY_PATH=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib" >> "$GITHUB_ENV"
+
+      # RelWithDebInfo：TSan 报告需要可读行号，Release 的 -O3 会让栈帧失真
+      - name: Configure（ThreadSanitizer）
+        run: >
+          cmake -B build-tsan -S . -G Ninja
+          -DCMAKE_C_COMPILER=gcc-13
+          -DCMAKE_CXX_COMPILER=g++-13
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+          -DLIBXCP_SANITIZER=thread
+          -DLIBXCP_BUILD_TESTS=ON
+          -DLIBXCP_BUILD_TOOLS=OFF
+          -DLIBXCP_BUILD_EXAMPLES=OFF
+          -DLIBXCP_ENABLE_LOG=OFF
+          "-DBoost_DIR=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib/cmake/Boost-${{ env.BOOST_VERSION }}"
+
+      - name: Build
+        run: cmake --build build-tsan -j "$(nproc)"
+
+      # halt_on_error=0：一次运行内报告全部竞争，而不是遇到第一条就退出，
+      # 便于一次性收集完善；退出码仍会因存在问题而为非零。
+      - name: Test（并发相关用例）
+        working-directory: build-tsan
+        env:
+          TSAN_OPTIONS: "halt_on_error=0 second_deadlock_stack=1 history_size=7"
+        run: >
+          ./tests/libxcp_tests
+          "--gtest_filter=UdpTransportLifecycle.*:TcpEndToEndTest.*:TcpLoopbackTest.*:*Transport*:*EventPoller*:*Socket*"
+
+      - name: Annotate failures
+        if: failure()
+        run: echo "::error title=ThreadSanitizer 检测到数据竞争::见上方 Test 步骤报告"

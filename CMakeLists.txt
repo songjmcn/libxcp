@@ -137,6 +137,38 @@ else()
   add_compile_options(-Wall -Wextra)
 endif()
 
+# ----------------------------------------------------------------------------
+# 运行时检查（Sanitizer）
+#
+# 仅用于 CI 与本地排查并发、内存缺陷；默认留空时完全不注入任何标志，正式产物
+# 与未启用时保持一致。可用取值：
+#   -DLIBXCP_SANITIZER=thread     数据竞争检测（ThreadSanitizer）
+#   -DLIBXCP_SANITIZER=address    越界与释放后使用（AddressSanitizer）
+#   -DLIBXCP_SANITIZER=undefined  未定义行为（UndefinedBehaviorSanitizer）
+# 取值不在此做白名单校验，交由编译器诊断；MSVC 不具备对应命令行开关，命中时
+# 直接报错终止，避免在 Windows 上静默生成"看似带检查、实际没有"的构建。
+# ----------------------------------------------------------------------------
+set(LIBXCP_SANITIZER "" CACHE STRING
+    "运行时检查类型：留空/thread/address/undefined")
+
+if(LIBXCP_SANITIZER)
+  if(MSVC)
+    message(FATAL_ERROR
+      "LIBXCP_SANITIZER=${LIBXCP_SANITIZER} 需要 GCC 或 Clang 工具链；"
+      "MSVC 不支持 ThreadSanitizer 等同类命令行开关。请在 Linux/macOS 上启用，"
+      "或留空该选项。")
+  endif()
+  set(LIBXCP_SANITIZER_FLAGS
+      "-fsanitize=${LIBXCP_SANITIZER}"
+      "-fno-omit-frame-pointer"
+      "-g")
+  # 编译与链接都必须注入：sanitizer 的运行时库由链接阶段决定，只加编译标志会
+  # 在链接时报未定义符号。
+  add_compile_options(${LIBXCP_SANITIZER_FLAGS})
+  add_link_options(${LIBXCP_SANITIZER_FLAGS})
+  message(STATUS "已启用运行时检查：-fsanitize=${LIBXCP_SANITIZER}")
+endif()
+
 include(GNUInstallDirs)
 
 # ----------------------------------------------------------------------------

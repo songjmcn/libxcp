@@ -139,7 +139,8 @@ struct TcpTestSlave::SocketImpl {
     /// @brief 监听 Socket
     NativeSocket listener{kInvalidSocket};
     /// @brief 当前活动连接 Socket
-    NativeSocket connection{kInvalidSocket};
+    /// @brief 活动连接句柄；接收线程会 accept 后写入、主线程会 shutdown，改用原子量避免竞争
+    std::atomic<NativeSocket> connection{kInvalidSocket};
 };
 
 // ---- 构造 / 析构 ----
@@ -226,9 +227,17 @@ void TcpTestSlave::Stop() {
     }
 
     // shutdown 打断阻塞中的 accept/recv，再 join —— 不遗留线程。
+    // 句柄取局部快照：接收线程可能同时 exchange 掉连接句柄，逐次读取原子量
+    // 会让 shutdown 与后续 close 落到不同句柄上。
     if (m_socket_) {
-        ShutdownNative(m_socket_->listener);
-        ShutdownNative(m_socket_->connection);
+        const NativeSocket listener = m_socket_->listener;
+        const NativeSocket conn = m_socket_->connection.load();
+        if (listener != kInvalidSocket) {
+            ShutdownNative(listener);
+        }
+        if (conn != kInvalidSocket) {
+            ShutdownNative(conn);
+        }
     }
     if (m_thread_.joinable()) {
         m_thread_.join();
@@ -309,10 +318,15 @@ void TcpTestSlave::CloseActiveConnection() {
 }
 
 void TcpTestSlave::CloseConnection() {
-    if (m_socket_ && m_socket_->connection != kInvalidSocket) {
-        ShutdownNative(m_socket_->connection);
-        CloseNative(m_socket_->connection);
-        m_socket_->connection = kInvalidSocket;
+    if (!m_socket_) {
+        return;
+    }
+    // exchange 原子地取走句柄：并发调用时只有一个线程真正执行 shutdown/close，
+    // 避免同一句柄被关两次，或关闭一个已被复用给他处的句柄。
+    const NativeSocket conn = m_socket_->connection.exchange(kInvalidSocket);
+    if (conn != kInvalidSocket) {
+        ShutdownNative(conn);
+        CloseNative(conn);
     }
 }
 
@@ -352,7 +366,7 @@ void TcpTestSlave::ReceiveLoop() {
         }
 
         // 3) 用 select 等可读，超时后回到循环顶继续 accept 新连接
-        const NativeSocket conn = m_socket_->connection;
+        const NativeSocket conn = m_socket_->connection.load();
         if (conn == kInvalidSocket) {
             m_has_connection_.store(false);
             continue;
@@ -434,7 +448,7 @@ void TcpTestSlave::AcceptPendingConnections() {
 
         DisableNagle(conn);
         SuppressSigpipe(conn);
-        m_socket_->connection = conn;
+        m_socket_->connection.store(conn);
         m_has_connection_.store(true);
     }
 }
@@ -445,7 +459,7 @@ int TcpTestSlave::ReadExact(std::uint8_t* out, std::size_t size) {
         if (!m_running_.load()) {
             return -1;
         }
-        const NativeSocket conn = m_socket_->connection;
+        const NativeSocket conn = m_socket_->connection.load();
         if (conn == kInvalidSocket) {
             return 0;
         }
@@ -816,7 +830,7 @@ bool TcpTestSlave::WriteResponse(BytesView packet) {
     m_send_ctr_.fetch_add(1);
 
     // 7) 分片注入：逐字节 / 固定块，然后写出
-    const NativeSocket conn = m_socket_->connection;
+    const NativeSocket conn = m_socket_->connection.load();
     if (conn == kInvalidSocket) {
         return false;
     }
@@ -885,7 +899,7 @@ bool TcpTestSlave::WriteResponse(BytesView packet) {
 }
 
 void TcpTestSlave::SendRaw(BytesView raw) {
-    const NativeSocket conn = m_socket_->connection;
+    const NativeSocket conn = m_socket_->connection.load();
     if (conn == kInvalidSocket) {
         throw detail::MakeInvalidState(
             "TcpTestSlave::SendRaw: 当前没有活动连接");

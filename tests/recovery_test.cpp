@@ -137,19 +137,25 @@ class ScriptedSlave {
 public:
     /// @brief 设置某个命令的持续响应
     void SetResponse(CommandCode cmd, Bytes response) {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
         m_responses_[cmd] = std::move(response);
     }
 
     /// @brief 设置某个命令的一次性响应（消费后回退到持续响应）
     void SetOnceResponse(CommandCode cmd, Bytes response) {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
         m_once_[cmd] = std::move(response);
     }
 
     /// @brief 令某个命令的第 n 次调用（1 起）不产生响应
-    void DropNthCall(CommandCode cmd, std::size_t n) { m_drop_[cmd] = n; }
+    void DropNthCall(CommandCode cmd, std::size_t n) {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_drop_[cmd] = n;
+    }
 
     /// @brief 令某个命令的前 n 次调用都不产生响应
     void DropFirstCalls(CommandCode cmd, std::size_t n) {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
         m_drop_first_[cmd] = n;
     }
 
@@ -160,26 +166,36 @@ public:
     /// @details F-11 用例需要「先 BUSY 若干次、再成功」的脚本，以验证重试
     ///          路径被走到后能立即收敛（而不是一直等到总体 deadline）。
     void SetBusyFirstCalls(CommandCode cmd, std::size_t n, Bytes then) {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
         m_busy_first_[cmd] = n;
         m_responses_[cmd] = std::move(then);
     }
 
     [[nodiscard]] int Count(CommandCode cmd) const {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
         const auto it = m_counts_.find(cmd);
         return it == m_counts_.end() ? 0 : it->second;
     }
-    [[nodiscard]] const std::vector<CommandCode>& Order() const {
+    /// @brief 返回调用顺序的**副本**：调用方可能在其它线程仍会追加记录，
+    ///        返回引用会让拷贝过程与写入并发。
+    [[nodiscard]] std::vector<CommandCode> Order() const {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
         return m_order_;
     }
     void ResetCounts() {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
         m_counts_.clear();
         m_order_.clear();
     }
 
+    /// @details 该方法由 Transport 的接收线程调用，与测试主线程的 Count()/Order()
+    ///          并发，因此整个函数体必须在同一把锁内完成：读脚本表与写计数不可分离，
+    ///          否则「第 n 次调用」的判定会和计数更新相互错位。
     Bytes operator()(BytesView packet) {
         if (packet.empty()) {
             return {};
         }
+        const std::lock_guard<std::mutex> lock(m_mutex_);
         const auto cmd = static_cast<CommandCode>(packet[0]);
         ++m_counts_[cmd];
         m_order_.push_back(cmd);
@@ -216,6 +232,8 @@ public:
     }
 
 private:
+    /// @brief 保护下方脚本表与计数：回调线程读脚本写计数，主线程读计数/顺序
+    mutable std::mutex m_mutex_;
     std::map<CommandCode, Bytes> m_responses_;
     std::map<CommandCode, Bytes> m_once_;
     std::map<CommandCode, std::size_t> m_drop_;
