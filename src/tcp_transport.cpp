@@ -230,13 +230,16 @@ void TcpTransport::Open(IPacketListener& listener) {
     }
 
     // ---- 解码器：构建期即校验，把配置错误挡在连接建立之前 ----
-    // max_packet_size 与 max_frame_packet_size 取两者较小值：decoder 的职责是
-    // 防止缓冲无界增长，必须遵守调用方给出的**任意一个**更严格上限。
-    // 用括号包住 `std::min` 是刻意的：Windows 头会在未定义 NOMINMAX 时注入
-    // `min` 宏，`std::min(a, b)` 会被预处理成 `std::((a)<(b)?...)` 而报
-    // C2589/C2059；`(std::min)(a, b)` 不满足函数式宏的展开条件，两个平台通吃。
+    // 定界上限取两个配置中的**较大值**：decoder 只负责按 LEN 定界，
+    // "这一帧要不要交付"由接收线程按 max_frame_packet_size 判定（超限帧
+    // 丢弃并告警，连接保持可用）。若这里取较小值，超过 max_frame_packet_size
+    // 的合法 LEN 会在 decoder 内部被判为畸形，导致整条 TCP 连接被终止——
+    // 一个超限帧不该拖垮整条流（T-02）。
+    // 用括号包住 `std::max` 是刻意的：Windows 头会在未定义 NOMINMAX 时注入
+    // `max` 宏，`std::max(a, b)` 会被预处理成 `std::((a)>(b)?...)` 而报
+    // C2589/C2059；`(std::max)(a, b)` 不满足函数式宏的展开条件，两个平台通吃。
     const std::size_t decoder_limit =
-        (std::min)(m_config_.max_packet_size, m_config_.max_frame_packet_size);
+        (std::max)(m_config_.max_packet_size, m_config_.max_frame_packet_size);
     m_decoder_ = std::make_unique<TcpStreamDecoder>(
         m_config_.wire_profile, m_config_.packet_alignment, decoder_limit);
 

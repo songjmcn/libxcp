@@ -25,6 +25,7 @@
 #include "src/event_poller.hpp"
 #include "tcp_fake_socket.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -1484,6 +1485,66 @@ TEST_F(TcpEndToEndTest, SendAfterPeerDisconnectReportsTransportError) {
         EXPECT_EQ(error.Category(), ErrorCategory::TransportError)
             << error.what();
     }
+    transport.Close();
+}
+
+/**
+ * @brief 一个超过 max_frame_packet_size 的帧只丢弃该帧，不得拖垮整条连接（T-02）
+ *
+ * @details 修复前：`Open()` 用 `min(max_packet_size, max_frame_packet_size)`
+ *          构造 decoder，于是 LEN 合法但超过 `max_frame_packet_size` 的帧
+ *          会让 decoder 判定"流已失步"并停机，接收线程随后以畸形原因关闭
+ *          连接——其后所有合法帧都被丢弃。修复后 decoder 只按 LEN 定界，
+ *          "是否交付"由接收线程判定：超限帧告警后丢弃，连接保持可用。
+ */
+TEST_F(TcpEndToEndTest, OversizeFrameIsDroppedWithoutClosingConnection) {
+    const std::uint16_t port = StartRawListener();
+    ASSERT_NE(port, 0);
+
+    TcpTransportConfig cfg = MakeMasterConfig(port);
+    cfg.wire_profile = TcpWireProfile::AsamV14;
+    // 故意把帧上限压到 16 字节，让随后 32 字节的合法帧越界
+    cfg.max_frame_packet_size = 16;
+    RecordingListener listener;
+    TcpTransport transport(cfg);
+
+    std::thread accept_thread([this] { AcceptPeer(); });
+    transport.Open(listener);
+    accept_thread.join();
+    ASSERT_TRUE(transport.IsOpen());
+
+    // 对端连发两帧：第一帧超限（应被丢弃），第二帧正常（应被交付）
+    Bytes stream = MakeWireFrame(Bytes(32, 0x11), 0);
+    const Bytes normal = MakeWireFrame(Bytes{0xFD, 0x00}, 1);
+    stream.insert(stream.end(), normal.begin(), normal.end());
+    SendAll(m_peer_handle, stream);
+
+    ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
+    const auto packets = listener.Packets();
+    ASSERT_EQ(packets.size(), 1U) << "超限帧不得被交付";
+    EXPECT_EQ(packets.front(), Bytes({0xFD, 0x00}));
+    EXPECT_TRUE(transport.IsOpen()) << "超限帧只丢弃该帧，不得断链";
+
+    // 告警必须出现，且措辞指出"超过配置上限"
+    std::vector<std::string> warnings;
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        warnings = listener.Warnings();
+        const bool found =
+            std::any_of(warnings.begin(), warnings.end(), [](const auto& w) {
+                return w.find("超过配置上限") != std::string::npos;
+            });
+        if (found) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_TRUE(std::any_of(warnings.begin(), warnings.end(),
+                            [](const auto& w) {
+                                return w.find("超过配置上限") !=
+                                       std::string::npos;
+                            }))
+        << "超限帧被丢弃时必须给出可见告警";
+
     transport.Close();
 }
 

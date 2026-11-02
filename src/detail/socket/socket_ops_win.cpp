@@ -10,6 +10,11 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
+// 旧版 Windows SDK 只有在 _WIN32_WINNT 足够新时才在 mstcpip.h 中提供该
+// IOCTL 码；值本身自 Windows Vista 起未变，缺失时按官方定义补上。
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
 #include <algorithm>
 #include <bit>
 #include <climits>
@@ -212,6 +217,17 @@ public:
         return ::setsockopt(ToNative(handle), SOL_SOCKET, SO_RCVTIMEO,
                             reinterpret_cast<const char*>(&timeout),
                             sizeof(timeout));
+    }
+    int disable_udp_icmp_error_reporting(SocketHandle handle) override {
+        // SIO_UDP_CONNRESET：把"ICMP 端口不可达导致的 WSAECONNRESET"关闭。
+        // 关闭后 recvfrom 不再因 ICMP 报错失败，未连接的 UDP 会话表现为
+        // "暂时没有数据"，符合 UDP 无连接语义（见 A-02 根因分析）。
+        BOOL disable = FALSE;
+        DWORD returned = 0;
+        const int rc = ::WSAIoctl(ToNative(handle), SIO_UDP_CONNRESET, &disable,
+                                  sizeof(disable), nullptr, 0, &returned,
+                                  nullptr, nullptr);
+        return rc == 0 ? 0 : -1;
     }
     int send(SocketHandle handle, const std::uint8_t* data, std::size_t size,
              bool) override {

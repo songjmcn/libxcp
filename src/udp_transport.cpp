@@ -279,6 +279,16 @@ void UdpTransport::Open(IPacketListener& listener) {
         throw detail::MakeTransportError("创建 UDP Socket 失败", error);
     }
 
+    // ---- 关闭 ICMP 端口不可达错误上报（Windows 专有）----
+    // 未连接的 UDP 套接字收到 ICMP port unreachable 后，Windows 会让下一次
+    // recvfrom 返回 WSAECONNRESET；若不关闭该上报，一次瞬态网络噪声就会被
+    // 误判为"连接丢失"。失败不致命：接收循环已把连接丢失降级为可恢复错误。
+    if (ops.disable_udp_icmp_error_reporting(impl->handle) != 0) {
+        LIBXCP_LOG_WARNING(
+            "UDP 关闭 ICMP 错误上报失败（连接丢失将按可恢复错误处理）：{}",
+            ops.last_error());
+    }
+
     // ---- 绑定本地端点 ----
     detail::Ipv4Endpoint local{};
     local.port = m_config_.local_port;
@@ -714,8 +724,8 @@ void UdpTransport::ReceiveLoop() {
         if (timed_out) {
             continue;  // 轮询周期到，检查关闭标记
         }
-        if (invalid || connection_lost) {
-            // 句柄失效或连接已断：不再可恢复，交付关闭原因后退出
+        if (invalid) {
+            // 句柄失效：不再可恢复，交付关闭原因后退出
             close_reason = "Socket 已关闭或失效，接收线程退出";
             break;
         }
@@ -728,7 +738,11 @@ void UdpTransport::ReceiveLoop() {
             NotifyWarning(
                 "recvfrom 失败(" + std::to_string(transient_failures) +
                 "): " + error +
-                (interrupted ? "（被信号打断，继续接收）" : "（继续接收）"));
+                (interrupted
+                     ? "（被信号打断，继续接收）"
+                     : (connection_lost
+                            ? "（ICMP 端口不可达/连接重置，已忽略并继续接收）"
+                            : "（继续接收）")));
         }
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kTransientRetryDelayMs));

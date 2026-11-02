@@ -462,17 +462,28 @@ TEST(UdpTransportRecvFromFault, InvalidHandleStopsReceiveLoop) {
     h.slave.Stop();
 }
 
-TEST(UdpTransportRecvFromFault, ConnectionLostStopsReceiveLoop) {
+/**
+ * @brief 一次"连接丢失"错误不得永久终止 UDP 接收线程（A-02 / M-03）
+ *
+ * @details Windows 上未连接的 UDP 套接字收到 ICMP port unreachable 后，
+ *          `recvfrom` 会返回 `WSAECONNRESET`。修复前的实现把它归入
+ *          "不可恢复"，于是接收线程在第一次 ICMP 后就永久退出——但 UDP
+ *          没有连接语义，这类错误应当被忽略并继续接收。本用例把该行为
+ *          固定为回归门禁：告警一条、连接保持打开、不得交付关闭事件。
+ */
+TEST(UdpTransportRecvFromFault, ConnectionLostWarnsAndContinues) {
     RecvFromFaultHarness h;
     h.Start(1,
             {test_support::FakeSocketOps::RecvFromAction::FailConnectionLost});
 
-    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
-    EXPECT_FALSE(h.transport->IsOpen());
-    EXPECT_NE(h.listener.CloseReason().find("Socket 已关闭或失效"),
-              std::string::npos);
+    ASSERT_TRUE(h.listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    EXPECT_NE(h.listener.Warnings().front().find("ICMP"), std::string::npos);
+    EXPECT_TRUE(h.transport->IsOpen())
+        << "一次 ICMP 端口不可达不得永久终止接收线程";
+    EXPECT_FALSE(h.listener.closed());
 
     h.transport->Close();
+    EXPECT_TRUE(h.listener.WaitForClose(std::chrono::seconds(2)));
     h.slave.Stop();
 }
 
