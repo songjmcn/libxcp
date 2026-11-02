@@ -352,8 +352,14 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
         }
 
         if (const auto* res = std::get_if<PositiveResponse>(&*parsed)) {
-            // 响应槽位已被占用说明协议失步：丢弃并上报畸形，绝不覆盖前一条响应
-            if (m_response_ready_) {
+            // 迟到的响应（当前没有任何待响应命令）必须丢弃：XCP 的 RES/ERR
+            // 不带事务关联 ID，一旦把无主响应存进唯一槽位，之后每条命令都会
+            // 取到上一条命令的应答，整条链路错位一格，最终表现为某条命令
+            // "收到 0 字节数据"之类的畸形包错误。
+            if (!m_session_.HasPendingCommand()) {
+                control_route = "stale RES discarded; no pending command";
+            } else if (m_response_ready_) {
+                // 响应槽位已被占用说明协议失步：丢弃并上报畸形，绝不覆盖前一条响应
                 notify_malformed = true;
                 control_route =
                     "duplicate RES discarded; response slot occupied";
@@ -372,6 +378,10 @@ void CommandExecutor::OnPacketReceived(BytesView packet) {
                 notify_synch = true;
                 control_route =
                     "ERR_CMD_SYNCH confirms recovery; SYNCH waiter notified";
+            } else if (!m_session_.HasPendingCommand()) {
+                // 与 RES 同理：无待响应命令的 ERR 属于被放弃的那条命令，
+                // 留在槽位里会污染下一条命令。
+                control_route = "stale ERR discarded; no pending command";
             } else if (m_response_ready_) {
                 notify_malformed = true;
                 control_route =
@@ -782,6 +792,14 @@ void CommandExecutor::PerformRecovery(CommandCode cmd) {
         throw XcpException(ErrorCategory::RecoveryFailed,
                            "SYNCH 未得到 ERR_CMD_SYNCH 确认", cmd);
     }
+    // SYNCH 确认后再清一次响应槽：恢复窗口内到达的 RES/ERR 属于那条已被
+    // 放弃的命令，若留在槽位里，紧随其后的重放命令会把它当成自己的应答。
+    {
+        const std::lock_guard<std::mutex> lock(m_mutex_);
+        m_pending_response_.reset();
+        m_response_ready_ = false;
+    }
+    LIBXCP_LOG_INFO("XCP recovery finished: stale responses dropped");
 }
 
 bool CommandExecutor::SendSynch() {

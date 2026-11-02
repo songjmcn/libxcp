@@ -1309,5 +1309,54 @@ TEST(TransportReopen, ReopenedTransportStillSupportsFullRecoveryBudget) {
         << "新会话须重新执行 SYNCH 恢复，而非沿用上一会话的确认结果";
 }
 
+// --------------------------------------------------------------------------
+// 迟到的 RES/ERR 不得占用响应槽（响应错位防护）
+// --------------------------------------------------------------------------
+
+/// @brief 无待响应命令时到达的 RES 必须被丢弃，不得污染下一次命令的应答。
+/// @details 现场表现：某命令超时被放弃后，它的响应才到达；若被存进唯一
+///          响应槽，下一条命令会把它当成自己的应答，整条链路错位一格。
+TEST(StaleResponse, ResponseWithoutPendingCommandIsDiscarded) {
+    Fixture f;
+    f.Connect();
+
+    // 模拟"上一条命令已被放弃，它的 1 字节 RES 此刻才到达"
+    f.transport.InjectPacket(
+        BytesOf({static_cast<std::uint8_t>(PacketType::Res)}));
+
+    // 之后的新命令必须拿到自己的 2 字节应答，而不是那条无主 RES
+    f.slave.SetResponse(CommandCode::Upload,
+                        BytesOf({static_cast<std::uint8_t>(PacketType::Res),
+                                 0xAB, 0xCD}));
+    EXPECT_EQ(f.executor.ExecuteUpload(2), BytesOf({0xAB, 0xCD}));
+}
+
+/// @brief SYNCH 恢复窗口内到达的迟到 RES 必须在恢复收尾时被丢弃。
+/// @details 恢复期间槽位可能被"被放弃命令的响应"占住；若不在确认后清空，
+///          紧随其后的重放命令会把它当作自己的应答（0 字节数据）。
+TEST(StaleResponse, SyncRecoveryDropsResponseArrivingDuringSynch) {
+    Fixture f;
+    f.Connect();
+    f.slave.DropNthCall(CommandCode::Upload, 1);
+    f.slave.SetResponse(CommandCode::Upload,
+                        BytesOf({static_cast<std::uint8_t>(PacketType::Res),
+                                 0x5A}));
+
+    // 在 SYNCH 等待期间注入一条迟到 RES（属于被放弃的那次 UPLOAD）
+    f.transport.SetResponse([&f](BytesView packet) {
+        if (!packet.empty() &&
+            packet[0] == static_cast<std::uint8_t>(CommandCode::Synch)) {
+            f.transport.InjectPacket(
+                BytesOf({static_cast<std::uint8_t>(PacketType::Res)}));
+        }
+        return f.slave(packet);
+    });
+
+    // 恢复后重放的 UPLOAD 必须拿到自己的 1 字节数据
+    EXPECT_EQ(f.executor.ExecuteUpload(1), BytesOf({0x5A}));
+    EXPECT_EQ(f.slave.Count(CommandCode::Synch), 1);
+    EXPECT_EQ(f.slave.Count(CommandCode::Upload), 2) << "原命令应被重放一次";
+}
+
 }  // namespace
 }  // namespace calmcar::xcp
