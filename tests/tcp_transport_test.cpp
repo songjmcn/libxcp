@@ -215,8 +215,8 @@ inline void SendAll(RawSocket handle, const Bytes& data) {
 TEST(TcpTransportConfigTest, RejectsUnknownWireProfile) {
     TcpTransportConfig cfg = MakeMasterConfig(4000);
     cfg.wire_profile = TcpWireProfile::Unknown;
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     EXPECT_THROW(transport.Open(listener), XcpException);
     EXPECT_FALSE(transport.IsOpen());
@@ -225,8 +225,8 @@ TEST(TcpTransportConfigTest, RejectsUnknownWireProfile) {
 TEST(TcpTransportConfigTest, RejectsUnknownPacketAlignment) {
     TcpTransportConfig cfg = MakeMasterConfig(4000);
     cfg.packet_alignment = PacketAlignment::Unknown;
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     EXPECT_THROW(transport.Open(listener), XcpException);
     EXPECT_FALSE(transport.IsOpen());
@@ -234,8 +234,8 @@ TEST(TcpTransportConfigTest, RejectsUnknownPacketAlignment) {
 
 TEST(TcpTransportConfigTest, MasterRejectsZeroRemotePort) {
     TcpTransportConfig cfg = MakeMasterConfig(0);
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     EXPECT_THROW(transport.Open(listener), XcpException);
 }
@@ -243,8 +243,8 @@ TEST(TcpTransportConfigTest, MasterRejectsZeroRemotePort) {
 TEST(TcpTransportConfigTest, MasterRejectsEmptyRemoteHost) {
     TcpTransportConfig cfg = MakeMasterConfig(4000);
     cfg.remote_host.clear();
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     EXPECT_THROW(transport.Open(listener), XcpException);
 }
@@ -303,8 +303,8 @@ TEST(TcpTransportConfigTest, RejectsOutOfRangePacketSizeLimits) {
 TEST(TcpTransportCapabilityTest, Ipv6RemoteReportsUnsupportedFeature) {
     TcpTransportConfig cfg = MakeMasterConfig(4000);
     cfg.remote_host = "::1";
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     try {
         transport.Open(listener);
@@ -318,8 +318,8 @@ TEST(TcpTransportCapabilityTest, Ipv6RemoteReportsUnsupportedFeature) {
 TEST(TcpTransportCapabilityTest, Ipv6LocalReportsUnsupportedFeature) {
     TcpTransportConfig cfg = MakeMasterConfig(4000);
     cfg.local_host = "fe80::1";
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     try {
         transport.Open(listener);
@@ -338,16 +338,16 @@ TEST(TcpTransportConnectionTest, MasterFailsWhenNothingListening) {
     TcpTransportConfig slave_cfg = MakeSlaveConfig();
     std::uint16_t dead_port = 0;
     {
-        TcpTransport probe(slave_cfg);
         RecordingListener probe_listener;
+        TcpTransport probe(slave_cfg);
         // 不存在可用的无监听取端口方式：直接用一个高位端口并接受极小概率冲突
         dead_port = 45711;
     }
 
     TcpTransportConfig cfg = MakeMasterConfig(dead_port);
     cfg.connect_timeout_ms = 500;
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     EXPECT_THROW(transport.Open(listener), XcpException);
     EXPECT_FALSE(transport.IsOpen());
@@ -356,8 +356,8 @@ TEST(TcpTransportConnectionTest, MasterFailsWhenNothingListening) {
 TEST(TcpTransportConnectionTest, SlaveAcceptTimesOutWithoutClient) {
     TcpTransportConfig cfg = MakeSlaveConfig();
     cfg.connect_timeout_ms = 300;
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     EXPECT_THROW(transport.Open(listener), XcpException);
     EXPECT_FALSE(transport.IsOpen());
@@ -366,8 +366,8 @@ TEST(TcpTransportConnectionTest, SlaveAcceptTimesOutWithoutClient) {
 TEST(TcpTransportConnectionTest, SlavePublishesOsAssignedPort) {
     // 用一个"客户端"角色来建立真实连接，从而验证 port 回填发生在 accept 之前
     TcpTransportConfig slave_cfg = MakeSlaveConfig();
-    TcpTransport slave(slave_cfg);
     RecordingListener slave_listener;
+    TcpTransport slave(slave_cfg);
 
     // 用线程同时扮演 Slave（accept）与 Master（connect）
     std::thread slave_thread([&] {
@@ -491,8 +491,10 @@ TEST_F(TcpEndToEndTest, MasterSendsAsamV14FrameWithoutTail) {
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
     cfg.wire_profile = TcpWireProfile::AsamV14;
-    TcpTransport transport(cfg);
+    // listener 必须先于 transport 声明：析构顺序与声明顺序相反，若 transport 先
+    // 析构，接收线程会在 listener 已销毁后仍回调 OnTransportClosed。
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -534,8 +536,8 @@ TEST_F(TcpEndToEndTest, CloseReturnsPromptlyWhilePeerIsSilent) {
     ASSERT_NE(port, 0);
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -566,8 +568,9 @@ TEST_F(TcpEndToEndTest, MasterSendsAsamV15FrameWithAlignmentTail) {
     cfg.wire_profile = TcpWireProfile::AsamV15;
     // alignment=32 且 Packet 长度使 Tail 非零，才能真正验证 Tail 被写出
     cfg.packet_alignment = PacketAlignment::Bit32;
-    TcpTransport transport(cfg);
+    // 同上：listener 必须先于 transport 声明，避免回调作用于已析构对象。
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -602,8 +605,8 @@ TEST_F(TcpEndToEndTest, ReceiveDecodesFrameSentByRawPeer) {
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
     cfg.wire_profile = TcpWireProfile::AsamV14;
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -634,8 +637,9 @@ TEST_F(TcpEndToEndTest, ReceiveHandlesFrameSplitAcrossWrites) {
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
     cfg.wire_profile = TcpWireProfile::AsamV14;
-    TcpTransport transport(cfg);
+    // 同上：listener 必须先于 transport 声明，避免回调作用于已析构对象。
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -670,8 +674,8 @@ TEST_F(TcpEndToEndTest, ReceiveHandlesTwoFramesInOneWrite) {
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
     cfg.wire_profile = TcpWireProfile::AsamV14;
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -711,8 +715,8 @@ TEST_F(TcpEndToEndTest, PeerCloseDeliversClosedCallback) {
     ASSERT_NE(port, 0);
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -732,8 +736,8 @@ TEST_F(TcpEndToEndTest, CloseInterruptsBlockingReceive) {
     ASSERT_NE(port, 0);
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -757,8 +761,8 @@ TEST_F(TcpEndToEndTest, CloseIsIdempotent) {
     ASSERT_NE(port, 0);
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -774,8 +778,8 @@ TEST_F(TcpEndToEndTest, SendAfterCloseThrowsInvalidState) {
     ASSERT_NE(port, 0);
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -790,8 +794,8 @@ TEST_F(TcpEndToEndTest, SendRejectsEmptyPacket) {
     ASSERT_NE(port, 0);
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -808,8 +812,8 @@ TEST_F(TcpEndToEndTest, SendRejectsPacketBeyondConfiguredLimit) {
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
     cfg.max_packet_size = 16;
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -827,8 +831,8 @@ TEST_F(TcpEndToEndTest, SendCtrAdvancesPerFrame) {
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
     cfg.wire_profile = TcpWireProfile::AsamV14;
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -852,8 +856,8 @@ TEST_F(TcpEndToEndTest, SendCtrAdvancesPerFrame) {
 TEST_F(TcpEndToEndTest, SlaveAcceptsConnectionAndReceivesFrame) {
     // Slave 角色：先起 listen，再用原生 Socket 连上去并写一帧
     TcpTransportConfig cfg = MakeSlaveConfig();
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     // 预先无法得知端口（由 Open 内 accept 之后才回填），故用固定高位端口。
     // 为避免冲突，先探测一个可用端口。
@@ -864,8 +868,8 @@ TEST_F(TcpEndToEndTest, SlaveAcceptsConnectionAndReceivesFrame) {
     m_listen_handle = kRawInvalid;
 
     cfg.local_port = probe_port;
-    TcpTransport slave(cfg);
     RecordingListener slave_listener;
+    TcpTransport slave(cfg);
 
     std::thread slave_thread([&] {
         try {
@@ -932,8 +936,8 @@ TEST_F(TcpEndToEndTest, AcceptClosesListenHandleExactlyOnce) {
     m_listen_handle = kRawInvalid;
     cfg.local_port = probe_port;
 
-    TcpTransport slave(cfg);
     RecordingListener listener;
+    TcpTransport slave(cfg);
     std::thread slave_thread([&] {
         try {
             slave.Open(listener);
@@ -986,8 +990,8 @@ TEST_F(TcpEndToEndTest, ReopenAfterCloseSucceeds) {
     ASSERT_NE(port, 0);
 
     TcpTransportConfig cfg = MakeMasterConfig(port);
-    TcpTransport transport(cfg);
     RecordingListener listener;
+    TcpTransport transport(cfg);
 
     std::thread accept_thread([this] { AcceptPeer(); });
     transport.Open(listener);
@@ -1279,6 +1283,103 @@ TEST(SocketPlatformTest, ShutdownSocketReportsInvalidHandle) {
     EXPECT_NE(
         detail::RealSocketOps().shutdown_socket(detail::kInvalidSocketHandle),
         0);
+}
+
+// ===========================================================================
+// 生命周期线程安全：并发 Close、回调内 Close、Send 与 Close 竞态
+// （发布门批次 1 回归：B-02/B-03/B-04）
+// ===========================================================================
+
+TEST_F(TcpEndToEndTest, ConcurrentCloseFromTwoThreadsIsSafe) {
+    const std::uint16_t port = StartRawListener();
+    ASSERT_NE(port, 0);
+
+    RecordingListener listener;
+    TcpTransport transport(MakeMasterConfig(port));
+    std::thread accept_thread([this] { AcceptPeer(); });
+    transport.Open(listener);
+    accept_thread.join();
+    ASSERT_TRUE(transport.IsOpen());
+
+    // 旧实现：两个线程都走 join + close 同一句柄，且都执行 reset —— 段错误
+    std::thread first([&transport] { transport.Close(); });
+    std::thread second([&transport] { transport.Close(); });
+    first.join();
+    second.join();
+
+    EXPECT_FALSE(transport.IsOpen());
+    // 关闭回调必须交付，且只由接收线程交付一次
+    EXPECT_TRUE(listener.closed());
+}
+
+/// @brief 在收包回调里请求关闭的监听器
+/// @details 回调运行在接收线程上；Close() 若在此 join 自己，旧实现会
+///          std::terminate 或只完成一半清理（句柄/端口泄漏）。
+class TcpClosingOnPacketListener : public RecordingListener {
+public:
+    /// @brief 绑定待关闭的 Transport（非拥有）
+    void SetTransport(TcpTransport* transport) { m_transport_ = transport; }
+
+    void OnPacketReceived(BytesView packet) override {
+        RecordingListener::OnPacketReceived(packet);
+        if (m_transport_ != nullptr) {
+            m_transport_->Close();  // 必须立即返回，不得阻塞或终止进程
+        }
+    }
+
+private:
+    TcpTransport* m_transport_{nullptr};
+};
+
+TEST_F(TcpEndToEndTest, CloseFromPacketCallbackReturnsImmediately) {
+    const std::uint16_t port = StartRawListener();
+    ASSERT_NE(port, 0);
+
+    TcpTransport transport(MakeMasterConfig(port));
+    TcpClosingOnPacketListener listener;
+    listener.SetTransport(&transport);
+    std::thread accept_thread([this] { AcceptPeer(); });
+    transport.Open(listener);
+    accept_thread.join();
+    ASSERT_TRUE(transport.IsOpen());
+
+    // 对端发一个合法帧，驱动接收线程在回调内发起关闭
+    SendAll(m_peer_handle, MakeWireFrame(Bytes{0xFD, 0x00}, 0));
+    EXPECT_TRUE(listener.WaitForClose(std::chrono::seconds(3)));
+
+    // 收尾由非接收线程完成：重复 Close 幂等
+    transport.Close();
+    EXPECT_FALSE(transport.IsOpen());
+}
+
+TEST_F(TcpEndToEndTest, SendRacingCloseDoesNotCrash) {
+    const std::uint16_t port = StartRawListener();
+    ASSERT_NE(port, 0);
+
+    RecordingListener listener;
+    TcpTransport transport(MakeMasterConfig(port));
+    std::thread accept_thread([this] { AcceptPeer(); });
+    transport.Open(listener);
+    accept_thread.join();
+    ASSERT_TRUE(transport.IsOpen());
+
+    std::atomic<bool> stop{false};
+    std::thread sender([&transport, &stop] {
+        while (!stop.load(std::memory_order_acquire)) {
+            try {
+                transport.Send(Bytes{0xFD, 0x00});
+            } catch (...) {
+                // 关闭过程中发送被拒是允许的结果，不得崩溃
+            }
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    transport.Close();
+    stop.store(true, std::memory_order_release);
+    sender.join();
+
+    EXPECT_FALSE(transport.IsOpen());
 }
 
 }  // namespace calmcar::xcp

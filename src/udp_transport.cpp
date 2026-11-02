@@ -181,6 +181,28 @@ UdpTransport::~UdpTransport() {
         Close();
     } catch (...) {
     }
+    // 若 Close() 是"从接收线程回调内发起"的降级路径，收尾会被延后；此处
+    // 对象正在销毁，接收线程必然已收到关闭请求。先 join（线程已退出，
+    // join 立即返回），再补做一次资源释放，保证句柄不泄漏。
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        if (m_state_ != LifecycleState::Closed) {
+            m_running_.store(false, std::memory_order_release);
+            m_state_ = LifecycleState::Closing;
+        }
+    }
+    SignalWakeup(m_wakeup_.get());
+    if (m_receive_thread_.joinable()) {
+        m_receive_thread_.join();
+    }
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        if (m_state_ == LifecycleState::Closing) {
+            ReleaseResources();
+            m_state_ = LifecycleState::Closed;
+            m_close_cv_.notify_all();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +270,7 @@ void UdpTransport::Open(IPacketListener& listener) {
             m_config_.local_host);
     }
 
-    auto impl = std::make_unique<SocketImpl>();
+    auto impl = std::make_shared<SocketImpl>();
     auto& ops = detail::CurrentSocketOps();
     impl->handle = ops.create(detail::SocketKind::Udp);
     if (impl->handle == kInvalidSocket) {
@@ -313,7 +335,7 @@ void UdpTransport::Open(IPacketListener& listener) {
     // 解析后的远端端点缓存到 SocketImpl，避免每次发送重复解析字符串。
     impl->remote = remote;
 
-    m_socket_ = std::move(impl);
+    m_socket_ = impl;
     m_listener_ = &listener;
 
     // ---- CTR 复位（设计决策 D1：每次 Open() 发送 CTR 置 0、清空接收基线）----
@@ -336,58 +358,138 @@ void UdpTransport::Open(IPacketListener& listener) {
             m_config_.receive_poll_interval_ms);
     }
     try {
-        m_receive_thread_ = std::thread([this] { ReceiveLoop(); });
+        // 接收线程入口先登记自己的身份：`Close()` 据此识别"回调内关闭"，
+        // 从而避免 join 自己导致的 std::terminate。
+        m_receive_thread_ = std::thread([this] {
+            {
+                const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+                m_receive_tid_ = std::this_thread::get_id();
+            }
+            ReceiveLoop();
+        });
     } catch (const std::system_error& e) {
         LIBXCP_LOG_ERROR("UDP receive thread creation failed: {}", e.what());
         m_running_.store(false, std::memory_order_release);
         detail::CurrentSocketOps().close(m_socket_->handle);
         m_socket_.reset();
+        // 唤醒对同样要释放，否则线程起不来时两个回环 Socket 会一直泄漏到
+        // 下一次 Open()/析构 之前（B-06）。
+        ReleaseWakeupPair();
         m_listener_ = nullptr;
         throw detail::MakeTransportError("启动接收线程失败", e.what());
+    }
+    // 线程起来之后才对外公布"已打开"：`Close()` 看到 `Open` 时线程必然
+    // 已是 joinable 状态。`Open()` 与 `Close()` 不得并发调用（见类文档）。
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        m_state_ = LifecycleState::Open;
+        m_finalize_owned_ = false;
     }
     LIBXCP_LOG_INFO("UDP transport open local={}:{} remote={}:{}",
                     m_config_.local_host, m_config_.local_port,
                     m_config_.remote_host, m_config_.remote_port);
 }
 
-void UdpTransport::Close() {
-    // 1. 通知接收线程退出
+bool UdpTransport::IsReceiveThread() const noexcept {
+    return m_receive_tid_ != std::thread::id{} &&
+           std::this_thread::get_id() == m_receive_tid_;
+}
+
+void UdpTransport::SignalShutdown() noexcept {
     m_running_.store(false, std::memory_order_release);
-
-    // 2. 立即唤醒阻塞在 select/recvfrom 的接收线程，使其无需等满一个轮询
-    //    周期即可观察到 m_running_==false。
+    // 立即唤醒阻塞在 select/recvfrom 的接收线程，使其无需等满一个轮询周期
     SignalWakeup(m_wakeup_.get());
+}
 
-    // 3. 等待接收线程结束（其退出前负责回调 OnTransportClosed）。
-    //    唤醒失效时仍有接收超时轮询兜底，因此不再需要先关 Socket；
-    //    反过来，若在 join 之前关闭 Socket，其句柄号会被 OS
-    //    立即回收并可能分配给 进程中其他新建的
-    //    Socket，而接收线程此刻仍可能在处理入站包并回调监听器，
-    //    迟到的操作就会命中被复用的句柄（跨会话/跨用例串扰）。
+void UdpTransport::ReleaseWakeupPair() {
+    if (m_wakeup_ == nullptr) {
+        return;
+    }
+    if (m_wakeup_->read_handle != kInvalidSocket) {
+        detail::CurrentSocketOps().close(m_wakeup_->read_handle);
+        m_wakeup_->read_handle = kInvalidSocket;
+    }
+    if (m_wakeup_->write_handle != kInvalidSocket) {
+        detail::CurrentSocketOps().close(m_wakeup_->write_handle);
+        m_wakeup_->write_handle = kInvalidSocket;
+    }
+    m_wakeup_.reset();
+}
+
+void UdpTransport::ReleaseResources() {
+    // 线程已停，此处关闭 Socket 不再存在竞态；用快照保证即使有发送线程仍
+    // 持有引用，关闭动作也只发生一次（句柄置无效后不会被二次 close）。
+    const auto sock = m_socket_;
+    if (sock != nullptr && sock->handle != kInvalidSocket) {
+        detail::CurrentSocketOps().close(sock->handle);
+        sock->handle = kInvalidSocket;
+    }
+    ReleaseWakeupPair();
+    m_socket_.reset();
+    m_listener_ = nullptr;
+    m_receive_tid_ = std::thread::id{};
+}
+
+void UdpTransport::NotifyWarning(const std::string& message) noexcept {
+    // 监听器异常不得终止接收线程；同时本函数**不能**在持有 m_recv_mutex_
+    // 时调用——监听器可能重入 LastReceiveCtr()，二次加同一把非递归锁会让
+    // 异常穿过 noexcept 边界直接 std::terminate（B-01）。
+    IPacketListener* listener = m_listener_;
+    if (listener == nullptr) {
+        return;
+    }
+    try {
+        listener->OnTransportWarning(message);
+    } catch (...) {
+        // 吞掉：告警通道故障不影响接收主流程
+    }
+}
+
+void UdpTransport::Close() {
+    std::unique_lock<std::mutex> lock(m_lifecycle_mutex_);
+
+    if (m_state_ == LifecycleState::Closed) {
+        return;  // 幂等：重复关闭直接返回
+    }
+
+    const bool from_receive_thread = IsReceiveThread();
+
+    if (m_state_ == LifecycleState::Closing) {
+        // 已有线程在关闭中
+        if (from_receive_thread) {
+            return;  // 回调内重复关闭：只登记意图，不参与收尾
+        }
+        if (m_finalize_owned_) {
+            // 收尾已被别的线程认领：等待其完成，绝不第二次 join 同一线程
+            m_close_cv_.wait(lock, [this] {
+                return m_state_ == LifecycleState::Closed;
+            });
+            return;
+        }
+        // 收尾尚未被认领（此前由接收线程在回调内发起）：由本线程接管
+        m_finalize_owned_ = true;
+    } else {
+        // Open → Closing：先置退出标记并唤醒接收线程，收尾必须等 join 之后
+        m_state_ = LifecycleState::Closing;
+        m_running_.store(false, std::memory_order_release);
+        SignalShutdown();
+        if (from_receive_thread) {
+            // 回调内关闭：不能 join 自己，收尾延后到析构或后续 Close()
+            return;
+        }
+        m_finalize_owned_ = true;
+    }
+
+    // join 不能在持锁时进行：接收线程可能正在等这把锁（例如它在回调里
+    // 调用了 Close()），持锁 join 会立即自锁。
+    lock.unlock();
     if (m_receive_thread_.joinable()) {
         m_receive_thread_.join();
     }
-
-    // 4. 线程已停，此处关闭 Socket 不再存在竞态
-    if (m_socket_ && m_socket_->handle != kInvalidSocket) {
-        detail::CurrentSocketOps().close(m_socket_->handle);
-        m_socket_->handle = kInvalidSocket;
-    }
-    // 5. 释放唤醒对（读端/写端均在此关闭）
-    if (m_wakeup_ != nullptr) {
-        if (m_wakeup_->read_handle != kInvalidSocket) {
-            detail::CurrentSocketOps().close(m_wakeup_->read_handle);
-            m_wakeup_->read_handle = kInvalidSocket;
-        }
-        if (m_wakeup_->write_handle != kInvalidSocket) {
-            detail::CurrentSocketOps().close(m_wakeup_->write_handle);
-            m_wakeup_->write_handle = kInvalidSocket;
-        }
-        m_wakeup_.reset();
-    }
-
-    m_socket_.reset();
-    m_listener_ = nullptr;
+    lock.lock();
+    ReleaseResources();
+    m_state_ = LifecycleState::Closed;
+    m_close_cv_.notify_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -399,6 +501,14 @@ void UdpTransport::Send(BytesView packet) {
 
     if (!IsOpen()) {
         LIBXCP_LOG_ERROR("UDP send rejected because transport is closed");
+        throw detail::MakeInvalidState("UdpTransport 未打开时调用 send()");
+    }
+    // 句柄快照：`Close()` 不取 m_send_mutex_，可能与本函数并发；持有一份
+    // shared_ptr 保证整个发送过程里 SocketImpl 不被释放，句柄若已被置无效
+    // 则显式拒绝，而不是解引用空指针（B-02）。
+    const auto sock = m_socket_;
+    if (sock == nullptr || sock->handle == kInvalidSocket) {
+        LIBXCP_LOG_ERROR("UDP send rejected because socket handle is invalid");
         throw detail::MakeInvalidState("UdpTransport 未打开时调用 send()");
     }
     if (packet.empty()) {
@@ -443,8 +553,7 @@ void UdpTransport::Send(BytesView packet) {
     }
 
     const int sent = detail::CurrentSocketOps().send_to(
-        m_socket_->handle, frame.data.data(), frame.data.size(),
-        m_socket_->remote);
+        sock->handle, frame.data.data(), frame.data.size(), sock->remote);
     if (sent < 0) {
         const auto error = detail::CurrentSocketOps().last_error();
         LIBXCP_LOG_ERROR("UDP sendto failed: {}", error);
@@ -527,7 +636,7 @@ void UdpTransport::ReceiveLoop() {
             }
             // 等待失败时直接退出，避免失效句柄或中断产生无限警告忙循环。
             if (listener != nullptr) {
-                listener->OnTransportWarning("等待数据 Socket 失败: " +
+                NotifyWarning("等待数据 Socket 失败: " +
                                              wait_error);
             }
             close_reason = "等待数据 Socket 失败: " + wait_error;
@@ -583,7 +692,7 @@ void UdpTransport::ReceiveLoop() {
         if (received == 0) {
             // UDP 下空 Datagram：按畸形处理并丢弃，继续运行
             if (listener != nullptr) {
-                listener->OnTransportWarning(
+                NotifyWarning(
                     "收到长度为 0 的 UDP Datagram，已丢弃");
             }
             continue;
@@ -614,7 +723,7 @@ void UdpTransport::ReceiveLoop() {
         if (listener != nullptr &&
             (transient_failures == 1 ||
              transient_failures % kTransientWarnStride == 0)) {
-            listener->OnTransportWarning(
+            NotifyWarning(
                 "recvfrom 失败(" + std::to_string(transient_failures) +
                 "): " + error +
                 (interrupted ? "（被信号打断，继续接收）" : "（继续接收）"));
@@ -655,7 +764,7 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
     if (!IsRemoteMatch(src_ip, src_port)) {
         // 来源过滤：项目安全策略（D3），丢弃并诊断
         if (listener != nullptr) {
-            listener->OnTransportWarning(
+            NotifyWarning(
                 "丢弃来自非配置远端的 Datagram: " + src_ip + ":" +
                 std::to_string(src_port));
         }
@@ -664,7 +773,7 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
 
     if (size > m_config_.max_datagram_size) {
         if (listener != nullptr) {
-            listener->OnTransportWarning("Datagram 长度 " +
+            NotifyWarning("Datagram 长度 " +
                                          std::to_string(size) +
                                          " 超过配置上限，已丢弃");
         }
@@ -679,7 +788,7 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
     if (!frames) {
         // 原子性策略：任一 Frame 非法则整个 Datagram 不交付（§8.1 第 7 条）
         if (listener != nullptr) {
-            listener->OnTransportWarning(
+            NotifyWarning(
                 "畸形 UDP Datagram（Header/LEN 越界或残留字节），整体丢弃");
         }
         return true;
@@ -693,7 +802,7 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
                 kEthernetHeaderSize +
                     static_cast<std::size_t>(frame.header.len));
             if (frame.tail_bytes != expected && listener != nullptr) {
-                listener->OnTransportWarning(
+                NotifyWarning(
                     "UDP Frame 的 Tail 与协商对齐不一致（期望 " +
                     std::to_string(expected) + " 字节，实得 " +
                     std::to_string(frame.tail_bytes) +
@@ -705,7 +814,7 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
     for (const auto& frame : *frames) {
         if (frame.header.len > m_config_.max_frame_packet_size) {
             if (listener != nullptr) {
-                listener->OnTransportWarning("Frame 内 XCP Packet 长度 " +
+                NotifyWarning("Frame 内 XCP Packet 长度 " +
                                              std::to_string(frame.header.len) +
                                              " 超过配置上限，该 Frame 已丢弃");
             }
@@ -729,64 +838,68 @@ bool UdpTransport::HandleDatagram(const std::uint8_t* data, std::size_t size,
 }
 
 bool UdpTransport::HandleFrame(const UdpFrameView& frame) {
-    const std::lock_guard<std::mutex> lock(m_recv_mutex_);
-    IPacketListener* listener = m_listener_;
+    std::string warning;  // 锁内生成、锁外上报：监听器可能重入读 CTR
+    bool deliver = true;
 
-    if (!m_recv_baseline_established_) {
-        // 首个合法 Frame 建立基线（§8.1 第 2 条）
-        m_recv_baseline_established_ = true;
-        m_last_recv_ctr_ = frame.header.ctr;
-        return true;
-    }
+    {
+        const std::lock_guard<std::mutex> lock(m_recv_mutex_);
 
-    const DatagramCtr previous = m_last_recv_ctr_.value_or(0U);
-    const DatagramCtr expected = static_cast<DatagramCtr>(previous + 1U);
-
-    if (frame.header.ctr == expected) {
-        m_last_recv_ctr_ = frame.header.ctr;  // §8.1 第 3 条
-        return true;
-    }
-
-    // 以期望值为基准计算前向距离：0 表示重复，1..32767 表示前向跳号（缺包），
-    // >= 32768 表示后向乱序或方向歧义。
-    const int delta_from_expected =
-        ctrForwardDistance(expected, frame.header.ctr);
-
-    if (delta_from_expected == 0) {
-        // 与期望值相同不可能走到这里（上面已判等），保留为防御分支
-        m_last_recv_ctr_ = frame.header.ctr;
-        return true;
-    }
-    if (delta_from_expected == 0x8000) {
-        // 恰好相差 0x8000：方向歧义，丢弃（§8.1 第 6 条 / D5）
-        // 诊断文本中的差值使用十六进制，便于与 §8.1 条款和测试断言逐字对应。
-        if (listener != nullptr) {
-            listener->OnTransportWarning(
-                "CTR 与期望值差 0x8000，方向歧义，已丢弃: " +
-                std::to_string(frame.header.ctr));
+        if (!m_recv_baseline_established_) {
+            // 首个合法 Frame 建立基线（§8.1 第 2 条）
+            m_recv_baseline_established_ = true;
+            m_last_recv_ctr_ = frame.header.ctr;
+            return true;
         }
-        return false;
-    }
-    if (delta_from_expected > 0 && delta_from_expected < 0x8000) {
-        // 前向跳号：接收、报告缺口、推进（§8.1 第 4 条）
-        if (listener != nullptr) {
-            listener->OnTransportWarning(
-                "CTR 前向跳号，疑似缺包：期望 " + ctrToHex(expected) +
-                "，实收 " + ctrToHex(frame.header.ctr) + "，缺口 " +
-                std::to_string(delta_from_expected));
+
+        const DatagramCtr previous = m_last_recv_ctr_.value_or(0U);
+        const DatagramCtr expected =
+            static_cast<DatagramCtr>(previous + 1U);
+
+        if (frame.header.ctr == expected) {
+            m_last_recv_ctr_ = frame.header.ctr;  // §8.1 第 3 条
+            return true;
         }
-        m_last_recv_ctr_ = frame.header.ctr;
-        return true;
+
+        // 以期望值为基准计算前向距离：0 表示重复，1..32767 表示前向跳号
+        // （缺包），>= 32768 表示后向乱序或方向歧义。
+        const int delta_from_expected =
+            ctrForwardDistance(expected, frame.header.ctr);
+
+        if (delta_from_expected == 0) {
+            // 与期望值相同不可能走到这里（上面已判等），保留为防御分支
+            m_last_recv_ctr_ = frame.header.ctr;
+            return true;
+        }
+        if (delta_from_expected == 0x8000) {
+            // 恰好相差 0x8000：方向歧义，丢弃（§8.1 第 6 条 / D5）
+            // 诊断文本中的差值使用十六进制，便于与 §8.1 条款和测试断言逐字
+            // 对应。
+            warning = "CTR 与期望值差 0x8000，方向歧义，已丢弃: " +
+                      std::to_string(frame.header.ctr);
+            deliver = false;
+        } else if (delta_from_expected > 0 &&
+                   delta_from_expected < 0x8000) {
+            // 前向跳号：接收、报告缺口、推进（§8.1 第 4 条）
+            warning = "CTR 前向跳号，疑似缺包：期望 " + ctrToHex(expected) +
+                      "，实收 " + ctrToHex(frame.header.ctr) + "，缺口 " +
+                      std::to_string(delta_from_expected);
+            m_last_recv_ctr_ = frame.header.ctr;
+            deliver = true;
+        } else {
+            // 后向（distance 落在 0x8001..0xFFFF）：重复或迟到乱序，丢弃
+            // （§8.1 第 5 条）
+            warning = "丢弃重复/后向乱序 CTR: " + ctrToHex(frame.header.ctr) +
+                      "，最近值 " + ctrToHex(previous);
+            deliver = false;
+        }
     }
 
-    // 后向（distance 落在 0x8001..0xFFFF）：重复或迟到乱序，丢弃（§8.1 第 5
-    // 条）
-    if (listener != nullptr) {
-        listener->OnTransportWarning(
-            "丢弃重复/后向乱序 CTR: " + ctrToHex(frame.header.ctr) +
-            "，最近值 " + ctrToHex(previous));
+    // 锁已释放：此处回调监听器不会与其重入的 LastReceiveCtr() 争用同一把
+    // 非递归锁（B-01）。
+    if (!warning.empty()) {
+        NotifyWarning(warning);
     }
-    return false;
+    return deliver;
 }
 
 }  // namespace calmcar::xcp

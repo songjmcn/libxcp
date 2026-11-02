@@ -27,6 +27,7 @@
 #define CALMCAR_XCP_TCP_TRANSPORT_HPP_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -104,7 +105,11 @@ public:
 
     /**
      * @brief 关闭通道：通知接收线程退出、打断阻塞 `recv`、join，并关闭连接
-     * @note 可安全重复调用；可从监听器回调内调用
+     * @note 可安全重复调用，可从任意线程调用（含监听器回调内）。
+     *       从监听器回调内调用时**只发出关闭请求并立即返回**：不 join、
+     *       不阻塞，避免"接收线程 join 自己"触发 `std::terminate`；
+     *       句柄关闭与解码器释放等收尾工作由析构函数或后续任意线程的
+     *       `Close()` 完成。
      */
     void Close() override;
 
@@ -134,6 +139,22 @@ public:
     [[nodiscard]] std::uint64_t DeliveredFrameCount() const noexcept;
 
 private:
+    /// @brief 生命周期状态：关闭 → 打开 → 关闭中（收尾完成后再回到关闭）
+    enum class LifecycleState { Closed, Open, Closing };
+
+    /// @brief 当前线程是否就是接收线程
+    /// @return true 表示调用发生在接收线程内（用于识别"回调内 Close"）
+    [[nodiscard]] bool IsReceiveThread() const noexcept;
+
+    /// @brief 打断接收线程的阻塞 IO（`Close()` 的第一步）
+    /// @note 只调用 `shutdown()`，不关闭句柄：句柄回收要等接收线程 join 之后
+    void SignalShutdown();
+
+    /// @brief 关闭收尾：关闭句柄并释放解码器与监听器
+    /// @pre 接收线程已 join（或从未启动）
+    /// @note 必须在持有 `m_lifecycle_mutex_` 时调用，保证只被执行一次
+    void ReleaseResources();
+
     /// @brief 接收线程主体：循环 `recv` → 投喂解码器 → 交付 Frame
     /// @details 退出前回调 `OnTransportClosed()`；解码器报告不可恢复畸形时
     ///          以"流失步"原因退出并**不**尝试重同步
@@ -196,13 +217,32 @@ private:
     /// @brief 收包监听器（非拥有）；`Open()` 写入、`Close()` 置空
     IPacketListener* m_listener_{nullptr};
     /// @brief 平台 Socket 实现（pimpl，隔离 Windows/POSIX 差异）
-    std::unique_ptr<SocketImpl> m_socket_;
+    /// @details 用 `shared_ptr` 而非 `unique_ptr`：`Send()` 可能在 `Close()`
+    ///          释放成员的同时仍在使用句柄，取一份快照即可保证对象存活到
+    ///          本次发送结束，避免悬垂引用。
+    std::shared_ptr<SocketImpl> m_socket_;
     /// @brief 流式解码器（仅在接收线程内使用，生命周期与打开期一致）
     std::unique_ptr<TcpStreamDecoder> m_decoder_;
     /// @brief 接收线程；仅在打开期间 joinable
     std::thread m_receive_thread_;
     /// @brief 接收线程运行标记；`Close()` 置 false 并通过 shutdown 立即打断
     std::atomic<bool> m_running_{false};
+
+    /// @brief 保护生命周期状态迁移（`m_state_` / `m_finalize_owned_`）
+    /// @note 绝不与 `m_send_mutex_` 嵌套持有；锁内不做任何 Socket IO
+    mutable std::mutex m_lifecycle_mutex_;
+    /// @brief 等待"关闭收尾完成"的线程在此阻塞
+    std::condition_variable m_close_cv_;
+    /// @brief 当前生命周期状态
+    LifecycleState m_state_{LifecycleState::Closed};
+    /// @brief 是否已有线程认领关闭收尾（负责 join 与资源释放）
+    /// @details 并发 `Close()` 时只有认领者执行收尾，其余线程在此条件变量上
+    ///          等待，从根上消除"同一 std::thread 被 join 两次"导致的崩溃。
+    bool m_finalize_owned_{false};
+    /// @brief 接收线程身份；由接收线程入口写入
+    /// @details 用于识别"监听器回调内调用 `Close()`"这一合法但危险的情形：
+    ///          此时不能 join 自己，只能登记关闭请求后立即返回。
+    std::thread::id m_receive_tid_{};
     /// @brief 保护发送路径与发送 CTR（保证 CTR 顺序 == 写入顺序）
     mutable std::mutex m_send_mutex_;
     /// @brief 下一个待分配的 Frame CTR

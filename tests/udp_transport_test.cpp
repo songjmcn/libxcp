@@ -1422,5 +1422,142 @@ TEST(UdpTransportCtrSemantics, ResponseMatchingDoesNotDependOnRequestCtr) {
     slave.Stop();
 }
 
+// --------------------------------------------------------------------------
+// 生命周期线程安全：Close() 并发、回调内 Close、告警回调重入、
+// Send 与 Close 竞态（发布门批次 1 回归，B-01/B-02/B-03/B-04）
+// --------------------------------------------------------------------------
+
+TEST(UdpTransportLifecycle, ConcurrentCloseFromTwoThreadsIsSafe) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    UdpTransport transport(MakeConfig(slave.Port()));
+    RecordingListener listener;
+    transport.Open(listener);
+
+    // 两个线程同时关闭：旧实现会双 join + 双向 close 同一句柄 + 双 reset
+    std::thread first([&transport] { transport.Close(); });
+    std::thread second([&transport] { transport.Close(); });
+    first.join();
+    second.join();
+
+    EXPECT_FALSE(transport.IsOpen());
+    // 关闭回调仍必须交付（且由接收线程唯一一次交付）
+    EXPECT_TRUE(listener.closed());
+    slave.Stop();
+}
+
+/// @brief 在收包回调里请求关闭的监听器（B-04 回归）
+/// @details 回调运行在接收线程上；若 Close() 在回调内 join 接收线程自己，
+///          旧实现会 std::terminate 或只完成一半清理。
+class ClosingOnPacketListener : public RecordingListener {
+public:
+    /// @brief 绑定待关闭的 Transport（非拥有）
+    void SetTransport(UdpTransport* transport) { m_transport_ = transport; }
+
+    void OnPacketReceived(BytesView packet) override {
+        RecordingListener::OnPacketReceived(packet);
+        if (m_transport_ != nullptr) {
+            m_transport_->Close();  // 必须立即返回，不得阻塞或终止进程
+        }
+    }
+
+private:
+    UdpTransport* m_transport_{nullptr};
+};
+
+TEST(UdpTransportLifecycle, CloseFromPacketCallbackReturnsImmediately) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    UdpTransport transport(MakeConfig(slave.Port()));
+    ClosingOnPacketListener listener;
+    listener.SetTransport(&transport);
+    transport.Open(listener);
+
+    transport.Send(BytesView{BytesOf({0xFF, 0x00})});
+    // 接收线程在回调内发起关闭后应能正常退出并交付 OnTransportClosed
+    EXPECT_TRUE(listener.WaitForClose(std::chrono::seconds(3)));
+
+    // 收尾由非接收线程完成：重复 Close 是幂等的
+    transport.Close();
+    EXPECT_FALSE(transport.IsOpen());
+    slave.Stop();
+}
+
+/// @brief 在告警回调里回读 CTR 的监听器（B-01 回归）
+/// @details 旧实现在持有接收锁时调用告警回调，回调再调用
+///          LastReceiveCtr() 会二次加同一把非递归锁，异常穿过 noexcept
+///          边界直接 std::terminate。
+class ReentrantWarningListener : public RecordingListener {
+public:
+    /// @brief 绑定待回读的 Transport（非拥有）
+    void SetTransport(UdpTransport* transport) { m_transport_ = transport; }
+
+    void OnTransportWarning(std::string_view message) override {
+        RecordingListener::OnTransportWarning(message);
+        if (m_transport_ != nullptr) {
+            (void)m_transport_->LastReceiveCtr();  // 不得死锁/终止
+            m_reentered.store(true);
+        }
+    }
+
+    /// @brief 告警回调是否被重入过
+    [[nodiscard]] bool Reentered() const { return m_reentered.load(); }
+
+private:
+    UdpTransport* m_transport_{nullptr};
+    std::atomic<bool> m_reentered{false};
+};
+
+TEST(UdpTransportLifecycle, WarningCallbackMayReadLastReceiveCtr) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    UdpTransport transport(MakeConfig(slave.Port()));
+    ReentrantWarningListener listener;
+    listener.SetTransport(&transport);
+    transport.Open(listener);
+
+    transport.Send(BytesView{BytesOf({0xFF, 0x00})});
+    ASSERT_TRUE(listener.WaitForPackets(1, std::chrono::seconds(2)));
+
+    // 制造前向跳号以触发告警回调
+    test::FaultInjection fault;
+    fault.jump_ctr_n = 1;
+    slave.SetFaultInjection(fault);
+    transport.Send(BytesView{BytesOf({0xFD, 0x00})});
+
+    EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    EXPECT_TRUE(listener.Reentered());
+    transport.Close();
+    slave.Stop();
+}
+
+TEST(UdpTransportLifecycle, SendRacingCloseDoesNotCrash) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    UdpTransport transport(MakeConfig(slave.Port()));
+    RecordingListener listener;
+    transport.Open(listener);
+
+    std::atomic<bool> stop{false};
+    std::thread sender([&transport, &stop] {
+        while (!stop.load(std::memory_order_acquire)) {
+            try {
+                transport.Send(BytesView{BytesOf({0xFD, 0x00})});
+            } catch (...) {
+                // 关闭过程中发送被拒是允许的结果，不得崩溃
+            }
+        }
+    });
+
+    // 让发送线程跑起来后再关闭，覆盖 Send 与 Close 的竞态
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    transport.Close();
+    stop.store(true, std::memory_order_release);
+    sender.join();
+
+    EXPECT_FALSE(transport.IsOpen());
+    slave.Stop();
+}
+
 }  // namespace
 }  // namespace calmcar::xcp

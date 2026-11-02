@@ -120,6 +120,27 @@ TcpTransport::~TcpTransport() {
         Close();
     } catch (...) {
     }
+    // 若 Close() 是"从接收线程回调内发起"的降级路径，收尾会被延后；此处
+    // 对象正在销毁，接收线程必然已收到关闭请求。先 join（线程已退出，
+    // join 立即返回），再补做一次资源释放，保证句柄不泄漏。
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        if (m_state_ != LifecycleState::Closed) {
+            m_running_.store(false, std::memory_order_release);
+            m_state_ = LifecycleState::Closing;
+        }
+    }
+    if (m_receive_thread_.joinable()) {
+        m_receive_thread_.join();
+    }
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        if (m_state_ == LifecycleState::Closing) {
+            ReleaseResources();
+            m_state_ = LifecycleState::Closed;
+            m_close_cv_.notify_all();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +240,7 @@ void TcpTransport::Open(IPacketListener& listener) {
         m_config_.wire_profile, m_config_.packet_alignment, decoder_limit);
 
     // ---- 创建 Socket 并建立连接 ----
-    auto impl = std::make_unique<SocketImpl>();
+    auto impl = std::make_shared<SocketImpl>();
     impl->handle = ops.create(detail::SocketKind::Tcp);
     if (impl->handle == detail::kInvalidSocketHandle) {
         const auto error = ops.last_error();
@@ -227,7 +248,7 @@ void TcpTransport::Open(IPacketListener& listener) {
         m_decoder_.reset();
         throw detail::MakeTransportError("创建 TCP Socket 失败", error);
     }
-    m_socket_ = std::move(impl);
+    m_socket_ = impl;
 
     try {
         EstablishConnection();
@@ -259,7 +280,15 @@ void TcpTransport::Open(IPacketListener& listener) {
 
     m_running_.store(true, std::memory_order_release);
     try {
-        m_receive_thread_ = std::thread([this] { ReceiveLoop(); });
+        // 接收线程入口先登记自己的身份：`Close()` 据此识别"回调内关闭"，
+        // 从而避免 join 自己导致的 std::terminate。
+        m_receive_thread_ = std::thread([this] {
+            {
+                const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+                m_receive_tid_ = std::this_thread::get_id();
+            }
+            ReceiveLoop();
+        });
     } catch (const std::system_error& e) {
         LIBXCP_LOG_ERROR("TCP receive thread creation failed: {}", e.what());
         m_running_.store(false, std::memory_order_release);
@@ -272,6 +301,14 @@ void TcpTransport::Open(IPacketListener& listener) {
         m_decoder_.reset();
         m_listener_ = nullptr;
         throw detail::MakeTransportError("启动接收线程失败", e.what());
+    }
+
+    // 线程起来之后才对外公布"已打开"：`Close()` 看到 `Open` 时线程必然
+    // 已是 joinable 状态。`Open()` 与 `Close()` 不得并发调用（见类文档）。
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        m_state_ = LifecycleState::Open;
+        m_finalize_owned_ = false;
     }
     LIBXCP_LOG_INFO(
         "TCP transport open profile={} local={}:{} remote={}:{} role={}",
@@ -502,45 +539,92 @@ void TcpTransport::ListenAndAccept() {
     }
 }
 
-void TcpTransport::Close() {
+bool TcpTransport::IsReceiveThread() const noexcept {
+    return m_receive_tid_ != std::thread::id{} &&
+           std::this_thread::get_id() == m_receive_tid_;
+}
+
+void TcpTransport::SignalShutdown() {
+    // 快照句柄：shutdown 不释放句柄号，因此不存在"句柄被 OS 回收后分配给
+    // 本进程新建 Socket"的复用风险（对比：直接 close 会有该风险，而接收
+    // 线程此刻仍可能在使用这个句柄）。
+    // 注意：shutdown **不是**接收线程的退出手段。Winsock 上它不会取消已
+    // 挂起的阻塞 recv()（详见 kReceivePollSliceMs 的说明），接收线程的退出
+    // 由 m_running_ + 轮询片保证。
+    const auto sock = m_socket_;
+    if (sock != nullptr && sock->handle != detail::kInvalidSocketHandle) {
+        (void)detail::CurrentSocketOps().shutdown_socket(sock->handle);
+    }
+}
+
+void TcpTransport::ReleaseResources() {
     auto& ops = detail::CurrentSocketOps();
-
-    // 1. 通知接收线程退出
-    m_running_.store(false, std::memory_order_release);
-
-    // 2. 让对端尽快观察到 FIN。shutdown 不释放句柄号，因此不存在"句柄被
-    //    OS 回收后分配给本进程新建 Socket"的复用风险（对比：直接 close 会有
-    //    该风险，而接收线程此刻仍可能在使用这个句柄）。
-    //    注意：shutdown **不是**接收线程的退出手段。Winsock 上它不会取消
-    //    已挂起的阻塞 recv()（详见 kReceivePollSliceMs 的说明），接收线程的
-    //    退出由 m_running_ + 轮询片保证。
-    if (m_socket_ != nullptr &&
-        m_socket_->handle != detail::kInvalidSocketHandle) {
-        (void)ops.shutdown_socket(m_socket_->handle);
-    }
-
-    // 3. 等待接收线程结束（其退出前负责回调 OnTransportClosed）。
-    //    最坏退出延迟为一个轮询片，与对端是否发数据无关。
-    if (m_receive_thread_.joinable()) {
-        m_receive_thread_.join();
-    }
-
-    // 4. 线程已停，此处关闭句柄不再存在竞态
-    if (m_socket_ != nullptr) {
-        if (m_socket_->handle != detail::kInvalidSocketHandle) {
-            ops.close(m_socket_->handle);
-            m_socket_->handle = detail::kInvalidSocketHandle;
+    // 线程已停，此处关闭句柄不再存在竞态；用快照保证即使有发送线程仍持有
+    // 引用，关闭动作也只发生一次（句柄已置无效后不会被二次 close）。
+    const auto sock = m_socket_;
+    if (sock != nullptr) {
+        if (sock->handle != detail::kInvalidSocketHandle) {
+            ops.close(sock->handle);
+            sock->handle = detail::kInvalidSocketHandle;
         }
-        if (m_socket_->listen_handle != detail::kInvalidSocketHandle) {
-            ops.close(m_socket_->listen_handle);
-            m_socket_->listen_handle = detail::kInvalidSocketHandle;
+        if (sock->listen_handle != detail::kInvalidSocketHandle) {
+            ops.close(sock->listen_handle);
+            sock->listen_handle = detail::kInvalidSocketHandle;
         }
     }
     m_socket_.reset();
-    // 5. 解码器随之释放：重连时会重新构造，保证不携带上一条连接的状态
+    // 解码器随之释放：重连时会重新构造，保证不携带上一条连接的状态
     m_decoder_.reset();
     m_listener_ = nullptr;
+    m_receive_tid_ = std::thread::id{};
     m_bound_local_port_.store(0, std::memory_order_release);
+}
+
+void TcpTransport::Close() {
+    std::unique_lock<std::mutex> lock(m_lifecycle_mutex_);
+
+    if (m_state_ == LifecycleState::Closed) {
+        return;  // 幂等：重复关闭直接返回
+    }
+
+    const bool from_receive_thread = IsReceiveThread();
+
+    if (m_state_ == LifecycleState::Closing) {
+        // 已有线程在关闭中
+        if (from_receive_thread) {
+            return;  // 回调内重复关闭：只登记意图，不参与收尾
+        }
+        if (m_finalize_owned_) {
+            // 收尾已被别的线程认领：等待其完成，绝不第二次 join 同一线程
+            m_close_cv_.wait(lock, [this] {
+                return m_state_ == LifecycleState::Closed;
+            });
+            return;
+        }
+        // 收尾尚未被认领（此前由接收线程在回调内发起）：由本线程接管
+        m_finalize_owned_ = true;
+    } else {
+        // Open → Closing：先置退出标记并打断阻塞 IO，收尾必须等 join 之后
+        m_state_ = LifecycleState::Closing;
+        m_running_.store(false, std::memory_order_release);
+        SignalShutdown();
+        if (from_receive_thread) {
+            // 回调内关闭：不能 join 自己，收尾延后到析构或后续 Close()
+            return;
+        }
+        m_finalize_owned_ = true;
+    }
+
+    // join 不能在持锁时进行：接收线程可能正在等这把锁（例如它在回调里
+    // 调用了 Close()），持锁 join 会立即自锁。
+    lock.unlock();
+    if (m_receive_thread_.joinable()) {
+        m_receive_thread_.join();
+    }
+    lock.lock();
+    ReleaseResources();
+    m_state_ = LifecycleState::Closed;
+    m_close_cv_.notify_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -603,10 +687,17 @@ void TcpTransport::WriteFrame(BytesView packet, DatagramCtr ctr) {
 
 void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
     auto& ops = detail::CurrentSocketOps();
+    // 句柄快照：`Close()` 可能与本函数并发，取一份 shared_ptr 保证整个写出
+    // 过程里句柄对象不被释放（`ReleaseResources()` 会先把 handle 置无效，
+    // 因此快照即便存活也不会被二次 close）。
+    const auto sock = m_socket_;
+    if (sock == nullptr || sock->handle == detail::kInvalidSocketHandle) {
+        throw detail::MakeInvalidState("TcpTransport 未打开时调用 send()");
+    }
     std::size_t written = 0;
 
     while (written < size && m_running_.load(std::memory_order_acquire)) {
-        const int sent = ops.send(m_socket_->handle, data + written,
+        const int sent = ops.send(sock->handle, data + written,
                                   size - written, /*no_signal=*/true);
         if (sent > 0) {
             written += static_cast<std::size_t>(sent);
@@ -633,7 +724,7 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
             // 而不是让调用线程无限期挂住。
             std::string wait_error;
             const int ready = ops.wait_writable(
-                m_socket_->handle, m_config_.send_timeout_ms, &wait_error);
+                sock->handle, m_config_.send_timeout_ms, &wait_error);
             if (ready > 0) {
                 continue;
             }
@@ -694,6 +785,12 @@ void TcpTransport::ReceiveLoop() {
     IPacketListener* listener = m_listener_;
     std::string close_reason = "Transport 正常关闭";
     std::vector<std::uint8_t> buffer(m_config_.receive_chunk_size);
+    // 句柄快照：本线程存活期间 socket 不会被释放（Close() 先 join 再释放
+    // 资源），快照只是让读取路径不必反复解引用 shared_ptr 成员。
+    const auto sock = m_socket_;
+    if (sock == nullptr || sock->handle == detail::kInvalidSocketHandle) {
+        return;  // 句柄已失效：没有可读的流，直接退出
+    }
 
     while (m_running_.load(std::memory_order_acquire)) {
         // ---- 先带超时等可读，再 recv ----
@@ -702,7 +799,7 @@ void TcpTransport::ReceiveLoop() {
         // 有详细说明）。等待超时即回到 while 顶部重新检查关闭标记，于是退出
         // 延迟有明确上界，且收包延迟不受影响（数据到达即刻唤醒）。
         std::string wait_error;
-        const int ready = ops.wait_readable(m_socket_->handle,
+        const int ready = ops.wait_readable(sock->handle,
                                             kReceivePollSliceMs, &wait_error);
         if (ready == 0) {
             continue;  // 轮询片超时：回到 while 重判退出条件
@@ -722,7 +819,7 @@ void TcpTransport::ReceiveLoop() {
         }
 
         const int received =
-            ops.recv(m_socket_->handle, buffer.data(), buffer.size());
+            ops.recv(sock->handle, buffer.data(), buffer.size());
 
         if (received > 0) {
             LIBXCP_LOG_INFO("TCP RX bytes={}", received);
