@@ -12,6 +12,7 @@
 #include "libxcp/tcp_transport.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -469,13 +470,10 @@ void TcpTransport::ConnectWithTimeout(const void* addr, std::size_t addr_len) {
             "SO_ERROR=" + std::to_string(so_error));
     }
 
-    // 恢复阻塞模式：发送路径依赖"可写等待 + 阻塞 send"的组合，
-    // 若保持非阻塞，send 会在缓冲满时返回 EAGAIN 而让 WriteAll 空转。
-    if (ops.set_blocking(m_socket_->handle) != 0) {
-        const auto error = ops.last_error();
-        LIBXCP_LOG_ERROR("TCP restore blocking failed: {}", error);
-        throw detail::MakeTransportError("恢复 TCP 阻塞模式失败", error);
-    }
+    // 连接建立后**保持非阻塞**：发送路径用"非阻塞 send + wait_writable
+    // (deadline)"组合，send_timeout_ms 才是真正的耗时上界（A-01）。
+    // 若在此恢复阻塞模式，内核会让 send() 一直睡到对端腾出接收窗口，
+    // 配置的发送超时形同虚设（这正是修复前的实际行为）。
 }
 
 void TcpTransport::ListenAndAccept() {
@@ -532,11 +530,7 @@ void TcpTransport::ListenAndAccept() {
     m_socket_->handle = accepted;
     m_socket_->bound_local = peer;
 
-    if (ops.set_blocking(m_socket_->handle) != 0) {
-        const auto error = ops.last_error();
-        LIBXCP_LOG_ERROR("TCP accepted restore blocking failed: {}", error);
-        throw detail::MakeTransportError("恢复 TCP 阻塞模式失败", error);
-    }
+    // 同上：accept 得到的连接保持非阻塞，发送与接收统一由 wait_* + 超时驱动。
 }
 
 bool TcpTransport::IsReceiveThread() const noexcept {
@@ -554,6 +548,20 @@ void TcpTransport::SignalShutdown() {
     const auto sock = m_socket_;
     if (sock != nullptr && sock->handle != detail::kInvalidSocketHandle) {
         (void)detail::CurrentSocketOps().shutdown_socket(sock->handle);
+    }
+}
+
+void TcpTransport::AbortConnection(const std::string& reason) noexcept {
+    try {
+        // 发送侧已判定通道不可继续使用（例如等待可写超时）：主动置停并
+        // shutdown，让接收线程尽快退出并把关闭事件交付给监听器，而不是
+        // 让连接停留在"能发不能收"的半可用状态。
+        if (m_running_.exchange(false, std::memory_order_acq_rel)) {
+            LIBXCP_LOG_WARNING("TCP connection aborted: {}", reason);
+            SignalShutdown();
+        }
+    } catch (...) {
+        // 断连路径本身不允许抛出：调用方此时已经在抛发送异常的路上。
     }
 }
 
@@ -635,6 +643,20 @@ void TcpTransport::Send(BytesView packet) {
     std::lock_guard<std::mutex> lock(m_send_mutex_);
 
     if (!IsOpen()) {
+        // 区分"从未打开"与"曾经打开但通道已失效"：对端断开（接收线程检测到
+        // EOF/RST 后置停运行标志）或发送超时主动断连都属于后者，调用方应据此
+        // 走断连恢复，而不是被当成用法错误（A-05）。
+        bool ever_opened = false;
+        {
+            const std::lock_guard<std::mutex> lifecycle_lock(
+                m_lifecycle_mutex_);
+            ever_opened = m_state_ != LifecycleState::Closed;
+        }
+        if (ever_opened) {
+            LIBXCP_LOG_ERROR("TCP send rejected because connection is closed");
+            throw detail::MakeTransportError(
+                "TCP 发送失败：通道已关闭（对端断开、发送超时或正在关闭）");
+        }
         LIBXCP_LOG_ERROR("TCP send rejected because transport is closed");
         throw detail::MakeInvalidState("TcpTransport 未打开时调用 send()");
     }
@@ -651,12 +673,8 @@ void TcpTransport::Send(BytesView packet) {
             std::to_string(m_config_.max_packet_size));
     }
 
-    // CTR 在同一把锁下取值并递增：CTR 分配顺序必须与写入顺序严格一致，
-    // 否则对端会看到乱序 CTR 并（按 §8.1 等价规则）丢弃我们的帧。
-    const auto ctr = m_send_ctr_.load(std::memory_order_relaxed);
-    m_send_ctr_.store(static_cast<DatagramCtr>(ctr + 1U),
-                      std::memory_order_relaxed);
-
+    // 先校验帧长再分配 CTR：被本地参数校验拒绝的发送不会写上线，
+    // 若先递增 CTR 就会给对端留下无法解释的缺口（A-03）。
     if (packet.size() > m_config_.max_frame_packet_size) {
         LIBXCP_LOG_ERROR("TCP send rejected XCP packet bytes={} frame max={}",
                          packet.size(), m_config_.max_frame_packet_size);
@@ -665,6 +683,12 @@ void TcpTransport::Send(BytesView packet) {
             " 超过配置上限 max_frame_packet_size=" +
             std::to_string(m_config_.max_frame_packet_size));
     }
+
+    // CTR 在同一把锁下取值并递增：CTR 分配顺序必须与写入顺序严格一致，
+    // 否则对端会看到乱序 CTR 并（按 §8.1 等价规则）丢弃我们的帧。
+    const auto ctr = m_send_ctr_.load(std::memory_order_relaxed);
+    m_send_ctr_.store(static_cast<DatagramCtr>(ctr + 1U),
+                      std::memory_order_relaxed);
 
     WriteFrame(packet, ctr);
 }
@@ -695,6 +719,11 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
         throw detail::MakeInvalidState("TcpTransport 未打开时调用 send()");
     }
     std::size_t written = 0;
+    // 整帧共用一个 deadline：若每次可写都重新计时，慢速对端能把一次 Send
+    // 拖成无限长，send_timeout_ms 就不是上界了（A-01）。
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(m_config_.send_timeout_ms);
 
     while (written < size && m_running_.load(std::memory_order_acquire)) {
         const int sent = ops.send(sock->handle, data + written,
@@ -720,17 +749,29 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
             throw detail::MakeTransportError("TCP 发送失败：连接已断开", error);
         }
         if (ops.is_would_block()) {
-            // 内核发送缓冲已满（对端停止读取）。等待可写，给出明确超时上界，
-            // 而不是让调用线程无限期挂住。
+            // 内核发送缓冲已满（对端停止读取）。按剩余 deadline 等待可写，
+            // 保证一次 Send 的总耗时不超过 send_timeout_ms。
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0) {
+                LIBXCP_LOG_ERROR("TCP send timeout pending_bytes={} timeout={}",
+                                 size - written, m_config_.send_timeout_ms);
+                AbortConnection("sending timed out");
+                throw MakeSendTimeoutError(size - written,
+                                           m_config_.send_timeout_ms);
+            }
             std::string wait_error;
             const int ready = ops.wait_writable(
-                sock->handle, m_config_.send_timeout_ms, &wait_error);
+                sock->handle, static_cast<std::uint32_t>(remaining.count()),
+                &wait_error);
             if (ready > 0) {
                 continue;
             }
             if (ready == 0) {
                 LIBXCP_LOG_ERROR("TCP send timeout pending_bytes={} timeout={}",
                                  size - written, m_config_.send_timeout_ms);
+                AbortConnection("sending timed out");
                 throw MakeSendTimeoutError(size - written,
                                            m_config_.send_timeout_ms);
             }
@@ -746,13 +787,14 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
     }
 
     if (written < size) {
-        // 走到这里说明 m_running_ 在发送过程中被置否：Close() 与本 Send()
-        // 并发。这不是对端故障，按"通道已关闭"上报，避免调用方触发恢复。
-        LIBXCP_LOG_ERROR("TCP send aborted by close pending_bytes={}",
-                         size - written);
-        throw detail::MakeInvalidState("TCP 发送被 Close() 中断：" +
-                                       std::to_string(size - written) +
-                                       " 字节未写出");
+        // m_running_ 在写出过程中被置否：可能是 Close() 并发，也可能是
+        // 发送超时后主动断连。两种情况都属于"通道已不可用"，而不是调用方
+        // 用法错误，因此按 TransportError 上报——上层应走断连恢复而非抛
+        // InvalidState（A-05）。
+        LIBXCP_LOG_ERROR("TCP send aborted pending_bytes={}", size - written);
+        throw detail::MakeTransportError(
+            "TCP 发送失败：通道已关闭，" + std::to_string(size - written) +
+            " 字节未写出");
     }
 }
 

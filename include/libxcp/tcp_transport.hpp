@@ -150,6 +150,12 @@ private:
     /// @note 只调用 `shutdown()`，不关闭句柄：句柄回收要等接收线程 join 之后
     void SignalShutdown();
 
+    /// @brief 发送路径判定通道不可继续使用时主动断连
+    /// @param reason 断连原因（仅用于日志）
+    /// @details 置 `m_running_` 为 false 并 shutdown Socket，接收线程会在下一个
+    ///          轮询片退出并通过 `OnTransportClosed` 交付关闭事件。可从发送线程调用。
+    void AbortConnection(const std::string& reason) noexcept;
+
     /// @brief 关闭收尾：关闭句柄并释放解码器与监听器
     /// @pre 接收线程已 join（或从未启动）
     /// @note 必须在持有 `m_lifecycle_mutex_` 时调用，保证只被执行一次

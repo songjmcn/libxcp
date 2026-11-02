@@ -524,10 +524,9 @@ void UdpTransport::Send(BytesView packet) {
             std::to_string(m_config_.max_frame_packet_size));
     }
 
-    // 取 CTR 并按模 65536 递增（每个 XCP Frame 消耗一个值，而非每个 Datagram）
+    // 先用"暂定 CTR"编码并校验长度，全部通过后才真正消耗 CTR：被本地校验
+    // 拒绝的发送不会写上线，若先递增就会给对端留下无法解释的缺口（T-01）。
     const auto ctr = m_send_ctr_.load(std::memory_order_relaxed);
-    m_send_ctr_.store(static_cast<DatagramCtr>(ctr + 1U),
-                      std::memory_order_relaxed);
 
     UdpFrame frame;
     try {
@@ -538,8 +537,7 @@ void UdpTransport::Send(BytesView packet) {
     } catch (...) {
         LIBXCP_LOG_ERROR("UDP frame encoding failed ctr={} xcp_bytes={}", ctr,
                          packet.size());
-        // 编码失败不回退 CTR：保持"发送方向每 Frame 独立消耗一个
-        // CTR"的可观察语义
+        // 编码失败同样不推进 CTR：没有帧写上线，就不应留下缺口。
         throw;
     }
 
@@ -551,6 +549,10 @@ void UdpTransport::Send(BytesView packet) {
             " 超过配置上限 max_datagram_size=" +
             std::to_string(m_config_.max_datagram_size));
     }
+
+    // 帧即将上线：此处才消耗 CTR，保证"线上的 CTR 序列无缺口"。
+    m_send_ctr_.store(static_cast<DatagramCtr>(ctr + 1U),
+                      std::memory_order_relaxed);
 
     const int sent = detail::CurrentSocketOps().send_to(
         sock->handle, frame.data.data(), frame.data.size(), sock->remote);

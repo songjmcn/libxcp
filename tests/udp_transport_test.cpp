@@ -1560,4 +1560,30 @@ TEST(UdpTransportLifecycle, SendRacingCloseDoesNotCrash) {
 }
 
 }  // namespace
+// ---------------------------------------------------------------------------
+// 批次 2 回归：T-01 被本地长度校验拒绝的发送不得消耗 CTR
+// ---------------------------------------------------------------------------
+
+TEST(UdpTransportSend, RejectedOversizeDatagramDoesNotConsumeSendCtr) {
+    test::UdpTestSlave slave;
+    slave.Start();
+    auto cfg = MakeConfig(slave.Port());
+    cfg.max_datagram_size = 64;
+    UdpTransport transport(cfg);
+    RecordingListener listener;
+    transport.Open(listener);
+
+    const Bytes too_long(200, 0x00);
+    EXPECT_THROW(transport.Send(BytesView{too_long}), XcpException);
+    // 编码后被长度校验拒绝：没有 Datagram 上线，CTR 不得前进。
+    EXPECT_EQ(transport.SendCtr(), 0U);
+
+    const Bytes fits(8, 0x00);
+    EXPECT_NO_THROW(transport.Send(BytesView{fits}));
+    EXPECT_EQ(transport.SendCtr(), 1U);
+
+    transport.Close();
+    slave.Stop();
+}
+
 }  // namespace calmcar::xcp

@@ -1382,4 +1382,109 @@ TEST_F(TcpEndToEndTest, SendRacingCloseDoesNotCrash) {
     EXPECT_FALSE(transport.IsOpen());
 }
 
+// ---------------------------------------------------------------------------
+// 批次 2 回归：发送路径
+//   A-01 对端停止读取时 Send 必须在 send_timeout_ms 附近失败并主动断连
+//   A-03 被本地帧长校验拒绝的发送不得消耗 CTR
+//   A-05 通道已不可用时 Send 报 TransportError 而不是 InvalidState
+// ---------------------------------------------------------------------------
+
+TEST_F(TcpEndToEndTest, RejectedOversizeFrameDoesNotConsumeSendCtr) {
+    const std::uint16_t port = StartRawListener();
+    ASSERT_NE(port, 0U);
+    TcpTransportConfig cfg = MakeMasterConfig(port);
+    cfg.max_frame_packet_size = 4;
+    // listener 必须先于 transport 声明：析构顺序与声明顺序相反，否则接收线程
+    // 可能在本对象析构后仍回调（TSan 已实测到 use-after-free）。
+    RecordingListener listener;
+    TcpTransport transport(cfg);
+    std::thread accept_thread([this] { AcceptPeer(); });
+    transport.Open(listener);
+    accept_thread.join();
+    ASSERT_NE(m_peer_handle, kRawInvalid);
+
+    const Bytes too_long(5, 0x00);
+    EXPECT_THROW(transport.Send(BytesView{too_long}), XcpException);
+    // 帧从未写上线，因此线上 CTR 序列不得出现缺口。
+    EXPECT_EQ(transport.SendCtr(), 0U);
+
+    const Bytes fits{0xFD, 0x00, 0x00, 0x00};
+    EXPECT_NO_THROW(transport.Send(BytesView{fits}));
+    EXPECT_EQ(transport.SendCtr(), 1U);
+    transport.Close();
+}
+
+TEST_F(TcpEndToEndTest, SendFailsWithinTimeoutWhenPeerStopsReading) {
+    const std::uint16_t port = StartRawListener();
+    ASSERT_NE(port, 0U);
+    TcpTransportConfig cfg = MakeMasterConfig(port);
+    cfg.send_timeout_ms = 300;
+    RecordingListener listener;
+    TcpTransport transport(cfg);
+    std::thread accept_thread([this] { AcceptPeer(); });
+    transport.Open(listener);
+    accept_thread.join();
+    ASSERT_NE(m_peer_handle, kRawInvalid);
+
+    // 对端压低接收窗口并完全不读，发送缓冲应在少量帧之后耗尽。
+    int small = 4096;
+    ::setsockopt(m_peer_handle, SOL_SOCKET, SO_RCVBUF,
+                 reinterpret_cast<const char*>(&small), sizeof(small));
+
+    const Bytes payload(60000, 0x5A);
+    const auto started = std::chrono::steady_clock::now();
+    bool failed = false;
+    std::string message;
+    for (int attempt = 0; attempt < 64 && !failed; ++attempt) {
+        try {
+            transport.Send(BytesView{payload});
+        } catch (const XcpException& error) {
+            failed = true;
+            message = error.what();
+        }
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started);
+
+    EXPECT_TRUE(failed) << "对端停止读取后 Send 必须超时返回，而不是无限阻塞";
+    EXPECT_NE(message.find("超时"), std::string::npos) << message;
+    // 上界只需远小于"永久阻塞"：正常失败时 elapsed 约等于 send_timeout_ms。
+    EXPECT_LT(elapsed.count(), 10000);
+    // 发送超时后主动断连：通道不应再被视为可用。
+    EXPECT_FALSE(transport.IsOpen());
+    transport.Close();
+}
+
+TEST_F(TcpEndToEndTest, SendAfterPeerDisconnectReportsTransportError) {
+    const std::uint16_t port = StartRawListener();
+    ASSERT_NE(port, 0U);
+    TcpTransportConfig cfg = MakeMasterConfig(port);
+    RecordingListener listener;
+    TcpTransport transport(cfg);
+    std::thread accept_thread([this] { AcceptPeer(); });
+    transport.Open(listener);
+    accept_thread.join();
+    ASSERT_NE(m_peer_handle, kRawInvalid);
+
+    // 对端直接关闭：接收线程会发现 EOF 并把通道置为不可用。
+    CloseRaw(m_peer_handle);
+    m_peer_handle = kRawInvalid;
+    for (int i = 0; i < 100 && transport.IsOpen(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_FALSE(transport.IsOpen()) << "对端关闭后通道应转为不可用";
+
+    // 断连后的 Send 必须报"通道不可用"（TransportError），而不是"用法错误"
+    // （InvalidState）：调用方据此决定是否进入恢复流程。
+    const Bytes frame{0xFD, 0x00};
+    try {
+        transport.Send(BytesView{frame});
+        FAIL() << "对端断开后 Send 应当抛出异常";
+    } catch (const XcpException& error) {
+        EXPECT_EQ(error.Category(), ErrorCategory::TransportError)
+            << error.what();
+    }
+    transport.Close();
+}
+
 }  // namespace calmcar::xcp
