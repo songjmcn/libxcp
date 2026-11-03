@@ -52,7 +52,6 @@ TEST(TcpFramingVerification, ProtocolViolationsAreRejected) {
                                 ErrorCategory::ProtocolError,
                                 ErrorCategory::InvalidState,
                                 ErrorCategory::InvalidArgument,
-                                ErrorCategory::RecoveryFailed,
                                 ErrorCategory::UnsupportedFeature,
                                 ErrorCategory::Cancelled}) {
         EXPECT_EQ(ClassifyFramingFailure(category, false),
@@ -60,6 +59,14 @@ TEST(TcpFramingVerification, ProtocolViolationsAreRejected) {
         EXPECT_EQ(ClassifyFramingFailure(category, true),
                   FramingVerdict::Rejected);
     }
+}
+
+/// @brief 连 SYNCH 恢复都没确认：对端只是没应答，不是明确拒绝该布局
+TEST(TcpFramingVerification, RecoveryFailureIsInconclusive) {
+    EXPECT_EQ(ClassifyFramingFailure(ErrorCategory::RecoveryFailed, false),
+              FramingVerdict::Inconclusive);
+    EXPECT_EQ(ClassifyFramingFailure(ErrorCategory::RecoveryFailed, true),
+              FramingVerdict::Inconclusive);
 }
 
 /// @brief 结果未知（响应丢失）证据强度等同超时，不得算成"被拒"

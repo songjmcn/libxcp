@@ -4,6 +4,15 @@
 
 #include <gtest/gtest.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <aclapi.h>
+#include <sddl.h>
+#include <windows.h>
+#endif
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -17,6 +26,51 @@ namespace fs = std::filesystem;
 using calmcar::xcp::StageTrustedA2lSnapshot;
 
 namespace {
+
+#if defined(_WIN32)
+/**
+ * @brief 把目录的 DACL 换成 NULL DACL（等价于所有人完全控制）。
+ * @param dir 目标目录。
+ * @return 是否设置成功。
+ * @details 用 NULL DACL 而不是依赖本机 %TEMP% 的既有权限，是为了让负向用例
+ *          "自己造出他人可写"的场景：环境的权限恰好是私有时也照常验证，
+ *          不允许退化成跳过。
+ */
+bool SetNullDacl(const fs::path& dir) {
+    auto* descriptor = static_cast<PSECURITY_DESCRIPTOR>(
+        ::LocalAlloc(LPTR, SECURITY_DESCRIPTOR_MIN_LENGTH));
+    if (descriptor == nullptr) return false;
+    bool ok = ::InitializeSecurityDescriptor(descriptor,
+                                             SECURITY_DESCRIPTOR_REVISION) != FALSE;
+    if (ok) {
+        ok = ::SetSecurityDescriptorDacl(descriptor, TRUE, nullptr, FALSE) != FALSE;
+    }
+    if (ok) {
+        ok = ::SetFileSecurityW(dir.c_str(), DACL_SECURITY_INFORMATION,
+                                descriptor) != FALSE;
+    }
+    ::LocalFree(descriptor);
+    return ok;
+}
+
+/**
+ * @brief 用 SDDL 覆盖目录的 DACL。
+ * @param dir 目标目录。
+ * @param sddl 安全描述符定义语言文本。
+ * @return 是否设置成功。
+ */
+bool SetDaclFromSddl(const fs::path& dir, const wchar_t* sddl) {
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    if (!::ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, SDDL_REVISION_1, &descriptor, nullptr)) {
+        return false;
+    }
+    const bool ok = ::SetFileSecurityW(dir.c_str(), DACL_SECURITY_INFORMATION,
+                                       descriptor) != FALSE;
+    ::LocalFree(descriptor);
+    return ok;
+}
+#endif
 
 /// @brief 最小可解析 A2L 文本：仅用于快照字节一致性校验，不参与语义解析。
 constexpr char kSampleA2l[] =
@@ -200,24 +254,73 @@ TEST_F(SnapshotTest, DeletesSnapshotWhenGuardReleased) {
     EXPECT_FALSE(fs::exists(stamped)) << "快照应由守卫释放时删除：" << stamped;
 }
 
-/// @brief 他人可写的目录必须失败关闭，并给出明确拒绝点（本机 %TEMP% 即此情形）。
+/**
+ * @brief 他人可写的目录必须失败关闭，并给出明确拒绝点。
+ * @details 目录权限由用例自己构造，不依赖本机 %TEMP% 的实际 ACL：否则在
+ *          "临时目录恰好仅本人可写"的机器上会退化成一跳而过，安全回归形同
+ *          虚设（把守卫改成永远通过也测不出来）。构造失败一律判失败。
+ */
 TEST_F(SnapshotTest, RejectsRootWritableByOthers) {
     const auto source = WriteSample("source.a2l");
-    const auto result = StageTrustedA2lSnapshot(source, dir_ / "snapshot");
-    if (result.trusted) {
-        GTEST_SKIP() << "本机临时目录已仅本人可写，该拒绝路径需在他人可写的目录上验证";
-    }
+    const auto root = dir_ / "snapshot";
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    ASSERT_FALSE(ec) << "无法创建快照目录：" << ec.message();
+#if defined(_WIN32)
+    ASSERT_TRUE(SetNullDacl(root))
+        << "无法把快照目录设为 NULL DACL，错误码 " << ::GetLastError();
+#else
+    fs::permissions(root, fs::perms::all, fs::perm_options::replace, ec);
+    ASSERT_FALSE(ec) << "无法放宽快照目录权限：" << ec.message();
+#endif
+    const auto result = StageTrustedA2lSnapshot(source, root);
+    EXPECT_FALSE(result.trusted) << "其他人可完全控制的目录不得作为可信快照根";
     EXPECT_TRUE(result.path.empty());
     EXPECT_FALSE(result.reason.empty());
+    // 拒绝点必须落在用例自己构造的目录上。若只断言"整体不可信"，祖先目录
+    // 的权限问题也会让用例通过，安全判定本身被关掉时照样测不出来（变异验证
+    // 已证实这一点）。
+    EXPECT_NE(result.reason.find(root.string()), std::string::npos)
+        << "拒绝点不在快照根上：" << result.reason;
     // 拒绝点措辞按平台不同：Windows 走 ACL/重解析点判定，POSIX 走权限位
     // 判定（"目录对组或其他身份可写"）。这里只断言"给出了可读的拒绝理由"，
     // 不把某一平台的措辞当作契约，否则同一语义会在另一平台误报失败。
     EXPECT_TRUE(result.reason.find("写权限") != std::string::npos ||
                 result.reason.find("可写") != std::string::npos ||
                 result.reason.find("ACL") != std::string::npos ||
+                result.reason.find("DACL") != std::string::npos ||
                 result.reason.find("重解析") != std::string::npos)
         << result.reason;
 }
+
+#if defined(_WIN32)
+/**
+ * @brief 目录上"仅继承"的 Everyone 写权限会落到快照文件上，必须拒绝。
+ * @details DACL 只有一条 OI|CI|IO 的 Everyone 完全控制 ACE：目录自身看不见
+ *          这份权限，但里面新建的快照文件会继承它。旧实现按"仅继承项跳过"
+ *          处理目录，就会把这个目录判成可信。
+ */
+TEST_F(SnapshotTest, RejectsRootWithInheritOnlyEveryoneWrite) {
+    const auto source = WriteSample("source.a2l");
+    const auto root = dir_ / "snapshot";
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    ASSERT_FALSE(ec) << "无法创建快照目录：" << ec.message();
+    // WD=Everyone（仅继承）、OW=属主、SY=SYSTEM、BA=Administrators；后三条
+    // 保证用例自己仍能访问目录，避免把它变成"谁都进不去"而误判通过。
+    ASSERT_TRUE(SetDaclFromSddl(
+        root, L"D:(A;OICIIO;FA;;;WD)(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"))
+        << "无法设置继承型 DACL，错误码 " << ::GetLastError();
+    const auto result = StageTrustedA2lSnapshot(source, root);
+    EXPECT_FALSE(result.trusted)
+        << "目录上仅继承的 Everyone 写权限会让快照文件被他人改写，必须拒绝";
+    EXPECT_TRUE(result.path.empty());
+    EXPECT_FALSE(result.reason.empty()) << result.reason;
+    // 同 RejectsRootWritableByOthers：拒绝点必须是这个目录本身。
+    EXPECT_NE(result.reason.find(root.string()), std::string::npos)
+        << "拒绝点不在快照根上：" << result.reason;
+}
+#endif
 
 #if !defined(_WIN32)
 /// @brief POSIX：其他人可写的目录不得作为可信快照根。

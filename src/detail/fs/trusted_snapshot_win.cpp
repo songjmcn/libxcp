@@ -116,16 +116,83 @@ constexpr ACCESS_MASK kAncestorForbiddenMask =
     FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
 
 /**
+ * @brief 检查句柄对应安全对象的 DACL：拒绝非可信主体可写。
+ * @param handle 已打开的对象句柄（必须含 READ_CONTROL 权限）。
+ * @param allowed 允许主体集合。
+ * @param mask 需要拒绝的权限位。
+ * @param include_inherit_only 是否把"仅继承给子项"的 ACE 也算作风险。
+ * @param violation 失败时写入违规描述（不含路径）。
+ * @return 是否通过。
+ */
+inline bool CheckAclByHandle(HANDLE handle, const AllowedSids& allowed,
+                             ACCESS_MASK mask, bool include_inherit_only,
+                             std::string* violation) {
+    PACL dacl = nullptr;
+    PSECURITY_DESCRIPTOR descriptor = nullptr;
+    const DWORD status = ::GetSecurityInfo(
+        handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl,
+        nullptr, &descriptor);
+    if (status != ERROR_SUCCESS) {
+        *violation = "无法读取 DACL（错误码 " + std::to_string(status) + "）";
+        return false;
+    }
+    bool safe = true;
+    if (dacl == nullptr) {
+        // NULL DACL 表示"没有访问控制"：Windows 把它解释为所有人都拥有完全
+        // 控制权，这样的目录/文件任何人都能替换内容，必须判为不可信。
+        *violation = "没有 DACL（Null DACL 等价于所有人完全控制）";
+        safe = false;
+    } else {
+        for (DWORD index = 0; index < dacl->AceCount && safe; ++index) {
+            LPVOID raw = nullptr;
+            if (!::GetAce(dacl, index, &raw)) continue;
+            const auto* header = static_cast<const ACE_HEADER*>(raw);
+            if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) continue;
+            // "仅继承"的 ACE 不作用于本对象，但它的子对象会继承这份权限：
+            // 检查快照目录与快照文件时必须一并计入，否则目录本身看似只读，
+            // 里面的快照文件却继承到 Everyone:(F)。
+            if (!include_inherit_only &&
+                (header->AceFlags & INHERIT_ONLY_ACE) != 0) {
+                continue;
+            }
+            const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw);
+            if ((ace->Mask & mask) == 0) continue;
+            auto* sid = const_cast<DWORD*>(&ace->SidStart);
+            if (allowed.Contains(sid)) continue;
+            wchar_t* text = nullptr;
+            std::string name = "未知主体";
+            if (::ConvertSidToStringSidW(sid, &text) != FALSE) {
+                const int need = ::WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr,
+                                                       0, nullptr, nullptr);
+                if (need > 0) {
+                    name.assign(static_cast<std::size_t>(need - 1), '\0');
+                    ::WideCharToMultiByte(CP_UTF8, 0, text, -1, name.data(), need,
+                                          nullptr, nullptr);
+                }
+                ::LocalFree(text);
+            }
+            *violation = "写权限授予了非可信主体 " + name;
+            safe = false;
+        }
+    }
+    ::LocalFree(descriptor);
+    return safe;
+}
+
+/**
  * @brief 检查单个目录：拒绝重解析点，拒绝非可信主体可写。
  * @param dir 目录路径。
  * @param allowed 允许主体集合。
  * @param mask 需要拒绝的权限位（快照目录用 kWriteLikeMask，祖先用
  *             kAncestorForbiddenMask）。
+ * @param include_inherit_only 是否把"仅继承给子项"的 ACE 也算作风险：
+ *             快照目录传 true（子文件会继承），祖先目录传 false。
  * @param reason 失败原因。
  * @return 是否通过。
  */
 inline bool CheckDirectoryByHandle(const std::filesystem::path& dir,
                                    const AllowedSids& allowed, ACCESS_MASK mask,
+                                   bool include_inherit_only,
                                    std::string* reason) {
     HANDLE handle = ::CreateFileW(
         dir.c_str(), GENERIC_READ,
@@ -148,51 +215,15 @@ inline bool CheckDirectoryByHandle(const std::filesystem::path& dir,
         *reason = "目录是重解析点/链接，快照路径无法证明：" + dir.string();
         return false;
     }
-    PACL dacl = nullptr;
-    PSECURITY_DESCRIPTOR descriptor = nullptr;
-    const DWORD status = ::GetSecurityInfo(
-        handle, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, nullptr, nullptr, &dacl,
-        nullptr, &descriptor);
-    if (status != ERROR_SUCCESS) {
-        ::CloseHandle(handle);
-        *reason = "无法读取目录 DACL（错误码 " + std::to_string(status) +
-                  "）：" + dir.string();
+    std::string violation;
+    const bool safe =
+        CheckAclByHandle(handle, allowed, mask, include_inherit_only, &violation);
+    ::CloseHandle(handle);
+    if (!safe) {
+        *reason = "目录" + violation + "：" + dir.string();
         return false;
     }
-    bool safe = true;
-    if (dacl != nullptr) {
-        for (DWORD index = 0; index < dacl->AceCount && safe; ++index) {
-            LPVOID raw = nullptr;
-            if (!::GetAce(dacl, index, &raw)) continue;
-            const auto* header = static_cast<const ACE_HEADER*>(raw);
-            if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) continue;
-            // 仅用于继承的 ACE 不会作用于本对象，按其语义跳过；否则卷根上
-            // "Authenticated Users:(OI)(CI)(IO)(M)" 这类常见配置会被误判。
-            if ((header->AceFlags & INHERIT_ONLY_ACE) != 0) continue;
-            const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(raw);
-            if ((ace->Mask & mask) == 0) continue;
-            auto* sid = const_cast<DWORD*>(&ace->SidStart);
-            if (allowed.Contains(sid)) continue;
-            wchar_t* text = nullptr;
-            std::string name = "未知主体";
-            if (::ConvertSidToStringSidW(sid, &text) != FALSE) {
-                const int need = ::WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr,
-                                                       0, nullptr, nullptr);
-                if (need > 0) {
-                    name.assign(static_cast<std::size_t>(need - 1), '\0');
-                    ::WideCharToMultiByte(CP_UTF8, 0, text, -1, name.data(), need,
-                                          nullptr, nullptr);
-                }
-                ::LocalFree(text);
-            }
-            *reason = "目录的写权限授予了非可信主体 " + name + "：" +
-                      dir.string();
-            safe = false;
-        }
-    }
-    ::LocalFree(descriptor);
-    ::CloseHandle(handle);
-    return safe;
+    return true;
 }
 
 /**
@@ -235,6 +266,25 @@ bool StageFileImpl(const std::filesystem::path& path, const std::string& bytes,
         *reason = "无法以只读方式打开快照（错误码 " +
                   std::to_string(::GetLastError()) + "）";
         return false;
+    }
+    // 快照文件本身也必须只被可信主体可写：仅校验目录不够——目录上
+    // Everyone:(OI)(CI)(IO)(F) 这类"只继承"的 ACE 不会作用于目录，却被
+    // 快照文件原样继承，攻击者就能直接改写快照内容。
+    {
+        AllowedSids allowed;
+        std::string violation;
+        if (!BuildAllowedSids(allowed)) {
+            ::CloseHandle(reader);
+            ::DeleteFileW(path.c_str());
+            *reason = "无法取得当前用户 SID，无法校验快照文件权限";
+            return false;
+        }
+        if (!CheckAclByHandle(reader, allowed, kWriteLikeMask, true, &violation)) {
+            ::CloseHandle(reader);
+            ::DeleteFileW(path.c_str());
+            *reason = "快照文件" + violation + "：" + path.string();
+            return false;
+        }
     }
     std::string verify(bytes.size(), '\0');
     std::size_t read_total = 0;
@@ -292,7 +342,9 @@ bool CheckRootChain(const std::filesystem::path& root, std::string* reason) {
         if (!CheckDirectoryByHandle(
                 current, allowed,
                 is_snapshot_dir ? kWriteLikeMask : kAncestorForbiddenMask,
-                reason)) {
+                // 快照目录里的文件会继承它的 ACE，必须把"仅继承"项也算进来；
+                // 祖先目录只需阻止他人删除/替换本路径，继承项不影响该判定。
+                is_snapshot_dir, reason)) {
             return false;
         }
         is_snapshot_dir = false;
