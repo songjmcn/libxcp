@@ -663,6 +663,20 @@ TEST_F(A2lGoldenTest, ConversionFailureIsStructured) {
     EXPECT_EQ(short_raw.ErrorInfo().code, ErrorCode::RawSizeMismatch);
 }
 
+TEST_F(A2lGoldenTest, Float32OverflowIsRejected) {
+    LoadOptions require_off;
+    require_off.require_if_data_xcp = false;
+    auto b = LoadOk(Golden("golden_convert.a2l"), require_off);
+    ASSERT_NE(b, nullptr);
+    const IA2lDatabase* db = b->Database();
+    ASSERT_NE(db, nullptr);
+
+    const auto encoded =
+        db->FromPhysical("CONV_ECU::M_F32", PhysicalValue{1.0e40});
+    ASSERT_FALSE(encoded.HasValue());
+    EXPECT_EQ(encoded.ErrorInfo().code, ErrorCode::ConversionOutOfRange);
+}
+
 TEST_F(A2lGoldenTest, PhysicalValuePreservesInt64) {
     LoadOptions require_off;
     require_off.require_if_data_xcp = false;

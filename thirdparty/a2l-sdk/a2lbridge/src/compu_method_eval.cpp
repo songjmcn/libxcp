@@ -237,6 +237,11 @@ Result<std::uint64_t> NumericToBits(double value, std::uint8_t size_bytes,
         }
         case E::Float16: {
             // 就近舍入转 half（RTNE，手动实现，避免平台依赖）
+            if (value > std::numeric_limits<float>::max() ||
+                value < -std::numeric_limits<float>::max()) {
+                return ConvError(ErrorCode::ConversionOutOfRange, symbol,
+                                 "逆算结果超出浮点类型可表示范围（B-15）");
+            }
             float f = static_cast<float>(value);
             std::uint32_t b = 0;
             std::memcpy(&b, &f, sizeof(b));
@@ -257,8 +262,9 @@ Result<std::uint64_t> NumericToBits(double value, std::uint8_t size_bytes,
                 return std::uint64_t{sign | rounded};
             }
             if (exp >= 31) {
-                return std::uint64_t{sign | 0x7C00u |
-                                     (frac ? 0x200u : 0u)};  // Inf / NaN 保留
+                return ConvError(
+                    ErrorCode::ConversionOutOfRange, symbol,
+                    "逆算结果超出 FLOAT16_IEEE 可表示范围（B-15）");
             }
             const std::uint32_t rounded_frac =
                 (frac + 0x1000u) >> 13;  // RTNE 进位可能溢出到指数
@@ -267,12 +273,20 @@ Result<std::uint64_t> NumericToBits(double value, std::uint8_t size_bytes,
             if (rounded_frac > 0x3FFu) {
                 ++h_exp;
                 if (h_exp >= 31) {
-                    return std::uint64_t{sign | 0x7C00u};
+                    return ConvError(
+                        ErrorCode::ConversionOutOfRange, symbol,
+                        "逆算结果舍入后超出 FLOAT16_IEEE 可表示范围（B-15）");
                 }
             }
             return std::uint64_t{sign | (h_exp << 10) | h_frac};
         }
         case E::Float32: {
+            if (value > std::numeric_limits<float>::max() ||
+                value < -std::numeric_limits<float>::max()) {
+                return ConvError(
+                    ErrorCode::ConversionOutOfRange, symbol,
+                    "逆算结果超出 FLOAT32_IEEE 可表示范围（B-15）");
+            }
             const float f = static_cast<float>(value);
             std::uint32_t u32 = 0;
             std::memcpy(&u32, &f, sizeof(u32));
