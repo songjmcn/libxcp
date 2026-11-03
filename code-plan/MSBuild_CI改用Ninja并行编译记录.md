@@ -16,5 +16,6 @@ CMake 源码、Linux/macOS 工作流。已确认 CMake 中无依赖 `Release/` �
 `CMakeLists.txt` 头注释中关于 VS 生成器 `-j` 的说明仅针对本地 VS 构建，保留。
 
 ## 测试结果
-待推送后由 MSBuild 工作流验证（仅验证 MSBuild，不验证 Linux/macOS）。
+MSBuild 工作流运行成功（仅验证 MSBuild，不验证 Linux/macOS）。Configure、Build、Test 均通过；
+Build 用时 6 分 28 秒，之前 VS 生成器运行的 Build 用时 12 分 10 秒。
 本地为 Linux 环境，无法运行 Windows 构建。
