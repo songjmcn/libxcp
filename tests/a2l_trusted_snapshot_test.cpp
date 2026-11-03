@@ -21,9 +21,15 @@
 #include <vector>
 
 #include "libxcp/trusted_a2l_snapshot.hpp"
+#include "src/detail/fs/trusted_snapshot_platform.hpp"
 
 namespace fs = std::filesystem;
 using calmcar::xcp::StageTrustedA2lSnapshot;
+// 快照用例的基目录不放在系统临时目录下：CI runner 的 %TEMP% 往往把写权限授予
+// Users/Authenticated Users，那样"他人可写"的拒绝点会落在用例自己构造的快照根
+// 之上，负向用例的锚定断言无法成立。改用可执行文件所在目录（构建产物目录，父链
+// 可控且仅本人可写）后，负向用例在 CI 上也能真跑而不是退化成跳过。
+namespace fs_platform = calmcar::xcp::detail::fs;
 
 namespace {
 
@@ -72,6 +78,29 @@ bool SetDaclFromSddl(const fs::path& dir, const wchar_t* sddl) {
 }
 #endif
 
+/**
+ * @brief 判断拒绝理由是否指向给定路径。
+ * @param reason 被测函数给出的拒绝理由。
+ * @param target 期望的拒绝点（用例自己构造并污染的快照根）。
+ * @return 理由中是否出现了该路径的任一等价写法。
+ * @details 被测函数内部会对路径做 `weakly_canonical`，在符号链接、短文件名
+ *          （8.3）或 `\\?\` 前缀目录下，规范形与用例传入的原始字符串可能不同。
+ *          只比较原始字符串会让"拒绝点正确"的用例在个别机器上误报失败，因此
+ *          这里同时接受相对原始形、绝对形与规范形三种写法。
+ */
+bool ReasonMentionsPath(const std::string& reason, const fs::path& target) {
+    std::error_code ec;
+    const auto absolute = fs::absolute(target, ec);
+    const auto canonical = fs::weakly_canonical(target, ec);
+    std::vector<std::string> forms{target.string()};
+    if (!absolute.empty()) forms.push_back(absolute.string());
+    if (!canonical.empty()) forms.push_back(canonical.string());
+    for (const auto& form : forms) {
+        if (!form.empty() && reason.find(form) != std::string::npos) return true;
+    }
+    return false;
+}
+
 /// @brief 最小可解析 A2L 文本：仅用于快照字节一致性校验，不参与语义解析。
 constexpr char kSampleA2l[] =
     "ASAP2_VERSION 1 71\n"
@@ -83,13 +112,19 @@ constexpr char kSampleA2l[] =
 /**
  * @brief 选择一个"仅本人可写"的基目录，用于验证成功路径。
  * @return 通过的基目录；本机没有任何满足条件的目录时返回空路径。
- * @details 不能直接使用 `temp_directory_path()`：Windows 的 `%TEMP%` 常常把
- *          写权限授予 Users/Authenticated Users，此时快照必须失败关闭，
- *          成功路径在这台机器上就不可验证。这里按"用户配置目录 → 临时目录"
- *          顺序探测，用被测函数自身判定（探测件本身也会被读回校验）。
+ * @details 探测顺序的第一候选是**可执行文件所在目录**：CI runner 的系统临时
+ *          目录常常把写权限授予 Users/Authenticated Users，此时快照必须失败
+ *          关闭，成功路径在那台机器上就不可验证。构建产物目录由构建过程创建，
+ *          祖先链可控，因此能稳定满足"仅本人可写"。`%LOCALAPPDATA%` 与系统
+ *          临时目录保留为兜底，覆盖"可执行文件目录被镜像成只读"的极端环境。
  */
 fs::path FindPrivateBase(std::string* last_reason = nullptr) {
     std::vector<fs::path> candidates;
+    // 首选可执行文件目录：CI 与本地构建产物目录都可写，且祖先链由构建过程创建。
+    const auto exe_dir = fs_platform::ExecutableDirectory();
+    if (!exe_dir.empty()) {
+        candidates.emplace_back(exe_dir / "libxcp_snapshot_base");
+    }
 #if defined(_WIN32)
     if (const char* local = std::getenv("LOCALAPPDATA");
         local != nullptr && *local != '\0') {
@@ -133,18 +168,28 @@ fs::path FindPrivateBase(std::string* last_reason = nullptr) {
 
 /**
  * @brief 每个用例独占的临时目录，析构时尽量清理。
+ * @details 目录建在可执行文件所在目录下，而不是系统临时目录：CI runner 的
+ *          `%TEMP%` 带"非可信主体可写"的 ACE，会让负向用例的拒绝点落在用例
+ *          自己构造的快照根之上，锚定断言随之失效（本用例集在 CI 上就是这样
+ *          失败的）。构建产物目录由构建过程创建，祖先链可控、仅本人可写。
  */
 class SnapshotTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        const auto base = fs::temp_directory_path() /
+        // 可执行文件目录是本用例集的唯一基目录来源：取不到就直接判失败，
+        // 绝不复用系统临时目录（那正是让负向用例在 CI 上失去锚定断言的原因）。
+        const auto exe_dir = fs_platform::ExecutableDirectory();
+        ASSERT_FALSE(exe_dir.empty())
+            << "无法确定可执行文件所在目录，快照用例无处建目录";
+        const auto base = exe_dir /
                           ("libxcp_snapshot_" +
                            std::to_string(::testing::UnitTest::GetInstance()
                                               ->random_seed()) +
                            "_" + std::to_string(counter_++));
         std::error_code ec;
         fs::create_directories(base, ec);
-        ASSERT_FALSE(ec) << "无法创建测试目录：" << ec.message();
+        ASSERT_FALSE(ec) << "无法创建测试目录：" << ec.message() << "（" << base
+                         << "）";
         dir_ = base;
     }
 
@@ -280,7 +325,7 @@ TEST_F(SnapshotTest, RejectsRootWritableByOthers) {
     // 拒绝点必须落在用例自己构造的目录上。若只断言"整体不可信"，祖先目录
     // 的权限问题也会让用例通过，安全判定本身被关掉时照样测不出来（变异验证
     // 已证实这一点）。
-    EXPECT_NE(result.reason.find(root.string()), std::string::npos)
+    EXPECT_TRUE(ReasonMentionsPath(result.reason, root))
         << "拒绝点不在快照根上：" << result.reason;
     // 拒绝点措辞按平台不同：Windows 走 ACL/重解析点判定，POSIX 走权限位
     // 判定（"目录对组或其他身份可写"）。这里只断言"给出了可读的拒绝理由"，
@@ -317,7 +362,7 @@ TEST_F(SnapshotTest, RejectsRootWithInheritOnlyEveryoneWrite) {
     EXPECT_TRUE(result.path.empty());
     EXPECT_FALSE(result.reason.empty()) << result.reason;
     // 同 RejectsRootWritableByOthers：拒绝点必须是这个目录本身。
-    EXPECT_NE(result.reason.find(root.string()), std::string::npos)
+    EXPECT_TRUE(ReasonMentionsPath(result.reason, root))
         << "拒绝点不在快照根上：" << result.reason;
 }
 #endif

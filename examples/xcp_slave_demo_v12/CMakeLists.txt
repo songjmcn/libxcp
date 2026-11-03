@@ -103,6 +103,14 @@ if(LIBXCP_BUILD_TESTS)
   if(MSVC)
     target_compile_options(XcpliteV12InteropTest PRIVATE /utf-8)
   endif()
+  # 必须在本目录再次 include(GoogleTest)：CMake ≤ 3.28 的 gtest_discover_tests
+  # 依赖模块作用域变量 _GOOGLETEST_DISCOVER_TESTS_SCRIPT 拿到发现脚本路径，
+  # 而本目录是 tests/ 的兄弟目录，继承不到 tests/CMakeLists.txt:105 那次 include
+  # 设置的变量，会使生成的发现命令带上空的脚本路径参数，构建期静默跳过用例发现，
+  # ctest 只能看到一个 XcpliteV12InteropTest_NOT_BUILT 占位符（Not Run → 计为失败）。
+  # CMake 4.0 起模块改用 ${CMAKE_ROOT} 拼路径，与本问题无关；此处 include 幂等，
+  # 对既有 CMake 版本无副作用。
+  include(GoogleTest)
   gtest_discover_tests(XcpliteV12InteropTest DISCOVERY_TIMEOUT 60
                        PROPERTIES TIMEOUT 60 RUN_SERIAL TRUE)
 endif()
