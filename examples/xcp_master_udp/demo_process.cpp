@@ -1,10 +1,12 @@
 /**
  * @file demo_process.cpp
- * @brief DemoProcess 的平台相关实现（仿 tests/xcplite_slave_fixture.cpp 的做法，独立重写）。
+ * @brief DemoProcess 的平台相关实现（仿 tests/xcplite_slave_fixture.cpp
+ * 的做法，独立重写）。
  */
 #include "demo_process.hpp"
 
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -21,29 +23,72 @@ extern char** environ;
 #endif
 
 namespace xcp_example {
+namespace {
 
-DemoProcess::~DemoProcess() {
-    Stop();
+#ifdef _WIN32
+/**
+ * @brief 按 Windows CRT 规则引用一个命令行参数。
+ * @param value 待引用参数
+ * @return 可安全拼接到 CreateProcessA 命令行的参数
+ */
+std::string QuoteWindowsArgument(const std::string& value) {
+    std::string quoted = "\"";
+    std::size_t slashes = 0;
+    for (const char ch : value) {
+        if (ch == '\\') {
+            ++slashes;
+            continue;
+        }
+        if (ch == '\"') {
+            quoted.append(slashes * 2U + 1U, '\\');
+            quoted.push_back('\"');
+            slashes = 0;
+            continue;
+        }
+        quoted.append(slashes, '\\');
+        slashes = 0;
+        quoted.push_back(ch);
+    }
+    quoted.append(slashes * 2U, '\\');
+    quoted.push_back('\"');
+    return quoted;
 }
+#endif
+
+}  // namespace
+
+DemoProcess::~DemoProcess() { Stop(); }
 
 bool DemoProcess::Start(const std::string& exePath,
                         const std::filesystem::path& workingDir,
                         std::string* errorMessage) {
+    return Start(exePath, workingDir, {}, errorMessage);
+}
+
+bool DemoProcess::Start(const std::string& exePath,
+                        const std::filesystem::path& workingDir,
+                        const std::vector<std::string>& arguments,
+                        std::string* errorMessage) {
     Stop();  // 幂等：先回收上一个
 
 #ifdef _WIN32
-    // 路径含空格时加引号（沿用夹具 cmdline 做法）
-    std::string cmdline = "\"" + exePath + "\"";
+    std::string cmdline = QuoteWindowsArgument(exePath);
+    for (const auto& argument : arguments) {
+        cmdline.push_back(' ');
+        cmdline += QuoteWindowsArgument(argument);
+    }
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
     // bInheritHandles=TRUE：子进程输出直接进入父控制台
-    const BOOL ok = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
-                                   0, nullptr, workingDir.string().c_str(), &si, &pi);
+    const BOOL ok =
+        CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE, 0,
+                       nullptr, workingDir.string().c_str(), &si, &pi);
     if (!ok) {
         if (errorMessage != nullptr) {
-            *errorMessage = "CreateProcessA 失败，GetLastError=" +
-                            std::to_string(static_cast<unsigned long>(GetLastError()));
+            *errorMessage =
+                "CreateProcessA 失败，GetLastError=" +
+                std::to_string(static_cast<unsigned long>(GetLastError()));
         }
         return false;
     }
@@ -55,10 +100,32 @@ bool DemoProcess::Start(const std::string& exePath,
     pid_t child = -1;
     // 子进程里先 chdir 到工作目录再 exec，等价于 Windows 的 lpCurrentDirectory
     posix_spawn_file_actions_t actions{};
-    posix_spawn_file_actions_init(&actions);
-    posix_spawn_file_actions_addchdir_np(&actions, workingDir.c_str());
-    char* argv[] = {const_cast<char*>(exePath.c_str()), nullptr};
-    const int rc = posix_spawn(&child, exePath.c_str(), &actions, nullptr, argv, environ);
+    int rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) {
+        if (errorMessage != nullptr) {
+            *errorMessage = "posix_spawn_file_actions_init 失败，errno=" +
+                            std::to_string(rc);
+        }
+        return false;
+    }
+    rc = posix_spawn_file_actions_addchdir_np(&actions, workingDir.c_str());
+    if (rc != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        if (errorMessage != nullptr) {
+            *errorMessage =
+                "设置子进程工作目录失败，errno=" + std::to_string(rc);
+        }
+        return false;
+    }
+    std::vector<char*> argv;
+    argv.reserve(arguments.size() + 2U);
+    argv.push_back(const_cast<char*>(exePath.c_str()));
+    for (const auto& argument : arguments) {
+        argv.push_back(const_cast<char*>(argument.c_str()));
+    }
+    argv.push_back(nullptr);
+    rc = posix_spawn(&child, exePath.c_str(), &actions, nullptr, argv.data(),
+                     environ);
     posix_spawn_file_actions_destroy(&actions);
     if (rc != 0) {
         if (errorMessage != nullptr) {
@@ -95,13 +162,52 @@ bool DemoProcess::IsRunning() const {
 #endif
 }
 
+bool DemoProcess::WaitForExit(std::chrono::milliseconds timeout,
+                              int* exitCode) {
+    if (pid_ == 0) return false;
+#ifdef _WIN32
+    if (processHandle_ == nullptr) return false;
+    const DWORD wait_result =
+        WaitForSingleObject(static_cast<HANDLE>(processHandle_),
+                            static_cast<DWORD>(timeout.count()));
+    if (wait_result != WAIT_OBJECT_0) return false;
+    DWORD process_exit_code = 0;
+    if (!GetExitCodeProcess(static_cast<HANDLE>(processHandle_),
+                            &process_exit_code)) {
+        return false;
+    }
+    if (exitCode != nullptr) *exitCode = static_cast<int>(process_exit_code);
+    pid_ = 0;
+    return true;
+#else
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const pid_t child = static_cast<pid_t>(pid_);
+    int status = 0;
+    do {
+        const pid_t result = waitpid(child, &status, WNOHANG);
+        if (result == child) {
+            pid_ = 0;
+            if (exitCode != nullptr) {
+                *exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            }
+            return true;
+        }
+        if (result < 0) return false;
+        if (std::chrono::steady_clock::now() >= deadline) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (true);
+    return false;
+#endif
+}
+
 void DemoProcess::Stop(std::chrono::milliseconds graceTime) {
 #ifdef _WIN32
     if (processHandle_ != nullptr) {
         WaitForSingleObject(static_cast<HANDLE>(processHandle_),
                             static_cast<DWORD>(graceTime.count()));
         DWORD exitCode = 0;
-        if (GetExitCodeProcess(static_cast<HANDLE>(processHandle_), &exitCode) &&
+        if (GetExitCodeProcess(static_cast<HANDLE>(processHandle_),
+                               &exitCode) &&
             exitCode == STILL_ACTIVE) {
             TerminateProcess(static_cast<HANDLE>(processHandle_), 0);
             WaitForSingleObject(static_cast<HANDLE>(processHandle_), 2000);
