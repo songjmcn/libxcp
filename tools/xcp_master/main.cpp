@@ -3951,8 +3951,12 @@ int main(int argc, char** argv) {
                     calmcar::xcp::tools::TcpNegotiationExitCode(outcome);
                 if (exit_code ==
                     calmcar::xcp::tools::kAutoNegotiationInconclusive) {
-                    std::cerr << "存在未决候选：对端没有给出任何协议层回应，无法"
-                                 "据此排除布局；请核查地址、端口与对端是否在运行。\n";
+                    std::cerr
+                        << "存在未决候选：对端没有给出可判读的协议层回应，无法"
+                           "据此排除布局。请依次核查：地址与端口是否正确、对端"
+                           "是否在运行、对端是否已启用 XCP；若 TCP 能建立连接"
+                           "但仍无应答，通常是帧布局（wire profile 或 "
+                           "PACKET_ALIGNMENT）不匹配。\n";
                     return exit_code;
                 }
                 std::cerr << "全部候选都被对端拒绝：请核对对端实际使用的帧布局与 "

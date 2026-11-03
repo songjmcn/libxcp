@@ -58,6 +58,18 @@ struct SocketOps {
     virtual int set_option(SocketHandle handle, SocketOption option, bool enabled) = 0;
     /// @brief 设置接收超时，单位毫秒。
     virtual int set_receive_timeout(SocketHandle handle, std::uint32_t timeout_ms) = 0;
+    /// @brief 关闭 UDP 套接字上的 ICMP 端口不可达错误上报。
+    /// @details Windows 上未连接的 UDP 套接字收到 ICMP port unreachable 后，
+    ///          下一次 `recvfrom` 会返回 `WSAECONNRESET`；若不关闭该上报，
+    ///          一次瞬态网络噪声就会被误判为"连接丢失"而终止接收线程。
+    ///          POSIX 不会向未连接的 UDP 套接字投递此类错误，故基类默认
+    ///          实现直接返回成功，平台实现无需覆盖。
+    /// @param handle 已创建的 UDP 套接字句柄。
+    /// @return 0 表示成功（或平台无需处理），-1 表示设置失败。
+    virtual int disable_udp_icmp_error_reporting(SocketHandle handle) {
+        (void)handle;
+        return 0;
+    }
     /// @brief 发送数据；请求长度由平台实现安全钳制。
     virtual int send(SocketHandle handle, const std::uint8_t* data, std::size_t size,
                      bool no_signal = true) = 0;

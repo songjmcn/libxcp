@@ -14,7 +14,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "LIBXCP_BUILD_TESTS": "OFF",
+        "LIBXCP_BUILD_TESTS": "ON",
         "LIBXCP_BUILD_TOOLS":"ON",
         "Boost_USE_STATIC_LIBS":"ON",
         "LIBXCP_BUILD_EXAMPLES":"ON",
@@ -32,7 +32,25 @@
         "LIBXCP_BUILD_TESTS": "OFF",
         "LIBXCP_BUILD_TOOLS":"ON",
         "Boost_USE_STATIC_LIBS": "ON",
-        "LIBXCP_BUILD_EXAMPLES":"ON"
+        "LIBXCP_BUILD_EXAMPLES":"ON",
+        "LIBXCP_ENABLE_LOG": "ON"
+      }
+    }
+  ],
+   "testPresets": [
+    {
+      "name": "ctest(Release)",
+      "displayName": "libxcp Test Ninja(Release)",
+      "configurePreset": "Cmake config(Release)",
+      "environment": {
+        "TEMP": "${sourceDir}/.tmp/ci_temp",
+        "TMP": "${sourceDir}/.tmp/ci_temp"
+      },
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
       }
     }
   ],

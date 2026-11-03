@@ -67,9 +67,13 @@ struct TcpFramingProbeConfig {
  *            被拒（这是明确的拒绝证据，XCPlite V1.2 在长度非法时正是如此）；
  *          - `OperationOutcomeUnknown`：命令可能已生效但响应丢失，等同于
  *            超时 → **未决**；
+ *          - `RecoveryFailed`：命令超时后连 SYNCH 恢复都没获确认，说明对端
+ *            没有按该布局给出任何应答，同样缺少"明确拒绝"的证据 →
+ *            **未决**（早期版本把它算作被拒，会把"对端协议层静默"误报成
+ *            "帧布局不匹配"，把排查方向带偏）；
  *          - 其余（`MalformedPacket` / `ProtocolError` / `InvalidState` /
- *            `InvalidArgument` / `RecoveryFailed` / `UnsupportedFeature` /
- *            `Cancelled`）：均为明确的"这一候选不可用"→ 被拒。
+ *            `InvalidArgument` / `UnsupportedFeature` / `Cancelled`）：
+ *            均为明确的"这一候选不可用"→ 被拒。
  * @note `Accepted` 不会从本函数返回。
  */
 [[nodiscard]] FramingVerdict ClassifyFramingFailure(

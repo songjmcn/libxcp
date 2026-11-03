@@ -48,11 +48,15 @@ FramingVerdict ClassifyFramingFailure(ErrorCategory category,
         case ErrorCategory::OperationOutcomeUnknown:
             // 命令可能已生效但响应丢失，证据强度等同于超时
             return FramingVerdict::Inconclusive;
+        case ErrorCategory::RecoveryFailed:
+            // 命令超时后用 SYNCH 恢复也没拿到确认：对端既没有按本候选的帧
+            // 格式给出应答，也没有返回任何可判读的协议层拒绝证据。这与超时
+            // 同属"证据不足"，据此断言布局不匹配会把用户引向错误的排查方向。
+            return FramingVerdict::Inconclusive;
         case ErrorCategory::MalformedPacket:
         case ErrorCategory::ProtocolError:
         case ErrorCategory::InvalidState:
         case ErrorCategory::InvalidArgument:
-        case ErrorCategory::RecoveryFailed:
         case ErrorCategory::UnsupportedFeature:
         case ErrorCategory::Cancelled:
         default:

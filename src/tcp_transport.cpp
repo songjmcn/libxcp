@@ -12,6 +12,7 @@
 #include "libxcp/tcp_transport.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -120,6 +121,27 @@ TcpTransport::~TcpTransport() {
         Close();
     } catch (...) {
     }
+    // 若 Close() 是"从接收线程回调内发起"的降级路径，收尾会被延后；此处
+    // 对象正在销毁，接收线程必然已收到关闭请求。先 join（线程已退出，
+    // join 立即返回），再补做一次资源释放，保证句柄不泄漏。
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        if (m_state_ != LifecycleState::Closed) {
+            m_running_.store(false, std::memory_order_release);
+            m_state_ = LifecycleState::Closing;
+        }
+    }
+    if (m_receive_thread_.joinable()) {
+        m_receive_thread_.join();
+    }
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        if (m_state_ == LifecycleState::Closing) {
+            ReleaseResources();
+            m_state_ = LifecycleState::Closed;
+            m_close_cv_.notify_all();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -208,18 +230,21 @@ void TcpTransport::Open(IPacketListener& listener) {
     }
 
     // ---- 解码器：构建期即校验，把配置错误挡在连接建立之前 ----
-    // max_packet_size 与 max_frame_packet_size 取两者较小值：decoder 的职责是
-    // 防止缓冲无界增长，必须遵守调用方给出的**任意一个**更严格上限。
-    // 用括号包住 `std::min` 是刻意的：Windows 头会在未定义 NOMINMAX 时注入
-    // `min` 宏，`std::min(a, b)` 会被预处理成 `std::((a)<(b)?...)` 而报
-    // C2589/C2059；`(std::min)(a, b)` 不满足函数式宏的展开条件，两个平台通吃。
+    // 定界上限取两个配置中的**较大值**：decoder 只负责按 LEN 定界，
+    // "这一帧要不要交付"由接收线程按 max_frame_packet_size 判定（超限帧
+    // 丢弃并告警，连接保持可用）。若这里取较小值，超过 max_frame_packet_size
+    // 的合法 LEN 会在 decoder 内部被判为畸形，导致整条 TCP 连接被终止——
+    // 一个超限帧不该拖垮整条流（T-02）。
+    // 用括号包住 `std::max` 是刻意的：Windows 头会在未定义 NOMINMAX 时注入
+    // `max` 宏，`std::max(a, b)` 会被预处理成 `std::((a)>(b)?...)` 而报
+    // C2589/C2059；`(std::max)(a, b)` 不满足函数式宏的展开条件，两个平台通吃。
     const std::size_t decoder_limit =
-        (std::min)(m_config_.max_packet_size, m_config_.max_frame_packet_size);
+        (std::max)(m_config_.max_packet_size, m_config_.max_frame_packet_size);
     m_decoder_ = std::make_unique<TcpStreamDecoder>(
         m_config_.wire_profile, m_config_.packet_alignment, decoder_limit);
 
     // ---- 创建 Socket 并建立连接 ----
-    auto impl = std::make_unique<SocketImpl>();
+    auto impl = std::make_shared<SocketImpl>();
     impl->handle = ops.create(detail::SocketKind::Tcp);
     if (impl->handle == detail::kInvalidSocketHandle) {
         const auto error = ops.last_error();
@@ -227,7 +252,7 @@ void TcpTransport::Open(IPacketListener& listener) {
         m_decoder_.reset();
         throw detail::MakeTransportError("创建 TCP Socket 失败", error);
     }
-    m_socket_ = std::move(impl);
+    m_socket_ = impl;
 
     try {
         EstablishConnection();
@@ -259,7 +284,15 @@ void TcpTransport::Open(IPacketListener& listener) {
 
     m_running_.store(true, std::memory_order_release);
     try {
-        m_receive_thread_ = std::thread([this] { ReceiveLoop(); });
+        // 接收线程入口先登记自己的身份：`Close()` 据此识别"回调内关闭"，
+        // 从而避免 join 自己导致的 std::terminate。
+        m_receive_thread_ = std::thread([this] {
+            {
+                const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+                m_receive_tid_ = std::this_thread::get_id();
+            }
+            ReceiveLoop();
+        });
     } catch (const std::system_error& e) {
         LIBXCP_LOG_ERROR("TCP receive thread creation failed: {}", e.what());
         m_running_.store(false, std::memory_order_release);
@@ -272,6 +305,14 @@ void TcpTransport::Open(IPacketListener& listener) {
         m_decoder_.reset();
         m_listener_ = nullptr;
         throw detail::MakeTransportError("启动接收线程失败", e.what());
+    }
+
+    // 线程起来之后才对外公布"已打开"：`Close()` 看到 `Open` 时线程必然
+    // 已是 joinable 状态。`Open()` 与 `Close()` 不得并发调用（见类文档）。
+    {
+        const std::lock_guard<std::mutex> lock(m_lifecycle_mutex_);
+        m_state_ = LifecycleState::Open;
+        m_finalize_owned_ = false;
     }
     LIBXCP_LOG_INFO(
         "TCP transport open profile={} local={}:{} remote={}:{} role={}",
@@ -432,13 +473,10 @@ void TcpTransport::ConnectWithTimeout(const void* addr, std::size_t addr_len) {
             "SO_ERROR=" + std::to_string(so_error));
     }
 
-    // 恢复阻塞模式：发送路径依赖"可写等待 + 阻塞 send"的组合，
-    // 若保持非阻塞，send 会在缓冲满时返回 EAGAIN 而让 WriteAll 空转。
-    if (ops.set_blocking(m_socket_->handle) != 0) {
-        const auto error = ops.last_error();
-        LIBXCP_LOG_ERROR("TCP restore blocking failed: {}", error);
-        throw detail::MakeTransportError("恢复 TCP 阻塞模式失败", error);
-    }
+    // 连接建立后**保持非阻塞**：发送路径用"非阻塞 send + wait_writable
+    // (deadline)"组合，send_timeout_ms 才是真正的耗时上界（A-01）。
+    // 若在此恢复阻塞模式，内核会让 send() 一直睡到对端腾出接收窗口，
+    // 配置的发送超时形同虚设（这正是修复前的实际行为）。
 }
 
 void TcpTransport::ListenAndAccept() {
@@ -495,52 +533,109 @@ void TcpTransport::ListenAndAccept() {
     m_socket_->handle = accepted;
     m_socket_->bound_local = peer;
 
-    if (ops.set_blocking(m_socket_->handle) != 0) {
-        const auto error = ops.last_error();
-        LIBXCP_LOG_ERROR("TCP accepted restore blocking failed: {}", error);
-        throw detail::MakeTransportError("恢复 TCP 阻塞模式失败", error);
+    // 同上：accept 得到的连接保持非阻塞，发送与接收统一由 wait_* + 超时驱动。
+}
+
+bool TcpTransport::IsReceiveThread() const noexcept {
+    return m_receive_tid_ != std::thread::id{} &&
+           std::this_thread::get_id() == m_receive_tid_;
+}
+
+void TcpTransport::SignalShutdown() {
+    // 快照句柄：shutdown 不释放句柄号，因此不存在"句柄被 OS 回收后分配给
+    // 本进程新建 Socket"的复用风险（对比：直接 close 会有该风险，而接收
+    // 线程此刻仍可能在使用这个句柄）。
+    // 注意：shutdown **不是**接收线程的退出手段。Winsock 上它不会取消已
+    // 挂起的阻塞 recv()（详见 kReceivePollSliceMs 的说明），接收线程的退出
+    // 由 m_running_ + 轮询片保证。
+    const auto sock = m_socket_;
+    if (sock != nullptr && sock->handle != detail::kInvalidSocketHandle) {
+        (void)detail::CurrentSocketOps().shutdown_socket(sock->handle);
     }
 }
 
-void TcpTransport::Close() {
-    auto& ops = detail::CurrentSocketOps();
-
-    // 1. 通知接收线程退出
-    m_running_.store(false, std::memory_order_release);
-
-    // 2. 让对端尽快观察到 FIN。shutdown 不释放句柄号，因此不存在"句柄被
-    //    OS 回收后分配给本进程新建 Socket"的复用风险（对比：直接 close 会有
-    //    该风险，而接收线程此刻仍可能在使用这个句柄）。
-    //    注意：shutdown **不是**接收线程的退出手段。Winsock 上它不会取消
-    //    已挂起的阻塞 recv()（详见 kReceivePollSliceMs 的说明），接收线程的
-    //    退出由 m_running_ + 轮询片保证。
-    if (m_socket_ != nullptr &&
-        m_socket_->handle != detail::kInvalidSocketHandle) {
-        (void)ops.shutdown_socket(m_socket_->handle);
-    }
-
-    // 3. 等待接收线程结束（其退出前负责回调 OnTransportClosed）。
-    //    最坏退出延迟为一个轮询片，与对端是否发数据无关。
-    if (m_receive_thread_.joinable()) {
-        m_receive_thread_.join();
-    }
-
-    // 4. 线程已停，此处关闭句柄不再存在竞态
-    if (m_socket_ != nullptr) {
-        if (m_socket_->handle != detail::kInvalidSocketHandle) {
-            ops.close(m_socket_->handle);
-            m_socket_->handle = detail::kInvalidSocketHandle;
+void TcpTransport::AbortConnection(const std::string& reason) noexcept {
+    try {
+        // 发送侧已判定通道不可继续使用（例如等待可写超时）：主动置停并
+        // shutdown，让接收线程尽快退出并把关闭事件交付给监听器，而不是
+        // 让连接停留在"能发不能收"的半可用状态。
+        if (m_running_.exchange(false, std::memory_order_acq_rel)) {
+            LIBXCP_LOG_WARNING("TCP connection aborted: {}", reason);
+            SignalShutdown();
         }
-        if (m_socket_->listen_handle != detail::kInvalidSocketHandle) {
-            ops.close(m_socket_->listen_handle);
-            m_socket_->listen_handle = detail::kInvalidSocketHandle;
+    } catch (...) {
+        // 断连路径本身不允许抛出：调用方此时已经在抛发送异常的路上。
+    }
+}
+
+void TcpTransport::ReleaseResources() {
+    auto& ops = detail::CurrentSocketOps();
+    // 线程已停，此处关闭句柄不再存在竞态；用快照保证即使有发送线程仍持有
+    // 引用，关闭动作也只发生一次（句柄已置无效后不会被二次 close）。
+    const auto sock = m_socket_;
+    if (sock != nullptr) {
+        if (sock->handle != detail::kInvalidSocketHandle) {
+            ops.close(sock->handle);
+            sock->handle = detail::kInvalidSocketHandle;
+        }
+        if (sock->listen_handle != detail::kInvalidSocketHandle) {
+            ops.close(sock->listen_handle);
+            sock->listen_handle = detail::kInvalidSocketHandle;
         }
     }
     m_socket_.reset();
-    // 5. 解码器随之释放：重连时会重新构造，保证不携带上一条连接的状态
+    // 解码器随之释放：重连时会重新构造，保证不携带上一条连接的状态
     m_decoder_.reset();
     m_listener_ = nullptr;
+    m_receive_tid_ = std::thread::id{};
     m_bound_local_port_.store(0, std::memory_order_release);
+}
+
+void TcpTransport::Close() {
+    std::unique_lock<std::mutex> lock(m_lifecycle_mutex_);
+
+    if (m_state_ == LifecycleState::Closed) {
+        return;  // 幂等：重复关闭直接返回
+    }
+
+    const bool from_receive_thread = IsReceiveThread();
+
+    if (m_state_ == LifecycleState::Closing) {
+        // 已有线程在关闭中
+        if (from_receive_thread) {
+            return;  // 回调内重复关闭：只登记意图，不参与收尾
+        }
+        if (m_finalize_owned_) {
+            // 收尾已被别的线程认领：等待其完成，绝不第二次 join 同一线程
+            m_close_cv_.wait(lock, [this] {
+                return m_state_ == LifecycleState::Closed;
+            });
+            return;
+        }
+        // 收尾尚未被认领（此前由接收线程在回调内发起）：由本线程接管
+        m_finalize_owned_ = true;
+    } else {
+        // Open → Closing：先置退出标记并打断阻塞 IO，收尾必须等 join 之后
+        m_state_ = LifecycleState::Closing;
+        m_running_.store(false, std::memory_order_release);
+        SignalShutdown();
+        if (from_receive_thread) {
+            // 回调内关闭：不能 join 自己，收尾延后到析构或后续 Close()
+            return;
+        }
+        m_finalize_owned_ = true;
+    }
+
+    // join 不能在持锁时进行：接收线程可能正在等这把锁（例如它在回调里
+    // 调用了 Close()），持锁 join 会立即自锁。
+    lock.unlock();
+    if (m_receive_thread_.joinable()) {
+        m_receive_thread_.join();
+    }
+    lock.lock();
+    ReleaseResources();
+    m_state_ = LifecycleState::Closed;
+    m_close_cv_.notify_all();
 }
 
 // ---------------------------------------------------------------------------
@@ -551,6 +646,20 @@ void TcpTransport::Send(BytesView packet) {
     std::lock_guard<std::mutex> lock(m_send_mutex_);
 
     if (!IsOpen()) {
+        // 区分"从未打开"与"曾经打开但通道已失效"：对端断开（接收线程检测到
+        // EOF/RST 后置停运行标志）或发送超时主动断连都属于后者，调用方应据此
+        // 走断连恢复，而不是被当成用法错误（A-05）。
+        bool ever_opened = false;
+        {
+            const std::lock_guard<std::mutex> lifecycle_lock(
+                m_lifecycle_mutex_);
+            ever_opened = m_state_ != LifecycleState::Closed;
+        }
+        if (ever_opened) {
+            LIBXCP_LOG_ERROR("TCP send rejected because connection is closed");
+            throw detail::MakeTransportError(
+                "TCP 发送失败：通道已关闭（对端断开、发送超时或正在关闭）");
+        }
         LIBXCP_LOG_ERROR("TCP send rejected because transport is closed");
         throw detail::MakeInvalidState("TcpTransport 未打开时调用 send()");
     }
@@ -567,12 +676,8 @@ void TcpTransport::Send(BytesView packet) {
             std::to_string(m_config_.max_packet_size));
     }
 
-    // CTR 在同一把锁下取值并递增：CTR 分配顺序必须与写入顺序严格一致，
-    // 否则对端会看到乱序 CTR 并（按 §8.1 等价规则）丢弃我们的帧。
-    const auto ctr = m_send_ctr_.load(std::memory_order_relaxed);
-    m_send_ctr_.store(static_cast<DatagramCtr>(ctr + 1U),
-                      std::memory_order_relaxed);
-
+    // 先校验帧长再分配 CTR：被本地参数校验拒绝的发送不会写上线，
+    // 若先递增 CTR 就会给对端留下无法解释的缺口（A-03）。
     if (packet.size() > m_config_.max_frame_packet_size) {
         LIBXCP_LOG_ERROR("TCP send rejected XCP packet bytes={} frame max={}",
                          packet.size(), m_config_.max_frame_packet_size);
@@ -581,6 +686,12 @@ void TcpTransport::Send(BytesView packet) {
             " 超过配置上限 max_frame_packet_size=" +
             std::to_string(m_config_.max_frame_packet_size));
     }
+
+    // CTR 在同一把锁下取值并递增：CTR 分配顺序必须与写入顺序严格一致，
+    // 否则对端会看到乱序 CTR 并（按 §8.1 等价规则）丢弃我们的帧。
+    const auto ctr = m_send_ctr_.load(std::memory_order_relaxed);
+    m_send_ctr_.store(static_cast<DatagramCtr>(ctr + 1U),
+                      std::memory_order_relaxed);
 
     WriteFrame(packet, ctr);
 }
@@ -603,10 +714,22 @@ void TcpTransport::WriteFrame(BytesView packet, DatagramCtr ctr) {
 
 void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
     auto& ops = detail::CurrentSocketOps();
+    // 句柄快照：`Close()` 可能与本函数并发，取一份 shared_ptr 保证整个写出
+    // 过程里句柄对象不被释放（`ReleaseResources()` 会先把 handle 置无效，
+    // 因此快照即便存活也不会被二次 close）。
+    const auto sock = m_socket_;
+    if (sock == nullptr || sock->handle == detail::kInvalidSocketHandle) {
+        throw detail::MakeInvalidState("TcpTransport 未打开时调用 send()");
+    }
     std::size_t written = 0;
+    // 整帧共用一个 deadline：若每次可写都重新计时，慢速对端能把一次 Send
+    // 拖成无限长，send_timeout_ms 就不是上界了（A-01）。
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(m_config_.send_timeout_ms);
 
     while (written < size && m_running_.load(std::memory_order_acquire)) {
-        const int sent = ops.send(m_socket_->handle, data + written,
+        const int sent = ops.send(sock->handle, data + written,
                                   size - written, /*no_signal=*/true);
         if (sent > 0) {
             written += static_cast<std::size_t>(sent);
@@ -629,17 +752,29 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
             throw detail::MakeTransportError("TCP 发送失败：连接已断开", error);
         }
         if (ops.is_would_block()) {
-            // 内核发送缓冲已满（对端停止读取）。等待可写，给出明确超时上界，
-            // 而不是让调用线程无限期挂住。
+            // 内核发送缓冲已满（对端停止读取）。按剩余 deadline 等待可写，
+            // 保证一次 Send 的总耗时不超过 send_timeout_ms。
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    deadline - std::chrono::steady_clock::now());
+            if (remaining.count() <= 0) {
+                LIBXCP_LOG_ERROR("TCP send timeout pending_bytes={} timeout={}",
+                                 size - written, m_config_.send_timeout_ms);
+                AbortConnection("sending timed out");
+                throw MakeSendTimeoutError(size - written,
+                                           m_config_.send_timeout_ms);
+            }
             std::string wait_error;
             const int ready = ops.wait_writable(
-                m_socket_->handle, m_config_.send_timeout_ms, &wait_error);
+                sock->handle, static_cast<std::uint32_t>(remaining.count()),
+                &wait_error);
             if (ready > 0) {
                 continue;
             }
             if (ready == 0) {
                 LIBXCP_LOG_ERROR("TCP send timeout pending_bytes={} timeout={}",
                                  size - written, m_config_.send_timeout_ms);
+                AbortConnection("sending timed out");
                 throw MakeSendTimeoutError(size - written,
                                            m_config_.send_timeout_ms);
             }
@@ -655,13 +790,14 @@ void TcpTransport::WriteAll(const std::uint8_t* data, std::size_t size) {
     }
 
     if (written < size) {
-        // 走到这里说明 m_running_ 在发送过程中被置否：Close() 与本 Send()
-        // 并发。这不是对端故障，按"通道已关闭"上报，避免调用方触发恢复。
-        LIBXCP_LOG_ERROR("TCP send aborted by close pending_bytes={}",
-                         size - written);
-        throw detail::MakeInvalidState("TCP 发送被 Close() 中断：" +
-                                       std::to_string(size - written) +
-                                       " 字节未写出");
+        // m_running_ 在写出过程中被置否：可能是 Close() 并发，也可能是
+        // 发送超时后主动断连。两种情况都属于"通道已不可用"，而不是调用方
+        // 用法错误，因此按 TransportError 上报——上层应走断连恢复而非抛
+        // InvalidState（A-05）。
+        LIBXCP_LOG_ERROR("TCP send aborted pending_bytes={}", size - written);
+        throw detail::MakeTransportError(
+            "TCP 发送失败：通道已关闭，" + std::to_string(size - written) +
+            " 字节未写出");
     }
 }
 
@@ -694,6 +830,12 @@ void TcpTransport::ReceiveLoop() {
     IPacketListener* listener = m_listener_;
     std::string close_reason = "Transport 正常关闭";
     std::vector<std::uint8_t> buffer(m_config_.receive_chunk_size);
+    // 句柄快照：本线程存活期间 socket 不会被释放（Close() 先 join 再释放
+    // 资源），快照只是让读取路径不必反复解引用 shared_ptr 成员。
+    const auto sock = m_socket_;
+    if (sock == nullptr || sock->handle == detail::kInvalidSocketHandle) {
+        return;  // 句柄已失效：没有可读的流，直接退出
+    }
 
     while (m_running_.load(std::memory_order_acquire)) {
         // ---- 先带超时等可读，再 recv ----
@@ -702,7 +844,7 @@ void TcpTransport::ReceiveLoop() {
         // 有详细说明）。等待超时即回到 while 顶部重新检查关闭标记，于是退出
         // 延迟有明确上界，且收包延迟不受影响（数据到达即刻唤醒）。
         std::string wait_error;
-        const int ready = ops.wait_readable(m_socket_->handle,
+        const int ready = ops.wait_readable(sock->handle,
                                             kReceivePollSliceMs, &wait_error);
         if (ready == 0) {
             continue;  // 轮询片超时：回到 while 重判退出条件
@@ -722,7 +864,7 @@ void TcpTransport::ReceiveLoop() {
         }
 
         const int received =
-            ops.recv(m_socket_->handle, buffer.data(), buffer.size());
+            ops.recv(sock->handle, buffer.data(), buffer.size());
 
         if (received > 0) {
             LIBXCP_LOG_INFO("TCP RX bytes={}", received);

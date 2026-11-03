@@ -11,6 +11,7 @@
 #define CALMCAR_XCP_UDP_TRANSPORT_HPP_
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -64,7 +65,11 @@ public:
     void Open(IPacketListener& listener) override;
 
     /// @brief 关闭通道：通知接收线程退出并 join，退出前由该线程回调
-    ///        OnTransportClosed；可安全重复调用
+    ///        OnTransportClosed
+    /// @note 可安全重复调用，也可从任意线程调用（**含监听器回调内**）。从
+    ///       监听器回调内调用时只发出关闭请求并立即返回：不 join、不阻塞，
+    ///       避免"接收线程 join 自己"触发 `std::terminate`；句柄关闭与唤醒对
+    ///       释放等收尾工作由析构函数或后续任意线程的 `Close()` 完成。
     /// @note 不在 join 之前关闭 Socket——句柄号会被 OS 立即回收并可能分配给
     ///       进程内新建的 Socket，而接收线程此刻仍可能正在处理入站包
     void Close() override;
@@ -89,6 +94,33 @@ public:
     [[nodiscard]] std::optional<DatagramCtr> LastReceiveCtr() const noexcept;
 
 private:
+    /// @brief 生命周期状态机：只允许 Closed→Open→Closing→Closed 单向前进
+    /// @details Closing 表示"关闭已开始、收尾尚未完成"（接收线程可能仍在
+    ///          运行，或收尾被延后到析构函数）。进入 Closed 前必须已完成
+    ///          线程 join 与资源释放。
+    enum class LifecycleState { Closed, Open, Closing };
+
+    /// @brief 当前线程是否是接收线程
+    /// @return true 表示调用方就是接收线程（此时禁止 join 自己）
+    [[nodiscard]] bool IsReceiveThread() const noexcept;
+
+    /// @brief 发出关闭请求：置运行标记并唤醒阻塞中的接收线程
+    /// @details 不 join、不释放资源，可在持 m_lifecycle_mutex_ 时调用
+    void SignalShutdown() noexcept;
+
+    /// @brief 释放唤醒 Socket 对（读端/写端在此关闭）
+    void ReleaseWakeupPair();
+
+    /// @brief 释放全部通道资源（Socket、唤醒对、监听器引用）
+    /// @pre 接收线程已 join，且调用方持有 m_lifecycle_mutex_
+    void ReleaseResources();
+
+    /// @brief 安全上报一条告警：吞掉监听器抛出的异常
+    /// @param message 告警文本
+    /// @note 禁止在持有 m_recv_mutex_ 时调用，否则监听器重入读
+    ///       LastReceiveCtr() 会因二次加锁自死锁/terminate
+    void NotifyWarning(const std::string& message) noexcept;
+
     /// @brief 接收线程主体：select 同时等待数据 Socket 与唤醒 Socket，
     ///        唤醒 Socket 可读或数据到达时即返回，交由 HandleDatagram 处理，
     ///        退出前回调 OnTransportClosed
@@ -145,7 +177,9 @@ private:
     /// @brief 收包监听器（非拥有）；Open() 写入、Close() 置空
     IPacketListener* m_listener_{nullptr};
     /// @brief 平台 Socket 实现（pimpl，隔离 Windows/POSIX 差异）
-    std::unique_ptr<SocketImpl> m_socket_;
+    /// @details 用 shared_ptr 承载：发送路径取一份快照后即可安全使用，
+    ///          不必与 Close() 争用同一把锁，也不会在 reset() 后被解引用。
+    std::shared_ptr<SocketImpl> m_socket_;
     /// @brief 唤醒 Socket 对（非拥有指针的 pimpl）；Open() 创建、Close() 释放
     /// @details 为空表示唤醒不可用，此时 ReceiveLoop 退化为纯 SO_RCVTIMEO
     ///          轮询（退出延迟为一个轮询周期），功能仍正确。
@@ -154,6 +188,16 @@ private:
     std::thread m_receive_thread_;
     /// @brief 接收线程运行标记，Close() 置 false 后由唤醒 Socket 立即打断
     std::atomic<bool> m_running_{false};
+    /// @brief 保护生命周期状态机与收尾认领，禁止与接收线程 join 同时持有
+    mutable std::mutex m_lifecycle_mutex_;
+    /// @brief 关闭完成通知：等待"收尾已被别人认领"的调用方在此挂起
+    std::condition_variable m_close_cv_;
+    /// @brief 当前生命周期状态（受 m_lifecycle_mutex_ 保护）
+    LifecycleState m_state_{LifecycleState::Closed};
+    /// @brief 收尾工作是否已被某个线程认领（保证只 join 一次）
+    bool m_finalize_owned_{false};
+    /// @brief 接收线程标识；用于识别"回调内关闭"（线程不能 join 自己）
+    std::thread::id m_receive_tid_{};
     /// @brief 保护发送路径与发送 CTR
     mutable std::mutex m_send_mutex_;
     /// @brief 下一个待分配的 Datagram CTR（逐 Frame 递增）
