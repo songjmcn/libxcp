@@ -11,7 +11,7 @@
 #define CALMCAR_XCP_COMMAND_CODEC_HPP_
 
 #include <cstdint>
-git #include <span>
+#include <span>
 
 #include "libxcp/protocol_types.hpp"
 #include "libxcp/xcp_error.hpp"
