@@ -24,6 +24,10 @@ constexpr std::uint8_t kLevel1CommandPrefix = 0xC0U;
 
 /// @brief GET_VERSION 的 Level-1 子命令码（原始 PDF 第 114 页 Table 44）
 constexpr std::uint8_t kGetVersionSubCommand = 0x00U;
+/// @brief Level-1 子命令：SET_DAQ_PACKED_MODE（V1.5 §7.5.4.7）
+constexpr std::uint8_t kSetDaqPackedModeSubCommand = 0x01U;
+/// @brief Level-1 子命令：GET_DAQ_PACKED_MODE（V1.5 §7.5.4.8）
+constexpr std::uint8_t kGetDaqPackedModeSubCommand = 0x02U;
 
 }  // namespace
 
@@ -263,6 +267,166 @@ Bytes CommandCodec::EncodeReadDaq() const {
     return cto;
 }
 
+Bytes CommandCodec::EncodeWriteDaqMultiple(
+    std::span<const WriteDaqElement> elements) const {
+    // WRITE_DAQ_MULTIPLE: [C7][n][每条目 8 字节]
+    // 条目内序：bit_offset、size、address(DWORD)、extension、dummy
+    // （docs §7.5.4.6 Table 122 的 Position 2..9 / 10..17 / …）
+    if (elements.empty()) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "WRITE_DAQ_MULTIPLE 至少需要一个 Entry");
+    }
+    if (elements.size() > 0xFFU) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "WRITE_DAQ_MULTIPLE 的 Entry 数超出 n 字段可表达范围（最大 255）");
+    }
+    Bytes cto;
+    cto.reserve(2U + (elements.size() * 8U));
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::WriteDaqMultiple));
+    cto.push_back(static_cast<std::uint8_t>(elements.size()));
+    for (const auto& element : elements) {
+        // size 为 0 的条目在 WRITE_DAQ 里也是非法值（docs L2161-2166），
+        // 这里提前拒绝，避免整份配置因单条无效而在 Slave 侧整体作废
+        if (element.size == 0U) {
+            LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+            throw detail::MakeInvalidArgument(
+                "WRITE_DAQ_MULTIPLE 的 Size 字段不得为 0（以 AG 为单位的元素数）");
+        }
+        cto.push_back(element.bit_offset);
+        cto.push_back(element.size);
+        WriteU32(cto, element.address);
+        cto.push_back(element.extension);
+        // 规范要求每个条目（含最后一个）都留 dummy 对齐字节，
+        // 少了这一个字节整帧就会短 1 字节
+        cto.push_back(0x00U);
+    }
+    return cto;
+}
+
+Bytes CommandCodec::EncodeDtoCtrProperties(
+    DtoCtrModifierBit modifier, std::uint16_t event_channel,
+    std::uint16_t related_event_channel, DaqCounterMode daq_mode,
+    bool stim_mode) const {
+    // DTO_CTR_PROPERTIES: [C5][MODIFIER][EVENT(WORD)][RELATED(WORD)][MODE]
+    // （docs §7.5.4.15 Table 159）
+    std::uint8_t mode = 0x00U;
+    if (HasDtoCtrModifier(modifier, DtoCtrModifierBit::kModifyDaqMode)) {
+        mode = static_cast<std::uint8_t>(
+            mode | static_cast<std::uint8_t>(daq_mode));
+    } else if (daq_mode != DaqCounterMode::InsertCounter) {
+        // 未声明修改 DAQ_MODE 却传了非默认值：这属于调用方语义自相矛盾，
+        // 若默默忽略会让上层以为改成功了，故直接拒绝
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "DTO_CTR_PROPERTIES 未置 MODIFY_DAQ_MODE 时不得指定非默认 DAQ_MODE");
+    }
+    if (HasDtoCtrModifier(modifier, DtoCtrModifierBit::kModifyStimMode)) {
+        if (stim_mode) {
+            mode = static_cast<std::uint8_t>(mode | 0x02U);  // bit1 STIM_MODE
+        }
+    } else if (stim_mode) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "DTO_CTR_PROPERTIES 未置 MODIFY_STIM_MODE 时不得指定 STIM_MODE");
+    }
+    if (!HasDtoCtrModifier(modifier, DtoCtrModifierBit::kModifyRelatedEvent) &&
+        related_event_channel != 0U) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "DTO_CTR_PROPERTIES 未置 MODIFY_RELATED_EVENT 时相关事件通道号应写 0");
+    }
+    Bytes cto;
+    cto.reserve(7);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::DtoCtrProperties));
+    cto.push_back(static_cast<std::uint8_t>(modifier));
+    WriteU16(cto, event_channel);
+    WriteU16(cto, related_event_channel);
+    cto.push_back(mode);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetDaqClock() const {
+    // GET_DAQ_CLOCK: 单字节 [DC]（docs §7.5.4.10 Table 132）
+    return Bytes{static_cast<std::uint8_t>(CommandCode::GetDaqClock)};
+}
+
+Bytes CommandCodec::EncodeTimeCorrelationProperties(
+    std::uint8_t set_properties, std::uint8_t get_properties_request,
+    std::uint16_t cluster_id) const {
+    // TIME_CORRELATION_PROPERTIES:
+    //   [C6][SET_PROPERTIES][GET_PROPERTIES_REQUEST][RESERVED][CLUSTER_ID(WORD)]
+    // （docs §7.5.6.1 Table 207，共 6 字节；RESERVED 规范要求写 0）
+    Bytes cto;
+    cto.reserve(6);
+    cto.push_back(
+        static_cast<std::uint8_t>(CommandCode::TimeCorrelationProperties));
+    cto.push_back(set_properties);
+    cto.push_back(get_properties_request);
+    cto.push_back(0x00U);
+    WriteU16(cto, cluster_id);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeSetDaqPackedMode(
+    std::uint16_t daq_list, DaqPackedMode mode,
+    DaqPackedTimestampMode timestamp_mode,
+    std::uint16_t sample_count) const {
+    // SET_DAQ_PACKED_MODE（原始 PDF Table 123/124）：
+    //   [C0][01][daq_list WORD][DAQ_PACKED_MODE][DPM_TIMESTAMP_MODE]
+    //   [DPM_SAMPLE_COUNT WORD]
+    const bool packed = (mode != DaqPackedMode::NotPacked);
+    if (packed) {
+        if (sample_count < kMinDaqPackedSampleCount ||
+            sample_count > kMaxDaqPackedSampleCount) {
+            throw detail::MakeInvalidArgument(
+                "SET_DAQ_PACKED_MODE: DPM_SAMPLE_COUNT 必须在 [2, 0xFFFF] 内，"
+                "实际 " +
+                std::to_string(sample_count));
+        }
+        if (ToDaqPackedTimestampMode(
+                static_cast<std::uint8_t>(timestamp_mode)) != timestamp_mode) {
+            throw detail::MakeInvalidArgument(
+                "SET_DAQ_PACKED_MODE: DPM_TIMESTAMP_MODE 只允许 0（末采样）"
+                "或 1（首采样）");
+        }
+    } else if (timestamp_mode != DaqPackedTimestampMode::LastSample ||
+               sample_count != 0U) {
+        // 规范规定 NotPacked 下第 5..7 字节被忽略；这里拒绝“给了又不用”的调用，
+        // 免得调用方以为设置的采样数生效了。
+        throw detail::MakeInvalidArgument(
+            "SET_DAQ_PACKED_MODE: DAQ_PACKED_MODE=0 时时间戳语义与采样数无意义，"
+            "必须传 LastSample 与 0");
+    }
+
+    Bytes cto;
+    cto.reserve(8);
+    cto.push_back(kLevel1CommandPrefix);
+    cto.push_back(kSetDaqPackedModeSubCommand);
+    WriteU16(cto, daq_list);
+    cto.push_back(static_cast<std::uint8_t>(mode));
+    if (packed) {
+        cto.push_back(static_cast<std::uint8_t>(timestamp_mode));
+        WriteU16(cto, sample_count);
+    } else {
+        // 规范：mode = 0 时格式与内容被忽略，统一写 0 保持报文长度一致
+        cto.push_back(0x00U);
+        WriteU16(cto, 0x0000U);
+    }
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetDaqPackedMode(std::uint16_t daq_list) const {
+    // GET_DAQ_PACKED_MODE（原始 PDF Table 127）：[C0][02][daq_list WORD]
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(kLevel1CommandPrefix);
+    cto.push_back(kGetDaqPackedModeSubCommand);
+    WriteU16(cto, daq_list);
+    return cto;
+}
+
 Bytes CommandCodec::EncodeSetDaqListMode(DaqListModeBit mode,
                                          std::uint16_t daq_list,
                                          std::uint16_t event_channel,
@@ -306,6 +470,16 @@ Bytes CommandCodec::EncodeGetDaqListInfo(std::uint16_t daq_list) const {
     Bytes cto;
     cto.reserve(4);
     cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqListInfo));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, daq_list);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeGetDaqListMode(std::uint16_t daq_list) const {
+    // GET_DAQ_LIST_MODE: [DF][reserved][daq(WORD)]（规范 Table 150）
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::GetDaqListMode));
     cto.push_back(0x00U);  // reserved
     WriteU16(cto, daq_list);
     return cto;
@@ -417,6 +591,99 @@ Bytes CommandCodec::EncodeDownload(ElementCount number_of_elements,
     // 对齐字节取值不受规范约束（原文只称 "Used for alignment"），统一填 0
     cto.insert(cto.end(), alignment, 0x00U);
     cto.insert(cto.end(), data.begin(), data.end());
+    return cto;
+}
+
+Bytes CommandCodec::EncodeDownloadNext(ElementCount number_of_elements,
+                                       BytesView data) const {
+    // DOWNLOAD_NEXT（原始 PDF 第 144 页 Table 83）：[EF][n][对齐][data...]
+    // 与 DOWNLOAD 结构同构，但 n 的语义是"剩余元素数（含本帧）"，
+    // Slave 据此检测丢包；序号不符时回 ERR_SEQUENCE 并附期望元素数。
+    if (number_of_elements == 0U || number_of_elements > kMaxElementsPerField) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "DOWNLOAD_NEXT NumberOfElements 超出单字节字段范围 1..255: " +
+            std::to_string(number_of_elements));
+    }
+    if (data.empty()) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument("DOWNLOAD_NEXT 数据段为空");
+    }
+    // 对齐规则与 DOWNLOAD 一致（Table 83 引用了同一段说明）：仅 AG>2 插 2 字节
+    const std::size_t alignment = DownloadAlignmentBytes();
+    Bytes cto;
+    cto.reserve(2 + alignment + data.size());
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::DownloadNext));
+    cto.push_back(static_cast<std::uint8_t>(number_of_elements));
+    cto.insert(cto.end(), alignment, 0x00U);
+    cto.insert(cto.end(), data.begin(), data.end());
+    return cto;
+}
+
+Bytes CommandCodec::EncodeDownloadMax(BytesView data,
+                                     std::size_t max_cto) const {
+    // DOWNLOAD_MAX（原始 PDF 第 145 页 Table 85）：[EE][对齐][data...]
+    // 对齐规则与 DOWNLOAD **不同**：Table 85 为 "only if AG > 1"，
+    // 元素 1 位于偏移 AG，故对齐字节数 = AG-1（AG=BYTE 时 0，AG=WORD 时 1）。
+    const std::size_t ag_bytes = AgToBytes(m_ag_);
+    if (ag_bytes == 0U || max_cto == 0U || (max_cto % ag_bytes) != 0U) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "DOWNLOAD_MAX 要求 MAX_CTO 为 AG 的整数倍: MAX_CTO=" +
+            std::to_string(max_cto) + ", AG=" + std::to_string(ag_bytes));
+    }
+    const std::size_t alignment = ag_bytes - 1U;
+    const std::size_t expected_data = max_cto - ag_bytes;
+    if (data.size() != expected_data) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "DOWNLOAD_MAX 数据长度必须为 MAX_CTO-AG = " +
+            std::to_string(expected_data) + " 字节，实际 " +
+            std::to_string(data.size()));
+    }
+    if (data.empty()) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument(
+            "DOWNLOAD_MAX 无处承载数据元素（MAX_CTO 仅够一帧头部）");
+    }
+    Bytes cto;
+    cto.reserve(1 + alignment + data.size());
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::DownloadMax));
+    cto.insert(cto.end(), alignment, 0x00U);
+    cto.insert(cto.end(), data.begin(), data.end());
+    return cto;
+}
+
+Bytes CommandCodec::EncodeSetRequest(
+    SetRequestModeBit mode, std::uint16_t session_configuration_id) const {
+    // SET_REQUEST（原始 PDF 第 128 页 Table 62）：
+    //   [F9][Mode][Session configuration id(WORD)]
+    const auto mode_bits = static_cast<std::uint8_t>(mode);
+    if (mode_bits == 0U) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument("SET_REQUEST Mode 不能为 0（未请求任何动作）");
+    }
+    Bytes cto;
+    cto.reserve(4);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::SetRequest));
+    cto.push_back(mode_bits);
+    WriteU16(cto, session_configuration_id);
+    return cto;
+}
+
+Bytes CommandCodec::EncodeBuildChecksum(std::uint32_t block_size) const {
+    // BUILD_CHECKSUM（原始 PDF 第 148 页 Table 73）：
+    //   [F3][reserved][reserved(WORD)][Block size [AG](DWORD)]
+    if (block_size == 0U) {
+        LIBXCP_LOG_ERROR("CommandCodec rejected invalid parameters");
+        throw detail::MakeInvalidArgument("BUILD_CHECKSUM Block size 必须大于 0");
+    }
+    Bytes cto;
+    cto.reserve(8);
+    cto.push_back(static_cast<std::uint8_t>(CommandCode::BuildChecksum));
+    cto.push_back(0x00U);  // reserved
+    WriteU16(cto, 0x0000U);  // reserved
+    WriteU32(cto, block_size);
     return cto;
 }
 

@@ -23,18 +23,38 @@ MeasurementPlanner::MeasurementPlanner(
     const IMeasurementDatabase& database, std::uint16_t max_dto,
     AddressGranularity address_granularity, std::size_t timestamp_bytes,
     std::size_t identification_bytes,
-    MeasurementDaqCapabilities daq_capabilities)
+    MeasurementDaqCapabilities daq_capabilities, bool dto_counter,
+    std::size_t counter_header_bytes, DaqPackedMode packed_mode,
+    std::uint16_t packed_sample_count)
     : m_database_(database),
       m_max_dto_(max_dto),
       m_ag_bytes_(AgToBytes(address_granularity)),
       m_timestamp_bytes_(timestamp_bytes),
       m_identification_bytes_(identification_bytes),
-      m_daq_capabilities_(daq_capabilities) {}
+      m_daq_capabilities_(daq_capabilities),
+      m_dto_counter_(dto_counter),
+      m_counter_header_bytes_(counter_header_bytes),
+      m_packed_mode_(packed_mode),
+      m_packed_sample_count_(packed_sample_count) {}
 
 MeasurementPlanner::~MeasurementPlanner() = default;
 
 MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
     const std::vector<std::string>& names) const {
+    // ---- B4：Packed Mode 的采样倍率 ----
+    // 非 packed 时倍率恒为 1（与既有行为逐字节一致）；packed 时一个 DTO
+    // 承载 S 个连续采样，净荷容量按 S 倍计算。规范明确 DPM_SAMPLE_COUNT 的
+    // 0 与 1 非法，这里在装箱前就拒绝，避免产出必然被对端拒绝的规划。
+    const bool packed = (m_packed_mode_ != DaqPackedMode::NotPacked);
+    if (packed && (m_packed_sample_count_ < kMinDaqPackedSampleCount ||
+                   m_packed_sample_count_ > kMaxDaqPackedSampleCount)) {
+        return detail::MakeMeasurementError<MeasurementPlan>(
+            MeasurementErrorCode::DaqConfigurationError,
+            "DAQ Packed Mode 的 DPM_SAMPLE_COUNT 必须在 [2, 0xFFFF] 内，实际 " +
+                std::to_string(m_packed_sample_count_));
+    }
+    const std::size_t sample_multiplier =
+        packed ? static_cast<std::size_t>(m_packed_sample_count_) : 1U;
     // ---- 第一步：逐个查库，取得布局；任一失败即整体失败（不产出半成品） ----
     struct Row {
         std::string name;
@@ -165,16 +185,25 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
             MeasurementErrorCode::DaqConfigurationError,
             "识别字段与时间戳头超出 MAX_DTO");
     }
+    // 计数器段：只有识别字段模式不把 CTR 并入 FILL 时才额外占 1 字节；
+    // 漏算这一字节会让规划刚好撑满 MAX_DTO，实际 DTO 超长被 Slave 拒绝（B2）。
+    const std::size_t envelope_fixed = m_timestamp_bytes_ + odt_id_bytes;
+    if (m_counter_header_bytes_ > max_dto_bytes - envelope_fixed) {
+        return detail::MakeMeasurementError<MeasurementPlan>(
+            MeasurementErrorCode::DaqConfigurationError,
+            "识别字段、时间戳与计数器头超出 MAX_DTO");
+    }
     const std::size_t usable =
-        max_dto_bytes - m_timestamp_bytes_ - odt_id_bytes;
+        max_dto_bytes - envelope_fixed - m_counter_header_bytes_;
 
     // ---- 单变量跨 ODT / 超容量检验 ----
     for (const auto& row : rows) {
-        if (row.byte_width > usable) {
+        if (row.byte_width * sample_multiplier > usable) {
             return detail::MakeMeasurementError<MeasurementPlan>(
                 MeasurementErrorCode::DaqConfigurationError,
                 "测量 '" + row.name + "' 需 " + std::to_string(row.byte_width) +
-                    " 字节净荷，超过单 ODT 可用容量 " +
+                    " 字节净荷（packed 倍率 " +
+                    std::to_string(sample_multiplier) + "），超过单 ODT 可用容量 " +
                     std::to_string(usable) +
                     "（MAX_DTO=" + std::to_string(m_max_dto_) +
                     " timestamp_bytes=" + std::to_string(m_timestamp_bytes_) +
@@ -217,11 +246,42 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
     struct Active {
         DaqListSpec spec;
         std::uint16_t event_channel{0};
-        std::size_t odt_used{0};  // 当前 ODT 已占净荷字节
+        std::size_t odt_used{0};        // 当前 ODT 已占净荷字节（含 S 倍）
+        std::size_t odt_single_used{0}; // 当前 ODT 单采样累计宽度
+        std::vector<std::size_t> odt_route_indices;  // 当前 ODT 的路由下标
     };
     Active cur;
     bool has_active = false;
     std::uint16_t daq_list_counter = 0;
+
+    // 关闭当前 ODT：把 packed 采样步长回填到本 ODT 的所有路由。
+    // element-grouped 的步长是各 Entry 自身宽度；event-grouped 的步长是
+    // 整个 ODT 的单采样总宽度（同 ODT 内按采样组连续排列）。非 packed 一律 0。
+    //
+    // element-grouped 还必须修正**基址**：装箱阶段 payload_offset 记录的是
+    // 单采样内偏移，而 element-grouped 的物理布局是「Entry e 的全部 S 个采样
+    // 连续排布，再排 Entry e+1」，故 Entry e 的背包基址应为
+    // `Σ_{i<e} w_i × S`，即单采样偏移乘以 S。漏乘会让第 2 个及以后的 Entry
+    // 从**前一个 Entry 的后续采样**中取数，产生静默错位且不报错。
+    // event-grouped 的布局是「采样 k 的全部 Entry 连续」，单采样偏移配
+    // `k × ODT 单采样宽`的步长已正确，基址不得再乘 S。
+    const auto close_odt = [&](Active& active) {
+        if (active.odt_route_indices.empty()) {
+            return;
+        }
+        for (const std::size_t index : active.odt_route_indices) {
+            MeasurementRoute& route = plan.routes[index];
+            if (!packed) {
+                route.packed_stride = 0;
+            } else if (m_packed_mode_ == DaqPackedMode::ElementGrouped) {
+                route.packed_stride = route.size;
+                route.payload_offset *= sample_multiplier;
+            } else {
+                route.packed_stride = active.odt_single_used;
+            }
+        }
+        active.odt_route_indices.clear();
+    };
 
     // 组内顺序即 grouped 顺序；同组连续，跨组即新 List。
     for (const auto& row : grouped) {
@@ -230,6 +290,7 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
 
         if (start_new_list) {
             if (has_active) {
+                close_odt(cur);
                 plan.daq_lists.push_back(std::move(cur.spec));
             }
             cur = Active{};
@@ -240,42 +301,52 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
             cur.spec.prescaler = 1;
             cur.spec.priority = 0;
             cur.spec.stim_direction = false;
-            cur.spec.dto_counter = false;
+            cur.spec.dto_counter = m_dto_counter_;
             cur.spec.timestamp = (m_timestamp_bytes_ > 0);
             cur.spec.pid_off = false;
             // 首 ODT
             cur.spec.odts.emplace_back();
             cur.odt_used = 0;
+            cur.odt_single_used = 0;
+            cur.odt_route_indices.clear();
             has_active = true;
         }
 
-        // 当前 ODT 装不下 → 开新 ODT（同组内新 ODT 仍属当前 List）
-        if (row.byte_width > usable - cur.odt_used) {
+        // 当前 ODT 装不下 → 开新 ODT（同组内新 ODT 仍属当前 List）。
+        // packed 时一帧要放下 S 个采样，故按 S 倍宽度判定。
+        if (row.byte_width * sample_multiplier > usable - cur.odt_used) {
             if (cur.spec.odts.size() >= 256U) {
                 return detail::MakeMeasurementError<MeasurementPlan>(
                     MeasurementErrorCode::DaqConfigurationError,
                     "DAQ List ODT 数量超过 8 位 ODT 编号范围(0..255)",
                     row.name);
             }
+            close_odt(cur);
             cur.spec.odts.emplace_back();
             cur.odt_used = 0;
+            cur.odt_single_used = 0;
         }
         DaqOdtSpec& odt = cur.spec.odts.back();
-        const std::size_t payload_offset = cur.odt_used;  // 记录偏移（此时尚未递增）
+        // 偏移是**单采样内**的偏移：packed 时第 k 个采样的同一测量位于
+        // payload_offset + k * packed_stride。
+        const std::size_t payload_offset = cur.odt_single_used;
         // DaqEntrySpec.size 以 AG 为单位（xcp_master 预检按 Σ size*ag_bytes 计）
         odt.entries.emplace_back(DaqEntrySpec{
             row.info.address, row.info.extension,
             static_cast<std::uint8_t>(row.ag_units), kDaqBitOffsetNone});
-        cur.odt_used += row.byte_width;
+        cur.odt_used += row.byte_width * sample_multiplier;
+        cur.odt_single_used += row.byte_width;
         const std::uint8_t odt_number =
             static_cast<std::uint8_t>(cur.spec.odts.size() - 1);
         plan.routes.push_back(MeasurementRoute{
             row.name, cur.spec.daq_list, odt_number, payload_offset,
             row.byte_width, row.info.is_array, row.info.element_count,
-            row.info.element_size_bytes});
+            row.info.element_size_bytes, 0});
+        cur.odt_route_indices.push_back(plan.routes.size() - 1);
     }
 
     if (has_active) {
+        close_odt(cur);
         plan.daq_lists.push_back(std::move(cur.spec));
     }
 

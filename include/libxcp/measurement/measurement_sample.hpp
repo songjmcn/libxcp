@@ -13,6 +13,7 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -48,12 +49,36 @@ struct MeasurementSample {
  *          `timestamp` 无意义、`timestamp_raw` 保留原始计数供上层自行处置
  *          （不猜，B-3/R13）。
  */
+/// @brief 时间戳的来源（B4：区分"DTO 自带"与"按周期重建"）
+enum class MeasurementTimestampSource : std::uint8_t {
+    None = 0,       ///< 本帧无可用时间戳（未配置或单位/位宽未知）
+    Dto = 1,        ///< 直接来自 DTO 时间戳字段（非 packed，或 packed 的锚点采样）
+    Reconstructed = 2,  ///< packed 下由事件周期 × 降频因子按采样序号重建
+};
+
 struct MeasurementFrame {
     std::uint16_t daq_list = 0;              ///< 所属 DAQ List 号
     std::uint8_t odt = 0;                    ///< 所属 ODT 号（0 基）
     std::chrono::nanoseconds timestamp{};    ///< 回卷安全的单调纳秒（valid 时可用）
     std::uint64_t timestamp_raw = 0;         ///< 原始计数（无时间戳段时为 0）
     bool timestamp_valid = false;            ///< 换算成功（位宽+单位均已知）
+    /// @brief DTO 计数器原始值（仅 DAQ List 模式置位 DTO_CTR 时存在）
+    /// @details 计数器由 Slave 逐帧自增（模 256），本类只转交原始值，
+    ///          不做任何补偿；`nullopt` 表示本会话未启用或该帧无计数器段。
+    std::optional<std::uint8_t> counter;
+    /// @brief 相对上一帧丢失的计数步数（0=无缺口；首帧或未启用亦为 0）
+    /// @details 由相邻两帧计数器差值减一得出（模 256），仅表示**观测到的**
+    ///          缺口，不等同于精确丢帧原因（传输错误/被覆盖/迟到均可能）。
+    std::uint8_t counter_lost_before = 0;
+    /// @brief 本帧是同一 DTO 内的第几个采样（0 基；非 packed 恒为 0）
+    /// @note 宽度必须为 16 位：DPM_SAMPLE_COUNT 合法范围是 [2, 0xFFFF]，
+    ///       8 位会截断 S>255 的场景并让帧数少于 DTO 实际承载的采样数。
+    std::uint16_t sample_index = 0;
+    /// @brief 同一 DTO 内共打包了多少个采样（非 packed 恒为 1）
+    std::uint16_t sample_count = 1;
+    /// @brief 时间戳来源（Dto / Reconstructed / None）
+    MeasurementTimestampSource timestamp_source{
+        MeasurementTimestampSource::None};
     std::vector<MeasurementSample> samples;  ///< 本帧包含的样本
 };
 
