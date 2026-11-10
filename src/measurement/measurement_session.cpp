@@ -304,11 +304,6 @@ void MeasurementSession::Prepare() {
     m_packed_lists_.clear();
     if (m_packed_mode_ != DaqPackedMode::NotPacked) {
         for (const DaqListSpec& spec : plan.Value().daq_lists) {
-            if (spec.daq_list >= 256U) {
-                throw XcpException(
-                    ErrorCategory::InvalidArgument,
-                    "DAQ Packed Mode 的采样序号按 8 位表达，DAQ List 号必须 < 256");
-            }
             // 采样间隔 = 事件周期 × 降频因子；事件周期不可得则不猜，拒绝启用
             const std::optional<GetDaqEventInfoResponse> event_info =
                 master.QueryDaqEventInfo(spec.event_channel);
@@ -332,6 +327,7 @@ void MeasurementSession::Prepare() {
             }
             const DaqPackedModeNegotiation negotiation =
                 master.SetDaqPackedMode(spec.daq_list, m_packed_mode_,
+                                        spec.event_channel,
                                         m_packed_timestamp_mode_,
                                         m_packed_sample_count_);
             if (!negotiation.active) {
@@ -341,14 +337,25 @@ void MeasurementSession::Prepare() {
                         std::to_string(spec.daq_list) + "）：" +
                         negotiation.reason);
             }
+            // 降频因子必须来自回读：SET_DAQ_LIST_MODE 的请求值允许被 Slave
+            // 改写，用请求值会让非锚点采样时间戳按错误间隔重建。
+            const XcpMaster::DaqPackedRuntimeInfo runtime =
+                master.ReadDaqPackedRuntimeInfo(spec.daq_list);
+            if (!runtime.prescaler_verified) {
+                throw XcpException(
+                    ErrorCategory::UnsupportedFeature,
+                    "已启用 DAQ Packed Mode，但无法回读该列表的实际降频因子"
+                    "（GET_DAQ_LIST_MODE 不可用或 prescaler=0，DAQ List " +
+                        std::to_string(spec.daq_list) +
+                        "），不能按请求值假设采样间隔");
+            }
             PackedListInfo info;
-            info.sample_count = static_cast<std::uint8_t>(
-                std::min<std::uint16_t>(m_packed_sample_count_, 0xFFU));
+            // 采样数保留完整 16 位：DPM_SAMPLE_COUNT 合法范围是 [2, 0xFFFF]，
+            // 截断会把 S=256 变成 0，进而只解出一个采样而静默丢弃其余采样。
+            info.sample_count = m_packed_sample_count_;
             info.sample_interval_ns =
                 static_cast<std::uint64_t>(event_info->time_cycle) *
-                (*unit_ns) * static_cast<std::uint64_t>(spec.prescaler == 0U
-                                                            ? 1U
-                                                            : spec.prescaler);
+                (*unit_ns) * static_cast<std::uint64_t>(runtime.prescaler);
             info.first_sample_timestamp =
                 (m_packed_timestamp_mode_ ==
                  DaqPackedTimestampMode::FirstSample);
@@ -618,7 +625,7 @@ void MeasurementSession::WorkerLoop() {
 
         // ---- B4：本 DTO 内打包了多少个采样 ----
         // 非 packed 恒为 1；packed 时由 Prepare 回读确认后的列表参数给出。
-        std::uint8_t sample_total = 1;
+        std::uint16_t sample_total = 1;
         std::uint64_t sample_interval_ns = 0;
         bool first_sample_timestamp = false;
         if (m_packed_active_) {
@@ -665,7 +672,7 @@ void MeasurementSession::WorkerLoop() {
             }
         }
 
-        for (std::uint8_t sample_index = 0; sample_index < sample_total;
+        for (std::uint16_t sample_index = 0; sample_index < sample_total;
              ++sample_index) {
             // 按切片取出原始字节：packed 时第 k 个采样位于
             // offset + k * packed_stride（stride 由规划器按分组方式给出）。

@@ -257,6 +257,14 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
     // 关闭当前 ODT：把 packed 采样步长回填到本 ODT 的所有路由。
     // element-grouped 的步长是各 Entry 自身宽度；event-grouped 的步长是
     // 整个 ODT 的单采样总宽度（同 ODT 内按采样组连续排列）。非 packed 一律 0。
+    //
+    // element-grouped 还必须修正**基址**：装箱阶段 payload_offset 记录的是
+    // 单采样内偏移，而 element-grouped 的物理布局是「Entry e 的全部 S 个采样
+    // 连续排布，再排 Entry e+1」，故 Entry e 的背包基址应为
+    // `Σ_{i<e} w_i × S`，即单采样偏移乘以 S。漏乘会让第 2 个及以后的 Entry
+    // 从**前一个 Entry 的后续采样**中取数，产生静默错位且不报错。
+    // event-grouped 的布局是「采样 k 的全部 Entry 连续」，单采样偏移配
+    // `k × ODT 单采样宽`的步长已正确，基址不得再乘 S。
     const auto close_odt = [&](Active& active) {
         if (active.odt_route_indices.empty()) {
             return;
@@ -267,6 +275,7 @@ MeasurementResult<MeasurementPlan> MeasurementPlanner::Build(
                 route.packed_stride = 0;
             } else if (m_packed_mode_ == DaqPackedMode::ElementGrouped) {
                 route.packed_stride = route.size;
+                route.payload_offset *= sample_multiplier;
             } else {
                 route.packed_stride = active.odt_single_used;
             }

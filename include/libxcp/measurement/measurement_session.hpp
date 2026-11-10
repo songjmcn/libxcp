@@ -242,7 +242,7 @@ private:
     bool m_packed_active_{false};  ///< Prepare 回读确认后的实际 packed 状态
     /// @brief 每个 DAQ List 的 packed 运行参数（仅 m_packed_active_ 时填充）
     struct PackedListInfo {
-        std::uint8_t sample_count{1};      ///< 一帧采样数（DTO 内）
+        std::uint16_t sample_count{1};    ///< 一帧采样数（DTO 内，[1, 0xFFFF]）
         std::uint64_t sample_interval_ns{0};  ///< 相邻采样间隔（纳秒）
         bool first_sample_timestamp{false};  ///< 帧时间戳是否指向首采样
     };

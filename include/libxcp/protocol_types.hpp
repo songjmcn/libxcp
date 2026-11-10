@@ -1100,10 +1100,20 @@ struct GetStatusResponse {
 };
 
 /**
+ * @brief COMM_MODE_OPTIONAL 的 MASTER_BLOCK_MODE 位（bit0）
+ * @details 该位置位才表示 Slave 接受 **Master→Slave** 的块下载序列
+ *          （DOWNLOAD 首帧 + DOWNLOAD_NEXT 续帧）。它与 CONNECT 响应里
+ *          COMM_MODE_BASIC bit6 的 SLAVE_BLOCK_MODE（Slave→Master 上传块模式）
+ *          是两个不同方向的能力，不可互相替代。
+ */
+constexpr std::uint8_t kCommModeOptionalMasterBlockMode = 0x01U;
+
+/**
  * @brief GET_COMM_MODE_INFO 响应解析结果
  */
 struct GetCommModeInfoResponse {
     std::uint8_t comm_mode_optional{0};    ///< COMM_MODE_OPTIONAL 原始字节
+                                           ///< bit0=MASTER_BLOCK_MODE
     std::uint8_t max_bs{0};                ///< Block Mode 最大块大小
     std::uint8_t min_st{0};                ///< 最小分离时间（单位 100μs）
     std::uint8_t queue_size{0};            ///< Interleaved Mode 队列深度

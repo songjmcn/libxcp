@@ -721,9 +721,23 @@ public:
         std::uint16_t daq_list);
 
     /**
+     * @brief DAQ Packed Mode 生效后回读的**运行时**参数
+     * @details `SET_DAQ_LIST_MODE` 里的 prescaler 只是请求值，规范允许 Slave
+     *          改写；packed 下非锚点采样的时间戳全部依赖
+     *          `事件周期 × 实际降频因子`，用请求值计算会把错误间隔伪装成
+     *          有效时间戳。故协商成功后另行回读，调用方必须使用这里的值。
+     */
+    struct DaqPackedRuntimeInfo {
+        bool prescaler_verified{false};   ///< true 表示 prescaler 来自回读
+        std::uint8_t prescaler{1U};       ///< 实际降频因子（0 按 1 处理）
+    };
+
+    /**
      * @brief 设置并**回读确认**某 DAQ List 的 Packed 模式
      * @param daq_list DAQ List 号
      * @param mode 目标打包方式；`NotPacked` 表示复位为常规传输
+     * @param event_channel 该 List 绑定的 Event Channel；`mode != NotPacked`
+     *        时必须提供，用于取证 `DAQ_EVENT_PROPERTIES` 的 PACKED 位
      * @param timestamp_mode 时间戳语义（仅 packed 有意义）
      * @param sample_count 一帧采样数（仅 packed 有意义，合法范围 [2, 0xFFFF]）
      * @return 协商结果；`active == false` 时 `reason` 说明失败环节，调用方
@@ -732,12 +746,26 @@ public:
      *       回读不一致都通过返回值表达，因为"退回非 packed"是正常业务分支，
      *       不是程序错误。本地参数非法（如采样数 0/1）仍抛
      *       `InvalidArgument`。
+     * @note 能力取证与 `CanUseDaqPackedMode` 同源：列表与**事件通道**都必须
+     *       申报 PACKED 且事件为周期事件。只查列表会让"列表支持、事件不支持"
+     *       的组合通过，随后按 packed 拆帧产生静默错位。
      * @warning 切换模式前应先停止该列表的测量；切换后本地布局账本与解码路由
      *          必须重建，旧代际 DTO 不得继续按新布局解码。
      */
     [[nodiscard]] DaqPackedModeNegotiation SetDaqPackedMode(
-        std::uint16_t daq_list, DaqPackedMode mode,
+        std::uint16_t daq_list, DaqPackedMode mode, std::uint16_t event_channel,
         DaqPackedTimestampMode timestamp_mode, std::uint16_t sample_count);
+
+    /**
+     * @brief 回读 Packed List 的运行时降频因子
+     * @param daq_list DAQ List 号
+     * @return 回读结果；`GET_DAQ_LIST_MODE` 不支持或返回非法值时
+     *         `prescaler_verified == false`
+     * @details 与 `SetDaqPackedMode` 分离，因为 `SET_DAQ_LIST_MODE` 本身来自
+     *          规划器的下行配置，回读必须发生在配置之后、按 packed 解码之前。
+     */
+    [[nodiscard]] DaqPackedRuntimeInfo ReadDaqPackedRuntimeInfo(
+        std::uint16_t daq_list);
 
     // ---- 变量标定批次：Calibration / Page Switching（docs §7.5.2.5 / §7.5.3）----
 

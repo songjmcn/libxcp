@@ -71,9 +71,11 @@ struct MeasurementFrame {
     ///          缺口，不等同于精确丢帧原因（传输错误/被覆盖/迟到均可能）。
     std::uint8_t counter_lost_before = 0;
     /// @brief 本帧是同一 DTO 内的第几个采样（0 基；非 packed 恒为 0）
-    std::uint8_t sample_index = 0;
+    /// @note 宽度必须为 16 位：DPM_SAMPLE_COUNT 合法范围是 [2, 0xFFFF]，
+    ///       8 位会截断 S>255 的场景并让帧数少于 DTO 实际承载的采样数。
+    std::uint16_t sample_index = 0;
     /// @brief 同一 DTO 内共打包了多少个采样（非 packed 恒为 1）
-    std::uint8_t sample_count = 1;
+    std::uint16_t sample_count = 1;
     /// @brief 时间戳来源（Dto / Reconstructed / None）
     MeasurementTimestampSource timestamp_source{
         MeasurementTimestampSource::None};

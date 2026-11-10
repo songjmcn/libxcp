@@ -369,8 +369,8 @@ TEST(DaqPackedModeMaster, SetRequiresMatchingReadback) {
     rig.slave.report_mode = 0x01U;
     rig.slave.report_sample_count = 4U;
     const auto ok = rig.master->SetDaqPackedMode(
-        0U, DaqPackedMode::ElementGrouped, DaqPackedTimestampMode::LastSample,
-        4U);
+        0U, DaqPackedMode::ElementGrouped, /*event_channel=*/1U,
+        DaqPackedTimestampMode::LastSample, 4U);
     EXPECT_TRUE(ok.active);
     EXPECT_TRUE(ok.reason.empty());
 
@@ -378,8 +378,8 @@ TEST(DaqPackedModeMaster, SetRequiresMatchingReadback) {
     PackedMasterRig ignored;
     ignored.slave.report_mode = 0x00U;
     const auto rejected = ignored.master->SetDaqPackedMode(
-        0U, DaqPackedMode::ElementGrouped, DaqPackedTimestampMode::LastSample,
-        4U);
+        0U, DaqPackedMode::ElementGrouped, /*event_channel=*/1U,
+        DaqPackedTimestampMode::LastSample, 4U);
     EXPECT_FALSE(rejected.active);
     EXPECT_FALSE(rejected.reason.empty());
 }
@@ -388,8 +388,8 @@ TEST(DaqPackedModeMaster, SetRejectsWhenSlaveRefusesMode) {
     PackedMasterRig rig;
     rig.slave.accept_set = false;
     const auto result = rig.master->SetDaqPackedMode(
-        0U, DaqPackedMode::ElementGrouped, DaqPackedTimestampMode::LastSample,
-        4U);
+        0U, DaqPackedMode::ElementGrouped, /*event_channel=*/1U,
+        DaqPackedTimestampMode::LastSample, 4U);
     EXPECT_FALSE(result.active);
     EXPECT_FALSE(result.reason.empty());
 }
@@ -398,7 +398,7 @@ TEST(DaqPackedModeMaster, SetRejectsInvalidSampleCountLocally) {
     PackedMasterRig rig;
     const int before = rig.slave.Count(CommandCode::GetVersion);
     EXPECT_THROW(static_cast<void>(rig.master->SetDaqPackedMode(
-                     0U, DaqPackedMode::ElementGrouped,
+                     0U, DaqPackedMode::ElementGrouped, /*event_channel=*/1U,
                      DaqPackedTimestampMode::LastSample, 1U)),
                  XcpException);
     // 本地拒绝：一个 0xC0 帧都不该发出
@@ -409,7 +409,8 @@ TEST(DaqPackedModeMaster, NotPackedIsAcceptedAsReset) {
     PackedMasterRig rig;
     rig.slave.report_mode = 0x00U;
     const auto result = rig.master->SetDaqPackedMode(
-        0U, DaqPackedMode::NotPacked, DaqPackedTimestampMode::LastSample, 0U);
+        0U, DaqPackedMode::NotPacked, /*event_channel=*/1U,
+        DaqPackedTimestampMode::LastSample, 0U);
     EXPECT_TRUE(result.active);
     EXPECT_EQ(result.mode.mode, DaqPackedMode::NotPacked);
 }
@@ -483,6 +484,64 @@ TEST(DaqPackedModePlanner, EventGroupedStrideIsWholeOdtWidth) {
     EXPECT_EQ(plan.Value().routes.at(1).packed_stride, 4U);
 }
 
+TEST(DaqPackedModePlanner, ElementGroupedBaseAddressIsScaledBySampleCount) {
+    // 回归：element-grouped 下物理布局是「Entry e 的全部 S 个采样连续，
+    // 再排 Entry e+1」，故第 e 个 Entry 的基址必须是 单采样偏移 × S。
+    // 漏乘会让 Entry b 从 Entry a 的第 2 个采样处开始取数（静默错位）。
+    PlannerDb db;
+    // 两个 2 字节测量：单采样占 4B，S=4 后一个 ODT 仍能同时装下两者
+    db.symbols["a"] = MeasurementSymbolInfo{0x1000U, 0, 1, 2, 1, false};
+    db.symbols["b"] = MeasurementSymbolInfo{0x1004U, 0, 1, 2, 1, false};
+    MeasurementPlanner planner(db, 64, AddressGranularity::Byte, 0, 3,
+                               MeasurementDaqCapabilities{}, false, 0,
+                               DaqPackedMode::ElementGrouped, 4U);
+    const auto plan = planner.Build({"a", "b"});
+    ASSERT_TRUE(plan.HasValue());
+    ASSERT_EQ(plan.Value().routes.size(), 2U);
+    // a 在净荷起点
+    EXPECT_EQ(plan.Value().routes.at(0).payload_offset, 0U);
+    // b 的单采样偏移为 2B，element-grouped 下应放大到 2 × 4 = 8B
+    EXPECT_EQ(plan.Value().routes.at(1).payload_offset, 8U);
+    // 步长仍是各 Entry 自身宽度
+    EXPECT_EQ(plan.Value().routes.at(0).packed_stride, 2U);
+    EXPECT_EQ(plan.Value().routes.at(1).packed_stride, 2U);
+    // 布局总量覆盖最后一个采样：8 + 2 + (4-1)*2 = 16 字节
+    EXPECT_LE(8U + 2U + 3U * 2U, 64U - 3U);
+}
+
+TEST(DaqPackedModePlanner, EventGroupedBaseAddressIsNotScaled) {
+    // 对照：event-grouped 布局是「采样 k 的全部 Entry 连续」，
+    // 单采样偏移已是正确基址，不得再乘 S（否则会越过整个采样组）。
+    PlannerDb db;
+    db.symbols["a"] = MeasurementSymbolInfo{0x1000U, 0, 1, 2, 1, false};
+    db.symbols["b"] = MeasurementSymbolInfo{0x1004U, 0, 1, 2, 1, false};
+    MeasurementPlanner planner(db, 64, AddressGranularity::Byte, 0, 3,
+                               MeasurementDaqCapabilities{}, false, 0,
+                               DaqPackedMode::EventGrouped, 4U);
+    const auto plan = planner.Build({"a", "b"});
+    ASSERT_TRUE(plan.HasValue());
+    ASSERT_EQ(plan.Value().routes.size(), 2U);
+    EXPECT_EQ(plan.Value().routes.at(0).payload_offset, 0U);
+    // b 仍紧跟在 a 之后（2B），不放大
+    EXPECT_EQ(plan.Value().routes.at(1).payload_offset, 2U);
+    // 步长是整个 ODT 单采样宽度
+    EXPECT_EQ(plan.Value().routes.at(1).packed_stride, 4U);
+}
+
+TEST(DaqPackedModePlanner, NonPackedBaseAddressIsNotScaled) {
+    // 非 packed 下倍率恒为 1，基址必须与 B4 之前逐字节一致
+    PlannerDb db;
+    db.symbols["a"] = MeasurementSymbolInfo{0x1000U, 0, 1, 2, 1, false};
+    db.symbols["b"] = MeasurementSymbolInfo{0x1004U, 0, 1, 2, 1, false};
+    MeasurementPlanner planner(db, 64, AddressGranularity::Byte, 0, 3);
+    const auto plan = planner.Build({"a", "b"});
+    ASSERT_TRUE(plan.HasValue());
+    ASSERT_EQ(plan.Value().routes.size(), 2U);
+    EXPECT_EQ(plan.Value().routes.at(0).payload_offset, 0U);
+    EXPECT_EQ(plan.Value().routes.at(1).payload_offset, 2U);
+    EXPECT_EQ(plan.Value().routes.at(1).packed_stride, 0U);
+}
+
 TEST(DaqPackedModePlanner, RejectsInvalidSampleCount) {
     PlannerDb db;
     db.symbols["a"] = MeasurementSymbolInfo{0x1000U, 0, 1, 4, 1, false};
@@ -532,6 +591,11 @@ class FakeDb final : public IMeasurementDatabase {
  */
 class PackedSessionSlave {
  public:
+    /// @brief CONNECT 报告的最大 DTO 字节数
+    /// @details 大采样数（如 S=256）的净荷可能超过默认 256 字节，
+    ///          相关用例需要按需调大，否则规划器会以容量不足拒绝。
+    std::uint16_t max_dto{0x0100U};
+
     Bytes operator()(BytesView packet) {
         if (packet.empty()) {
             return {};
@@ -540,7 +604,10 @@ class PackedSessionSlave {
         ++m_counts_[cmd];
         switch (cmd) {
             case CommandCode::Connect:
-                return Res({0x15, 0xC0, 0x10, 0x00, 0x01, 0x10, 0x10});
+                return Res({0x15, 0xC0, 0x10,
+                            static_cast<std::uint8_t>(max_dto & 0xFFU),
+                            static_cast<std::uint8_t>((max_dto >> 8U) & 0xFFU),
+                            0x10, 0x10});
             case CommandCode::Disconnect:
                 return Res({});
             case CommandCode::GetStatus:
@@ -793,6 +860,154 @@ TEST(DaqPackedModeSession, RejectsWhenEventLacksPackedProperty) {
         return no_packed(p);
     });
     EXPECT_THROW(rig.session.Prepare(), XcpException);
+}
+
+TEST(DaqPackedModeSession, SampleCountAbove255IsNotTruncated) {
+    // 回归（PR#22 #1/#4）：S=256 曾被
+    //   static_cast<uint8_t>(min<uint16_t>(S, 0xFF))
+    // 截断成 0，worker 再把 0 兜底成 1，于是每个 DTO 只解出 1 个采样、
+    // 静默丢弃其余 255 个。修复后 sample_total/sample_index 均为 16 位。
+    PackedSessionRig rig;
+    // 用 1 字节符号：S=256 时净荷 256B，加上 4B 时间戳与 3B 识别字段
+    // 共 263B，故 MAX_DTO 必须 ≥ 263。默认 256 不够，这里调到 512。
+    // 注意：MAX_DTO 在 CONNECT 时固化为会话参数，改完必须重新连接，
+    // 否则规划器仍按旧值算容量。
+    rig.slave.max_dto = 0x0200U;
+    rig.master->Disconnect();
+    rig.master->Connect();
+    rig.db.symbols["Flags"] = MeasurementSymbolInfo{0x2000U, 0, 1, 1, 1,
+                                                    false};
+    rig.session.Add({"Flags"});
+    rig.session.SetDaqPackedMode(DaqPackedMode::ElementGrouped,
+                                 DaqPackedTimestampMode::FirstSample, 256U);
+    rig.session.Prepare();
+    EXPECT_EQ(rig.slave.m_packed_sample_count, 256U);
+
+    FrameCollector collector;
+    rig.session.Start([&](const MeasurementFrame& f) { collector(f); });
+
+    // 净荷 = 256 采样 × 1 字节，按 1、2、…、256 填充便于识别取数位置
+    Bytes payload;
+    payload.reserve(256U);
+    for (std::uint16_t v = 1; v <= 256U; ++v) {
+        payload.push_back(static_cast<std::uint8_t>(v & 0xFFU));
+    }
+    rig.session.OnDto(MakeDto(MakeFrame(0U, 0U, 7000U, payload)));
+    ASSERT_TRUE(collector.WaitFor(256U, std::chrono::milliseconds(5000)));
+
+    const auto frames = collector.Frames();
+    ASSERT_EQ(frames.size(), 256U);
+    // 帧数与 sample_count 都是完整 16 位，不再是 1
+    EXPECT_EQ(frames.back().sample_index, 255U);
+    EXPECT_EQ(frames.back().sample_count, 256U);
+    // 首采样锚点 7000ns，事件周期 1µs × 降频 1 → 末采样 = 7000 + 255000
+    EXPECT_EQ(frames.front().timestamp.count(), 7000);
+    EXPECT_EQ(frames.back().timestamp.count(), 7000 + 255000);
+}
+
+TEST(DaqPackedModeSession, UsesReadBackPrescalerForSampleInterval) {
+    // 回归：采样间隔曾用规划器硬编码的 prescaler=1 计算，Slave 实际降频
+    // （例如 4）时非锚点采样时间戳会按错误间隔重建，且错误看起来完全“有效”。
+    PackedSessionRig rig;
+    rig.session.Add({"EngineSpeed"});
+    rig.session.SetDaqPackedMode(DaqPackedMode::ElementGrouped,
+                                 DaqPackedTimestampMode::FirstSample, 3U);
+
+    // Slave 忽略请求的 prescaler，GET_DAQ_LIST_MODE 回读恒为 4。
+    // 用指针转发到同一个 slave 实例，保证 SET_DAQ_PACKED_MODE 的状态
+    // 与随后的 GET 回显一致（值拷贝会让两者分叉）。
+    const std::uint8_t forced_prescaler = 0x04U;
+    PackedSessionSlave* slave_ptr = &rig.slave;
+    rig.transport->SetResponse([slave_ptr, forced_prescaler](
+                                   BytesView p) -> Bytes {
+        if (!p.empty() &&
+            static_cast<CommandCode>(p[0]) == CommandCode::GetDaqListMode) {
+            // GET_DAQ_LIST_MODE RES（规范 Table 150，含 RES 标识）：
+            //   [RES][Current Mode][reserved(WORD)][Event Channel(WORD)]
+            //   [Prescaler][Priority] → 共 8 字节
+            // 解析器拿到的是**去掉 RES** 的载荷，故 prescaler 在载荷
+            // 第 5 字节（下标 5），对应含 RES 报文的 body[6]。
+            (void)(*slave_ptr)(p);  // 仍让 Slave 记账（计数/状态）
+            return Res({0x00U, 0x00U, 0x00U, 0x01U, 0x00U,
+                        forced_prescaler, 0x00U});
+        }
+        return (*slave_ptr)(p);
+    });
+    rig.session.Prepare();
+
+    FrameCollector collector;
+    rig.session.Start([&](const MeasurementFrame& f) { collector(f); });
+
+    const Bytes payload{1U, 0U, 0U, 0U, 2U, 0U, 0U, 0U,
+                        3U, 0U, 0U, 0U};  // 3 采样 × 4B
+    rig.session.OnDto(MakeDto(MakeFrame(0U, 0U, 1000U, payload)));
+    ASSERT_TRUE(collector.WaitFor(3U));
+
+    const auto frames = collector.Frames();
+    ASSERT_EQ(frames.size(), 3U);
+    // 间隔 = 事件周期 1µs × 实际降频 4 = 4000ns（若沿用请求值 1 会得到 1000/2000）
+    EXPECT_EQ(frames[0].timestamp.count(), 1000);
+    EXPECT_EQ(frames[1].timestamp.count(), 5000);
+    EXPECT_EQ(frames[2].timestamp.count(), 9000);
+}
+
+TEST(DaqPackedModeSession, RejectsWhenPrescalerCannotBeReadBack) {
+    // GET_DAQ_LIST_MODE 不可用时无从确定实际降频因子，必须拒绝启用，
+    // 不能用请求值冒充已确认的采样间隔。
+    PackedSessionRig rig;
+    rig.session.Add({"EngineSpeed"});
+    rig.session.SetDaqPackedMode(DaqPackedMode::ElementGrouped,
+                                 DaqPackedTimestampMode::LastSample, 2U);
+    auto passthrough = rig.slave;
+    rig.transport->SetResponse([passthrough](BytesView p) mutable {
+        if (!p.empty() &&
+            static_cast<CommandCode>(p[0]) == CommandCode::GetDaqListMode) {
+            return Err(ErrorCode::CmdUnknown);
+        }
+        return passthrough(p);
+    });
+    EXPECT_THROW(rig.session.Prepare(), XcpException);
+}
+
+TEST(DaqPackedModePlanner, LargeDaqListNumberIsNotRejectedInPackedMode) {
+    // 回归：旧实现曾以“采样序号按 8 位表达”为由要求 DAQ List 号 < 256。
+    // 该限制源自 MeasurementFrame::sample_index 用 uint8_t，是错误的：
+    // DAQ List 号在协议上是 EPK（16 位）。位宽改为 16 位后，规划层必须
+    // 能为 List 号 ≥ 256 的列表正常产出 packed 路由。
+    PlannerDb db;
+    // 每个事件通道各成一条 List；2 字节符号 + MAX_DTO=4 → 每 List 只装 1 个 Entry
+    std::vector<std::string> names;
+    for (std::uint16_t i = 0; i <= 300U; ++i) {
+        const std::string name = "m" + std::to_string(i);
+        // 字段序：address / extension / event_channel / element_size /
+        //         element_count / is_array
+        // 事件通道逐一递增 → 每个符号自成一条 DAQ List
+        db.symbols[name] = MeasurementSymbolInfo{
+            0x1000U + static_cast<Address>(i) * 4U,
+            0U,
+            static_cast<std::uint16_t>(i),
+            2,
+            1,
+            false};
+        names.push_back(name);
+    }
+    // MAX_DTO=16、识别字段 3B → 单 ODT 可用 13B；S=2 时每 Entry 占 4B，
+    // 故一条 List 只容 1 个 Entry，301 个事件通道正好产出 301 条 List，
+    // 最大 List 号为 300（≥ 256），足以验证限制已移除。
+    MeasurementPlanner planner(db, 16, AddressGranularity::Byte, 0, 3,
+                               MeasurementDaqCapabilities{}, false, 0,
+                               DaqPackedMode::ElementGrouped, 2U);
+    const auto plan = planner.Build(names);
+    ASSERT_TRUE(plan.HasValue());
+    // 规划成功且确实产出了 256 以上的 List 号
+    std::uint16_t max_list = 0;
+    bool has_large = false;
+    for (const DaqListSpec& spec : plan.Value().daq_lists) {
+        max_list = spec.daq_list > max_list ? spec.daq_list : max_list;
+        has_large = has_large || spec.daq_list >= 256U;
+    }
+    EXPECT_TRUE(has_large);
+    EXPECT_GE(max_list, 256U);
 }
 
 TEST(DaqPackedModeSession, RejectsInvalidConfigurationLocally) {

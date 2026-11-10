@@ -63,8 +63,16 @@ Bytes ConnectResponse(AddressGranularity ag, ByteOrder order,
 }
 
 /// @brief GET_COMM_MODE_INFO 响应：MAX_BS 位于报文 byte4（解析器读 res_data[3]）
-Bytes CommModeInfoResponse(std::uint8_t max_bs) {
-    return Bytes{static_cast<std::uint8_t>(PacketType::Res), 0x00U, 0x0EU,
+/// @param max_bs 从站可接受的最多块元素数
+/// @param master_block_mode true 表示 COMM_MODE_OPTIONAL(bit0) 置位，即从站
+///        能在 DAQ/STIM 之外接受 Master→Slave 的 DOWNLOAD 块序列
+/// @note COMM_MODE_OPTIONAL 解析为报告的 byte2（res_data[1]）；其值 0x0E
+///       表示 bit1/bit2/bit3 置位，若执行 `| 0x01` 会得到 0x0F，不再是 0x0E，
+///       所以这里按位**重建**而非在 0x0E 上叠加，保证两种取值的位含义都正确。
+Bytes CommModeInfoResponse(std::uint8_t max_bs,
+                           bool master_block_mode = true) {
+    const std::uint8_t optional = master_block_mode ? 0x0FU : 0x0EU;
+    return Bytes{static_cast<std::uint8_t>(PacketType::Res), 0x00U, optional,
                  0x00U, max_bs, 0x02U, 0x08U, 0x13U};
 }
 
@@ -116,12 +124,14 @@ std::uint32_t ParseU32At4(BytesView packet, ByteOrder order) {
 class BlockSlave {
 public:
     BlockSlave(AddressGranularity ag, ByteOrder order, std::uint8_t max_cto,
-               std::uint8_t max_bs, bool block_mode)
+               std::uint8_t max_bs, bool block_mode,
+               bool master_block_mode = true)
         : m_ag_(ag),
           m_order_(order),
           m_max_cto_(max_cto),
           m_max_bs_(max_bs),
-          m_block_mode_(block_mode) {}
+          m_block_mode_(block_mode),
+          m_master_block_mode_(master_block_mode) {}
 
     void SetMemory(Address address, const Bytes& data) {
         for (std::size_t k = 0; k < data.size(); ++k) {
@@ -177,7 +187,7 @@ public:
                 return ConnectResponse(m_ag_, m_order_, m_max_cto_, 0x0010U,
                                        m_block_mode_);
             case CommandCode::GetCommModeInfo:
-                return CommModeInfoResponse(m_max_bs_);
+                return CommModeInfoResponse(m_max_bs_, m_master_block_mode_);
             case CommandCode::GetStatus:
                 return handleGetStatus();
             case CommandCode::Synch:
@@ -246,8 +256,11 @@ private:
         if (block_elements == 0U) {
             return Err(ErrorCode::CmdSyntax);
         }
-        if (!m_block_mode_ && block_elements > capacity) {
-            // 未协商块模式却报超帧 size：按普通 DOWNLOAD 语义这是非法帧
+        if (!m_master_block_mode_ && block_elements > capacity) {
+            // 未声明 MASTER_BLOCK_MODE(下载块) 却报超帧 size：
+            // 按普通 DOWNLOAD 语义这是非法帧。
+            // 这里**必须**看下载方向能力 bit0，而不是 CONNECT 的
+            // SLAVE_BLOCK_MODE(bit6)：后者描述 Slave→Master 上传块。
             return Err(ErrorCode::CmdSyntax);
         }
         // 本帧实际承载的元素数 = min(块总元素数, 帧容量)
@@ -413,7 +426,8 @@ private:
     ByteOrder m_order_;
     std::uint8_t m_max_cto_;
     std::uint8_t m_max_bs_;
-    bool m_block_mode_;
+    bool m_block_mode_;         ///< COMM_MODE_BASIC bit6：Slave→Master 上传块
+    bool m_master_block_mode_;  ///< COMM_MODE_OPTIONAL bit0：Master→Slave 下载块
     std::map<Address, std::uint8_t> m_memory_;
     Address m_mta_{0};
     std::size_t m_block_remaining_{0};
@@ -433,8 +447,8 @@ struct Harness {
     explicit Harness(AddressGranularity ag = AddressGranularity::Byte,
                      ByteOrder order = ByteOrder::Intel,
                      std::uint8_t max_cto = 0x10U, std::uint8_t max_bs = 0x04U,
-                     bool block_mode = true)
-        : slave(ag, order, max_cto, max_bs, block_mode),
+                     bool block_mode = true, bool master_block_mode = true)
+        : slave(ag, order, max_cto, max_bs, block_mode, master_block_mode),
           executor(transport, session,
                    CommandTimeouts{std::chrono::milliseconds(150),
                                    std::chrono::milliseconds(150), 2}) {
@@ -619,10 +633,14 @@ TEST(CalibrationBlockWrite, LastFrameOfEachBlockIsIdenticalToRemaining) {
     EXPECT_EQ(sizes[7], 2U);
 }
 
-TEST(CalibrationBlockWrite, FallsBackToChunkedWhenBlockModeNotNegotiated) {
-    // CONNECT 未声明块模式 → 走逐块 SET_MTA + DOWNLOAD，不算错
+TEST(CalibrationBlockWrite, FallsBackToChunkedWhenMasterBlockModeMissing) {
+    // 回归（PR#22 #6）：块下载能力必须看 COMM_MODE_OPTIONAL 的
+    // MASTER_BLOCK_MODE(bit0)，而不是 CONNECT 的 SLAVE_BLOCK_MODE(bit6)。
+    // 这里 Slave 声明了 SLAVE_BLOCK_MODE（上传块）但**未**声明
+    // MASTER_BLOCK_MODE（下载块）→ 必须回退逐块 SET_MTA + DOWNLOAD。
+    // 旧实现只看 bit6，会误判为可块传并对该 Slave 下发 DOWNLOAD_NEXT。
     Harness h(AddressGranularity::Byte, ByteOrder::Intel, 0x10U, 0x04U,
-              /*block_mode=*/false);
+              /*block_mode=*/true, /*master_block_mode=*/false);
     h.FetchCommModeInfo();
     Bytes data(40U);
     for (std::size_t i = 0; i < data.size(); ++i) {
@@ -637,6 +655,27 @@ TEST(CalibrationBlockWrite, FallsBackToChunkedWhenBlockModeNotNegotiated) {
     EXPECT_EQ(h.slave.count(CommandCode::Download), 3);
     EXPECT_GE(h.slave.count(CommandCode::SetMta), 3);
     EXPECT_EQ(h.slave.Peek(0x0300, data.size()), data);
+}
+
+TEST(CalibrationBlockWrite, BlocksWhenOnlyMasterBlockModeIsDeclared) {
+    // 反向回归（PR#22 #6）：只申报 MASTER_BLOCK_MODE(bit0)、未申报
+    // SLAVE_BLOCK_MODE(bit6) 时，下载块**应当**启用。旧实现只看 bit6，
+    // 会把这类 Slave 错误降级为逐块写入（多花往返但不报错，故更难发现）。
+    Harness h(AddressGranularity::Byte, ByteOrder::Intel, 0x10U, 0x04U,
+              /*block_mode=*/false, /*master_block_mode=*/true);
+    h.FetchCommModeInfo();
+    Bytes data(100U);
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        data[i] = static_cast<std::uint8_t>(i);
+    }
+    MemoryAccess access(h.executor, h.session);
+    access.SetBlockModeEnabled(true);
+    access.WriteBytes(0x0400, 0x00, data);
+
+    // 100 = 56 + 44 → 两块，每块 1 首帧 + 3 续帧
+    EXPECT_EQ(h.slave.count(CommandCode::Download), 2);
+    EXPECT_EQ(h.slave.count(CommandCode::DownloadNext), 6);
+    EXPECT_EQ(h.slave.Peek(0x0400, data.size()), data);
 }
 
 TEST(CalibrationBlockWrite, DefaultsToChunkedEvenWhenBlockModeSupported) {

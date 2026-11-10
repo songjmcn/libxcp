@@ -1937,7 +1937,7 @@ std::optional<DaqPackedModeResponse> XcpMaster::QueryDaqPackedMode(
 }
 
 DaqPackedModeNegotiation XcpMaster::SetDaqPackedMode(
-    std::uint16_t daq_list, DaqPackedMode mode,
+    std::uint16_t daq_list, DaqPackedMode mode, std::uint16_t event_channel,
     DaqPackedTimestampMode timestamp_mode, std::uint16_t sample_count) {
     DaqPackedModeNegotiation result;
     // 本地参数校验：规范明确 DPM_SAMPLE_COUNT 的 0 与 1 非法，这里在
@@ -1950,16 +1950,37 @@ DaqPackedModeNegotiation XcpMaster::SetDaqPackedMode(
             std::to_string(sample_count));
     }
 
-    // 能力前置判定：列表或事件未声明 PACKED 时，SET 注定被对端拒绝
-    // （规范：列表不支持回 ERR_OUT_OF_RANGE）；不把注定失败的命令推给
-    // 对端，也不把"拒绝"与"暂不可读"混为一谈。复位为非 packed 时不校验。
+    // 能力前置判定：列表**与事件通道**都必须申报 PACKED，且事件必须是周期
+    // 事件。只查列表不足以证明可打包：当列表支持而事件不支持时，SET 仍可能
+    // 被接受，但 Slave 会按非 packed 发 DTO，本端按 packed 拆帧即静默错位。
+    // 判定标准与 CanUseDaqPackedMode 完全一致，避免两处取证口径分叉。
+    // 复位为非 packed 时不校验。
     if (mode != DaqPackedMode::NotPacked) {
-        // event_channel 未知时按列表属性单独判定：先取列表信息
         const auto list_info = QueryDaqListInfo(daq_list);
         if (!list_info.has_value() ||
             !HasDaqProperty(list_info->properties, DaqListPropertyBit::kPacked)) {
             result.reason =
                 "DAQ List 未声明 PACKED 属性（GET_DAQ_LIST_INFO 不可用或 bit4=0）";
+            return result;
+        }
+        const auto event_info = QueryDaqEventInfo(event_channel);
+        if (!event_info.has_value()) {
+            result.reason =
+                "GET_DAQ_EVENT_INFO 不可用，无法确认事件通道 " +
+                std::to_string(event_channel) + " 是否支持 PACKED";
+            return result;
+        }
+        if (!HasDaqEventProperty(
+                static_cast<DaqEventPropertyBit>(event_info->properties),
+                DaqEventPropertyBit::kPacked)) {
+            result.reason = "事件通道 " + std::to_string(event_channel) +
+                            " 未声明 PACKED 属性（DAQ_EVENT_PROPERTIES bit4=0）";
+            return result;
+        }
+        if (event_info->time_cycle == 0U) {
+            result.reason = "事件通道 " + std::to_string(event_channel) +
+                            " 非周期事件（EVENT_CHANNEL_TIME_CYCLE=0），"
+                            "无法按固定间隔重建采样时间戳";
             return result;
         }
     }
@@ -2003,6 +2024,24 @@ DaqPackedModeNegotiation XcpMaster::SetDaqPackedMode(
 
     result.active = true;
     return result;
+}
+
+XcpMaster::DaqPackedRuntimeInfo XcpMaster::ReadDaqPackedRuntimeInfo(
+    std::uint16_t daq_list) {
+    DaqPackedRuntimeInfo info;
+    const std::optional<DaqListModeSnapshot> mode = QueryDaqListMode(daq_list);
+    if (!mode.has_value()) {
+        // Optional 命令不可用：如实标注"未回读"，调用方据此拒绝启用 packed，
+        // 绝不能退回用本地请求值冒充实际降频因子。
+        return info;
+    }
+    // 规范中 prescaler=0 非法；出现时按 1 处理，但不算"已验证"
+    if (mode->prescaler == 0U) {
+        return info;
+    }
+    info.prescaler = mode->prescaler;
+    info.prescaler_verified = true;
+    return info;
 }
 
 std::optional<Bytes> XcpMaster::UploadClockInfo() {

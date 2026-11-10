@@ -321,14 +321,16 @@ bool MemoryAccess::CanUseBlockMode() const {
     if (!m_block_mode_enabled_) {
         return false;
     }
-    // 只有 CONNECT 明确声明支持块模式，且已从 GET_COMM_MODE_INFO 取得
-    // MAX_BS 时才编排块序列：缺任一项就无法判断 Slave 是否愿意落后续帧，
-    // 贸然块传会让对端把多余帧当新命令解析。
+    // 块下载是 Master→Slave 方向，规范要求查 GET_COMM_MODE_INFO 的
+    // COMM_MODE_OPTIONAL.MASTER_BLOCK_MODE(bit0)。CONNECT 的 COMM_MODE_BASIC
+    // bit6（SLAVE_BLOCK_MODE）只描述 Slave→Master 上传块，与下载无关：
+    // 用它判定会两个方向都判错（漏降级 / 误启用），因此不得回落到该位。
     const SessionParameters params = m_session_.Parameters();
-    if (!params.connect.slave_block_mode_supported) {
+    if (!params.comm_mode_info.has_value()) {
         return false;
     }
-    if (!params.comm_mode_info.has_value()) {
+    if ((params.comm_mode_info->comm_mode_optional &
+         kCommModeOptionalMasterBlockMode) == 0U) {
         return false;
     }
     return params.comm_mode_info->max_bs >= 1U;

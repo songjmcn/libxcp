@@ -279,10 +279,14 @@ private:
 
     /**
      * @brief 是否可走块传输（DOWNLOAD / DOWNLOAD_NEXT 序列）
-     * @details 需要同时满足：调用方已显式启用块传输、CONNECT 声明支持
-     *          SLAVE_BLOCK_MODE、GET_COMM_MODE_INFO 已取到且 MAX_BS >= 1。
-     *          任一条件缺失即视为"不能确认可块传"，退回逐块 SET_MTA +
-     *          DOWNLOAD。
+     * @details 需要同时满足：调用方已显式启用块传输、已取得
+     *          GET_COMM_MODE_INFO 且其 `COMM_MODE_OPTIONAL` 置位
+     *          MASTER_BLOCK_MODE(bit0)、MAX_BS >= 1。任一条件缺失即视为
+     *          "不能确认可块传"，退回逐块 SET_MTA + DOWNLOAD。
+     *
+     *          **不使用 CONNECT 的 SLAVE_BLOCK_MODE(bit6)**：该位描述
+     *          Slave→Master 上传块，与 Master→Slave 下载块不是同一能力，
+     *          用它会同时造成"支持下载块却被降级"与"仅支持上传却下发续帧"。
      *
      *          **默认不启用**的理由：块序列依赖 Slave 逐帧自增 MTA，且中间
      *          帧没有应答——丢一帧就会静默把后续数据写错位置，而逐块
