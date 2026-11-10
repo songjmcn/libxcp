@@ -112,9 +112,15 @@ bool HasUnknownOutcomeOnTimeout(CommandCode cmd) {
         case CommandCode::ModifyBits:
         case CommandCode::Download:
         case CommandCode::ShortDownload:
+        case CommandCode::DownloadNext:
+        case CommandCode::DownloadMax:
+        case CommandCode::BuildChecksum:
         case CommandCode::SetCalPage:
         case CommandCode::SetSegmentMode:
         case CommandCode::CopyCalPage:
+        // WRITE_DAQ_MULTIPLE 一次写多条且 Slave 侧指针随即前移：超时后
+        // 既不知写进了几条，也不知指针停在哪，重发会覆盖到错误的 Entry
+        case CommandCode::WriteDaqMultiple:
             return true;
         default:
             return false;
@@ -129,12 +135,20 @@ std::string_view NonReplayableCommandName(CommandCode cmd) {
             return "DOWNLOAD";
         case CommandCode::ShortDownload:
             return "SHORT_DOWNLOAD";
+        case CommandCode::DownloadNext:
+            return "DOWNLOAD_NEXT";
+        case CommandCode::DownloadMax:
+            return "DOWNLOAD_MAX";
+        case CommandCode::BuildChecksum:
+            return "BUILD_CHECKSUM";
         case CommandCode::SetCalPage:
             return "SET_CAL_PAGE";
         case CommandCode::SetSegmentMode:
             return "SET_SEGMENT_MODE";
         case CommandCode::CopyCalPage:
             return "COPY_CAL_PAGE";
+        case CommandCode::WriteDaqMultiple:
+            return "WRITE_DAQ_MULTIPLE";
         default:
             return "标定变更命令";
     }
@@ -664,6 +678,34 @@ std::optional<ParsedPacket> CommandExecutor::PerformAttempt(
     const auto response = WaitForResponse(m_timeouts_.command_timeout);
     m_session_.ClearPendingCommand();
     return response;  // nullopt 表示超时或 Transport 关闭
+}
+
+void CommandExecutor::SendFrameNoResponse(CommandCode cmd,
+                                          BytesView encoded_packet) {
+    // 块传输中间帧：占用命令槽位 → 发送 → 立即释放，不进入等待。
+    // 规范（原始 PDF 第 144 页）只要求 Slave 对最后一帧肯定应答，
+    // 中间帧不应答，因此这里不能复用 PerformAttempt（它会等满 command_timeout）。
+    m_session_.MarkCommandSent(cmd);
+    try {
+        m_transport_.Send(encoded_packet);
+#if LIBXCP_ENABLE_LOG
+        const PacketLogSummary packet_summary =
+            SummarizePacket(encoded_packet, /*is_seed_key=*/false);
+        LIBXCP_LOG_INFO(
+            "XCP TX (block frame, no response) cmd={} bytes={} shown_bytes={} "
+            "truncated={} data={}",
+            toHex(static_cast<std::uint8_t>(cmd)), encoded_packet.size(),
+            packet_summary.shown_bytes, packet_summary.truncated,
+            packet_summary.data);
+#endif
+    } catch (...) {
+        LIBXCP_LOG_ERROR("XCP TX (block frame) failed cmd={} bytes={}",
+                         toHex(static_cast<std::uint8_t>(cmd)),
+                         encoded_packet.size());
+        m_session_.ClearPendingCommand();
+        throw;
+    }
+    m_session_.ClearPendingCommand();
 }
 
 void CommandExecutor::RestoreUploadMta() {
@@ -1406,6 +1448,183 @@ void CommandExecutor::ExecuteWriteDaq(std::uint8_t bit_offset,
     // SET_DAQ_PTR，避免"写过 ODT 末位后指针未定义"（docs L2172）
 }
 
+void CommandExecutor::ExecuteWriteDaqMultiple(
+    std::span<const WriteDaqElement> elements) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    // MAX_CTO 相关的容量校验只在执行器层做：Codec 不持有 MAX_CTO，
+    // 而编排层必须知道"一帧能装几个条目"才能按 ODT 边界切分
+    const std::size_t max_cto = m_session_.MaxCto();
+    if (max_cto < 10U) {
+        // 规范：使用 WRITE_DAQ_MULTIPLE 的前提是 MAX_CTO >= 10
+        LIBXCP_LOG_WARNING("ExecuteWriteDaqMultiple rejected: MAX_CTO < 10");
+        throw detail::MakeInvalidArgument(
+            "WRITE_DAQ_MULTIPLE 要求 MAX_CTO >= 10");
+    }
+    const std::size_t per_frame = (max_cto - 2U) / 8U;
+    if (elements.empty() || elements.size() > per_frame) {
+        LIBXCP_LOG_WARNING("ExecuteWriteDaqMultiple rejected: entry count out of range");
+        throw detail::MakeInvalidArgument(
+            "WRITE_DAQ_MULTIPLE 条目数超出单帧容量（(MAX_CTO-2)/8）");
+    }
+    const Bytes encoded = m_codec_->EncodeWriteDaqMultiple(elements);
+    (void)RunCommand(CommandCode::WriteDaqMultiple, encoded);
+    // 与 ExecuteWriteDaq 同理：Slave 侧指针前移，本端不跟进，
+    // 编排层对每个 ODT 起点都显式 SET_DAQ_PTR
+}
+
+std::optional<DtoCtrPropertiesResponse> CommandExecutor::ExecuteDtoCtrProperties(
+    DtoCtrModifierBit modifier, std::uint16_t event_channel,
+    std::uint16_t related_event_channel, DaqCounterMode daq_mode,
+    bool stim_mode) {
+    try {
+        EnsureCodec(m_session_.GetByteOrder(),
+                    m_session_.GetAddressGranularity());
+        const Bytes encoded = m_codec_->EncodeDtoCtrProperties(
+            modifier, event_channel, related_event_channel, daq_mode, stim_mode);
+        const ParsedPacket packet =
+            RunCommand(CommandCode::DtoCtrProperties, encoded);
+        const auto* positive = std::get_if<PositiveResponse>(&packet);
+        if (positive == nullptr) {
+            // 走到这里说明 RunCommand 未按预期抛错，保守按协议错处理
+            throw detail::MakeMalformedPacket("DTO_CTR_PROPERTIES 未收到正响应");
+        }
+        const auto parsed = m_parser_->ParseDtoCtrProperties(positive->data);
+        if (!parsed.has_value()) {
+            throw detail::MakeMalformedPacket(
+                "DTO_CTR_PROPERTIES 响应长度不足（RES 数据 " +
+                std::to_string(positive->data.size()) + " 字节，期望 >= 5）");
+        }
+        return parsed;
+    } catch (const XcpException& e) {
+        // 仅"命令未知"降级为无值：其余协议错误必须让调用方看到
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+}
+
+std::optional<GetDaqClockResponse> CommandExecutor::ExecuteGetDaqClock(
+    bool extended) {
+    try {
+        EnsureCodec(m_session_.GetByteOrder(),
+                    m_session_.GetAddressGranularity());
+        const Bytes encoded = m_codec_->EncodeGetDaqClock();
+        const ParsedPacket packet =
+            RunCommand(CommandCode::GetDaqClock, encoded);
+        const auto* positive = std::get_if<PositiveResponse>(&packet);
+        if (positive == nullptr) {
+            throw detail::MakeMalformedPacket("GET_DAQ_CLOCK 未收到正响应");
+        }
+        const auto parsed =
+            m_parser_->ParseGetDaqClock(positive->data, extended);
+        if (!parsed.has_value()) {
+            throw detail::MakeMalformedPacket(
+                "GET_DAQ_CLOCK 响应无法解析（RES 数据 " +
+                std::to_string(positive->data.size()) + " 字节，" +
+                (extended ? "extended" : "legacy") +
+                " 布局长度不足或 PAYLOAD_FMT 非法）");
+        }
+        return parsed;
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+}
+
+void CommandExecutor::ExecuteSetDaqPackedMode(
+    std::uint16_t daq_list, DaqPackedMode mode,
+    DaqPackedTimestampMode timestamp_mode,
+    std::uint16_t sample_count) {
+    try {
+        EnsureCodec(m_session_.GetByteOrder(),
+                    m_session_.GetAddressGranularity());
+        const Bytes encoded = m_codec_->EncodeSetDaqPackedMode(
+            daq_list, mode, timestamp_mode, sample_count);
+        // Level-1 双字节命令码共用 0xC0 前缀，故这里以 GetVersion 作为
+        // 命令族标识；具体子命令语义由编码器与解析阶段负责。
+        static_cast<void>(RunCommand(CommandCode::GetVersion, encoded));
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            throw XcpException(
+                ErrorCategory::UnsupportedFeature,
+                "对端未实现 SET_DAQ_PACKED_MODE（Level-1 子命令 0x01）",
+                CommandCode::GetVersion, e.GetErrorCode(), e.RetryCount(),
+                std::string(e.what()));
+        }
+        throw;
+    }
+}
+
+std::optional<DaqPackedModeResponse> CommandExecutor::ExecuteGetDaqPackedMode(
+    std::uint16_t daq_list) {
+    try {
+        EnsureCodec(m_session_.GetByteOrder(),
+                    m_session_.GetAddressGranularity());
+        const Bytes encoded = m_codec_->EncodeGetDaqPackedMode(daq_list);
+        const ParsedPacket packet =
+            RunCommand(CommandCode::GetVersion, encoded);
+        const auto* positive = std::get_if<PositiveResponse>(&packet);
+        if (positive == nullptr) {
+            throw detail::MakeMalformedPacket("GET_DAQ_PACKED_MODE 未收到正响应");
+        }
+        const auto parsed = m_parser_->ParseDaqPackedMode(positive->data);
+        if (!parsed.has_value()) {
+            throw detail::MakeMalformedPacket(
+                "GET_DAQ_PACKED_MODE 响应无法解析（RES 数据 " +
+                std::to_string(positive->data.size()) +
+                " 字节，长度不足或 DAQ_PACKED_MODE/DPM_TIMESTAMP_MODE 为保留值）");
+        }
+        return parsed;
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+}
+
+std::optional<TimeCorrelationPropertiesResponse>
+CommandExecutor::ExecuteTimeCorrelationProperties(
+    std::uint8_t set_properties, std::uint8_t get_properties_request,
+    std::uint16_t cluster_id) {
+    try {
+        EnsureCodec(m_session_.GetByteOrder(),
+                    m_session_.GetAddressGranularity());
+        const Bytes encoded = m_codec_->EncodeTimeCorrelationProperties(
+            set_properties, get_properties_request, cluster_id);
+        const ParsedPacket packet =
+            RunCommand(CommandCode::TimeCorrelationProperties, encoded);
+        const auto* positive = std::get_if<PositiveResponse>(&packet);
+        if (positive == nullptr) {
+            throw detail::MakeMalformedPacket(
+                "TIME_CORRELATION_PROPERTIES 未收到正响应");
+        }
+        const auto parsed =
+            m_parser_->ParseTimeCorrelationProperties(positive->data);
+        if (!parsed.has_value()) {
+            throw detail::MakeMalformedPacket(
+                "TIME_CORRELATION_PROPERTIES 响应长度不足（RES 数据 " +
+                std::to_string(positive->data.size()) + " 字节，期望 >= 7）");
+        }
+        if ((get_properties_request & 0x01U) != 0U) {
+            // GET_CLK_INFO 让 Slave 把 MTA 指向时钟信息数据块起点：本端
+            // 记录的隐含 MTA 立刻失真。作废它，避免后续 UPLOAD/DOWNLOAD
+            // 的超时恢复按陈旧地址重放 SET_MTA 而读错位置。
+            const std::lock_guard<std::mutex> lock(m_mutex_);
+            m_last_mta_.reset();
+        }
+        return parsed;
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+}
+
 void CommandExecutor::ExecuteClearDaqList(std::uint16_t daq_list) {
     EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
     const Bytes encoded = m_codec_->EncodeClearDaqList(daq_list);
@@ -1513,6 +1732,31 @@ std::optional<GetDaqListInfoResponse> CommandExecutor::ExecuteGetDaqListInfo(
         throw detail::MakeMalformedPacket(
             "GET_DAQ_LIST_INFO 响应长度不足（RES 数据 " +
             std::to_string(res.data.size()) + " 字节，期望 >= 5）");
+    }
+    return parsed;
+}
+
+std::optional<GetDaqListModeResponse> CommandExecutor::ExecuteGetDaqListMode(
+    std::uint16_t daq_list) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    const Bytes encoded = m_codec_->EncodeGetDaqListMode(daq_list);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::GetDaqListMode, encoded);
+    } catch (const XcpException& e) {
+        // Optional 命令未实现 → ERR_CMD_UNKNOWN 且无副作用：
+        // 视为"能力缺失"，由调用方保留本端记录并明确标注未回读
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseGetDaqListMode(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "GET_DAQ_LIST_MODE 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 7）");
     }
     return parsed;
 }
@@ -1632,6 +1876,89 @@ void CommandExecutor::ExecuteShortDownload(ElementCount number_of_elements,
     // 写回必须有确认：ERR_CMD_UNKNOWN 不降级为成功，原样上抛由
     // MemoryAccess 回落 SET_MTA + DOWNLOAD 通路
     (void)RunCommand(CommandCode::ShortDownload, encoded);
+}
+
+// ---------------------------------------------------------------------------
+// B1：标定闭环——块传输下载 / 持久化请求 / 区间校验
+// ---------------------------------------------------------------------------
+
+void CommandExecutor::ExecuteDownloadBlockHead(ElementCount block_elements,
+                                               BytesView data) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    const Bytes encoded = m_codec_->EncodeDownload(block_elements, data);
+    SendFrameNoResponse(CommandCode::Download, encoded);
+    // 块内 MTA 由 Slave 逐帧自增：这里不推进也不重放 SET_MTA
+}
+
+void CommandExecutor::ExecuteDownloadNextFrame(ElementCount remaining_elements,
+                                               BytesView data) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    const Bytes encoded = m_codec_->EncodeDownloadNext(remaining_elements, data);
+    SendFrameNoResponse(CommandCode::DownloadNext, encoded);
+    // 块内 MTA 由 Slave 逐帧自增，本端不重放 SET_MTA（重放会回到块首而错位）
+}
+
+void CommandExecutor::ExecuteDownloadNextTail(ElementCount remaining_elements,
+                                              BytesView data) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    const Bytes encoded = m_codec_->EncodeDownloadNext(remaining_elements, data);
+    // 末帧必须等应答：Slave 在此帧回报整块结论（成功或 ERR_SEQUENCE 等）
+    (void)RunCommand(CommandCode::DownloadNext, encoded);
+}
+
+void CommandExecutor::ExecuteDownloadMax(BytesView data) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    const Bytes encoded =
+        m_codec_->EncodeDownloadMax(data, m_session_.MaxCto());
+    // DOWNLOAD_MAX 不支持块传输（原始 PDF 第 145 页），照常一问一答
+    (void)RunCommand(CommandCode::DownloadMax, encoded);
+}
+
+std::optional<BuildChecksumResponse> CommandExecutor::ExecuteBuildChecksum(
+    std::uint32_t block_size) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    const Bytes encoded = m_codec_->EncodeBuildChecksum(block_size);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::BuildChecksum, encoded);
+    } catch (const XcpException& e) {
+        if (IsCmdUnknown(e)) {
+            return std::nullopt;  // Optional 命令，Slave 不支持区间校验
+        }
+        throw;
+    }
+    const auto& res = std::get<PositiveResponse>(response);
+    auto parsed = m_parser_->ParseBuildChecksum(BytesView{res.data});
+    if (!parsed) {
+        throw detail::MakeMalformedPacket(
+            "BUILD_CHECKSUM 响应长度不足（RES 数据 " +
+            std::to_string(res.data.size()) + " 字节，期望 >= 7）");
+    }
+    return parsed;
+}
+
+void CommandExecutor::ExecuteSetRequest(SetRequestModeBit mode,
+                                        std::uint16_t session_configuration_id) {
+    EnsureCodec(m_session_.GetByteOrder(), m_session_.GetAddressGranularity());
+    const Bytes encoded = m_codec_->EncodeSetRequest(mode,
+                                                     session_configuration_id);
+    ParsedPacket response;
+    try {
+        response = RunCommand(CommandCode::SetRequest, encoded);
+    } catch (const XcpException& e) {
+        // 规范未定义可等效的自动持久化后备：不支持即明确报告
+        if (IsCmdUnknown(e)) {
+            throw XcpException(
+                ErrorCategory::UnsupportedFeature,
+                "Slave 不支持 SET_REQUEST（0xF9），无法请求保存标定数据到非易失存储",
+                CommandCode::SetRequest, ErrorCode::CmdUnknown,
+                e.RetryCount());
+        }
+        throw;
+    }
+    // 正响应无参数（规范第 128 页无响应字段表），仅表示请求已被接受；
+    // 是否完成必须由 GET_STATUS 中对应请求位被清除来确认。
+    (void)std::get<PositiveResponse>(response);
 }
 
 // ---------------------------------------------------------------------------

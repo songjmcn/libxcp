@@ -341,6 +341,10 @@ bool XcpMaster::IsCapabilityUnsupported(
     // 而不是新增限制。
     switch (capability) {
         case UnsupportedCapability::DaqPackedMode:
+            // B4 批次起本库已提供 SET/GET_DAQ_PACKED_MODE 的编码路径，
+            // 因此它不再是"确定不提供"的静态边界；能否真正启用取决于
+            // 对端列表/事件属性（见 CanUseDaqPackedMode）。
+            return false;
         case UnsupportedCapability::Level1OtherSubcommand:
         case UnsupportedCapability::Ipv6Transport:
         case UnsupportedCapability::OptionalTlSubcommand:
@@ -359,14 +363,17 @@ void XcpMaster::ThrowIfUnsupported(UnsupportedCapability capability) const {
     std::string hint;
     switch (capability) {
         case UnsupportedCapability::DaqPackedMode:
+            // 自 B4 起不再静态 Block（见 IsCapabilityUnsupported），此分支
+            // 仅保留以满足 switch 全覆盖。
             name = "DAQ Packed Mode（SET/GET_DAQ_PACKED_MODE）";
-            hint = "该能力为 V1.5 新特性且本实现未提供；请使用既有"
-                   " SET_DAQ_LIST_MODE + WRITE_DAQ 的非 Packed 路径";
+            hint = "该能力已提供编码路径，是否可用请用 CanUseDaqPackedMode "
+                   "按列表/事件属性取证";
             break;
         case UnsupportedCapability::Level1OtherSubcommand:
             name = "Level-1 命令族子命令";
-            hint = "本实现只提供 GET_VERSION（0xC0,0x00）；其余 0xC0 族"
-                   "子命令未实现，禁止内容探测式尝试";
+            hint = "本实现只提供 GET_VERSION（0xC0,0x00）与 Packed Mode 的"
+                   " 0xC0,0x01 / 0xC0,0x02；其余 0xC0 族子命令未实现，"
+                   "禁止内容探测式尝试";
             break;
         case UnsupportedCapability::Ipv6Transport:
             name = "IPv6 传输";
@@ -418,6 +425,9 @@ void XcpMaster::Connect() {
     // 新会话：本端 WRITE_DAQ 账本随之作废（Session 的 DAQ 运行态在
     // EstablishConnection 里一并归零）
     m_daq_ledger_.clear();
+    // 新会话：Slave 侧的"状态未知"登记同样作废——对端可能已经重启，
+    // 没有任何证据能证明旧登记仍然成立（B2）
+    ClearAllDaqListStateUnknown();
     m_daq_processor_info_queried_ = false;
     m_daq_processor_properties_.reset();
     m_daq_resolution_info_queried_ = false;
@@ -711,6 +721,69 @@ void XcpMaster::WriteMemoryBytes(Address address, AddressExtension extension,
 // DAQ 编排与 WRITE_DAQ 账本（批次14，T14-08）
 // ---------------------------------------------------------------------------
 
+void XcpMaster::WriteOdtEntries(std::uint16_t daq_list,
+                                std::uint8_t odt_number,
+                                const std::vector<DaqEntrySpec>& entries) {
+    // 账本登记逻辑两条路径共用，保证"发出去的形态"不影响"解码用的布局"
+    const auto record = [this, daq_list, odt_number](const DaqEntrySpec& e,
+                                                     std::uint8_t entry_no) {
+        DaqLedgerEntry rec;
+        rec.daq_list = daq_list;
+        rec.odt_number = odt_number;
+        rec.odt_entry = entry_no;
+        rec.address = e.address;
+        rec.extension = e.extension;
+        rec.size = e.size;
+        rec.bit_offset = e.bit_offset;
+        m_daq_ledger_.push_back(rec);
+    };
+
+    if (!m_write_daq_multiple_enabled_ || entries.size() <= 1U) {
+        // 默认路径：逐条 SET_DAQ_PTR + WRITE_DAQ。不依赖 Slave 指针自增
+        //（docs L2172：写过末位后指针未定义）
+        std::uint8_t entry_no = 0U;
+        for (const auto& e : entries) {
+            m_executor_->ExecuteSetDaqPtr(daq_list, odt_number, entry_no);
+            m_executor_->ExecuteWriteDaq(e.bit_offset, e.size, e.extension,
+                                         e.address);
+            record(e, entry_no);
+            ++entry_no;
+        }
+        return;
+    }
+
+    // 批量路径：MAX_CTO 决定单包能装几个 8 字节条目；切包只在本 ODT 内进行
+    const std::size_t max_cto = m_session_.MaxCto();
+    if (max_cto < 10U) {
+        // 规范要求 MAX_CTO >= 10 才能用 WRITE_DAQ_MULTIPLE
+        throw detail::MakeInvalidArgument(
+            "MAX_CTO < 10，不能使用 WRITE_DAQ_MULTIPLE 批量写 ODT Entry");
+    }
+    const std::size_t per_frame = (max_cto - 2U) / 8U;
+    std::size_t index = 0U;
+    while (index < entries.size()) {
+        const std::size_t batch =
+            std::min(per_frame, entries.size() - index);
+        // 每包起点重新 SET_DAQ_PTR：批量命令内部条目是"连续"的，包与包之间
+        // 本端不假设 Slave 指针停在何处
+        m_executor_->ExecuteSetDaqPtr(
+            daq_list, odt_number, static_cast<std::uint8_t>(index));
+        std::vector<WriteDaqElement> wire;
+        wire.reserve(batch);
+        for (std::size_t k = 0; k < batch; ++k) {
+            const auto& e = entries[index + k];
+            wire.push_back(WriteDaqElement{e.bit_offset, e.size, e.address,
+                                           e.extension});
+        }
+        m_executor_->ExecuteWriteDaqMultiple(wire);
+        for (std::size_t k = 0; k < batch; ++k) {
+            record(entries[index + k],
+                   static_cast<std::uint8_t>(index + k));
+        }
+        index += batch;
+    }
+}
+
 void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
     // ---- 1) 入参预检 + 解码能力校验（批次20 抽出共享函数，文案不变）
     PreflightDaqListSpec(spec);
@@ -783,22 +856,7 @@ void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
         // （docs L2172 写过末位后指针未定义）
         std::uint8_t odt_no = 0U;
         for (const auto& odt : spec.odts) {
-            std::uint8_t entry_no = 0U;
-            for (const auto& e : odt.entries) {
-                m_executor_->ExecuteSetDaqPtr(spec.daq_list, odt_no, entry_no);
-                m_executor_->ExecuteWriteDaq(e.bit_offset, e.size, e.extension,
-                                             e.address);
-                DaqLedgerEntry rec;
-                rec.daq_list = spec.daq_list;
-                rec.odt_number = odt_no;
-                rec.odt_entry = entry_no;
-                rec.address = e.address;
-                rec.extension = e.extension;
-                rec.size = e.size;
-                rec.bit_offset = e.bit_offset;
-                m_daq_ledger_.push_back(rec);
-                ++entry_no;
-            }
+            WriteOdtEntries(spec.daq_list, odt_no, odt.entries);
             ++odt_no;
         }
 
@@ -821,18 +879,28 @@ void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
                                            spec.priority);
     } catch (const XcpException&) {
         rollback();
+        // B2 失败状态策略：账本回滚只保证"本端不拿半份布局去解码"，并不
+        // 意味着 Slave 也回滚了——CLEAR_DAQ_LIST 已执行、部分 WRITE_DAQ 已
+        // 生效。必须把该 List 登记为"Slave 侧未知"，禁止后续启动/复用。
+        MarkDaqListStateUnknown(spec.daq_list);
         LIBXCP_LOG_WARNING(
-            "DAQ static configure failed list={}; local ledger rolled back",
+            "DAQ static configure failed list={}; local ledger rolled back, "
+            "slave-side state now unknown; list must be reconfigured",
             spec.daq_list);
         throw;
     } catch (const std::exception& e) {
         rollback();
+        MarkDaqListStateUnknown(spec.daq_list);
         LIBXCP_LOG_WARNING(
-            "DAQ static configure failed list={}; local ledger rolled back",
+            "DAQ static configure failed list={}; local ledger rolled back, "
+            "slave-side state now unknown; list must be reconfigured",
             spec.daq_list);
         throw detail::MakeTransportError("DAQ 配置过程中发生非协议异常",
                                          e.what());
     }
+    // 整表重配成功（CLEAR_DAQ_LIST + 全部 Entry + List mode 都已确认），
+    // 该 List 回到已知状态（B2）
+    ClearDaqListStateUnknown(spec.daq_list);
     LIBXCP_LOG_INFO(
         "DAQ static configure completed list={} entries={} generation={}",
         spec.daq_list, m_daq_ledger_.size() - ledger_mark,
@@ -840,6 +908,18 @@ void XcpMaster::ConfigureDaqList(const DaqListSpec& spec) {
 }
 
 std::uint8_t XcpMaster::StartDaqList(std::uint16_t daq_list) {
+    // B2 失败状态策略：Slave 侧处于"半成品"的 List 一律拒绝启动。即使账本
+    // 里还残留旧条目（例如这次重配失败但上次配置仍在 Slave 里），也说明
+    // 本端对 Slave 的真实内容已经失去掌控，启动只会产出无法解释的 DTO。
+    if (IsDaqListStateUnknown(daq_list)) {
+        LIBXCP_LOG_ERROR(
+            "XCP StartDaqList rejected: DAQ list {} slave-side state unknown",
+            daq_list);
+        throw detail::MakeInvalidState(
+            "DAQ List " + std::to_string(daq_list) +
+            " 在 Slave 侧处于配置失败的未知状态，拒绝启动；请先 "
+            "ConfigureDaqList 整表重配或 ClearDaqList");
+    }
     const bool configured = std::any_of(
         m_daq_ledger_.begin(), m_daq_ledger_.end(),
         [daq_list](const DaqLedgerEntry& e) { return e.daq_list == daq_list; });
@@ -893,6 +973,9 @@ void XcpMaster::ClearDaqList(std::uint16_t daq_list) {
                            return e.daq_list == daq_list;
                        }),
         m_daq_ledger_.end());
+    // CLEAR_DAQ_LIST 被 Slave 确认：该 List 在 Slave 侧回到已知的空状态，
+    // 此前的"未知"登记可以撤销（B2）
+    ClearDaqListStateUnknown(daq_list);
     LIBXCP_LOG_INFO("DAQ list cleared list={} generation={} ledger_entries={}",
                     daq_list, m_session_.DaqConfigGeneration(),
                     m_daq_ledger_.size());
@@ -945,6 +1028,45 @@ bool XcpMaster::IsOverloadMsbEnabled() const {
     }
     const std::uint8_t props = *m_daq_processor_properties_;
     return ((props & 0xC0U) >> 6) == 0x01U;
+}
+
+bool XcpMaster::IsDaqListStateUnknown(std::uint16_t daq_list) const {
+    return std::find(m_daq_lists_unknown_state_.begin(),
+                     m_daq_lists_unknown_state_.end(),
+                     daq_list) != m_daq_lists_unknown_state_.end();
+}
+
+void XcpMaster::MarkDaqListStateUnknown(std::uint16_t daq_list) {
+    if (IsDaqListStateUnknown(daq_list)) {
+        return;
+    }
+    m_daq_lists_unknown_state_.push_back(daq_list);
+    // 该日志是给使用者看的行动指引：不是"配置失败了"，而是"这个 List 现在
+    // 不能直接用，必须先整表重配"
+    LIBXCP_LOG_WARNING(
+        "DAQ list {} marked as unknown on slave side; call ConfigureDaqList "
+        "or ClearDaqList before starting it",
+        daq_list);
+}
+
+void XcpMaster::ClearDaqListStateUnknown(std::uint16_t daq_list) {
+    const auto it = std::find(m_daq_lists_unknown_state_.begin(),
+                              m_daq_lists_unknown_state_.end(), daq_list);
+    if (it == m_daq_lists_unknown_state_.end()) {
+        return;
+    }
+    m_daq_lists_unknown_state_.erase(it);
+    LIBXCP_LOG_INFO("DAQ list {} slave-side state is known again", daq_list);
+}
+
+void XcpMaster::ClearAllDaqListStateUnknown() {
+    if (m_daq_lists_unknown_state_.empty()) {
+        return;
+    }
+    LIBXCP_LOG_INFO(
+        "clearing {} DAQ list(s) previously marked unknown on slave side",
+        m_daq_lists_unknown_state_.size());
+    m_daq_lists_unknown_state_.clear();
 }
 
 void XcpMaster::ClearDynamicTableBestEffort() {
@@ -1092,8 +1214,11 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
     //         （xcplite.c:1143-1186）：ALLOC_DAQ 一次给足总数；一个 List 的
     //         全部 ODT 分配完才能开始分 Entry。失败：整表 FREE 复位+账本清零。
     m_executor_->ExecuteFreeDaq();
-    // FREE 成功即全表作废（含此前静态通路的登记）：代际推进、运行态清零
+    // FREE 成功即全表作废（含此前静态通路的登记）：代际推进、运行态清零。
+    // B2：FREE_DAQ 是唯一能"证实"Slave 侧整表被清空的操作，因此这里同时
+    // 清除全部"状态未知"登记——此前的半成品列表已被证实不存在。
     m_daq_ledger_.clear();
+    ClearAllDaqListStateUnknown();
     m_session_.ClearStartedDaqLists();
     m_session_.BumpDaqConfigGeneration();
     LIBXCP_LOG_INFO(
@@ -1119,26 +1244,10 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
         for (const auto& spec : specs) {
             std::uint8_t odt_no = 0U;
             for (const auto& odt : spec.odts) {
-                std::uint8_t entry_no = 0U;
-                for (const auto& e : odt.entries) {
-                    m_executor_->ExecuteSetDaqPtr(spec.daq_list, odt_no,
-                                                  entry_no);
-                    m_executor_->ExecuteWriteDaq(e.bit_offset, e.size,
-                                                 e.extension, e.address);
-                    DaqLedgerEntry rec;
-                    rec.daq_list = spec.daq_list;
-                    rec.odt_number = odt_no;
-                    rec.odt_entry = entry_no;
-                    rec.address = e.address;
-                    rec.extension = e.extension;
-                    rec.size = e.size;
-                    rec.bit_offset = e.bit_offset;
-                    // rec.pid 留 nullopt：XCPlite 识别字段是
-                    // ODT(rel)+0xAA(FIL)+DAQ16（DAQ_KEY=0xC0），
-                    // FIRST_PID/Absolute 推导不成立（docs L2228，D19）
-                    m_daq_ledger_.push_back(rec);
-                    ++entry_no;
-                }
+                // 账本 rec.pid 一律留 nullopt：XCPlite 识别字段是
+                // ODT(rel)+0xAA(FIL)+DAQ16（DAQ_KEY=0xC0），
+                // FIRST_PID/Absolute 推导不成立（docs L2228，D19）
+                WriteOdtEntries(spec.daq_list, odt_no, odt.entries);
                 ++odt_no;
             }
         }
@@ -1152,9 +1261,18 @@ void XcpMaster::ConfigureDaqListsDynamicImpl(
         }
     } catch (const XcpException&) {
         ClearDynamicTableBestEffort();
+        // B2 失败状态策略：best-effort FREE 未必成功，因此不能假定
+        // Slave 已复位。把本次涉及的 List 全部登记为未知，直到出现
+        // 一次被证实的 FREE_DAQ / CLEAR_DAQ_LIST 或重新 CONNECT。
+        for (const auto& spec : specs) {
+            MarkDaqListStateUnknown(spec.daq_list);
+        }
         throw;
     } catch (const std::exception& e) {
         ClearDynamicTableBestEffort();
+        for (const auto& spec : specs) {
+            MarkDaqListStateUnknown(spec.daq_list);
+        }
         throw detail::MakeTransportError("动态 DAQ 编排过程中发生非协议异常",
                                          e.what());
     }
@@ -1177,6 +1295,20 @@ void XcpMaster::StartDaqSync() {
             "XCP StartDaqSync rejected: no DAQ lists are configured");
         throw detail::MakeInvalidState(
             "没有任何已配置的 DAQ List（账本为空），拒绝同步启动");
+    }
+    // B2 失败状态策略：同步启动会一次拉起全部已配置列表，只要有一个列表的
+    // Slave 侧状态未知，整批 DTO 都无法解释，故整体拒绝而不是悄悄跳过它
+    for (const std::uint16_t list : lists) {
+        if (IsDaqListStateUnknown(list)) {
+            LIBXCP_LOG_ERROR(
+                "XCP StartDaqSync rejected: DAQ list {} slave-side state "
+                "unknown",
+                list);
+            throw detail::MakeInvalidState(
+                "DAQ List " + std::to_string(list) +
+                " 在 Slave 侧处于配置失败的未知状态，拒绝同步启动；请先 "
+                "ConfigureDaqList 整表重配或 ClearDaqList");
+        }
     }
     LIBXCP_LOG_INFO("DAQ synchronized start selecting lists={}", lists.size());
     // 逐表 SELECT → START_STOP_SYNCH(START)：XCPlite 下单表 START(mode=1)
@@ -1285,6 +1417,23 @@ XcpMaster::QueryDaqResolutionInfo() {
 std::optional<GetDaqListInfoResponse> XcpMaster::QueryDaqListInfo(
     std::uint16_t daq_list) {
     return m_executor_->ExecuteGetDaqListInfo(daq_list);
+}
+
+std::optional<DaqListModeSnapshot> XcpMaster::QueryDaqListMode(
+    std::uint16_t daq_list) {
+    // 薄转发：仅把 Slave 返回的字段与本端入参组装成快照。
+    // 不在此处用本地账本"补齐"缺失字段——未回读就是未回读。
+    auto parsed = m_executor_->ExecuteGetDaqListMode(daq_list);
+    if (!parsed) {
+        return std::nullopt;
+    }
+    DaqListModeSnapshot snapshot;
+    snapshot.daq_list = daq_list;
+    snapshot.mode = parsed->mode;
+    snapshot.event_channel = parsed->event_channel;
+    snapshot.prescaler = parsed->prescaler;
+    snapshot.priority = parsed->priority;
+    return snapshot;
 }
 
 std::optional<GetDaqEventInfoResponse> XcpMaster::QueryDaqEventInfo(
@@ -1520,6 +1669,369 @@ void XcpMaster::ModifyBits(Address address, AddressExtension extension,
     RequireCalPag(m_session_.IsConnected(), HasCalPagResource());
     m_memory_access_->ModifyBits(address, extension, shift, and_mask,
                                  xor_mask);
+}
+
+
+std::optional<DtoCounterProperties> XcpMaster::QueryDtoCounterProperties(
+    std::uint16_t event_channel) {
+    // 纯查询：MODIFIER = kNone，后续三个参数按规范要求写默认值
+    auto parsed = m_executor_->ExecuteDtoCtrProperties(
+        DtoCtrModifierBit::kNone, event_channel, 0U,
+        DaqCounterMode::InsertCounter, false);
+    if (!parsed) {
+        return std::nullopt;
+    }
+    DtoCounterProperties snapshot;
+    // 事件通道号**不在响应中回显**，只能由入参回填
+    snapshot.event_channel = event_channel;
+    snapshot.properties = parsed->properties;
+    snapshot.related_event_channel = parsed->related_event_channel;
+    // MODE bit0 = DAQ_MODE，bit1 = STIM_MODE（Table 167）
+    snapshot.daq_mode = ((parsed->mode & 0x01U) != 0U)
+                            ? DaqCounterMode::InsertStimCounterCopy
+                            : DaqCounterMode::InsertCounter;
+    snapshot.stim_check_counter = (parsed->mode & 0x02U) != 0U;
+    const auto bits = static_cast<DtoCtrPropertiesBit>(parsed->properties);
+    snapshot.has_related_event =
+        HasDtoCtrProperty(bits, DtoCtrPropertiesBit::kRelatedEventPresent);
+    snapshot.supports_dto_counter =
+        HasDtoCtrProperty(bits, DtoCtrPropertiesBit::kDaqModePresent);
+    snapshot.daq_mode_fixed =
+        HasDtoCtrProperty(bits, DtoCtrPropertiesBit::kDaqModeFixed);
+    snapshot.related_event_fixed =
+        HasDtoCtrProperty(bits, DtoCtrPropertiesBit::kRelatedEventFixed);
+    return snapshot;
+}
+
+DtoCounterProperties XcpMaster::ConfigureDaqCounterEvent(
+    std::uint16_t event_channel, DaqCounterMode mode) {
+    // 先查一次：规范允许 Slave 把属性标为 FIXED 或干脆不支持 DAQ 方向
+    // 计数器，此时下发修改多半被忽略或回 ERR_OUT_OF_RANGE。前置判定能把
+    // "本端请求不合理"与"对端拒绝"区分开。
+    const auto before = QueryDtoCounterProperties(event_channel);
+    if (!before) {
+        // 纯查询就得不到值 → 命令本身不支持，不做"盲改"
+        throw XcpException(
+            ErrorCategory::UnsupportedFeature,
+            "DTO_CTR_PROPERTIES 不可用：Slave 未实现该可选命令（ERR_CMD_UNKNOWN）",
+            CommandCode::DtoCtrProperties, ErrorCode::CmdUnknown, 0,
+            std::string{});
+    }
+    if (!before->supports_dto_counter) {
+        throw XcpException(
+            ErrorCategory::UnsupportedFeature,
+            "该事件通道不支持 DTO 计数器（PROPERTIES.DAQ_MODE_PRESENT=0）",
+            CommandCode::DtoCtrProperties, std::nullopt, 0, std::string{});
+    }
+    if (before->daq_mode_fixed) {
+        throw XcpException(
+            ErrorCategory::UnsupportedFeature,
+            "该事件通道的 DAQ_MODE 被 Slave 固定（PROPERTIES.DAQ_MODE_FIXED=1），"
+            "不可修改",
+            CommandCode::DtoCtrProperties, std::nullopt, 0, std::string{});
+    }
+    // 只置 MODIFY_DAQ_MODE：不碰相关事件通道号，也不碰 STIM_MODE
+    auto parsed = m_executor_->ExecuteDtoCtrProperties(
+        DtoCtrModifierBit::kModifyDaqMode, event_channel, 0U, mode, false);
+    if (!parsed) {
+        throw XcpException(
+            ErrorCategory::UnsupportedFeature,
+            "DTO_CTR_PROPERTIES 不可用：Slave 未实现该可选命令（ERR_CMD_UNKNOWN）",
+            CommandCode::DtoCtrProperties, ErrorCode::CmdUnknown, 0,
+            std::string{});
+    }
+    // 以 Slave 回读值构造结果，不用"我发了什么"冒充"它是什么"
+    DtoCounterProperties after;
+    after.event_channel = event_channel;
+    after.properties = parsed->properties;
+    after.related_event_channel = parsed->related_event_channel;
+    after.daq_mode = ((parsed->mode & 0x01U) != 0U)
+                         ? DaqCounterMode::InsertStimCounterCopy
+                         : DaqCounterMode::InsertCounter;
+    after.stim_check_counter = (parsed->mode & 0x02U) != 0U;
+    const auto bits = static_cast<DtoCtrPropertiesBit>(parsed->properties);
+    after.has_related_event =
+        HasDtoCtrProperty(bits, DtoCtrPropertiesBit::kRelatedEventPresent);
+    after.supports_dto_counter =
+        HasDtoCtrProperty(bits, DtoCtrPropertiesBit::kDaqModePresent);
+    after.daq_mode_fixed =
+        HasDtoCtrProperty(bits, DtoCtrPropertiesBit::kDaqModeFixed);
+    after.related_event_fixed =
+        HasDtoCtrProperty(bits, DtoCtrPropertiesBit::kRelatedEventFixed);
+    if (after.daq_mode != mode) {
+        // 命令被接受但属性没变：规范允许 Slave 如此，绝不能报成功
+        LIBXCP_LOG_WARNING(
+            "XCP DTO_CTR_PROPERTIES accepted but DAQ_MODE unchanged event={}",
+            event_channel);
+    }
+    return after;
+}
+
+void XcpMaster::SetWriteDaqMultipleEnabled(bool enabled) {
+    m_write_daq_multiple_enabled_ = enabled;
+}
+
+std::size_t ClockCorrelationSnapshot::ClockInfoTotalBytes() const noexcept {
+    // CLOCK_INFO 的每个置位对应一个紧跟的数据块（Table 219/220），
+    // 顺序固定为 slave/grandmaster/relation/ECU/ECU grandmaster。
+    std::size_t total = 0;
+    for (const ClockInfoBlock block :
+         {ClockInfoBlock::kSlaveClock, ClockInfoBlock::kGrandmasterClock,
+          ClockInfoBlock::kClockRelation, ClockInfoBlock::kEcuClock,
+          ClockInfoBlock::kEcuGrandmasterClock}) {
+        if (HasClockInfoBlock(clock_info_blocks, block)) {
+            total += ClockInfoBlockByteSize(block);
+        }
+    }
+    return total;
+}
+
+std::optional<ClockCorrelationSnapshot> XcpMaster::QueryClockCorrelation() {
+    // 纯查询：SET_PROPERTIES = 0（不改变任何格式），GET_PROPERTIES_REQUEST = 0
+    auto parsed = m_executor_->ExecuteTimeCorrelationProperties(0x00U, 0x00U, 0U);
+    m_clock_correlation_queried_ = true;
+    if (!parsed) {
+        // Slave 未实现该可选命令：清缓存，避免沿用旧会话的快照
+        m_clock_correlation_.reset();
+        return std::nullopt;
+    }
+    ClockCorrelationSnapshot snapshot;
+    snapshot.slave_config = parsed->slave_config;
+    snapshot.observable_clocks = parsed->observable_clocks;
+    snapshot.sync_state = parsed->sync_state;
+    snapshot.clock_info = parsed->clock_info;
+    snapshot.cluster_id = parsed->cluster_id;
+    snapshot.response_format = ResponseFormatModeOf(parsed->slave_config);
+    snapshot.timestamp_relation = DaqTimestampRelationOf(parsed->slave_config);
+    snapshot.bridge = TimeSyncBridgeStateOf(parsed->slave_config);
+    snapshot.slave_clock = SlaveClockObservabilityOf(parsed->observable_clocks);
+    snapshot.grandmaster_clock =
+        GrandmasterClockObservabilityOf(parsed->observable_clocks);
+    snapshot.ecu_clock = EcuClockObservabilityOf(parsed->observable_clocks);
+    snapshot.slave_sync_state = SlaveClockSyncStateOf(parsed->sync_state);
+    snapshot.grandmaster_sync_state = GrandmasterSyncStateOf(parsed->sync_state);
+    snapshot.ecu_sync_state = EcuSyncStateOf(parsed->sync_state);
+    snapshot.clock_info_blocks = static_cast<ClockInfoBlock>(parsed->clock_info);
+    m_clock_correlation_ = snapshot;
+    return snapshot;
+}
+
+ClockCorrelationSnapshot XcpMaster::SetClockResponseFormat(
+    ResponseFormatMode format) {
+    if (format == ResponseFormatMode::Legacy) {
+        // RESPONSE_FMT = 0 的协议含义是"不改变"，没有"改回 legacy"的取值；
+        // 谎称能降级会让调用方以为切换成功。
+        LIBXCP_LOG_ERROR("XCP SetClockResponseFormat rejected Legacy request");
+        throw detail::MakeInvalidArgument(
+            "EV_TIME_SYNC 响应格式无法降级回 legacy：规范中 RESPONSE_FMT=0 "
+            "表示不改变，不存在“改回 legacy”的取值");
+    }
+    // 先查询确认 Slave 是否具备扩展能力，避免对完全不支持的命令盲改
+    const auto before = QueryClockCorrelation();
+    if (!before) {
+        throw XcpException(
+            ErrorCategory::UnsupportedFeature,
+            "TIME_CORRELATION_PROPERTIES 不可用：Slave 未实现该可选命令"
+            "（ERR_CMD_UNKNOWN）",
+            CommandCode::TimeCorrelationProperties, ErrorCode::CmdUnknown,
+            0, std::string{});
+    }
+    const std::uint8_t set_properties =
+        EncodeTimeCorrelationSetProperties(format, TimeSyncBridgeRequest::NoChange,
+                                          false);
+    const auto after =
+        m_executor_->ExecuteTimeCorrelationProperties(set_properties, 0x00U, 0U);
+    if (!after) {
+        // 已经确认支持却回 CMD_UNKNOWN：属于协议矛盾，不能当成成功
+        throw detail::MakeMalformedPacket(
+            "TIME_CORRELATION_PROPERTIES 修改请求收到 ERR_CMD_UNKNOWN，"
+            "与先前查询结果矛盾");
+    }
+    ClockCorrelationSnapshot snapshot;
+    snapshot.slave_config = after->slave_config;
+    snapshot.observable_clocks = after->observable_clocks;
+    snapshot.sync_state = after->sync_state;
+    snapshot.clock_info = after->clock_info;
+    snapshot.cluster_id = after->cluster_id;
+    snapshot.response_format = ResponseFormatModeOf(after->slave_config);
+    snapshot.timestamp_relation = DaqTimestampRelationOf(after->slave_config);
+    snapshot.bridge = TimeSyncBridgeStateOf(after->slave_config);
+    snapshot.slave_clock = SlaveClockObservabilityOf(after->observable_clocks);
+    snapshot.grandmaster_clock =
+        GrandmasterClockObservabilityOf(after->observable_clocks);
+    snapshot.ecu_clock = EcuClockObservabilityOf(after->observable_clocks);
+    snapshot.slave_sync_state = SlaveClockSyncStateOf(after->sync_state);
+    snapshot.grandmaster_sync_state = GrandmasterSyncStateOf(after->sync_state);
+    snapshot.ecu_sync_state = EcuSyncStateOf(after->sync_state);
+    snapshot.clock_info_blocks = static_cast<ClockInfoBlock>(after->clock_info);
+    m_clock_correlation_ = snapshot;
+    if (snapshot.response_format != format) {
+        // 规范允许 Slave 静默忽略不支持的格式位：以回读为准
+        throw XcpException(
+            ErrorCategory::UnsupportedFeature,
+            "Slave 未采纳所请求的 EV_TIME_SYNC 响应格式（请求 " +
+                std::to_string(static_cast<std::uint8_t>(format)) + "，回读 " +
+                std::to_string(static_cast<std::uint8_t>(
+                    snapshot.response_format)) +
+                "）",
+            CommandCode::TimeCorrelationProperties, std::nullopt, 0,
+            std::string{});
+    }
+    return snapshot;
+}
+
+std::optional<GetDaqClockResponse> XcpMaster::ReadDaqClock(
+    std::optional<bool> extended) {
+    bool use_extended = false;
+    if (extended.has_value()) {
+        use_extended = *extended;
+    } else if (m_clock_correlation_) {
+        use_extended =
+            m_clock_correlation_->response_format != ResponseFormatMode::Legacy;
+    } else {
+        // 没查过（或 Slave 不支持该命令）：按规范定义的初始格式 legacy 解析
+        LIBXCP_LOG_WARNING(
+            "XCP GET_DAQ_CLOCK parsed as legacy without clock correlation query");
+    }
+    return m_executor_->ExecuteGetDaqClock(use_extended);
+}
+
+bool XcpMaster::CanUseDaqPackedMode(std::uint16_t daq_list,
+                                   std::uint16_t event_channel) {
+    // 依据原始 PDF §4.1.10.2 与 Table 172/155：
+    //   1. DAQ List 的 DAQ_LIST_PROPERTIES bit4 PACKED 必须置位；
+    //   2. 事件通道的 DAQ_EVENT_PROPERTIES bit4 PACKED 必须置位；
+    //   3. 事件必须是周期事件（EVENT_CHANNEL_TIME_CYCLE != 0）。
+    // 任一取证失败（命令不支持）都视为"无法证明支持"→ false，不启用。
+    const auto list_info = QueryDaqListInfo(daq_list);
+    if (!list_info.has_value()) {
+        LIBXCP_LOG_WARNING(
+            "XCP DAQ packed probe: GET_DAQ_LIST_INFO 不可用（DAQ List {}）",
+            daq_list);
+        return false;
+    }
+    if (!HasDaqProperty(list_info->properties, DaqListPropertyBit::kPacked)) {
+        return false;
+    }
+
+    const auto event_info = QueryDaqEventInfo(event_channel);
+    if (!event_info.has_value()) {
+        LIBXCP_LOG_WARNING(
+            "XCP DAQ packed probe: GET_DAQ_EVENT_INFO 不可用（Event Channel "
+            "{}）",
+            event_channel);
+        return false;
+    }
+    if (!HasDaqEventProperty(
+            static_cast<DaqEventPropertyBit>(event_info->properties),
+            DaqEventPropertyBit::kPacked)) {
+        return false;
+    }
+    // 非周期事件不允许使用 packed 模式
+    return event_info->time_cycle != 0U;
+}
+
+std::optional<DaqPackedModeResponse> XcpMaster::QueryDaqPackedMode(
+    std::uint16_t daq_list) {
+    return m_executor_->ExecuteGetDaqPackedMode(daq_list);
+}
+
+DaqPackedModeNegotiation XcpMaster::SetDaqPackedMode(
+    std::uint16_t daq_list, DaqPackedMode mode,
+    DaqPackedTimestampMode timestamp_mode, std::uint16_t sample_count) {
+    DaqPackedModeNegotiation result;
+    // 本地参数校验：规范明确 DPM_SAMPLE_COUNT 的 0 与 1 非法，这里在
+    // 发帧之前就拒绝，避免把注定失败的组合推给对端。
+    if (mode != DaqPackedMode::NotPacked &&
+        (sample_count < kMinDaqPackedSampleCount ||
+         sample_count > kMaxDaqPackedSampleCount)) {
+        throw detail::MakeInvalidArgument(
+            "SET_DAQ_PACKED_MODE: DPM_SAMPLE_COUNT 必须在 [2, 0xFFFF] 内，实际 " +
+            std::to_string(sample_count));
+    }
+
+    // 能力前置判定：列表或事件未声明 PACKED 时，SET 注定被对端拒绝
+    // （规范：列表不支持回 ERR_OUT_OF_RANGE）；不把注定失败的命令推给
+    // 对端，也不把"拒绝"与"暂不可读"混为一谈。复位为非 packed 时不校验。
+    if (mode != DaqPackedMode::NotPacked) {
+        // event_channel 未知时按列表属性单独判定：先取列表信息
+        const auto list_info = QueryDaqListInfo(daq_list);
+        if (!list_info.has_value() ||
+            !HasDaqProperty(list_info->properties, DaqListPropertyBit::kPacked)) {
+            result.reason =
+                "DAQ List 未声明 PACKED 属性（GET_DAQ_LIST_INFO 不可用或 bit4=0）";
+            return result;
+        }
+    }
+
+    try {
+        m_executor_->ExecuteSetDaqPackedMode(daq_list, mode, timestamp_mode,
+                                             sample_count);
+    } catch (const XcpException& e) {
+        // 能力缺失/组合被拒都走"退回非 packed"的正常分支，不上抛。
+        result.reason = e.what();
+        return result;
+    }
+
+    // 唯一可信来源：回读。
+    const auto readback = m_executor_->ExecuteGetDaqPackedMode(daq_list);
+    if (!readback.has_value()) {
+        result.reason =
+            "GET_DAQ_PACKED_MODE 不可用，无法确认 packed 模式是否生效（DAQ List " +
+            std::to_string(daq_list) + "）";
+        return result;
+    }
+    result.mode = *readback;
+    if (readback->mode != mode) {
+        result.reason = "回读的 DAQ_PACKED_MODE 与请求不一致（请求 " +
+                        std::to_string(static_cast<int>(mode)) + "，回读 " +
+                        std::to_string(static_cast<int>(readback->mode)) + "）";
+        return result;
+    }
+    if (mode != DaqPackedMode::NotPacked) {
+        if (readback->sample_count != sample_count) {
+            result.reason = "回读的 DPM_SAMPLE_COUNT 与请求不一致（请求 " +
+                            std::to_string(sample_count) + "，回读 " +
+                            std::to_string(readback->sample_count) + "）";
+            return result;
+        }
+        if (readback->timestamp_mode != timestamp_mode) {
+            result.reason = "回读的 DPM_TIMESTAMP_MODE 与请求不一致";
+            return result;
+        }
+    }
+
+    result.active = true;
+    return result;
+}
+
+std::optional<Bytes> XcpMaster::UploadClockInfo() {
+    if (!m_clock_correlation_queried_) {
+        throw detail::MakeInvalidState(
+            "上传时钟信息前必须先调用 QueryClockCorrelation 取得 CLOCK_INFO");
+    }
+    if (!m_clock_correlation_) {
+        // 查询过但 Slave 不支持该可选命令
+        return std::nullopt;
+    }
+    const ClockCorrelationSnapshot& snapshot = *m_clock_correlation_;
+    const std::size_t total_bytes = snapshot.ClockInfoTotalBytes();
+    if (total_bytes == 0U) {
+        // CLOCK_INFO 全为 0：Slave 没有可上传的时钟信息块
+        return Bytes{};
+    }
+    const AddressGranularity ag = m_session_.GetAddressGranularity();
+    if (ag != AddressGranularity::Byte) {
+        // 数据块长度 18/16/8 不是 AG 的整数倍：按元素读取会跨出块边界
+        throw XcpException(
+            ErrorCategory::UnsupportedFeature,
+            "地址粒度大于 BYTE 时无法按字节上传时钟信息块（块长 " +
+                std::to_string(total_bytes) + " 字节）",
+            CommandCode::Upload, std::nullopt, 0, std::string{});
+    }
+    // GET_CLK_INFO 让 Slave 把 MTA 指向数据块起点，随后用 UPLOAD 读取
+    (void)m_executor_->ExecuteTimeCorrelationProperties(0x00U, 0x01U, 0U);
+    return m_executor_->ExecuteUpload(static_cast<ElementCount>(total_bytes));
 }
 
 }  // namespace calmcar::xcp

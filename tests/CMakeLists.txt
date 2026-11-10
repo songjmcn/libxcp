@@ -79,8 +79,15 @@ add_executable(libxcp_tests
         xcp_tcp_loopback_test.cpp
         dto_envelope_decoder_test.cpp
         get_daq_event_info_test.cpp
+        get_daq_list_mode_test.cpp
+        checksum_test.cpp
+        calibration_block_test.cpp
+        daq_control_plane_test.cpp
+        time_correlation_test.cpp
+        daq_packed_mode_test.cpp
         measurement_planner_test.cpp
         measurement_session_test.cpp
+        measurement_counter_test.cpp
         daq_timestamp_test.cpp
         measurement_session_hardening_test.cpp
         logging_test.cpp

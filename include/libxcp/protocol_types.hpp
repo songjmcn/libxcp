@@ -97,8 +97,11 @@ enum class CommandCode : std::uint8_t {
     SetDaqPtr = 0xE2,         ///< 设置 DAQ 指针（后续 WRITE/READ_DAQ 用）
     WriteDaq = 0xE1,          ///< 向 DAQ 指针处写一个 ODT Entry
     SetDaqListMode = 0xE0,    ///< 设置 DAQ List 工作模式
+    GetDaqListMode = 0xDF,    ///< 回读 DAQ List 当前模式（可选命令）
     StartStopDaqList = 0xDE,  ///< 启停/选择一个 DAQ List（响应含 FIRST_PID）
     StartStopSynch = 0xDD,    ///< 同步启停全部或选中的 DAQ List
+    // ---- 批次 B3：基础时间关联（docs §7.5.4.10 / §7.5.6.1；均 Optional）----
+    GetDaqClock = 0xDC,       ///< 读取与 DAQ 时间戳关联的时钟（legacy/extended）
     ReadDaq = 0xDB,           ///< 从 DAQ 指针处读一个 ODT Entry
     GetDaqResolutionInfo = 0xD9,  ///< 读 ODT Entry 粒度与时间戳信息
     GetDaqProcessorInfo = 0xDA,   ///< 读 DAQ 处理器能力（识别字段/扩展模式）
@@ -120,6 +123,10 @@ enum class CommandCode : std::uint8_t {
     //      尚未实现，故不登记（方案 §4.3 将其归为 Block，返回
     //      UnsupportedFeature，不做内容探测式尝试）。----
     GetVersion = 0xC0,  ///< Level-1 命令族前缀；实际报文为 [0xC0][子命令 0x00]
+    // ---- 批次 B2：DAQ 控制面命令（docs §7.5.4.6 / §7.5.4.15；均 Optional）----
+    WriteDaqMultiple = 0xC7,   ///< 一次写入同一 ODT 内连续多个 Entry
+    TimeCorrelationProperties = 0xC6,  ///< 时间关联属性查询/受控设置
+    DtoCtrProperties = 0xC5,   ///< 查询/修改事件通道的 DTO 计数器属性
 };
 
 /**
@@ -192,6 +199,32 @@ enum class DaqListModeBit : std::uint8_t {
     kPidOff = 0x20,       ///< bit5 PID_OFF → DTO 不携带识别字段
 };
 
+/**
+ * @brief GET_DAQ_LIST_MODE 响应中 Current Mode 的位（规范 Table 150）
+ * @details 与 SET_DAQ_LIST_MODE 的请求 MODE **不是同一套位语义**：
+ *          - bit0 在请求里是 ALTERNATING，在响应里是 SELECTED；
+ *          - 响应额外携带 RUNNING(bit6) 与 RESUME(bit7) 两个状态位。
+ *          因此禁止把本枚举取到的字节原样回填给 SET_DAQ_LIST_MODE。
+ */
+enum class DaqListStatusBit : std::uint8_t {
+    kNone = 0x00,          ///< 无标志
+    kSelected = 0x01,      ///< bit0 SELECTED：等待 START_STOP_SYNCH 同步启动
+    kStim = 0x02,          ///< bit1 DIRECTION=1 → STIM 方向
+    kDtoCounter = 0x08,    ///< bit3 DTO_CTR → DTO 携带计数器
+    kTimestamp = 0x10,     ///< bit4 TIMESTAMP → DTO 携带时间戳
+    kPidOff = 0x20,        ///< bit5 PID_OFF → DTO 不携带识别字段
+    kRunning = 0x40,       ///< bit6 RUNNING：该 List 正在发送/接收
+    kResume = 0x80,        ///< bit7 RESUME：停止后保留配置以便续传
+};
+
+/// @brief GET_DAQ_LIST_MODE 响应状态位命中的掩码判断
+[[nodiscard]] constexpr bool HasDaqStatus(DaqListStatusBit status,
+                                          DaqListStatusBit mask) noexcept;
+
+/// @brief 状态位合并
+[[nodiscard]] constexpr DaqListStatusBit operator|(DaqListStatusBit lhs,
+                                                   DaqListStatusBit rhs) noexcept;
+
 /// @brief DAQ List 模式位合并（供 Master 组装 MODE 字节）
 [[nodiscard]] constexpr DaqListModeBit operator|(DaqListModeBit lhs,
                                                  DaqListModeBit rhs) noexcept;
@@ -201,6 +234,286 @@ enum class DaqListModeBit : std::uint8_t {
 ///       （固定底层类型，取值覆盖整个 uint8 范围）。
 [[nodiscard]] constexpr bool HasDaqMode(DaqListModeBit mode,
                                         DaqListModeBit mask) noexcept;
+
+/**
+ * @brief 一个待写入 ODT Entry 的线格式字段（WRITE_DAQ / WRITE_DAQ_MULTIPLE 共用）
+ * @details 字段顺序与命令报文严格一致（docs §7.5.4.6 Table 122）：
+ *          BIT_OFFSET、SIZE、Address、AddressExtension、Dummy。
+ *          放在协议层而非 Master 层，是因为 Codec 需要它，而 Codec 不应
+ *          反向依赖 XcpMaster 的入参结构。
+ */
+struct WriteDaqElement {
+    std::uint8_t bit_offset{kDaqBitOffsetNone};  ///< 位偏；0xFF=无位偏
+    std::uint8_t size{0};                        ///< 元素数（以 AG 为单位）
+    Address address{0};                          ///< 32 位地址
+    AddressExtension extension{0};               ///< 8 位地址扩展
+};
+
+/**
+ * @brief DTO_CTR_PROPERTIES 请求的 MODIFIER 位（规范 Table 160/161）
+ * @details 每个置位的标志表示"采用命令参数中的对应值"，否则保持 Slave
+ *          当前值。未置位时对应命令参数应写 0。
+ */
+enum class DtoCtrModifierBit : std::uint8_t {
+    kNone = 0x00,               ///< 全部保持当前值（纯查询）
+    kModifyRelatedEvent = 0x01,  ///< bit0 采用命令里的相关事件通道号
+    kModifyDaqMode = 0x02,       ///< bit1 采用命令里的 DAQ_MODE
+    kModifyStimMode = 0x04,      ///< bit2 采用命令里的 STIM_MODE
+};
+
+/// @brief DTO_CTR_PROPERTIES 修改器位合并
+[[nodiscard]] constexpr DtoCtrModifierBit operator|(
+    DtoCtrModifierBit lhs, DtoCtrModifierBit rhs) noexcept;
+
+/// @brief 修改器位命中判断
+[[nodiscard]] constexpr bool HasDtoCtrModifier(DtoCtrModifierBit modifier,
+                                               DtoCtrModifierBit mask) noexcept;
+
+/**
+ * @brief 事件通道的 DTO 计数器 DAQ 方向模式（规范 Table 163 的 DAQ_MODE）
+ * @details 只在插入 DTO 计数器字段时生效，决定用的是相关事件自己的计数器
+ *          还是相关事件的 STIM 计数器副本。
+ */
+enum class DaqCounterMode : std::uint8_t {
+    InsertCounter = 0x00,          ///< DAQ_MODE=0 使用相关事件的计数器
+    InsertStimCounterCopy = 0x01,  ///< DAQ_MODE=1 使用 STIM 计数器副本
+};
+
+/**
+ * @brief DTO_CTR_PROPERTIES 响应的 PROPERTIES 位（规范 Table 165/166）
+ * @details 注意位语义**不统一**：`kRelatedEventFixed`/`kDaqModeFixed`/
+ *          `kStimModeFixed` 是"1 = 不可修改"，其余 `*Present` 是
+ *          "1 = 存在/支持"。混用会得出反向结论，故在类型注释里显式区分。
+ */
+enum class DtoCtrPropertiesBit : std::uint8_t {
+    kNone = 0x00,                ///< 无标志
+    kRelatedEventFixed = 0x01,   ///< bit0 1=相关事件通道号不可修改
+    kDaqModeFixed = 0x02,        ///< bit1 1=DAQ_MODE 不可修改
+    kStimModeFixed = 0x04,       ///< bit2 1=STIM_MODE 不可修改
+    kRelatedEventPresent = 0x08, ///< bit3 1=存在相关事件通道
+    kDaqModePresent = 0x10,      ///< bit4 1=DAQ 方向支持 DTO 计数器
+    kStimModePresent = 0x20,     ///< bit5 1=STIM 方向支持 DTO 计数器
+    kStimCtrCopyPresent = 0x40,  ///< bit6 1=**不能**保存 STIM 计数器副本
+    kEvtCtrPresent = 0x80,       ///< bit7 1=该事件通道带周期计数器
+};
+
+/// @brief PROPERTIES 位命中判断
+[[nodiscard]] constexpr bool HasDtoCtrProperty(DtoCtrPropertiesBit properties,
+                                               DtoCtrPropertiesBit mask) noexcept;
+
+/**
+ * @brief 时间关联载荷中单个时钟字段的格式（规范 Table 245/246 的 FMT_*）
+ * @details 2 位编码，`0xFF` 不是合法值；解析时对 3（保留）必须报错，
+ *          不能按"未知就当 DWORD"处理，否则会把 8 字节字段读成 4 字节，
+ *          后面所有时间戳与 SYNC_STATE 全部错位。
+ */
+enum class ClockPayloadFormat : std::uint8_t {
+    Absent = 0,  ///< 该时钟不在载荷中
+    Dword = 1,   ///< 4 字节无符号
+    Dlong = 2,   ///< 8 字节无符号
+};
+
+/// @brief 取 2 位编码对应的载荷格式；3（保留）返回 std::nullopt
+[[nodiscard]] constexpr std::optional<ClockPayloadFormat>
+DecodeClockPayloadFormat(std::uint8_t raw) noexcept;
+
+/// @brief 该格式对应的时间戳字节数（Absent=0、Dword=4、Dlong=8）
+[[nodiscard]] constexpr std::size_t
+ClockPayloadFormatByteSize(ClockPayloadFormat format) noexcept;
+
+/// @brief 触发源（规范 Table 243/244 的 TRIGGER_INITIATOR，TRIGGER_INFO bit0-2）
+enum class TriggerInitiator : std::uint8_t {
+    HardwareTrigger = 0,           ///< 硬件触发（如 Vector Syncline）
+    TimeSyncEvent = 1,             ///< XCP 无关的时基同步事件（如 PPS）
+    GetDaqClockMulticast = 2,      ///< 由 GET_DAQ_CLOCK_MULTICAST 触发
+    TimeSyncBridge = 3,            ///< 经 Time Sync Bridge 的 multicast
+    SyncStateChange = 4,           ///< 与 grandmaster 同步/锁频状态变化
+    LeapSecond = 5,                ///< grandmaster 闰秒
+    EcuResetRelease = 6,           ///< ECU 复位释放
+    Reserved = 7,                  ///< 保留
+};
+
+/// @brief 取 TRIGGER_INFO 低 3 位的触发源
+[[nodiscard]] constexpr TriggerInitiator
+TriggerInitiatorOf(std::uint8_t trigger_info) noexcept;
+
+/// @brief 时间戳采样时刻（规范 Table 244 的 TIME_OF_TS_SAMPLING，bit3-4）
+enum class TimestampSamplingPoint : std::uint8_t {
+    CommandProcessing = 0,    ///< 协议层命令处理期间采样
+    HighPriorityInterrupt = 1, ///< 高优先级中断中采样（低抖动）
+    PhysicalTransmission = 2,  ///< 物理发送时采样
+    PhysicalReception = 3,     ///< 物理收到命令时采样
+};
+
+/// @brief 取 TRIGGER_INFO 的 bit3-4 采样时刻
+[[nodiscard]] constexpr TimestampSamplingPoint
+TimestampSamplingPointOf(std::uint8_t trigger_info) noexcept;
+
+/// @brief 取 PAYLOAD_FMT 中的 XCP Slave 时钟格式（bit0-1）
+[[nodiscard]] constexpr std::optional<ClockPayloadFormat>
+XcpSlaveClockFormatOf(std::uint8_t payload_fmt) noexcept;
+
+/// @brief 取 PAYLOAD_FMT 中的 grandmaster 时钟格式（bit2-3）
+[[nodiscard]] constexpr std::optional<ClockPayloadFormat>
+GrandmasterClockFormatOf(std::uint8_t payload_fmt) noexcept;
+
+/// @brief 取 PAYLOAD_FMT 中的 ECU 时钟格式（bit4-5）
+[[nodiscard]] constexpr std::optional<ClockPayloadFormat>
+EcuClockFormatOf(std::uint8_t payload_fmt) noexcept;
+
+/// @brief PAYLOAD_FMT bit6：是否在载荷中附加 Cluster Identifier 与 Counter
+[[nodiscard]] constexpr bool
+HasClusterIdentifier(std::uint8_t payload_fmt) noexcept;
+
+/**
+ * @brief SLAVE_CONFIG 中的 RESPONSE_FMT（规范 Table 213/214 的 bit0-1）
+ * @details 0 = legacy；>=1 表示已启用高级时间关联（extended 格式）。
+ */
+enum class ResponseFormatMode : std::uint8_t {
+    Legacy = 0,                 ///< 向后兼容格式（EV_TIME_SYNC 与 GET_DAQ_CLOCK 均为 legacy）
+    TriggerInitiatorZeroTwoThree = 1,  ///< extended，EV_TIME_SYNC 仅对触发源 0/2/3 发送
+    AllTriggers = 2,            ///< extended，对所有触发条件发送 EV_TIME_SYNC
+};
+
+/// @brief 取 SLAVE_CONFIG 的 bit0-1 响应格式
+[[nodiscard]] constexpr ResponseFormatMode
+ResponseFormatModeOf(std::uint8_t slave_config) noexcept;
+
+/// @brief TIME_SYNC_BRIDGE 的**请求**语义（规范 Table 208/209 bit2-3）
+enum class TimeSyncBridgeRequest : std::uint8_t {
+    NoChange = 0,  ///< 不改变（写入位 0）
+    Enable = 1,    ///< 启用桥接（写入位 1）
+    Disable = 2,   ///< 禁用桥接（写入位 2）
+};
+
+/// @brief TIME_SYNC_BRIDGE 的**上报**语义（规范 Table 213/214 bit3-4）
+enum class TimeSyncBridgeState : std::uint8_t {
+    NotAvailable = 0,  ///< Slave 不提供桥接特性
+    Disabled = 1,      ///< 提供但当前禁用
+    Enabled = 2,       ///< 提供且已启用
+};
+
+/// @brief 取 SLAVE_CONFIG 的 bit3-4 桥接状态
+[[nodiscard]] constexpr TimeSyncBridgeState
+TimeSyncBridgeStateOf(std::uint8_t slave_config) noexcept;
+
+/// @brief DAQ 时间戳关联的时钟（规范 Table 213/214 的 DAQ_TS_RELATION，bit2）
+enum class DaqTimestampRelation : std::uint8_t {
+    XcpSlaveClock = 0,  ///< DAQ 时间戳关联 XCP Slave 自己的时钟
+    EcuClock = 1,       ///< DAQ 时间戳关联 ECU 时钟
+};
+
+/// @brief 取 SLAVE_CONFIG 的 bit2 时间戳关联时钟
+[[nodiscard]] constexpr DaqTimestampRelation
+DaqTimestampRelationOf(std::uint8_t slave_config) noexcept;
+
+/**
+ * @brief 组装 TIME_CORRELATION_PROPERTIES 的 SET_PROPERTIES 字节
+ * @param mode 目标响应格式；`Legacy` 表示写 0（不改）
+ * @param bridge 桥接请求
+ * @param set_cluster_id 是否采用传入的 CLUSTER_ID（bit4）
+ * @return 可直接下发的 SET_PROPERTIES 字节
+ * @note 规范里 `RESPONSE_FMT=0` 与 `TIME_SYNC_BRIDGE=0` 都表示"不改变"，
+ *       因此**无法用本命令把 Slave 降级回 legacy**；降级只能靠断开重连
+ *       （规范要求上电/致命错误后回到 legacy）。这一点在文档里显式写明。
+ */
+[[nodiscard]] constexpr std::uint8_t EncodeTimeCorrelationSetProperties(
+    ResponseFormatMode mode, TimeSyncBridgeRequest bridge,
+    bool set_cluster_id) noexcept;
+
+/// @brief XCP Slave 时钟的可观测性（OBSERVABLE_CLOCKS bit0-1）
+enum class SlaveClockObservability : std::uint8_t {
+    FreeRunning = 0,        ///< 自由运行、可随机读
+    MaybeSynchronized = 1,  ///< 可能已同步/锁频到 grandmaster、可随机读
+    NoSlaveClock = 2,       ///< 没有 Slave 时钟
+};
+
+/// @brief grandmaster 时钟的可观测性（OBSERVABLE_CLOCKS bit2-3）
+enum class GrandmasterClockObservability : std::uint8_t {
+    None = 0,            ///< 没有同步到 grandmaster 的专用时钟
+    RandomReadable = 1,  ///< 有且可随机读
+    EventOnly = 2,       ///< 有但不可随机读，只能靠 EV_TIME_SYNC
+};
+
+/// @brief ECU 时钟的可观测性（OBSERVABLE_CLOCKS bit4-5）
+enum class EcuClockObservability : std::uint8_t {
+    None = 0,          ///< 没有 ECU 时钟
+    RandomReadable = 1,///< 能访问且可随机读
+    EventOnly = 2,     ///< 能访问但不可随机读，只能靠 EV_TIME_SYNC
+    NotReadable = 3,   ///< 只上报 ECU 时间戳，无法读取 ECU 时钟
+};
+
+/// @brief 取 OBSERVABLE_CLOCKS 的 bit0-1（XCP_SLV_CLK）
+[[nodiscard]] constexpr SlaveClockObservability
+SlaveClockObservabilityOf(std::uint8_t observable_clocks) noexcept;
+
+/// @brief 取 OBSERVABLE_CLOCKS 的 bit2-3（GRANDM_CLK）
+[[nodiscard]] constexpr GrandmasterClockObservability
+GrandmasterClockObservabilityOf(std::uint8_t observable_clocks) noexcept;
+
+/// @brief 取 OBSERVABLE_CLOCKS 的 bit4-5（ECU_CLK）
+[[nodiscard]] constexpr EcuClockObservability
+EcuClockObservabilityOf(std::uint8_t observable_clocks) noexcept;
+
+/// @brief Slave 时钟的同步状态（SYNC_STATE bit0-2 的 SLV_CLK_SYNC_STATE）
+enum class SlaveClockSyncState : std::uint8_t {
+    Synchronizing = 0,  ///< 正在同步到 grandmaster
+    Synchronized = 1,   ///< 已同步
+    Syntonizing = 2,    ///< 正在锁频
+    Syntonized = 3,     ///< 已锁频
+    NotSupported = 7,   ///< 不支持同步/锁频
+};
+
+/// @brief 取 SYNC_STATE 的 bit0-2
+[[nodiscard]] constexpr SlaveClockSyncState
+SlaveClockSyncStateOf(std::uint8_t sync_state) noexcept;
+
+/// @brief grandmaster 时钟的同步状态（SYNC_STATE bit3）
+enum class GrandmasterSyncState : std::uint8_t {
+    NotSynchronized = 0,  ///< 尚未同步
+    Synchronized = 1,     ///< 已同步
+};
+
+/// @brief 取 SYNC_STATE 的 bit3
+[[nodiscard]] constexpr GrandmasterSyncState
+GrandmasterSyncStateOf(std::uint8_t sync_state) noexcept;
+
+/// @brief ECU 时钟的同步状态（SYNC_STATE bit4-5）
+enum class EcuSyncState : std::uint8_t {
+    NotSynchronized = 0,  ///< 未同步
+    Synchronized = 1,     ///< 已同步
+    Unknown = 2,          ///< 未知
+};
+
+/// @brief 取 SYNC_STATE 的 bit4-5
+[[nodiscard]] constexpr EcuSyncState
+EcuSyncStateOf(std::uint8_t sync_state) noexcept;
+
+/**
+ * @brief CLOCK_INFO 位：哪些时钟信息块在 MTA 指向的数据块中
+ * @details 规范 Table 219/220。位值即 `TIME_CORRELATION_PROPERTIES`
+ *          正响应 CLOCK_INFO 字段的编码。
+ */
+enum class ClockInfoBlock : std::uint8_t {
+    kNone = 0x00,               ///< 无数据块
+    kSlaveClock = 0x01,         ///< bit0 XCP Slave 时钟信息（18 字节）
+    kGrandmasterClock = 0x02,   ///< bit1 grandmaster 时钟信息（18 字节）
+    kClockRelation = 0x04,      ///< bit2 时钟关系时间元组（16 字节）
+    kEcuClock = 0x08,           ///< bit3 ECU 时钟信息（18 字节）
+    kEcuGrandmasterClock = 0x10,///< bit4 ECU 的 grandmaster UUID（8 字节）
+};
+
+/// @brief 时钟信息块位合并
+[[nodiscard]] constexpr ClockInfoBlock operator|(ClockInfoBlock lhs,
+                                                ClockInfoBlock rhs) noexcept;
+
+/// @brief 时钟信息块命中判断
+[[nodiscard]] constexpr bool HasClockInfoBlock(ClockInfoBlock blocks,
+                                               ClockInfoBlock mask) noexcept;
+
+/// @brief 单个时钟信息块的字节数（Table 221..225：18/18/16/18/8）
+[[nodiscard]] constexpr std::size_t
+ClockInfoBlockByteSize(ClockInfoBlock block) noexcept;
 
 /**
  * @brief GET_DAQ_LIST_INFO 响应的 DAQ_LIST_PROPERTIES 位
@@ -213,6 +526,7 @@ enum class DaqListPropertyBit : std::uint8_t {
     kFixedEvent = 0x02,     ///< 事件通道固定（不可重设）
     kDirectionDaq = 0x04,   ///< 方向为 DAQ
     kDirectionStim = 0x08,  ///< 方向为 STIM
+    kPacked = 0x10,         ///< bit4 PACKED：该列表支持 DAQ Packed Mode（V1.5）
 };
 
 /// @brief DAQ List 属性位合并
@@ -222,6 +536,128 @@ enum class DaqListPropertyBit : std::uint8_t {
 /// @brief 属性位命中判断
 [[nodiscard]] constexpr bool HasDaqProperty(DaqListPropertyBit props,
                                             DaqListPropertyBit mask) noexcept;
+
+/**
+ * @brief GET_DAQ_EVENT_INFO 响应的 DAQ_EVENT_PROPERTIES 位
+ * @details 原始 PDF Table 155：bit2 DAQ、bit3 STIM、bit4 PACKED。
+ *          **只有 PACKED 置位且事件为周期事件（TIME_CYCLE != 0）时**，
+ *          关联的 DAQ List 才允许配置为 DAQ Packed Mode。
+ */
+enum class DaqEventPropertyBit : std::uint8_t {
+    kNone = 0x00,    ///< 无声明能力
+    kDaq = 0x04,     ///< bit2：该事件可用于 DAQ 方向
+    kStim = 0x08,    ///< bit3：该事件可用于 STIM 方向
+    kPacked = 0x10,  ///< bit4：该事件支持关联列表使用 DAQ Packed Mode
+};
+
+/// @brief 事件属性位合并
+[[nodiscard]] constexpr DaqEventPropertyBit operator|(
+    DaqEventPropertyBit lhs, DaqEventPropertyBit rhs) noexcept;
+
+/// @brief 事件属性位命中判断
+[[nodiscard]] constexpr bool HasDaqEventProperty(DaqEventPropertyBit props,
+                                                 DaqEventPropertyBit mask) noexcept;
+
+/**
+ * @brief DAQ Packed Mode 的打包方式（SET/GET_DAQ_PACKED_MODE 的 DAQ_PACKED_MODE）
+ * @details 原始 PDF Table 123：0 = 不打包；1 = element-grouped；
+ *          2 = event-grouped；3..127 预留给未来扩展；128..255 保留。
+ */
+enum class DaqPackedMode : std::uint8_t {
+    NotPacked = 0x00,      ///< 常规模式：一个 DTO 一个采样
+    ElementGrouped = 0x01, ///< 同一变量的连续采样集中排放
+    EventGrouped = 0x02,   ///< 同一采样时刻的所有变量集中排放
+};
+
+/// @brief Packed 模式名称（日志/诊断用）
+[[nodiscard]] std::string_view DaqPackedModeName(DaqPackedMode mode) noexcept;
+
+/// @brief 原始字节 → DaqPackedMode；3..255 返 nullopt（预留给未来扩展/保留值）
+[[nodiscard]] constexpr std::optional<DaqPackedMode> ToDaqPackedMode(
+    std::uint8_t raw) noexcept {
+    switch (raw) {
+        case 0x00U:
+            return DaqPackedMode::NotPacked;
+        case 0x01U:
+            return DaqPackedMode::ElementGrouped;
+        case 0x02U:
+            return DaqPackedMode::EventGrouped;
+        default:
+            return std::nullopt;
+    }
+}
+
+/**
+ * @brief Packed 模式时间戳语义（DPM_TIMESTAMP_MODE）
+ * @details 原始 PDF Table 126：只有 bit0-1 有意义，**bit1-7 置位即保留值**。
+ *          规范中一帧只带**一个**时间戳，其余采样时刻由接收方按事件周期反推。
+ */
+enum class DaqPackedTimestampMode : std::uint8_t {
+    LastSample = 0x00,   ///< 该帧时间戳 = 本组**最后**一个采样的时刻
+    FirstSample = 0x01,  ///< 该帧时间戳 = 本组**第一个**采样的时刻
+};
+
+/// @brief 原始字节 → DaqPackedTimestampMode；bit1-7 置位或取值 2/3 返 nullopt
+[[nodiscard]] constexpr std::optional<DaqPackedTimestampMode>
+ToDaqPackedTimestampMode(std::uint8_t raw) noexcept {
+    switch (raw) {
+        case 0x00U:
+            return DaqPackedTimestampMode::LastSample;
+        case 0x01U:
+            return DaqPackedTimestampMode::FirstSample;
+        default:
+            return std::nullopt;
+    }
+}
+
+/**
+ * @brief 事件通道时间单位码 → 纳秒（B4：packed 采样间隔重建用）
+ * @details 原始 PDF Table 156 `EVENT_CHANNEL_TIME_UNIT` 位于**低半字节**：
+ *          0=1ns、1=10ns、2=100ns、3=1µs、4=10µs、5=100µs、6=1ms、
+ *          7=10ms、8=100ms、9=1s、10=1ps、11=10ps、12=100ps。
+ *          注意这与时间戳单位（高半字节编码）**不是同一张表**，不可混用。
+ * @param unit_code 原始单位码（调用方可直接传 `time_unit`，本函数只取低 4 位）
+ * @return 对应纳秒数；13..15 等保留值返 `nullopt`（不猜）
+ */
+[[nodiscard]] constexpr std::optional<std::uint64_t>
+EventChannelTimeUnitNanoseconds(std::uint8_t unit_code) noexcept {
+    switch (static_cast<std::uint8_t>(unit_code & 0x0FU)) {
+        case 0x00U:
+            return 1ULL;
+        case 0x01U:
+            return 10ULL;
+        case 0x02U:
+            return 100ULL;
+        case 0x03U:
+            return 1000ULL;
+        case 0x04U:
+            return 10000ULL;
+        case 0x05U:
+            return 100000ULL;
+        case 0x06U:
+            return 1000000ULL;
+        case 0x07U:
+            return 10000000ULL;
+        case 0x08U:
+            return 100000000ULL;
+        case 0x09U:
+            return 1000000000ULL;
+        case 0x0AU:
+            return 1ULL;  // 1ps → 0.001ns，已低于纳秒精度，向上取整为 1ns
+        case 0x0BU:
+            return 1ULL;  // 10ps
+        case 0x0CU:
+            return 1ULL;  // 100ps
+        default:
+            return std::nullopt;
+    }
+}
+
+/// @brief DPM_SAMPLE_COUNT 的最小合法值（规范：0 与 1 非法）
+inline constexpr std::uint16_t kMinDaqPackedSampleCount = 2U;
+
+/// @brief DPM_SAMPLE_COUNT 的最大合法值（16 位无符号上限）
+inline constexpr std::uint16_t kMaxDaqPackedSampleCount = 0xFFFFU;
 
 /**
  * @brief GET_DAQ_PROCESSOR_INFO 响应的 DAQ_PROPERTIES 位
@@ -452,6 +888,58 @@ enum class ErrorCode : std::uint8_t {
 
 /// @brief 将原始错误码字节安全转为 ErrorCode；未知值返回 std::nullopt
 [[nodiscard]] std::optional<ErrorCode> ToErrorCode(std::uint8_t raw) noexcept;
+
+/**
+ * @brief BUILD_CHECKSUM 的校验算法类型（原始 PDF 第 148 页 Table 75）
+ *
+ * 枚举值即线上 Checksum type 字节，不做重排，便于与原始报文对照。
+ * 所有算法的结果都以 DWORD 返回（规范原文：The result is always given as a
+ * DWORD, regardless of the checksum type）。
+ */
+enum class CalibrationChecksumType : std::uint8_t {
+    Add11 = 0x01,        ///< XCP_ADD_11：BYTE 累加进 BYTE 校验和
+    Add12 = 0x02,        ///< XCP_ADD_12：BYTE 累加进 WORD 校验和
+    Add14 = 0x03,        ///< XCP_ADD_14：BYTE 累加进 DWORD 校验和
+    Add22 = 0x04,        ///< XCP_ADD_22：WORD 累加进 WORD（块长须为 2 的倍数）
+    Add24 = 0x05,        ///< XCP_ADD_24：WORD 累加进 DWORD（块长须为 2 的倍数）
+    Add44 = 0x06,        ///< XCP_ADD_44：DWORD 累加进 DWORD（块长须为 4 的倍数）
+    Crc16 = 0x07,        ///< XCP_CRC_16（poly 0x8005, init 0x0000, 反射）
+    Crc16Citt = 0x08,    ///< XCP_CRC_16_CITT（poly 0x1021, init 0xFFFF, 不反射）
+    Crc32 = 0x09,        ///< XCP_CRC_32
+    UserDefined = 0xFF,  ///< XCP_USER_DEFINED：需外部算法实现，本库不自行计算
+};
+
+/// @brief 将校验算法类型转为字符串名称（用于诊断和日志）
+[[nodiscard]] std::string_view ChecksumTypeName(
+    CalibrationChecksumType type) noexcept;
+
+/// @brief 将原始校验类型字节安全转为枚举；未知值返回 std::nullopt
+[[nodiscard]] std::optional<CalibrationChecksumType> ToChecksumType(
+    std::uint8_t raw) noexcept;
+
+/**
+ * @brief SET_REQUEST 的 Mode 位掩码（原始 PDF 第 128 页 Table 63）
+ *
+ * 本库只使用 STORE_CAL_REQ；其余位置位时按“请求其他持久化动作”原样下发给
+ * Slave，不自行解释其副作用。
+ */
+enum class SetRequestModeBit : std::uint8_t {
+    kNone = 0x00,                 ///< 无请求位
+    kStoreCalReq = 0x01,          ///< bit0：请求把标定数据保存到非易失存储
+    kStoreDaqReqNoResume = 0x02,  ///< bit1：保存 DAQ 列表且不进入 RESUME
+    kStoreDaqReqResume = 0x04,    ///< bit2：保存 DAQ 列表并进入 RESUME
+    kClearDaqReq = 0x08,          ///< bit3：清除非易失存储中的 DAQ 配置
+    kClearCalPagCfgLost = 0x10,   ///< bit4：清除 CAL_PAG_CFG_LOST 标志
+    kClearDaqCfgLost = 0x20,      ///< bit5：清除 DAQ_CFG_LOST 标志
+};
+
+/// @brief 组合两个 SET_REQUEST Mode 位
+[[nodiscard]] constexpr SetRequestModeBit operator|(SetRequestModeBit lhs,
+                                                    SetRequestModeBit rhs) noexcept;
+
+/// @brief 判断 Mode 中是否置位指定掩码
+[[nodiscard]] constexpr bool HasSetRequestMode(SetRequestModeBit mode,
+                                               SetRequestModeBit mask) noexcept;
 
 /**
  * @brief XCP 事件码（EV Packet 的 Byte 1）
@@ -800,6 +1288,189 @@ constexpr bool HasDaqMode(DaqListModeBit mode, DaqListModeBit mask) noexcept {
             static_cast<std::uint8_t>(mask)) != 0U;
 }
 
+constexpr DaqListStatusBit operator|(DaqListStatusBit lhs,
+                                     DaqListStatusBit rhs) noexcept {
+    return static_cast<DaqListStatusBit>(static_cast<std::uint8_t>(lhs) |
+                                         static_cast<std::uint8_t>(rhs));
+}
+
+constexpr bool HasDaqStatus(DaqListStatusBit status,
+                            DaqListStatusBit mask) noexcept {
+    return (static_cast<std::uint8_t>(status) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr SetRequestModeBit operator|(SetRequestModeBit lhs,
+                                      SetRequestModeBit rhs) noexcept {
+    return static_cast<SetRequestModeBit>(static_cast<std::uint8_t>(lhs) |
+                                          static_cast<std::uint8_t>(rhs));
+}
+
+constexpr bool HasSetRequestMode(SetRequestModeBit mode,
+                                 SetRequestModeBit mask) noexcept {
+    return (static_cast<std::uint8_t>(mode) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr DtoCtrModifierBit operator|(DtoCtrModifierBit lhs,
+                                      DtoCtrModifierBit rhs) noexcept {
+    return static_cast<DtoCtrModifierBit>(static_cast<std::uint8_t>(lhs) |
+                                          static_cast<std::uint8_t>(rhs));
+}
+
+constexpr bool HasDtoCtrModifier(DtoCtrModifierBit modifier,
+                                 DtoCtrModifierBit mask) noexcept {
+    return (static_cast<std::uint8_t>(modifier) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr bool HasDtoCtrProperty(DtoCtrPropertiesBit properties,
+                                 DtoCtrPropertiesBit mask) noexcept {
+    return (static_cast<std::uint8_t>(properties) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr std::optional<ClockPayloadFormat>
+DecodeClockPayloadFormat(std::uint8_t raw) noexcept {
+    switch (raw & 0x03U) {
+        case 0U:
+            return ClockPayloadFormat::Absent;
+        case 1U:
+            return ClockPayloadFormat::Dword;
+        case 2U:
+            return ClockPayloadFormat::Dlong;
+        default:
+            return std::nullopt;  // 3 = 保留，不得猜测
+    }
+}
+
+constexpr std::size_t
+ClockPayloadFormatByteSize(ClockPayloadFormat format) noexcept {
+    switch (format) {
+        case ClockPayloadFormat::Dword:
+            return 4U;
+        case ClockPayloadFormat::Dlong:
+            return 8U;
+        case ClockPayloadFormat::Absent:
+        default:
+            return 0U;
+    }
+}
+
+constexpr TriggerInitiator TriggerInitiatorOf(std::uint8_t trigger_info) noexcept {
+    return static_cast<TriggerInitiator>(trigger_info & 0x07U);
+}
+
+constexpr TimestampSamplingPoint
+TimestampSamplingPointOf(std::uint8_t trigger_info) noexcept {
+    return static_cast<TimestampSamplingPoint>((trigger_info >> 3U) & 0x03U);
+}
+
+constexpr std::optional<ClockPayloadFormat>
+XcpSlaveClockFormatOf(std::uint8_t payload_fmt) noexcept {
+    return DecodeClockPayloadFormat(payload_fmt & 0x03U);
+}
+
+constexpr std::optional<ClockPayloadFormat>
+GrandmasterClockFormatOf(std::uint8_t payload_fmt) noexcept {
+    return DecodeClockPayloadFormat((payload_fmt >> 2U) & 0x03U);
+}
+
+constexpr std::optional<ClockPayloadFormat>
+EcuClockFormatOf(std::uint8_t payload_fmt) noexcept {
+    return DecodeClockPayloadFormat((payload_fmt >> 4U) & 0x03U);
+}
+
+constexpr bool HasClusterIdentifier(std::uint8_t payload_fmt) noexcept {
+    return (payload_fmt & 0x40U) != 0U;
+}
+
+constexpr ResponseFormatMode
+ResponseFormatModeOf(std::uint8_t slave_config) noexcept {
+    return static_cast<ResponseFormatMode>(slave_config & 0x03U);
+}
+
+constexpr TimeSyncBridgeState
+TimeSyncBridgeStateOf(std::uint8_t slave_config) noexcept {
+    return static_cast<TimeSyncBridgeState>((slave_config >> 3U) & 0x03U);
+}
+
+constexpr DaqTimestampRelation
+DaqTimestampRelationOf(std::uint8_t slave_config) noexcept {
+    return static_cast<DaqTimestampRelation>((slave_config >> 2U) & 0x01U);
+}
+
+constexpr std::uint8_t EncodeTimeCorrelationSetProperties(
+    ResponseFormatMode mode, TimeSyncBridgeRequest bridge,
+    bool set_cluster_id) noexcept {
+    // bit0-1 RESPONSE_FMT、bit2-3 TIME_SYNC_BRIDGE、bit4 SET_CLUSTER_ID
+    std::uint8_t value = static_cast<std::uint8_t>(mode) & 0x03U;
+    value = static_cast<std::uint8_t>(
+        value | ((static_cast<std::uint8_t>(bridge) & 0x03U) << 2U));
+    if (set_cluster_id) {
+        value = static_cast<std::uint8_t>(value | 0x10U);
+    }
+    return value;
+}
+
+constexpr SlaveClockObservability
+SlaveClockObservabilityOf(std::uint8_t observable_clocks) noexcept {
+    return static_cast<SlaveClockObservability>(observable_clocks & 0x03U);
+}
+
+constexpr GrandmasterClockObservability
+GrandmasterClockObservabilityOf(std::uint8_t observable_clocks) noexcept {
+    return static_cast<GrandmasterClockObservability>(
+        (observable_clocks >> 2U) & 0x03U);
+}
+
+constexpr EcuClockObservability
+EcuClockObservabilityOf(std::uint8_t observable_clocks) noexcept {
+    return static_cast<EcuClockObservability>((observable_clocks >> 4U) & 0x03U);
+}
+
+constexpr SlaveClockSyncState
+SlaveClockSyncStateOf(std::uint8_t sync_state) noexcept {
+    return static_cast<SlaveClockSyncState>(sync_state & 0x07U);
+}
+
+constexpr GrandmasterSyncState
+GrandmasterSyncStateOf(std::uint8_t sync_state) noexcept {
+    return static_cast<GrandmasterSyncState>((sync_state >> 3U) & 0x01U);
+}
+
+constexpr EcuSyncState EcuSyncStateOf(std::uint8_t sync_state) noexcept {
+    return static_cast<EcuSyncState>((sync_state >> 4U) & 0x03U);
+}
+
+constexpr ClockInfoBlock operator|(ClockInfoBlock lhs,
+                                   ClockInfoBlock rhs) noexcept {
+    return static_cast<ClockInfoBlock>(static_cast<std::uint8_t>(lhs) |
+                                       static_cast<std::uint8_t>(rhs));
+}
+
+constexpr bool HasClockInfoBlock(ClockInfoBlock blocks,
+                                 ClockInfoBlock mask) noexcept {
+    return (static_cast<std::uint8_t>(blocks) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr std::size_t ClockInfoBlockByteSize(ClockInfoBlock block) noexcept {
+    switch (block) {
+        case ClockInfoBlock::kSlaveClock:
+        case ClockInfoBlock::kGrandmasterClock:
+        case ClockInfoBlock::kEcuClock:
+            return 18U;
+        case ClockInfoBlock::kClockRelation:
+            return 16U;
+        case ClockInfoBlock::kEcuGrandmasterClock:
+            return 8U;
+        case ClockInfoBlock::kNone:
+        default:
+            return 0U;
+    }
+}
+
 constexpr DaqListPropertyBit operator|(DaqListPropertyBit lhs,
                                        DaqListPropertyBit rhs) noexcept {
     return static_cast<DaqListPropertyBit>(static_cast<std::uint8_t>(lhs) |
@@ -808,6 +1479,18 @@ constexpr DaqListPropertyBit operator|(DaqListPropertyBit lhs,
 
 constexpr bool HasDaqProperty(DaqListPropertyBit props,
                               DaqListPropertyBit mask) noexcept {
+    return (static_cast<std::uint8_t>(props) &
+            static_cast<std::uint8_t>(mask)) != 0U;
+}
+
+constexpr DaqEventPropertyBit operator|(DaqEventPropertyBit lhs,
+                                        DaqEventPropertyBit rhs) noexcept {
+    return static_cast<DaqEventPropertyBit>(static_cast<std::uint8_t>(lhs) |
+                                           static_cast<std::uint8_t>(rhs));
+}
+
+constexpr bool HasDaqEventProperty(DaqEventPropertyBit props,
+                                   DaqEventPropertyBit mask) noexcept {
     return (static_cast<std::uint8_t>(props) &
             static_cast<std::uint8_t>(mask)) != 0U;
 }

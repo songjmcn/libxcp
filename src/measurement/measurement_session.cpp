@@ -158,6 +158,32 @@ void MeasurementSession::SetDaqEntryCapabilities(
     m_daq_entry_capabilities_ = capabilities;
 }
 
+void MeasurementSession::SetDtoCounterEnabled(bool enabled) {
+    if (m_prepared_ || Running()) {
+        ThrowState("MeasurementSession::SetDtoCounterEnabled 须在 Prepare 前调用");
+    }
+    m_dto_counter_enabled_ = enabled;
+}
+
+void MeasurementSession::SetDaqPackedMode(DaqPackedMode mode,
+                                          DaqPackedTimestampMode timestamp_mode,
+                                          std::uint16_t sample_count) {
+    if (m_prepared_ || Running()) {
+        ThrowState("MeasurementSession::SetDaqPackedMode 须在 Prepare 前调用");
+    }
+    // 规范明确 DPM_SAMPLE_COUNT 的 0 与 1 非法：本地先拒绝，不发帧。
+    if (mode != DaqPackedMode::NotPacked &&
+        (sample_count < kMinDaqPackedSampleCount ||
+         sample_count > kMaxDaqPackedSampleCount)) {
+        ThrowInvalid(
+            "MeasurementSession::SetDaqPackedMode 的采样数必须在 [2, 0xFFFF] 内");
+    }
+    m_packed_mode_ = mode;
+    m_packed_timestamp_mode_ = timestamp_mode;
+    m_packed_sample_count_ =
+        (mode == DaqPackedMode::NotPacked) ? 1U : sample_count;
+}
+
 void MeasurementSession::Bind(XcpMaster& master) {
     if (m_bound_) {
         ThrowInvalid("MeasurementSession::Bind 重复绑定");
@@ -214,10 +240,19 @@ void MeasurementSession::Prepare() {
     }
 
     // 规划 + 下发（一个整体：失败不留半份账，ConfigureDaqListsDynamic 自回滚）
+    // 计数器段是否额外占用 1 字节：RelativeWordAligned 模式下 CTR 取代
+    // FILL 字节（Figure 56），不增加帧长；其余识别模式各占 1 字节。
+    const std::size_t counter_header_bytes =
+        (m_dto_counter_enabled_ &&
+         !IdentificationFieldMergesCounter(m_id_field_type_))
+            ? 1U
+            : 0U;
     MeasurementPlanner planner(m_database_, m_max_dto_,
                                params.connect.address_granularity,
                                m_timestamp_bytes_, m_id_field_bytes_,
-                               m_daq_entry_capabilities_);
+                               m_daq_entry_capabilities_,
+                               m_dto_counter_enabled_, counter_header_bytes,
+                               m_packed_mode_, m_packed_sample_count_);
     const MeasurementResult<MeasurementPlan> plan = planner.Build(names);
     if (!plan.HasValue()) {
         // v0.6 硬化：按错误码映射异常类别上抛（不再统一 InvalidArgument）
@@ -231,6 +266,96 @@ void MeasurementSession::Prepare() {
         ThrowInvalid("Absolute PID DTO 当前仅支持单个 DAQ List（DAQ_LIST 0）");
     }
     master.ConfigureDaqListsDynamic(plan.Value().daq_lists, m_id_field_bytes_);
+
+    // B2 Counter 贯通：解码布局的计数器位**只认回读事实**，不认本地期望。
+    // GET_DAQ_LIST_MODE 是 Optional 命令：启用了计数器却无法回读时，无从
+    // 确定 DTO 是否真的带计数器段——此时若按“无计数器”解析，净荷会整体
+    // 前移 1 字节，全部样本错位。故明确拒绝，不静默降级（计划 §3 B2-2）。
+    m_counter_active_ = false;
+    if (m_dto_counter_enabled_) {
+        for (const DaqListSpec& spec : plan.Value().daq_lists) {
+            const std::optional<DaqListModeSnapshot> mode =
+                master.QueryDaqListMode(spec.daq_list);
+            if (!mode.has_value()) {
+                throw XcpException(
+                    ErrorCategory::UnsupportedFeature,
+                    "已要求 DTO 计数器，但 Slave 不支持 GET_DAQ_LIST_MODE，"
+                    "无法确认计数器布局（DAQ List " +
+                        std::to_string(spec.daq_list) + "）");
+            }
+            const bool actual =
+                HasDaqStatus(static_cast<DaqListStatusBit>(mode->mode),
+                             DaqListStatusBit::kDtoCounter);
+            if (!actual) {
+                throw XcpException(
+                    ErrorCategory::ProtocolError,
+                    "SET_DAQ_LIST_MODE 已请求 DTO 计数器，但回读未置该位"
+                    "（DAQ List " +
+                        std::to_string(spec.daq_list) + "）");
+            }
+        }
+        m_counter_active_ = true;
+    }
+
+    // ---- B4：DAQ Packed Mode 协商（逐个 List 设置 + 回读确认）----
+    // 只有回读确认的列表才允许按 packed 布局解码；任一处失败即整体拒绝，
+    // 绝不出现"按 packed 配置、按普通 DTO 解码"的错位（方案 §6/§7）。
+    m_packed_active_ = false;
+    m_packed_lists_.clear();
+    if (m_packed_mode_ != DaqPackedMode::NotPacked) {
+        for (const DaqListSpec& spec : plan.Value().daq_lists) {
+            if (spec.daq_list >= 256U) {
+                throw XcpException(
+                    ErrorCategory::InvalidArgument,
+                    "DAQ Packed Mode 的采样序号按 8 位表达，DAQ List 号必须 < 256");
+            }
+            // 采样间隔 = 事件周期 × 降频因子；事件周期不可得则不猜，拒绝启用
+            const std::optional<GetDaqEventInfoResponse> event_info =
+                master.QueryDaqEventInfo(spec.event_channel);
+            if (!event_info.has_value()) {
+                throw XcpException(
+                    ErrorCategory::UnsupportedFeature,
+                    "已请求 DAQ Packed Mode，但无法取得事件通道 " +
+                        std::to_string(spec.event_channel) +
+                        " 的周期信息（GET_DAQ_EVENT_INFO 不可用），"
+                        "无法重建采样时间戳");
+            }
+            const std::optional<std::uint64_t> unit_ns =
+                EventChannelTimeUnitNanoseconds(event_info->time_unit);
+            if (event_info->time_cycle == 0U || !unit_ns.has_value()) {
+                throw XcpException(
+                    ErrorCategory::UnsupportedFeature,
+                    "DAQ Packed Mode 要求周期事件且单位可解析（Event Channel " +
+                        std::to_string(spec.event_channel) + "，time_cycle=" +
+                        std::to_string(event_info->time_cycle) + "，time_unit=" +
+                        std::to_string(event_info->time_unit) + "）");
+            }
+            const DaqPackedModeNegotiation negotiation =
+                master.SetDaqPackedMode(spec.daq_list, m_packed_mode_,
+                                        m_packed_timestamp_mode_,
+                                        m_packed_sample_count_);
+            if (!negotiation.active) {
+                throw XcpException(
+                    ErrorCategory::UnsupportedFeature,
+                    "DAQ Packed Mode 未生效（DAQ List " +
+                        std::to_string(spec.daq_list) + "）：" +
+                        negotiation.reason);
+            }
+            PackedListInfo info;
+            info.sample_count = static_cast<std::uint8_t>(
+                std::min<std::uint16_t>(m_packed_sample_count_, 0xFFU));
+            info.sample_interval_ns =
+                static_cast<std::uint64_t>(event_info->time_cycle) *
+                (*unit_ns) * static_cast<std::uint64_t>(spec.prescaler == 0U
+                                                            ? 1U
+                                                            : spec.prescaler);
+            info.first_sample_timestamp =
+                (m_packed_timestamp_mode_ ==
+                 DaqPackedTimestampMode::FirstSample);
+            m_packed_lists_[spec.daq_list] = info;
+        }
+        m_packed_active_ = true;
+    }
 
     // 建成路由视图：按 (daq_list, odt) 分组的切片规格
     m_routes_.clear();
@@ -258,7 +383,8 @@ void MeasurementSession::Prepare() {
                                       false,
                                       r.is_array,
                                       r.element_count,
-                                      r.element_size_bytes});
+                                      r.element_size_bytes,
+                                      r.packed_stride});
     }
 
     m_plan_generation_ = master.DaqConfigGeneration();
@@ -349,6 +475,8 @@ MeasurementStatistics MeasurementSession::Statistics() const {
     s.dto_dropped = m_dto_dropped_.load();
     s.decode_errors = m_decode_errors_.load();
     s.timestamp_wraps = m_timestamp_wraps_.load();
+    s.counter_gaps = m_counter_gaps_.load();
+    s.counter_lost = m_counter_lost_.load();
     return s;
 }
 
@@ -384,7 +512,9 @@ void MeasurementSession::WorkerLoop() {
     layout.first_odt = m_id_field_type_ == IdentificationFieldType::Absolute
                            ? m_first_pid_
                            : 0U;
-    layout.counter_enabled = false;
+    // B2：计数器位只来自 Prepare 的回读确认（m_counter_active_），
+    // 绝不按“配置请求了”就假定生效——错 1 字节即整帧净荷错位。
+    layout.counter_enabled = m_counter_active_;
     layout.timestamp_enabled = m_timestamp_bytes_ > 0;
     layout.timestamp_size_bits =
         static_cast<std::uint8_t>(m_timestamp_bytes_ * 8U);
@@ -410,6 +540,11 @@ void MeasurementSession::WorkerLoop() {
     const std::uint8_t ts_bits =
         static_cast<std::uint8_t>(m_timestamp_bytes_ * 8U);
     std::map<std::uint16_t, DaqTimestampConverter> converters;
+
+    // B2 Counter 贯通：逐 DAQ List 记住“上一次观测到的计数”（模 256）。
+    // 计数器由 Slave 逐帧自增，缺口即可观测的丢帧；这里只上报，不重排、
+    // 不补偿——丢帧成因（传输错误/被覆盖/迟到）无法仅凭计数器判定。
+    std::map<std::uint16_t, std::uint8_t> last_counters;
 
     for (;;) {
         Bytes frame;
@@ -457,23 +592,55 @@ void MeasurementSession::WorkerLoop() {
             continue;
         }
 
-        // 按切片取出原始字节
-        std::vector<PayloadSlice> specs;
-        specs.reserve(view->slices.size());
-        for (const OdtSlice& s : view->slices) {
-            specs.push_back(PayloadSlice{s.name, s.offset, s.size});
+        // B2 Counter 贯通：按 DAQ List 校验计数连续性（逐帧 +1，模 256）。
+        // 只有真正参与测量的帧才推进期望值，避免无样本帧污染序列。
+        std::uint8_t counter_lost = 0;
+        if (envelope.counter.has_value()) {
+            const std::uint8_t current = *envelope.counter;
+            const auto last_it = last_counters.find(dq);
+            if (last_it != last_counters.end()) {
+                // 差值为模 256 的当前值减上一观测值：0=重复帧，1=连续，
+                // 其余 delta-1 即观测到的丢帧数。
+                const std::uint8_t delta =
+                    static_cast<std::uint8_t>(current - last_it->second);
+                if (delta == 0U) {
+                    // 与上一帧同值：重发/迟到帧，记一次不连续但无丢帧
+                    m_counter_gaps_.fetch_add(1, std::memory_order_relaxed);
+                } else if (delta != 1U) {
+                    counter_lost = static_cast<std::uint8_t>(delta - 1U);
+                    m_counter_gaps_.fetch_add(1, std::memory_order_relaxed);
+                    m_counter_lost_.fetch_add(counter_lost,
+                                              std::memory_order_relaxed);
+                }
+            }
+            last_counters[dq] = current;
         }
-        const std::vector<DecodedSlice> slices =
-            DecodePayload(envelope.payload, specs);
 
-        // 换算 + 构造帧
-        MeasurementFrame frame_out;
-        frame_out.daq_list = dq;
-        frame_out.odt = odt;
+        // ---- B4：本 DTO 内打包了多少个采样 ----
+        // 非 packed 恒为 1；packed 时由 Prepare 回读确认后的列表参数给出。
+        std::uint8_t sample_total = 1;
+        std::uint64_t sample_interval_ns = 0;
+        bool first_sample_timestamp = false;
+        if (m_packed_active_) {
+            const auto packed_it = m_packed_lists_.find(dq);
+            if (packed_it != m_packed_lists_.end()) {
+                sample_total = packed_it->second.sample_count;
+                sample_interval_ns = packed_it->second.sample_interval_ns;
+                first_sample_timestamp =
+                    packed_it->second.first_sample_timestamp;
+            }
+        }
+        if (sample_total == 0U) {
+            sample_total = 1U;
+        }
+
+        // ---- 时间戳锚点 ----
+        // v0.6：raw 计数经每流独立转换器做回卷延展；位宽或单位未知时不猜
+        // ——timestamp_valid=false，仅保留 timestamp_raw。packed 下一帧只有
+        // 一个时间戳（锚点采样），其余采样按事件周期 × 降频因子重建。
+        bool base_valid = false;
+        std::chrono::nanoseconds base_ts{};
         if (envelope.raw_timestamp.has_value()) {
-            // v0.6：raw 计数经每流独立转换器做回卷延展；位宽或单位未知
-            // 时不猜——timestamp_valid=false，仅保留 timestamp_raw。
-            frame_out.timestamp_raw = *envelope.raw_timestamp;
             auto conv_it = converters.find(dq);
             if (conv_it == converters.end()) {
                 conv_it =
@@ -493,95 +660,161 @@ void MeasurementSession::WorkerLoop() {
                                              std::memory_order_relaxed);
             }
             if (ts.valid) {
-                frame_out.timestamp_valid = true;
-                frame_out.timestamp = ts.value;
+                base_valid = true;
+                base_ts = ts.value;
             }
         }
-        frame_out.samples.reserve(slices.size());
-        for (const DecodedSlice& ds : slices) {
-            MeasurementSample sample;
-            sample.name = ds.name;
-            sample.raw = ds.raw;
-            sample.valid = ds.valid;
-            sample.timestamp = frame_out.timestamp;
-            const auto route_it = std::find_if(
-                view->slices.begin(), view->slices.end(),
-                [&](const OdtSlice& slice) { return slice.name == ds.name; });
-            if (route_it == view->slices.end()) {
-                sample.valid = false;
-                sample.error = "DTO 切片缺少已规划路由";
-            } else {
-                sample.is_array = route_it->is_array;
-                if (!ds.valid) {
-                    sample.error = "DTO 原始切片解码失败";
-                } else if (!route_it->is_array) {
-                    const MeasurementResult<MeasurementValue> conv =
-                        m_database_.ToPhysical(ds.name, BytesView{ds.raw});
-                    if (conv.HasValue()) {
-                        sample.value = conv.Value();
-                    } else {
-                        sample.valid = false;
-                        sample.error = conv.ErrorInfo().message;
-                    }
-                } else if (route_it->element_count == 0U ||
-                           route_it->element_size_bytes == 0U ||
-                           route_it->element_count >
-                               std::numeric_limits<std::size_t>::max() /
-                                   route_it->element_size_bytes ||
-                           ds.raw.size() !=
-                               static_cast<std::size_t>(route_it->element_count) *
-                                   route_it->element_size_bytes) {
-                    sample.valid = false;
-                    sample.error = "DTO 数组字节数与已规划元素布局不匹配";
+
+        for (std::uint8_t sample_index = 0; sample_index < sample_total;
+             ++sample_index) {
+            // 按切片取出原始字节：packed 时第 k 个采样位于
+            // offset + k * packed_stride（stride 由规划器按分组方式给出）。
+            std::vector<PayloadSlice> specs;
+            specs.reserve(view->slices.size());
+            for (const OdtSlice& s : view->slices) {
+                const std::size_t offset =
+                    s.offset +
+                    static_cast<std::size_t>(sample_index) * s.packed_stride;
+                specs.push_back(PayloadSlice{s.name, offset, s.size});
+            }
+            const std::vector<DecodedSlice> slices =
+                DecodePayload(envelope.payload, specs);
+
+            // 换算 + 构造帧
+            MeasurementFrame frame_out;
+            frame_out.daq_list = dq;
+            frame_out.odt = odt;
+            frame_out.counter = envelope.counter;
+            frame_out.counter_lost_before = counter_lost;
+            frame_out.sample_index = sample_index;
+            frame_out.sample_count = sample_total;
+            if (envelope.raw_timestamp.has_value()) {
+                frame_out.timestamp_raw = *envelope.raw_timestamp;
+            }
+            if (base_valid) {
+                // 相对锚点的采样步数：ts_mode=0 时锚点是末采样，
+                // ts_mode=1 时锚点是首采样
+                const std::uint64_t steps =
+                    first_sample_timestamp
+                        ? static_cast<std::uint64_t>(sample_index)
+                        : static_cast<std::uint64_t>(sample_total - 1U -
+                                                     sample_index);
+                if (steps == 0U) {
+                    frame_out.timestamp_valid = true;
+                    frame_out.timestamp = base_ts;
+                    frame_out.timestamp_source =
+                        MeasurementTimestampSource::Dto;
                 } else {
-                    std::vector<MeasurementValue> elements;
-                    elements.reserve(route_it->element_count);
-                    for (std::uint64_t index = 0;
-                         index < route_it->element_count; ++index) {
-                        const std::size_t byte_offset =
-                            static_cast<std::size_t>(index) *
-                            route_it->element_size_bytes;
-                        const BytesView element_raw{
-                            ds.raw.data() + byte_offset,
-                            route_it->element_size_bytes};
-                        const MeasurementResult<MeasurementValue> converted =
-                            m_database_.ToPhysicalElement(ds.name, index,
-                                                          element_raw);
-                        if (!converted.HasValue()) {
-                            sample.valid = false;
-                            sample.error = converted.ErrorInfo().message;
-                            elements.clear();
-                            break;
-                        }
-                        elements.push_back(converted.Value());
-                    }
-                    if (sample.valid &&
-                        elements.size() == route_it->element_count) {
-                        sample.elements = std::move(elements);
+                    const std::uint64_t offset_ns = steps * sample_interval_ns;
+                    if (first_sample_timestamp) {
+                        frame_out.timestamp_valid = true;
+                        frame_out.timestamp =
+                            base_ts + std::chrono::nanoseconds(offset_ns);
+                        frame_out.timestamp_source =
+                            MeasurementTimestampSource::Reconstructed;
+                    } else if (base_ts.count() >= 0 &&
+                               static_cast<std::uint64_t>(base_ts.count()) >=
+                                   offset_ns) {
+                        frame_out.timestamp_valid = true;
+                        frame_out.timestamp =
+                            base_ts - std::chrono::nanoseconds(offset_ns);
+                        frame_out.timestamp_source =
+                            MeasurementTimestampSource::Reconstructed;
                     } else {
-                        sample.valid = false;
-                        if (sample.error.empty()) {
-                            sample.error = "数组元素换算未生成完整样本";
-                        }
+                        // 锚点是末采样但纳秒值不足以回退：不猜，标记无效
+                        frame_out.timestamp_valid = false;
+                        frame_out.timestamp_source =
+                            MeasurementTimestampSource::None;
                     }
                 }
             }
-            // 截断 DTO 切片维持原有降级语义：仍回调无效样本，但只对完整切片的
-            // 换算/数组布局失败递增解码错误计数（畸形整帧在上层单独计数）。
-            if (!sample.valid && ds.valid) {
-                m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
+            frame_out.samples.reserve(slices.size());
+            for (const DecodedSlice& ds : slices) {
+                MeasurementSample sample;
+                sample.name = ds.name;
+                sample.raw = ds.raw;
+                sample.valid = ds.valid;
+                sample.timestamp = frame_out.timestamp;
+                const auto route_it = std::find_if(
+                    view->slices.begin(), view->slices.end(),
+                    [&](const OdtSlice& slice) { return slice.name == ds.name; });
+                if (route_it == view->slices.end()) {
+                    sample.valid = false;
+                    sample.error = "DTO 切片缺少已规划路由";
+                } else {
+                    sample.is_array = route_it->is_array;
+                    if (!ds.valid) {
+                        sample.error = "DTO 原始切片解码失败";
+                    } else if (!route_it->is_array) {
+                        const MeasurementResult<MeasurementValue> conv =
+                            m_database_.ToPhysical(ds.name, BytesView{ds.raw});
+                        if (conv.HasValue()) {
+                            sample.value = conv.Value();
+                        } else {
+                            sample.valid = false;
+                            sample.error = conv.ErrorInfo().message;
+                        }
+                    } else if (route_it->element_count == 0U ||
+                               route_it->element_size_bytes == 0U ||
+                               route_it->element_count >
+                                   std::numeric_limits<std::size_t>::max() /
+                                       route_it->element_size_bytes ||
+                               ds.raw.size() !=
+                                   static_cast<std::size_t>(route_it->element_count) *
+                                       route_it->element_size_bytes) {
+                        sample.valid = false;
+                        sample.error = "DTO 数组字节数与已规划元素布局不匹配";
+                    } else {
+                        std::vector<MeasurementValue> elements;
+                        elements.reserve(route_it->element_count);
+                        for (std::uint64_t index = 0;
+                             index < route_it->element_count; ++index) {
+                            const std::size_t byte_offset =
+                                static_cast<std::size_t>(index) *
+                                route_it->element_size_bytes;
+                            const BytesView element_raw{
+                                ds.raw.data() + byte_offset,
+                                route_it->element_size_bytes};
+                            const MeasurementResult<MeasurementValue> converted =
+                                m_database_.ToPhysicalElement(ds.name, index,
+                                                              element_raw);
+                            if (!converted.HasValue()) {
+                                sample.valid = false;
+                                sample.error = converted.ErrorInfo().message;
+                                elements.clear();
+                                break;
+                            }
+                            elements.push_back(converted.Value());
+                        }
+                        if (sample.valid &&
+                            elements.size() == route_it->element_count) {
+                            sample.elements = std::move(elements);
+                        } else {
+                            sample.valid = false;
+                            if (sample.error.empty()) {
+                                sample.error = "数组元素换算未生成完整样本";
+                            }
+                        }
+                    }
+                }
+                // 截断 DTO 切片维持原有降级语义：仍回调无效样本，但只对完整切片的
+                // 换算/数组布局失败递增解码错误计数（畸形整帧在上层单独计数）。
+                if (!sample.valid && ds.valid) {
+                    m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
+                }
+                frame_out.samples.push_back(std::move(sample));
             }
-            frame_out.samples.push_back(std::move(sample));
+
+            MeasurementCallback cb;
+            {
+                std::lock_guard<std::mutex> lock(m_run_mutex_);
+                cb = m_callback_;
+            }
+            if (cb) {
+                cb(frame_out);
+            }
         }
 
-        MeasurementCallback cb;
-        {
-            std::lock_guard<std::mutex> lock(m_run_mutex_);
-            cb = m_callback_;
-        }
-        if (cb) {
-            cb(frame_out);
-        }
     }
 }
 
