@@ -764,7 +764,7 @@ TEST(DaqPackedModeSession, RejectsWhenEventIsNotPeriodic) {
     PackedSessionSlave non_periodic;
     non_periodic.periodic = false;
     // 事件周期为 0 → 无法重建采样时间戳，必须在开始测量前拒绝
-    rig.transport->SetResponse([&non_periodic](BytesView p) {
+    rig.transport->SetResponse([non_periodic](BytesView p) mutable {
         if (!p.empty() &&
             static_cast<CommandCode>(p[0]) == CommandCode::GetDaqEventInfo) {
             return Res({0x10, 0xFF, 0x00, 0x00, 0x03, 0x00});
@@ -781,7 +781,7 @@ TEST(DaqPackedModeSession, RejectsWhenEventLacksPackedProperty) {
                                  DaqPackedTimestampMode::LastSample, 2U);
 
     PackedSessionSlave no_packed;
-    rig.transport->SetResponse([&no_packed](BytesView p) {
+    rig.transport->SetResponse([no_packed](BytesView p) mutable {
         if (!p.empty() &&
             static_cast<CommandCode>(p[0]) == CommandCode::GetDaqEventInfo) {
             return Res({0x00, 0xFF, 0x00, 0x01, 0x03, 0x00});
