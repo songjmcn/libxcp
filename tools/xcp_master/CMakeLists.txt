@@ -17,6 +17,10 @@ target_compile_features(xcp_master PRIVATE cxx_std_20)
 target_link_libraries(xcp_master PRIVATE
   libxcp::libxcp libxcp::a2lbridge libxcp_measurement_adapter
   ftxui::ftxui)
+# nlohmann/json 以纯头文件 vendor 入库（include/vendor/nlohmann_json），
+# 不走 FetchContent；此处只暴露头文件搜索路径（PRIVATE，不外泄给使用方）。
+target_include_directories(xcp_master PRIVATE
+  ${PROJECT_SOURCE_DIR}/include/vendor/nlohmann_json)
 libxcp_configure_program_logging(xcp_master)
 
 if(MSVC)

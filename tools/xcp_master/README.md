@@ -15,14 +15,44 @@ Disable the tool with `-DLIBXCP_BUILD_TOOLS=OFF` (the default). This option is i
 ## Run
 
 ```text
-xcp_master --a2l <path> [--host <IPv4> --port <1..65535>] [--transport udp|tcp] [--tcp-profile asam-v1.4|asam-v1.5|auto|auto-legacy] [--packet-alignment 8|16|32] [--module <name>] [--mode poll|daq] [--interval-ms <ms>] [--preset xcplite] [--a2l-trusted-snapshot-root <dir>]
+xcp_master (--a2l <path> | -c <file>) [--host <IPv4> --port <1..65535>] [--transport udp|tcp] [--tcp-profile asam-v1.4|asam-v1.5|auto|auto-legacy] [--packet-alignment 8|16|32] [--module <name>] [--mode poll|daq] [--interval-ms <ms>] [--preset xcplite] [--a2l-trusted-snapshot-root <dir>] [--config <file>]
 ```
 
-The A2L file is required. TCP may use an IPv4 endpoint from command-line options or a matching A2L transport declaration; UDP requires an explicit endpoint. `--module` filters the symbol listing. The default is `--mode poll`; the poll target interval is 500 ms. `--interval-ms` is rejected in DAQ mode; DAQ timing is controlled by ECU events. The DAQ DTO layout is selected from the slave's reported capabilities; there is no `--daq-profile` option. Use `--help` for the current transport options.
+Either an A2L file or a project file (`-c`/`--config`) is required. TCP may use an IPv4 endpoint from command-line options or a matching A2L transport declaration; UDP requires an explicit endpoint. `--module` filters the symbol listing. The default is `--mode poll`; the poll target interval is 500 ms. `--interval-ms` is rejected in DAQ mode; DAQ timing is controlled by ECU events. The DAQ DTO layout is selected from the slave's reported capabilities; there is no `--daq-profile` option. Use `--help` for the current transport options.
 
 TCP `auto` resolves the wire profile from real wire evidence: it builds a candidate list (the A2L TL version and `PACKET_ALIGNMENT` only *reorder* that list, they never decide it), then verifies each candidate on a brand-new connection with the real protocol stack (`VerifyTcpFramingCandidate`). The first `Accepted` candidate wins and the session is re-established on another fresh connection; the verification connections are always closed. Each attempt is reported as `被拒` (the peer answered with a protocol violation), `未决` (no protocol-level reply at all — typically a wrong address/port or a stopped slave) or `接受`. Exit codes: `0` resolved, `3` every candidate was rejected by the peer (fix the layout/alignment), `4` at least one candidate stayed inconclusive (check address, port, peer). `auto-legacy` explicitly opts into the older first-success attempts, which can affect the ECU session and do not establish a unique profile.
 
 For TCP the tool stages the A2L into a private snapshot before the SDK parses it (`--a2l-trusted-snapshot-root`, default `<exe dir>/tmp`) and only trusts the A2L alignment when the restricted raw-text scan and the SDK endpoint facts agree. The snapshot root and every ancestor must be writable only by the current user (plus SYSTEM/Administrators); if that cannot be proven — for example on a tree that grants `Users:(F)` — the tool prints `A2L 受控快照不可信: <reason>` and keeps the A2L alignment untrusted. In that case specify `--packet-alignment` for `asam-v1.5`. This conservative limitation does not change UDP.
+
+### Project file
+
+`-c <file>` / `--config <file>` loads a JSON project file instead of retyping the A2L path, transport, endpoint, session mode and the variable lists. The file is written by the interactive `save` command, so the normal first-run flow is: start with explicit options, register the variables you want, then `save`. The project file uses `schema_version` 1; unknown keys, wrong types, out-of-range ports, a `tcp_profile` on UDP, and a `mode` other than `poll`/`daq` are rejected with a line/column position rather than being silently ignored. Parsing is strict: no JSON comments, no trailing commas. A repeated key keeps the last value.
+
+```json
+{
+  "schema_version": 1,
+  "a2l_path": "C:/A2L/demo.a2l",
+  "connection": {
+    "transport": "tcp",
+    "host": "127.0.0.1",
+    "port": 5555,
+    "endpoint_from_a2l": false,
+    "tcp_profile": "asam-v1.5",
+    "packet_alignment_bits": 8,
+    "protocol_version": "1.5",
+    "transport_version": "1.5",
+    "preset_xcplite": false,
+    "a2l_snapshot_root": null
+  },
+  "session": { "mode": "poll", "interval_ms": 500, "module": "demo" },
+  "observe": ["demo::meas_fast"],
+  "calibrate": ["demo::cal_gain"]
+}
+```
+
+Precedence is command line > project file > built-in default, evaluated per field. An explicit CLI transport option (`--transport`, `--tcp-profile`, `--packet-alignment`, `--preset`) replaces the whole `connection` block, because mixing a CLI `--transport tcp` with a file `tcp_profile` could describe a combination that never connected. A CLI `--a2l` that disagrees with the file's `a2l_path` is an error, not a silent override.
+
+`save [path]` refuses to run while DAQ is active (the saved endpoint must be the one the session actually uses) and refuses to overwrite an existing file; it writes to `<path>.tmp` and renames. Without an argument the default is `<exe dir>/<A2L stem>.xcp.json`. Loading a file registers `observe` symbols in the observation set and `calibrate` symbols in the calibration list, but does not start watching: symbols that no longer exist or are not admissible are reported by name and skipped, and `watch` still needs to be typed.
 
 ### Reusable pieces
 
@@ -51,13 +81,17 @@ They depend only on other `include/libxcp` headers; `tests/transport_selection_s
 - `stop` then Enter: stop the active polling or DAQ session. Polling waits for any in-flight XCP command to return or time out.
 - `write <module::name> <physical-value>`: request a scalar CHARACTERISTIC/VALUE write. The tool displays current and target values and asks for explicit confirmation; it then writes and reads back.
 - `find [pattern]`: search A2L measurements and calibration characteristics; results appear in the unified variable-preview view. Scalar `CHARACTERISTIC/VALUE` and verified fixed-axis `CHARACTERISTIC/CURVE` points may expose write actions; other candidates show their policy reason. The command and preview search box share the active filter when the result is applied. Searching only queries A2L metadata and does not access the ECU.
+- `calmark <module::name>`: add a symbol to the calibration list. Registration only records intent; it never writes to the ECU. Admission uses the same rule as `write`, so symbols that cannot be written are refused with their reason.
+- `calunmark <module::name>`: remove a symbol from the calibration list.
+- `callist`: show the calibration list with per-symbol write support.
+- `save [path]`: write the project file described above.
 - `help`, `quit`.
 
 ## UI layout and keyboard
 
 The screen has four fixed layers: a two-line status area, the main panel, a persistent command input, and a one-line context hint. The main panel has three horizontal views: **Variables**, **Command results**, and **Logs**. There are no global Watch/Stop/Quit buttons; commands remain available, and F5 requests stop.
 
-The Variables view searches A2L metadata and switches between all candidates and the sampling set. It shows measurements and calibration characteristics; each row includes a compact A2L category, base type, and data-shape label (for example, `MEAS · ULONG · 数组[128]`). Selecting a row does not read the ECU. Enter expands/collapses the selected symbol inline; expanded arrays show every available element in the scrollable list, and an explicit read-once row is available when the symbol is not actively sampled. F3 opens metadata-only details: full symbol name, A2L category, base type, data shape, element width, and static capability reasons. Details do not show live samples or issue ECU requests. One-dimensional MEASUREMENT arrays are observed as complete snapshots in POLL; one-shot reads also update the preview snapshot. F6 toggles observation membership without starting sampling; enter command mode with F7 and run `watch` to start. F4 opens the separate calibration workflow without writing anything until explicit confirmation. Fixed-axis CURVE symbols expose single-point read/write only in the separate calibration view; unsupported axes/layouts remain read-only. Esc closes the current modal step. While a modal is open, background views and the command input cannot receive events.
+The Variables view searches A2L metadata and switches between all candidates, the sampling set, and the calibration list (`全部变量` / `仅采样` / `仅标定`). It shows measurements and calibration characteristics; each row includes a compact A2L category, base type, and data-shape label (for example, `MEAS · ULONG · 数组[128]`). Selecting a row does not read the ECU. Enter expands/collapses the selected symbol inline; expanded arrays show every available element in the scrollable list, and an explicit read-once row is available when the symbol is not actively sampled. F3 opens metadata-only details: full symbol name, A2L category, base type, data shape, element width, and static capability reasons. Details do not show live samples or issue ECU requests. One-dimensional MEASUREMENT arrays are observed as complete snapshots in POLL; one-shot reads also update the preview snapshot. F6 toggles observation membership without starting sampling; enter command mode with F7 and run `watch` to start. F4 opens the separate calibration workflow without writing anything until explicit confirmation. Fixed-axis CURVE symbols expose single-point read/write only in the separate calibration view; unsupported axes/layouts remain read-only. Esc closes the current modal step. While a modal is open, background views and the command input cannot receive events.
 
 The UI starts in **preview mode** with focus on the Variables list. Tab/Shift+Tab cycle only among its search box, scope menu, and list; they cannot reach the command input. F2 cycles Variables, Command results, and Logs without changing input mode. In the focused Variables list, Enter expands/collapses a symbol or activates an explicit read-once row; F3 opens read-only details, F4 opens calibration, and F6 adds/removes an observation member. F7 explicitly enters **command mode** from any view. There, ordinary characters are entered as command text, ↑/↓ browse command history, and Enter submits; after a successful submission the command box remains active. Esc leaves command mode without submitting or clearing an unfinished draft, returns to the Variables list, and F7 can reopen that draft. Plain `:`, `m`, and `c` are not operation shortcuts; the previous Ctrl/Command/Alt+A/S bindings are removed. In a modal, navigation and F7 do not reach the background; Esc closes/cancels it, and F5 cancels any pending confirmation before requesting stop. The UI requires an interactive terminal; below 80×24 it keeps command/status areas available but disables variable details and dangerous confirmations. Function keys may be intercepted by OS, terminal, or laptop Fn settings: verify F2–F7 delivery in the target terminal.
 

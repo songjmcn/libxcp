@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <deque>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <ctime>
 #include <cstdlib>
@@ -47,6 +48,7 @@
 #include "calibration_policy.hpp"
 #include "cli_selection.hpp"
 #include "preview_refresh.hpp"
+#include "project_file.hpp"
 #include "windowed_menu.hpp"
 #include "symbol_display.hpp"
 #include "tui_model.hpp"
@@ -187,6 +189,34 @@ struct Options {
      *          从而"用户给了什么"与"最终怎么连"可以分开断言。
      */
     calmcar::xcp::TransportSelectionRequest transport_request;
+
+    /**
+     * @brief 工程配置文件路径（`-c`/`--config`）。
+     * @details 为空表示本次启动未指定工程配置文件。非空时在命令行解析完成
+     *          之后立即加载该文件，并按"文件提供缺省值、命令行覆盖"的合并
+     *          规则（见计划 §4 的优先级表）得到最终配置。
+     */
+    std::string config_path;
+
+    /**
+     * @brief 是否显式写了 `-c`/`--config`。
+     * @details 用于实现"重复指定即报错"，避免后一个参数静默覆盖前一个，
+     *          这与 `--tcp-profile` 的既有约定保持一致。
+     */
+    bool config_explicit{false};
+
+    /** @brief `--interval-ms` 是否由命令行显式给出（覆盖配置文件） */
+    bool host_explicit{false};
+    /** @brief `--port` 是否由命令行显式给出（覆盖配置文件） */
+    bool port_explicit{false};
+    /** @brief `--module` 是否由命令行显式给出（覆盖配置文件） */
+    bool module_explicit{false};
+    /** @brief `--mode` 是否由命令行显式给出（覆盖配置文件） */
+    bool mode_explicit{false};
+    /** @brief `--transport` 或 `--preset` 是否由命令行显式给出（覆盖配置文件） */
+    bool transport_cli_explicit{false};
+    /** @brief 任一 `--tcp-profile`/`--packet-alignment`/版本号/`--preset` 是否显式给出 */
+    bool transport_detail_explicit{false};
 };
 
 void PrintUsage(std::ostream& out) {
@@ -197,7 +227,13 @@ void PrintUsage(std::ostream& out) {
            "                  [--protocol-version 1.2|1.3|1.4|1.5] "
            "[--transport-version 1.4|1.5] [--preset xcplite]\n"
            "                  [--a2l-trusted-snapshot-root <dir>]\n"
+           "                  [-c <file> | --config <file>]\n"
            "       xcp_master --help\n"
+           "-c/--config: load a project file previously written by the `save` "
+           "command. The file supplies defaults; command-line options override "
+           "it, so one project file works with several temporary overrides. "
+           "Observe/calibrate lists stored in the file are registered at "
+           "startup (observe targets are listed, not auto-watched).\n"
            "poll: --interval-ms is the target polling cycle (default 500 ms).\n"
            "daq: event-driven; --interval-ms is invalid. The DTO layout is "
            "selected automatically from the slave's reported identification "
@@ -257,7 +293,19 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
             return std::nullopt;
         }
         const std::string value(argv[++i]);
-        if (key == "--a2l") {
+        if (key == "--config" || key == "-c") {
+            // 重复指定即拒绝：与 `--tcp-profile` 一致，避免静默覆盖。
+            if (options.config_explicit) {
+                error = "--config must not be specified more than once";
+                return std::nullopt;
+            }
+            if (value.empty()) {
+                error = "--config must not be empty";
+                return std::nullopt;
+            }
+            options.config_path = value;
+            options.config_explicit = true;
+        } else if (key == "--a2l") {
             options.a2l_path = value;
         } else if (key == "--a2l-trusted-snapshot-root") {
             if (value.empty()) {
@@ -267,6 +315,7 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
             options.a2l_snapshot_root = value;
         } else if (key == "--host") {
             options.host = value;
+            options.host_explicit = true;
         } else if (key == "--port") {
             std::uint64_t parsed = 0;
             if (!ParseUnsigned(value, parsed) || parsed == 0 ||
@@ -275,8 +324,10 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 return std::nullopt;
             }
             options.port = static_cast<std::uint16_t>(parsed);
+            options.port_explicit = true;
         } else if (key == "--module") {
             options.module = value;
+            options.module_explicit = true;
         } else if (key == "--interval-ms") {
             std::uint64_t parsed = 0;
             if (!ParseUnsigned(value, parsed) || parsed == 0 ||
@@ -293,6 +344,7 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 return std::nullopt;
             }
             options.mode = value;
+            options.mode_explicit = true;
         } else if (key == "--transport") {
             const auto parsed = calmcar::xcp::tools::ParseTransportKind(value);
             if (!parsed.has_value()) {
@@ -301,6 +353,7 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
             }
             options.transport_request.transport = *parsed;
             transport_explicit = true;
+            options.transport_cli_explicit = true;
         } else if (key == "--tcp-profile") {
             // 不允许后一个参数静默覆盖严格模式并触发旧式试连。
             if (tcp_profile_seen) {
@@ -312,6 +365,7 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 options.transport_request.tcp_profile_auto = true;
             } else if (value == "auto-legacy") {
                 options.transport_request.tcp_profile_auto_legacy = true;
+            options.transport_detail_explicit = true;
             } else {
                 const auto parsed =
                     calmcar::xcp::tools::ParseTcpWireProfileText(value);
@@ -321,6 +375,7 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                     return std::nullopt;
                 }
                 options.transport_request.tcp_profile = *parsed;
+            options.transport_detail_explicit = true;
             }
         } else if (key == "--packet-alignment") {
             const auto parsed =
@@ -330,6 +385,7 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 return std::nullopt;
             }
             options.transport_request.packet_alignment_bits = *parsed;
+            options.transport_detail_explicit = true;
         } else if (key == "--protocol-version") {
             const auto parsed = calmcar::xcp::tools::ParseVersionText(value);
             if (!parsed.has_value()) {
@@ -337,6 +393,7 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 return std::nullopt;
             }
             options.transport_request.protocol_version = *parsed;
+            options.transport_detail_explicit = true;
         } else if (key == "--transport-version") {
             const auto parsed = calmcar::xcp::tools::ParseVersionText(value);
             if (!parsed.has_value()) {
@@ -344,12 +401,15 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
                 return std::nullopt;
             }
             options.transport_request.transport_version = *parsed;
+            options.transport_detail_explicit = true;
         } else if (key == "--preset") {
             if (value != "xcplite") {
                 error = "--preset only supports xcplite";
                 return std::nullopt;
             }
             options.transport_request.preset_xcplite = true;
+            options.transport_cli_explicit = true;
+            options.transport_detail_explicit = true;
         } else {
             error = "unknown option: " + std::string(key);
             return std::nullopt;
@@ -379,11 +439,84 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
     if (port_given) {
         options.transport_request.port = options.port;
     }
-    if (options.a2l_path.empty()) {
-        error = "--a2l is required";
+    if (options.a2l_path.empty() && !options.config_explicit) {
+        error = "--a2l is required (or supply --config/-c)";
         return std::nullopt;
     }
     return options;
+}
+
+/**
+ * @brief 把工程配置文件的内容按"文件提供缺省值、命令行覆盖"合并进 `Options`
+ *
+ * @details 优先级（计划 §4）：
+ *          命令行 > 工程配置文件 > 内置缺省。
+ *          逐项判断命令行是否**显式**给出（`*_explicit` 标记），只有未显式给出
+ *          的字段才由文件填充。这样做的好处是：同一份配置文件配合不同的命令行
+ *          参数可以临时改接口/改周期，而配置文件本身不被意外改写。
+ *
+ * @param options 已解析完命令行的选项，函数会就地合并
+ * @param file 已解析并通过校验的工程配置文件
+ * @return 合并过程中发现冲突时返回 false，并在 `error` 中给出中文原因
+ */
+bool MergeProjectFileIntoOptions(Options& options,
+                                 const calmcar::xcp::tools::ProjectFile& file,
+                                 std::string& error) {
+    // ---- A2L 路径：命令行显式给出时必须以一致；否则直接用文件取值 ----------
+    if (!options.a2l_path.empty() &&
+        options.a2l_path != file.a2l_path) {
+        error = "工程配置文件的 a2l_path 与命令行 --a2l 不一致：" +
+                file.a2l_path + " vs " + options.a2l_path;
+        return false;
+    }
+    options.a2l_path = file.a2l_path;
+
+    // ---- 会话参数 ---------------------------------------------------------
+    if (file.session.interval_ms.has_value() &&
+        !options.interval_explicit) {
+        options.interval = std::chrono::milliseconds(
+            static_cast<std::chrono::milliseconds::rep>(
+                *file.session.interval_ms));
+        options.interval_explicit = true;
+    }
+    if (file.session.module.has_value() && !options.module_explicit) {
+        options.module = *file.session.module;
+        options.module_explicit = true;
+    }
+    if (!file.session.mode.empty() && !options.mode_explicit) {
+        options.mode = file.session.mode;
+        options.mode_explicit = true;
+    }
+
+    // ---- 传输层：命令行只要碰过传输层细节，就整体以命令行为准 --------------
+    // 理由：`--transport tcp` 与文件里的 udp 混着来会产生自相矛盾的组合
+    // （例如文件给了 tcp_profile 但命令行改成 udp），这类组合交给
+    // ResolveTransportSelection() 报错不如在这里整体让位给命令行。
+    if (!options.transport_cli_explicit &&
+        !options.transport_detail_explicit) {
+        calmcar::xcp::TransportSelectionRequest request;
+        if (!calmcar::xcp::tools::ProjectConnectionToRequest(
+                file.connection, request, error)) {
+            return false;
+        }
+        options.transport_request = request;
+        // 端点来源：文件明确写下 host/port 时才算"命令行显式给出"。
+        options.host_explicit = request.host.has_value();
+        options.port_explicit = request.port.has_value();
+        if (request.host.has_value()) {
+            options.host = *request.host;
+        }
+        if (request.port.has_value()) {
+            options.port = *request.port;
+        }
+    }
+
+    // ---- A2L 受控快照根目录：只在命令行没给时补 ---------------------------
+    if (options.a2l_snapshot_root.empty() &&
+        file.connection.a2l_snapshot_root.has_value()) {
+        options.a2l_snapshot_root = *file.connection.a2l_snapshot_root;
+    }
+    return true;
 }
 
 std::string QualifiedName(const SymbolInfo& symbol) {
@@ -1071,6 +1204,65 @@ public:
         screen_ = nullptr;
     }
 
+    /**
+     * @brief 用工程配置文件里的观测/标定清单预置内存集合（不读写 ECU）
+     * @param observe 观测清单（`模块::名字`）
+     * @param calibrate 标定清单（`模块::名字`）
+     * @details 计划 §6：逐项用 `Find()` 校验，并给出三类结果
+     *          - 通过资格检查：登记进 `watched_` / `calibrate_names_`；
+     *          - 找不到：记为警告；
+     *          - 不满足资格：记为警告并附原因。
+     *          观测项**只登记不自动 watch**：启动即开始采样会让现场失去
+     *          "先看清再动手"的机会，且 DAQ 模式下自动开采样会立刻占用
+     *          事件通道。用户按 watch 才开始。
+     * @return 逐条诊断文本（供启动日志展示）
+     */
+    std::vector<std::string> PreloadFromProjectFile(
+        const std::vector<std::string>& observe,
+        const std::vector<std::string>& calibrate) {
+        std::vector<std::string> notes;
+        for (const auto& name : observe) {
+            auto found = database_.Find(name);
+            if (!found.HasValue()) {
+                notes.push_back("观测清单中的 " + name + " 未在 A2L 中找到，已跳过。");
+                continue;
+            }
+            const auto reason = ObservationUnsupportedReason(found.Value());
+            if (!reason.empty()) {
+                notes.push_back("观测清单中的 " + name + " 不可观测（" + reason +
+                                "），已跳过。");
+                continue;
+            }
+            const auto canonical = QualifiedName(found.Value());
+            std::lock_guard lock(watched_mutex_);
+            if (std::find(watched_.begin(), watched_.end(), canonical) ==
+                watched_.end()) {
+                watched_.push_back(canonical);
+            }
+        }
+        for (const auto& name : calibrate) {
+            auto found = database_.Find(name);
+            if (!found.HasValue()) {
+                notes.push_back("标定清单中的 " + name + " 未在 A2L 中找到，已跳过。");
+                continue;
+            }
+            const auto reason =
+                calmcar::xcp::tools::SymbolWriteUnsupportedReason(found.Value());
+            if (!reason.empty()) {
+                notes.push_back("标定清单中的 " + name + " 不可标定（" + reason +
+                                "），已跳过。");
+                continue;
+            }
+            const auto canonical = QualifiedName(found.Value());
+            std::lock_guard lock(calibrate_mutex_);
+            if (std::find(calibrate_names_.begin(), calibrate_names_.end(),
+                          canonical) == calibrate_names_.end()) {
+                calibrate_names_.push_back(canonical);
+            }
+        }
+        return notes;
+    }
+
 private:
     /** @brief 按当前尺寸渲染结果或日志分页，调用期间保护共享缓冲。 */
     ftxui::Element RenderPanel(std::size_t panel) {
@@ -1246,11 +1438,18 @@ private:
         std::unordered_map<std::string, std::string> read_reasons_by_name;
         std::lock_guard lock(output_mutex_);
         std::lock_guard watched_lock(watched_mutex_);
+        std::lock_guard calibrate_lock(calibrate_mutex_);
         for (const auto& symbol : preview_symbols_) {
             const auto name = QualifiedName(symbol);
             const bool watched = std::find(watched_.begin(), watched_.end(),
                                            name) != watched_.end();
+            // 页签 2「仅标定」按标定名单过滤；名单为空时该页签自然为空，
+            // 这是可接受的，因为 calmark 之前的标定名单本来就没有内容。
+            const bool marked =
+                std::find(calibrate_names_.begin(), calibrate_names_.end(),
+                          name) != calibrate_names_.end();
             if (preview_scope_selected_ == 1 && !watched) continue;
+            if (preview_scope_selected_ == 2 && !marked) continue;
             const auto sample = observation_model_.Find(name);
             const bool expanded = expanded_preview_names_.contains(name);
             const bool has_sample = sample.has_value() && sample->has_value;
@@ -1347,7 +1546,9 @@ private:
         LIBXCP_LOG_INFO(
             "UI 整表重建耗时 {:.1f} ms（候选 {} 个 / 展开后 {} 行 / 范围 {}）",
             stopwatch.ElapsedMs(), preview_symbols_.size(), preview_rows_.size(),
-            preview_scope_selected_ == 1 ? "仅采样" : "全部");
+            preview_scope_selected_ == 1   ? "仅采样"
+            : preview_scope_selected_ == 2 ? "仅标定"
+                                           : "全部");
     }
 
     /** @brief 保存一次成功样本；保留最近值并刷新预览行。 */
@@ -2059,6 +2260,20 @@ private:
                 Say("标定表单参数无效。");
             else
                 ReadCalibration(*request.calibration, request.element_index);
+        } else if (command == "calmark") {
+            std::string name;
+            input >> name;
+            CalibrationMark(name);
+        } else if (command == "calunmark") {
+            std::string name;
+            input >> name;
+            CalibrationUnmark(name);
+        } else if (command == "callist") {
+            CalibrationList();
+        } else if (command == "save") {
+            std::string target;
+            input >> target;
+            Save(target);
         } else if (command == "help") {
             PrintHelp();
         } else if (command == "list") {
@@ -2098,6 +2313,9 @@ private:
             "| read <name> | watch | stop | write <name> <value> | find "
             "[pattern] | quit；变量预览 Enter 展开/折叠，F3 只读详情，"
             "F4 标定、F6 观测成员，F7 进入命令、Esc 返回预览。");
+        Say("工程配置：calmark <name> 登记标定对象（只登记不写入）、"
+            "calunmark <name> 取消登记、callist 查看标定名单、"
+            "save [path] 保存工程配置文件（缺省存到可执行文件目录）。");
         Say("mode=" + options_.mode +
             (options_.mode == "poll"
                  ? "；watch 按目标周期 " +
@@ -2335,6 +2553,158 @@ private:
         }
         Say(removed ? "已移除: " + canonical : "该变量不在观测列表。");
     }
+
+    /**
+     * @brief 把一个可写符号登记进标定名单（只登记，不写 ECU）
+     * @param name 变量名（可带或不带模块前缀）
+     * @details 准入条件是"该符号可以作为标定量"：必须是可写符号。这里刻意
+     *          复用 `SymbolWriteUnsupportedReason()` 而不是另起一套规则，
+     *          以保证"能 calmark 的量"与"能 calwrite 的量"口径一致。
+     */
+    void CalibrationMark(const std::string& name) {
+        if (name.empty()) {
+            Say("请指定要标定的变量名，例如：calmark EngineSpeed。");
+            return;
+        }
+        auto found = database_.Find(name);
+        if (!found.HasValue()) {
+            Say("Find 失败: " + found.ErrorInfo().message);
+            return;
+        }
+        const auto& symbol = found.Value();
+        const auto reason = calmcar::xcp::tools::SymbolWriteUnsupportedReason(symbol);
+        if (!reason.empty()) {
+            Say("不能作为标定对象: " + reason);
+            return;
+        }
+        const auto canonical = QualifiedName(symbol);
+        bool added = false;
+        {
+            std::lock_guard lock(calibrate_mutex_);
+            if (std::find(calibrate_names_.begin(), calibrate_names_.end(),
+                          canonical) == calibrate_names_.end()) {
+                calibrate_names_.push_back(canonical);
+                added = true;
+            }
+        }
+        Say(added ? "已登记标定对象: " + canonical
+                  : "该变量已在标定名单: " + canonical);
+    }
+
+    /**
+     * @brief 从标定名单中移除一个符号
+     * @param name 变量名（可带或不带模块前缀）
+     */
+    void CalibrationUnmark(const std::string& name) {
+        if (name.empty()) {
+            Say("请指定要取消登记的变量名，例如：calunmark EngineSpeed。");
+            return;
+        }
+        auto found = database_.Find(name);
+        if (!found.HasValue()) {
+            Say("Find 失败: " + found.ErrorInfo().message);
+            return;
+        }
+        const auto canonical = QualifiedName(found.Value());
+        bool removed = false;
+        {
+            std::lock_guard lock(calibrate_mutex_);
+            const auto old_size = calibrate_names_.size();
+            std::erase(calibrate_names_, canonical);
+            removed = old_size != calibrate_names_.size();
+        }
+        Say(removed ? "已取消标定对象: " + canonical
+                    : "该变量不在标定名单: " + canonical);
+    }
+
+    /** @brief 列出当前标定名单（按登记顺序）。 */
+    void CalibrationList() {
+        std::vector<std::string> snapshot;
+        {
+            std::lock_guard lock(calibrate_mutex_);
+            snapshot = calibrate_names_;
+        }
+        if (snapshot.empty()) {
+            Say("标定名单为空；用 calmark <name> 登记。");
+            return;
+        }
+        Say("标定名单（" + std::to_string(snapshot.size()) +
+            " 项，仅登记不写入 ECU）：");
+        for (const auto& name : snapshot) Say("  " + name);
+    }
+
+    /**
+     * @brief 把当前生效的配置保存为工程配置文件
+     * @param path 目标路径；为空时用 `DefaultProjectFilePath()` 推导
+     * @details 保存的是**本次实际生效**的配置：
+     *          - 连接字段来自 `options_.transport_request`，它已经在
+     *            `ResolveTransportSelection()` 之后回填了 A2L 提供的端点；
+     *          - `observe` 取 `WatchedSnapshot()`，`calibrate` 取
+     *            `CalibrateSnapshot()`，两者都以 `模块::名字` 规范名落盘。
+     *          DAQ 运行期间拒绝保存：此时 `watched_` 正被采样流程使用，
+     *          而且"保存一份正在变的观测集"也没有确定的语义。
+     */
+    void Save(const std::string& path) {
+        if (DaqRunning()) {
+            Say("DAQ 运行期间不能保存工程配置；请先 stop。");
+            return;
+        }
+        auto target = path.empty()
+                          ? calmcar::xcp::tools::DefaultProjectFilePath(
+                                options_.a2l_path)
+                          : std::filesystem::path(path);
+        if (target.empty()) {
+            Say("无法推导默认保存路径（A2L 路径为空）；请用 save <path> 指定。");
+            return;
+        }
+        // 保存的是生效值：`options_` 在 main() 里已被
+        // ResolveTransportSelection() 的结果回填过 host/port。
+        calmcar::xcp::tools::ProjectFile file;
+        file.a2l_path = options_.a2l_path;
+        file.observe = WatchedSnapshot();
+        file.calibrate = CalibrateSnapshot();
+        file.session.mode = options_.mode;
+        file.session.interval_ms =
+            options_.mode == "poll"
+                ? std::optional<std::uint64_t>(
+                      static_cast<std::uint64_t>(options_.interval.count()))
+                : std::nullopt;
+        if (!options_.module.empty()) file.session.module = options_.module;
+        if (!options_.a2l_snapshot_root.empty()) {
+            file.connection.a2l_snapshot_root = options_.a2l_snapshot_root;
+        }
+        calmcar::xcp::tools::ConnectionFromRequest(options_.transport_request,
+                                                   file.connection);
+        const auto text = calmcar::xcp::tools::ProjectFileToJson(file);
+        std::string error;
+        if (!calmcar::xcp::tools::WriteProjectFileAtomically(target, text,
+                                                             error)) {
+            Say("保存失败: " + error);
+            return;
+        }
+        Say("已保存工程配置: " + target.string() + "（观测 " +
+            std::to_string(file.observe.size()) + " 项，标定 " +
+            std::to_string(file.calibrate.size()) + " 项）");
+    }
+
+    /**
+     * @brief 取观测集合快照（供 `save` 落盘）
+     * @return 规范名列表副本
+     */
+    std::vector<std::string> WatchedSnapshot() const {
+        std::lock_guard lock(watched_mutex_);
+        return watched_;
+    }
+
+    /**
+     * @brief 取标定名单快照（供 `save` 落盘）
+     * @return 规范名列表副本
+     */
+    std::vector<std::string> CalibrateSnapshot() const {
+        std::lock_guard lock(calibrate_mutex_);
+        return calibrate_names_;
+    }
+
 
     /** @brief 执行标定表单读取并更新其状态显示。 */
     void ReadCalibration(
@@ -3417,7 +3787,7 @@ private:
     std::vector<A2lEventMetadata> events_;
     mutable std::mutex output_mutex_;
     std::mutex command_mutex_;
-    std::mutex watched_mutex_;
+    mutable std::mutex watched_mutex_;
     std::mutex wait_mutex_;
     std::condition_variable wait_cv_;
     std::atomic<bool> watching_{false};
@@ -3439,6 +3809,17 @@ private:
     bool frame_output_stop_{true};
     std::thread frame_output_thread_;
     std::vector<std::string> watched_;
+    /**
+     * @brief 已登记的标定对象规范名（`模块::名字`）。
+     * @details 与 `watched_` 并列，但语义完全不同：`watched_` 是会进入采样
+     *          （poll 轮询或 DAQ）的变量；`calibrate_names_` 只是"我想标定哪些
+     *          量"的名单，不参与采样、也不会被自动写入 ECU。它存在的唯一目的
+     *          是让 `save` 能把标定清单写进工程配置文件。
+     *          运行期不做采样，因此 DAQ 运行期间也允许增删。
+     */
+    std::vector<std::string> calibrate_names_;
+    /** @brief 保护 `calibrate_names_` 的互斥量（与 `watched_mutex_` 独立）。 */
+    mutable std::mutex calibrate_mutex_;
     std::vector<ListedSymbol> listing_;
     std::size_t page_{0};
     bool list_all_{false};
@@ -3486,12 +3867,13 @@ private:
     std::vector<std::string> view_labels_{"变量预览", "命令结果",
                                           "日志"}; /**< 顶部三视图标签。 */
     std::vector<std::string> preview_scope_labels_{
-        "全部变量", "仅采样"}; /**< 变量预览范围筛选。 */
+        "全部变量", "仅采样",
+        "仅标定"}; /**< 变量预览范围筛选：0=全部，1=仅观测，2=仅标定登记。 */
     calmcar::xcp::tools::TuiInputModeState
         input_mode_;                /**< 显式预览/命令输入模式及事件隔离。 */
     int view_selected_{0};          /**< 当前选中视图：预览、结果、日志。 */
     int preview_selected_{0};       /**< 当前变量预览菜单行。 */
-    int preview_scope_selected_{0}; /**< 0=全部变量，1=仅采样。 */
+    int preview_scope_selected_{0}; /**< 0=全部变量，1=仅采样，2=仅标定。 */
     std::string preview_filter_;    /**< 当前变量名搜索输入框草稿。 */
     std::string preview_active_filter_; /**< 当前结果使用的实际筛选。 */
     calmcar::xcp::tools::SearchInputRevision
@@ -3540,6 +3922,20 @@ int main(int argc, char** argv) {
         std::cerr << "参数错误: " << error << '\n';
         PrintUsage(std::cerr);
         return 2;
+    }
+    // ---- 工程配置文件（-c/--config）：文件提供缺省值，命令行覆盖 -----------
+    calmcar::xcp::tools::ProjectFile project_file;
+    if (options->config_explicit) {
+        if (!calmcar::xcp::tools::LoadProjectFile(
+                std::filesystem::path(options->config_path), project_file,
+                error)) {
+            std::cerr << "读取工程配置文件失败: " << error << '\n';
+            return 2;
+        }
+        if (!MergeProjectFileIntoOptions(*options, project_file, error)) {
+            std::cerr << "工程配置文件与命令行冲突: " << error << '\n';
+            return 2;
+        }
     }
     if (!IsInteractiveTerminal()) {
         std::cerr
@@ -4056,6 +4452,15 @@ int main(int argc, char** argv) {
         CliApp app(*options, *database, event_bound_database,
                    measurement_session, *master, std::move(event_metadata),
                    calibration_page_facts);
+        // 工程配置文件里带来的观测/标定清单：启动时预置（不读写 ECU）。
+        if (options->config_explicit) {
+            const auto preload_notes =
+                app.PreloadFromProjectFile(project_file.observe,
+                                           project_file.calibrate);
+            for (const auto& note : preload_notes) {
+                std::cerr << "工程配置: " << note << '\n';
+            }
+        }
         app.Run();
         if (measurement_session.Running()) measurement_session.Stop();
         master->Disconnect();

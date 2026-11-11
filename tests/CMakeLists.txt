@@ -370,6 +370,11 @@ if(LIBXCP_BUILD_TOOLS)
   add_test(NAME XcpMasterToolRejectsDuplicateProfile
            COMMAND ${CMAKE_COMMAND} "-DXCP_MASTER=$<TARGET_FILE:xcp_master>"
                    -P "${CMAKE_CURRENT_SOURCE_DIR}/xcp_master_duplicate_profile_test.cmake")
+  # 工程配置文件选项（-c/--config）：重复、空值、与 --a2l 互斥缺失、
+  # 文件不存在四种入口错误都在进入交互界面之前被拒绝。
+  add_test(NAME XcpMasterToolConfigOption
+           COMMAND ${CMAKE_COMMAND} "-DXCP_MASTER=$<TARGET_FILE:xcp_master>"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/xcp_master_config_option_test.cmake")
   add_test(NAME XcpMasterToolRejectsMissingArgs COMMAND xcp_master)
   set_tests_properties(XcpMasterToolRejectsMissingArgs PROPERTIES WILL_FAIL TRUE)
   add_test(NAME XcpMasterToolRejectsPollingIntervalInDaq
@@ -393,10 +398,14 @@ if(LIBXCP_BUILD_TOOLS)
           # 受控 A2L 快照：成功路径与失败关闭路径的用例。
           a2l_trusted_snapshot_test.cpp
           # B-T5：传输层选择解析层（纯函数）的规则级用例。
-          xcp_master_transport_selection_test.cpp)
+          xcp_master_transport_selection_test.cpp
+          # 工程配置文件（JSON）的序列化、校验与原子写入用例。
+          xcp_master_project_file_test.cpp)
   target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
   target_include_directories(XcpMasterSymbolPolicyTest PRIVATE
-          ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
+          ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include
+          # 工程配置文件的 JSON 读写用 vendor 入库的 nlohmann/json（纯头文件）。
+          ${PROJECT_SOURCE_DIR}/include/vendor/nlohmann_json)
   # B-T5：传输层选择解析层使用 `XcpProtocolVersion::ToString()` 等实现符号，
   # 故需链接 libxcp 本体（a2lbridge 自身不导出这些符号）。
   target_link_libraries(XcpMasterSymbolPolicyTest PRIVATE
