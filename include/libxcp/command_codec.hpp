@@ -11,6 +11,7 @@
 #define CALMCAR_XCP_COMMAND_CODEC_HPP_
 
 #include <cstdint>
+#include <span>
 
 #include "libxcp/protocol_types.hpp"
 #include "libxcp/xcp_error.hpp"
@@ -243,6 +244,90 @@ public:
     [[nodiscard]] Bytes EncodeReadDaq() const;
 
     /**
+     * @brief 编码 WRITE_DAQ_MULTIPLE 命令（docs §7.5.4.6 Table 122；Optional）
+     * @param elements 同一 ODT 内**连续**的 Entry 序列（顺序即写入顺序）
+     * @return CTO: [0xC7][n=倒计数][elem1(8B)][elem2(8B)]…[elemN(8B)]
+     * @throws XcpException(InvalidArgument) 序列为空，或任一条目的 size 为 0
+     * @note 每个条目固定 8 字节：bit_offset(1)、size(1)、address(4)、
+     *       extension(1)、dummy(1)。**最后一个条目也必须有 dummy**，
+     *       否则帧长会短 1 字节而被对端判为语法错。
+     * @note 本方法不校验 n 是否超过 MAX_CTO 允许值（Codec 不持有 MAX_CTO）；
+     *       `n <= (MAX_CTO-2)/8` 由调用方（CommandExecutor）把关。
+     * @warning 规范要求所有条目落在**同一个 ODT 内**且不得跨越 ODT 边界；
+     *          且该命令失败时无法定位是哪个条目出错，**整份配置视为无效**
+     *          （docs §7.5.4.6 "the whole configuration is invalid"）。
+     */
+    [[nodiscard]] Bytes EncodeWriteDaqMultiple(
+        std::span<const WriteDaqElement> elements) const;
+
+    /**
+     * @brief 编码 DTO_CTR_PROPERTIES 命令（docs §7.5.4.15 Table 159；Optional）
+     * @param modifier 修改器位（Table 160）；kNone 表示纯查询
+     * @param event_channel 目标事件通道号
+     * @param related_event_channel 新的相关事件通道号；modifier 未置
+     *        kModifyRelatedEvent 时应传 0（规范要求未用参数写 0）
+     * @param mode MODE 字节（Table 162）；未置对应修改器时应传 0
+     * @param daq_mode DAQ_MODE 取值（仅当 modifier 含 kModifyDaqMode 时生效）
+     * @param stim_mode STIM_MODE 取值，true=CHECK_COUNTER（仅当 modifier 含
+     *        kModifyStimMode 时生效）
+     * @return CTO: [0xC5][modifier][event(WORD)][related(WORD)][mode]
+     * @throws XcpException(InvalidArgument) mode 字节与修改器不自洽
+     * @note STIM_MODE 方向属本库排除范围（只做测量），但仍需能按原样
+     *       编码以支持"纯查询 + 只改 DAQ_MODE"的合法用法。
+     */
+    [[nodiscard]] Bytes EncodeDtoCtrProperties(
+        DtoCtrModifierBit modifier, std::uint16_t event_channel,
+        std::uint16_t related_event_channel, DaqCounterMode daq_mode,
+        bool stim_mode) const;
+
+    /**
+     * @brief 编码 GET_DAQ_CLOCK 命令（docs §7.5.4.10；Optional）
+     * @return CTO: 单字节 [0xDC]
+     * @note 该命令没有参数；legacy/extended 的**响应**格式由会话状态
+     *       （SLAVE_CONFIG 的 RESPONSE_FMT）决定，不在请求里体现。
+     */
+    [[nodiscard]] Bytes EncodeGetDaqClock() const;
+
+    /**
+     * @brief 编码 TIME_CORRELATION_PROPERTIES 命令（docs §7.5.6.1；Optional）
+     * @param set_properties SET_PROPERTIES 字节（用
+     *        `EncodeTimeCorrelationSetProperties` 组装；0 = 全部不改变）
+     * @param get_properties_request GET_PROPERTIES_REQUEST 字节
+     *        （bit0 GET_CLK_INFO；0 = 不请求时钟信息数据块）
+     * @param cluster_id CLUSTER_ID；未置 SET_CLUSTER_ID 时应传 0
+     * @return CTO: [0xC6][set][get][reserved=0][cluster_id(WORD)]
+     */
+    [[nodiscard]] Bytes EncodeTimeCorrelationProperties(
+        std::uint8_t set_properties, std::uint8_t get_properties_request,
+        std::uint16_t cluster_id) const;
+
+    /**
+     * @brief 编码 SET_DAQ_PACKED_MODE 命令（V1.5 §7.5.4.7；Optional）
+     * @param daq_list DAQ List 号 [0, MAX_DAQ-1]
+     * @param mode 打包方式；`NotPacked` 表示复位为常规单采样传输
+     * @param timestamp_mode 时间戳语义（仅 `mode != NotPacked` 有意义）
+     * @param sample_count 一帧打包的采样数，合法范围
+     *        `[kMinDaqPackedSampleCount, kMaxDaqPackedSampleCount]`；规范明确
+     *        0 与 1 非法
+     * @return CTO: [0xC0][0x01][daq_list(WORD)][mode][ts_mode][sample_count(WORD)]
+     *         （共 8 字节）
+     * @throws XcpException(InvalidArgument) 采样数越界；或 `mode == NotPacked`
+     *         却给了非默认时间戳语义/采样数
+     * @note `mode == NotPacked` 时规范规定第 5..7 字节被忽略，本编码器一律
+     *       写 0，避免把无意义的采样数发出去让对端误判。
+     */
+    [[nodiscard]] Bytes EncodeSetDaqPackedMode(
+        std::uint16_t daq_list, DaqPackedMode mode,
+        DaqPackedTimestampMode timestamp_mode, std::uint16_t sample_count) const;
+
+    /**
+     * @brief 编码 GET_DAQ_PACKED_MODE 命令（V1.5 §7.5.4.8；Optional）
+     * @param daq_list DAQ List 号
+     * @return CTO: [0xC0][0x02][daq_list(WORD)]（共 4 字节）
+     */
+    [[nodiscard]] Bytes EncodeGetDaqPackedMode(std::uint16_t daq_list) const;
+
+    /**
      * @brief 编码 SET_DAQ_LIST_MODE 命令（docs L2174-2204；Mandatory）
      * @param mode MODE 位（DaqListModeBit 组合）
      * @param daq_list DAQ List 号（EPK）
@@ -280,6 +365,15 @@ public:
      * @return CTO: [0xD8][reserved][daq_lo][daq_hi]
      */
     [[nodiscard]] Bytes EncodeGetDaqListInfo(std::uint16_t daq_list) const;
+
+    /**
+     * @brief 编码 GET_DAQ_LIST_MODE 命令（规范 Table 150；Optional）
+     * @param daq_list DAQ List 号（EPK）
+     * @return CTO: [0xDF][reserved][daq_lo][daq_hi]
+     * @details 响应包含 Slave 当前模式字、事件通道、prescaler 与 priority；
+     *          模式字是状态位，不能直接回填 SET_DAQ_LIST_MODE。
+     */
+    [[nodiscard]] Bytes EncodeGetDaqListMode(std::uint16_t daq_list) const;
 
     /**
      * @brief 编码 GET_DAQ_EVENT_INFO 命令（v0.3；XCPlite 实然 xcp.h:817-818：
@@ -387,6 +481,67 @@ public:
      *       供 MemoryAccess 计算本帧可用元素数时扣减。
      */
     [[nodiscard]] std::size_t DownloadAlignmentBytes() const noexcept;
+
+    /**
+     * @brief 编码 DOWNLOAD_NEXT 命令（块模式续帧；原始 PDF 第 144 页
+     *        Table 83；Optional）
+     * @param number_of_elements 本帧之后**剩余**的数据元素数（含本帧）
+     * @param data 本帧承载的数据字节（元素数 × AG）
+     * @return CTO: [0xEF][n][对齐字节(仅 AG>2)][data...]
+     * @throws XcpException(InvalidArgument) 元素数为 0/超 0xFF，或数据段为空
+     * @note 结构与 DOWNLOAD 完全相同（含对齐规则），差别只在语义：
+     *       DOWNLOAD 的 n 是"本块总元素数"，DOWNLOAD_NEXT 的 n 是"剩余元素数"。
+     *       `n - 本帧元素数` 即 Slave 侧校验下一帧序号的依据；序号不符时
+     *       Slave 回 ERR_SEQUENCE 并在附加字节给出期望元素数。
+     * @note 块模式中间帧**不应答**，只有最后一帧被肯定应答；发送编排由
+     *       CommandExecutor 负责，本函数只产生字节。
+     */
+    [[nodiscard]] Bytes EncodeDownloadNext(ElementCount number_of_elements,
+                                           BytesView data) const;
+
+    /**
+     * @brief 编码 DOWNLOAD_MAX 命令（固定满帧；原始 PDF 第 145 页
+     *        Table 85；Optional）
+     * @param data 满帧数据字节，长度必须等于 `max_cto - AG`
+     * @param max_cto 会话协商的 MAX_CTO
+     * @return CTO: [0xEE][对齐字节(仅 AG>1，AG-1 个)][data...]，总长 = max_cto
+     * @throws XcpException(InvalidArgument) MAX_CTO 不是 AG 的整数倍、
+     *         数据长度不等于 `max_cto - AG`、或数据段为空
+     * @note 本命令的对齐规则**与 DOWNLOAD 不同**：Table 85 为
+     *       "Used for alignment, only if AG > 1"，元素 1 位于偏移 AG，
+     *       即对齐字节数 = AG-1（AG=BYTE 时为 0），故 AG=WORD 也要插 1 字节。
+     *       不得复用 DownloadAlignmentBytes()。
+     * @note 固定长度 n = MAX_CTO/AG - 1 个元素；规范明确它**不支持块传输**，
+     *       也不得出现在块传输序列中，因此每帧都必须被应答。
+     */
+    [[nodiscard]] Bytes EncodeDownloadMax(BytesView data,
+                                         std::size_t max_cto) const;
+
+    /**
+     * @brief 编码 SET_REQUEST 命令（保存到非易失存储；原始 PDF 第 128 页
+     *        Table 62；Optional）
+     * @param mode Mode 位掩码（见 SetRequestModeBit）
+     * @param session_configuration_id 会话配置 ID（随 DAQ 列表一起保存）
+     * @return CTO: [0xF9][mode][session_config_id(WORD)]（4 字节）
+     * @throws XcpException(InvalidArgument) mode 为 0（无任何请求）
+     * @note 规范只要求确认收到的 mode 位；正响应无参数，仅 [0xFF]。
+     *       STORE_CAL_REQ 的完成状态必须通过 GET_STATUS 中该位被清除确认，
+     *       不能用本命令的正响应代替。
+     */
+    [[nodiscard]] Bytes EncodeSetRequest(
+        SetRequestModeBit mode, std::uint16_t session_configuration_id) const;
+
+    /**
+     * @brief 编码 BUILD_CHECKSUM 命令（内存区间校验；原始 PDF 第 148 页
+     *        Table 73；Optional）
+     * @param block_size 参与校验的块长度，单位 AG；从当前 MTA 起算
+     * @return CTO: [0xF3][reserved][reserved(WORD)][block_size(DWORD)]（8 字节）
+     * @throws XcpException(InvalidArgument) block_size 为 0
+     * @note MTA 必须由前置 SET_MTA 指定；执行后 Slave 把 MTA 前移 block_size。
+     *       对齐违规或超出单次上限时 Slave 回 ERR_OUT_OF_RANGE 并在参数里带
+     *       MTA_BLOCK_SIZE_ALIGN / Maximum block size，由解析层保留。
+     */
+    [[nodiscard]] Bytes EncodeBuildChecksum(std::uint32_t block_size) const;
 
     /**
      * @brief 编码 SHORT_DOWNLOAD 命令（docs L2018-2026；Optional）

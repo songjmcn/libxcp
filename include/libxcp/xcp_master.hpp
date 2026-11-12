@@ -106,6 +106,102 @@ struct DaqLedgerEntry {
 };
 
 /**
+ * @brief GET_DAQ_LIST_MODE 的回读快照（B0 批次）
+ * @details 与 `GetDaqListModeResponse` 的区别是额外回填了查询入参
+ *          `daq_list`，使调用方无需自行关联。`mode` 是 **Slave 当前状态位**
+ *          （`DaqListStatusBit`：SELECTED/DIRECTION/DTO_CTR/TIMESTAMP/
+ *          PID_OFF/RUNNING/RESUME），**不是** `SET_DAQ_LIST_MODE` 的请求位，
+ *          禁止原样回填。
+ */
+struct DaqListModeSnapshot {
+    std::uint16_t daq_list{0};       ///< 查询使用的 DAQ List 号（0 基）
+    std::uint8_t mode{0};            ///< Slave 当前模式字（状态位）
+    std::uint16_t event_channel{0};  ///< 当前绑定的 Event Channel
+    std::uint8_t prescaler{0};       ///< 当前分频因子
+    std::uint8_t priority{0};        ///< 当前优先级
+};
+
+/**
+ * @brief 事件通道的 DTO 计数器属性快照（B2 批次）
+ * @details 保留规范 `PROPERTIES` 原始位（语义见 `DtoCtrPropertiesBit`），
+ *          并把其中**与 DAQ 测量相关**的几项解出来，避免调用方反复做位
+ *          运算。`properties` 原样保留，供需要 STIM 位或 `*Fixed`
+ *          判定的调用方自行解释。
+ * @note `related_event_channel` 仅在 `has_related_event` 为 true 时有意义；
+ *       规范允许不置该位时字段仍为 0，调用方必须看标志而不是看数值。
+ */
+struct DtoCounterProperties {
+    std::uint16_t event_channel{0};          ///< 被查询的事件通道号（入参回填）
+    std::uint8_t properties{0};              ///< PROPERTIES 原始位
+    std::uint16_t related_event_channel{0};  ///< 当前相关事件通道号
+    DaqCounterMode daq_mode{DaqCounterMode::InsertCounter};  ///< DAQ_MODE
+    bool stim_check_counter{false};     ///< STIM_MODE（true=CHECK_COUNTER）
+    bool has_related_event{false};      ///< PROPERTIES bit3 有相关事件通道
+    bool supports_dto_counter{false};   ///< PROPERTIES bit4（DAQ 方向支持）
+    bool daq_mode_fixed{false};         ///< PROPERTIES bit1（1=不可修改）
+    bool related_event_fixed{false};    ///< PROPERTIES bit0（1=不可修改）
+};
+
+/**
+ * @brief 时间关联状态快照（B3 批次）
+ * @details 直接保留 `TIME_CORRELATION_PROPERTIES` 响应的原始字段，并把
+ *          其中与“能否得到可信相关时间”相关的位解出来。**原始字节一律
+ *          保留**，因为 `*_FIXED`/`*_PRESENT` 这类位与直觉相反，掩盖掉
+ *          会让调用方做出错误判断。
+ * @note `clock_info_reload_required` 是**本端推断**，不是协议字段：Slave
+ *       若在测量启动时回 `ERR_TIMECORR_STATE_CHANGE`，说明时钟信息已变更，
+ *       调用方必须重新上传时钟信息块后再启动。
+ */
+/**
+ * @brief DAQ Packed Mode 协商结果（`SetDaqPackedMode` 的返回值）
+ * @details 只有 `active == true` 才表示**回读确认**该列表已按 packed 运行；
+ *          任何一次失败（能力缺失、组合非法、回读不一致）都返回
+ *          `active == false` 并给出 `reason`，调用方必须退回非 packed 路径。
+ * @warning 绝不能依据"`SET_DAQ_PACKED_MODE` 返回了正响应"就按 packed 解码：
+ *          规范允许 Slave 静默忽略/降级，唯一可信来源是 GET 回读。
+ */
+struct DaqPackedModeNegotiation {
+    bool active{false};              ///< 是否已生效（回读确认）
+    DaqPackedModeResponse mode;      ///< 回读到的当前模式（失败时为默认值）
+    std::string reason;              ///< 未生效的具体原因；生效时为空
+};
+
+struct ClockCorrelationSnapshot {
+    std::uint8_t slave_config{0};       ///< SLAVE_CONFIG 原始位
+    std::uint8_t observable_clocks{0};  ///< OBSERVABLE_CLOCKS 原始位
+    std::uint8_t sync_state{0};         ///< SYNC_STATE 原始位
+    std::uint8_t clock_info{0};         ///< CLOCK_INFO 原始位
+
+    /// @brief 当前 EV_TIME_SYNC 响应格式（随 extended 特性切换）
+    ResponseFormatMode response_format{ResponseFormatMode::Legacy};
+    /// @brief DAQ 时间戳关联哪个时钟（slave 时钟或 ECU 时钟）
+    DaqTimestampRelation timestamp_relation{DaqTimestampRelation::XcpSlaveClock};
+    /// @brief Time Sync Bridge 状态（NotAvailable = Slave 无此特性）
+    TimeSyncBridgeState bridge{TimeSyncBridgeState::NotAvailable};
+    /// @brief XCP slave 时钟可观测性
+    SlaveClockObservability slave_clock{SlaveClockObservability::FreeRunning};
+    /// @brief Grandmaster 时钟可观测性
+    GrandmasterClockObservability grandmaster_clock{
+        GrandmasterClockObservability::None};
+    /// @brief ECU 时钟可观测性
+    EcuClockObservability ecu_clock{EcuClockObservability::None};
+    /// @brief slave 时钟同步状态
+    SlaveClockSyncState slave_sync_state{SlaveClockSyncState::NotSupported};
+    /// @brief grandmaster 同步状态
+    GrandmasterSyncState grandmaster_sync_state{
+        GrandmasterSyncState::NotSynchronized};
+    /// @brief ECU 时钟同步状态
+    EcuSyncState ecu_sync_state{EcuSyncState::Unknown};
+    /// @brief CLOCK_INFO 指示的数据块组成（决定 UPLOAD 需要读多少字节）
+    ClockInfoBlock clock_info_blocks{ClockInfoBlock::kNone};
+    /// @brief CLUSTER_ID
+    std::uint16_t cluster_id{0};
+
+    /// @brief 时钟信息块总字节数（按 `clock_info_blocks` 累加）
+    [[nodiscard]] std::size_t ClockInfoTotalBytes() const noexcept;
+};
+
+/**
  * @brief XCP Master 构造配置聚合（批次 B1 引入）
  *
  * @details 批次 B1 之前，`XcpMaster` 的构造参数是逐个位置参数
@@ -341,6 +437,27 @@ public:
                                   std::size_t dto_identification_bytes);
 
     /**
+     * @brief 是否允许用 WRITE_DAQ_MULTIPLE 批量写 ODT Entry（B2 批次）
+     * @param enabled true 表示在 ODT 内条目数大于 1 时改用一次
+     *        WRITE_DAQ_MULTIPLE 代替多次 WRITE_DAQ
+     * @details **默认关闭**，理由与 `MemoryAccess::SetBlockModeEnabled` 同源：
+     *
+     *          1. WRITE_DAQ_MULTIPLE 是 **Optional** 命令，Slave 不支持时回
+     *             ERR_CMD_UNKNOWN；若默认开启，所有既有对接方每次配置都要
+     *             多付一次失败往返；
+     *          2. 失败语义比逐条 WRITE_DAQ 更差——规范明确"无法定位哪个条目
+     *             出错，整份配置视为无效"，而逐条写入时至少能知道失败的位置；
+     *          3. 该命令对 `MAX_CTO` 有硬性要求（>= 10）且单帧条目数受
+     *             `(MAX_CTO-2)/8` 限制，小帧场景下切包点反而更碎。
+     *
+     *          开启后仍会按 `MAX_CTO` 在单个 ODT 内部切包，**不跨 ODT**。
+     * @note 只影响后续 `ConfigureDaqList(s)` / `ConfigureDaqListsDynamic`
+     *       的发送形态；本端 WRITE_DAQ 账本内容与顺序不变，因此 DTO 解码
+     *       布局不受影响。
+     */
+    void SetWriteDaqMultipleEnabled(bool enabled);
+
+    /**
      * @brief 动态列表的同步启动：逐 List Select → START_STOP_SYNCH(Start
      *        Selected)（批次20，T20-01b）
      * @details 绕开拒绝单列表 START(mode=1) 的 Slave（D12：xcplite.c:2668-
@@ -406,6 +523,22 @@ public:
     /// @brief 当前 DAQ 配置代际（与 Session 一致；解码侧用于识别陈旧账本）
     [[nodiscard]] std::uint32_t DaqConfigGeneration() const;
 
+    /**
+     * @brief 指定 DAQ List 在 Slave 侧的配置状态是否未知（B2 失败状态策略）
+     *
+     * @details 配置事务中途失败时本端会回滚账本（解码只用完整账本，B-6），
+     *          但**回滚本端账本不等于回滚 Slave**：CLEAR_DAQ_LIST 可能已执行、
+     *          部分 WRITE_DAQ 可能已生效、SET_DAQ_LIST_MODE 可能尚未下发。
+     *          该 List 在 Slave 上处于"半成品"状态，必须整表重配（先
+     *          CLEAR_DAQ_LIST）才能再次使用。
+     * @param daq_list DAQ List 号（EPK）
+     * @return true 表示 Slave 侧状态未知，禁止启动/解码
+     * @note 判定口径：只有"把该 List 推到一个已知状态"的成功操作（成功的
+     *       ConfigureDaqList、成功的 ClearDaqList、成功的免费 FREE_DAQ、
+     *       重新 CONNECT）才会清除该标志。
+     */
+    [[nodiscard]] bool IsDaqListStateUnknown(std::uint16_t daq_list) const;
+
     // ---- DAQ 运行时取证（批次14；T14-10 的 PREDEFINED 通路与 T14-11 的
     //      B-16 比对都必须有运行时数据源，故在此薄转发 CommandExecutor 的
     //      Execute*。四个方法零策略、零新逻辑，仅解决"Executor 是私有成员、
@@ -440,6 +573,51 @@ public:
         std::uint16_t daq_list);
 
     /**
+     * @brief 回读单个 DAQ List 在 Slave 侧实际生效的模式（GET_DAQ_LIST_MODE，
+     *        Optional，0xDF）
+     * @param daq_list DAQ List 号（EPK）
+     * @return 快照；Slave 回 ERR_CMD_UNKNOWN 时为 std::nullopt
+     * @details 用于校验 `ConfigureDaqList(s)` 之后 Slave 真的采用了期望的
+     *          事件通道/prescaler/priority/模式位，而不是只凭本端发送记录
+     *          假设成功。返回的是 Slave 当前值，不能以本地期望值补空。
+     *          该命令是 optional，Slave 不支持时调用方应保留本端账本并把
+     *          “未回读”如实告知上层，不得当作已确认。
+     */
+    [[nodiscard]] std::optional<DaqListModeSnapshot> QueryDaqListMode(
+        std::uint16_t daq_list);
+
+    /**
+     * @brief 查询单个事件通道的 DTO 计数器属性（DTO_CTR_PROPERTIES，Optional）
+     * @param event_channel 事件通道号
+     * @return 属性快照；Slave 回 ERR_CMD_UNKNOWN 时为 std::nullopt
+     * @details 纯查询：`MODIFIER` 传 kNone，不修改相关事件号、不触及
+     *          STIM_MODE。事件通道号不在响应中回显，故由入参回填。
+     * @note 其余协议错误（例如事件通道不存在 → ERR_OUT_OF_RANGE）照常抛出；
+     *       把"通道不存在"吞成 nullopt 会被误读为"查询成功但无属性"。
+     */
+    [[nodiscard]] std::optional<DtoCounterProperties> QueryDtoCounterProperties(
+        std::uint16_t event_channel);
+
+    /**
+     * @brief 修改单个事件通道的 DTO 计数器 DAQ 方向模式
+     * @param event_channel 事件通道号
+     * @param mode 期望的 DAQ_MODE（仅 InsertCounter / InsertStimCounterCopy）
+     * @return 修改后由 Slave 回读的完整属性快照
+     * @throws XcpException(UnsupportedFeature) 该事件通道不支持 DTO 计数器
+     *         （PROPERTIES 的 DAQ_MODE_PRESENT 为 0）或 DAQ_MODE 被固定
+     *         （DAQ_MODE_FIXED 为 1）
+     * @throws XcpException(ProtocolError) Slave 回 ERR_CMD_UNKNOWN
+     * @details 只发 `MODIFY_DAQ_MODE` 一个修改器，**不动** RELATED_EVENT 与
+     *          STIM_MODE 位，因此不会顺带改变其它方向的行为。
+     *
+     *          实现上先查询一次拿 PROPERTIES 做前置判定，再下发修改，最后由
+     *          响应确认。规范允许 Slave 静默忽略不该改的属性，若只看发送
+     *          成功就报告"已生效"会给出错误结论，故以回读值为准。
+     */
+    [[nodiscard]] DtoCounterProperties ConfigureDaqCounterEvent(
+        std::uint16_t event_channel, DaqCounterMode mode);
+
+    /**
      * @brief 查询单个事件通道的运行时信息（GET_DAQ_EVENT_INFO，v0.3，Optional）
      * @param event_channel 事件通道号（uint16_t）
      * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时为 std::nullopt
@@ -463,6 +641,131 @@ public:
     [[nodiscard]] std::optional<ReadDaqResponse> ReadDaqEntryAt(
         std::uint16_t daq_list, std::uint8_t odt_number,
         std::uint8_t odt_entry);
+
+    // ---- B3 批次：基础时间关联（docs §7.5.4.10 / §7.5.6.1）----
+
+    /**
+     * @brief 读取并解释 Slave 的时间关联状态（TIME_CORRELATION_PROPERTIES）
+     * @return 状态快照；Slave 回 `ERR_CMD_UNKNOWN` 时为 `std::nullopt`
+     * @throws XcpException 其它协议错误、超时
+     * @details 只做纯查询（SET_PROPERTIES = 0、GET_PROPERTIES_REQUEST = 0），
+     *          **不改变** Slave 的响应格式，也不请求时钟信息数据块。
+     *          解析后的快照决定后续 `ReadDaqClock` 用 legacy 还是 extended。
+     */
+    [[nodiscard]] std::optional<ClockCorrelationSnapshot>
+    QueryClockCorrelation();
+
+    /**
+     * @brief 请求 Slave 切换到指定 EV_TIME_SYNC 响应格式
+     * @param format 目标格式；`Legacy` 会被本地拒绝
+     * @return 设置后的状态快照（由响应回读，不是本地记账）
+     * @throws XcpException(InvalidArgument) format == Legacy
+     * @throws XcpException(UnsupportedFeature) Slave 不支持该命令、
+     *         或 slave 上报的格式与请求不一致
+     * @details 规范里 `RESPONSE_FMT = 0` 含义是"不改变"，**没有**"改回
+     *          legacy"的取值，因此本方法无法降级；调用方可传 `Legacy`
+     *          之外的值，但只能向 extended 方向切换。
+     *
+     *          切换后必须重新 `QueryClockCorrelation` 确认，Slave 允许静默
+     *          忽略不支持的格式位，只看发送成功会得出错误结论。
+     */
+    [[nodiscard]] ClockCorrelationSnapshot SetClockResponseFormat(
+        ResponseFormatMode format);
+
+    /**
+     * @brief 读取 Slave 当前时钟（GET_DAQ_CLOCK）
+     * @param extended 是否按 extended 布局解析；`std::nullopt` 表示按最近一次
+     *        `QueryClockCorrelation` 的 `response_format` 决定
+     * @return 时钟响应；Slave 回 `ERR_CMD_UNKNOWN` 时为 `std::nullopt`
+     * @throws XcpException 协议错误、超时；`ERR_RESOURCE_TEMPORARY_NOT_ACCESSIBLE`
+     *         照常抛出——它表示"此刻读不到"，不是"不支持"
+     * @note 未查询过时间关联状态时按 **legacy** 解析：规范把 legacy 定义为
+     *       初始格式，extended 只能由 Master 显式请求切换。此时会记 warning，
+     *       因为若另一 Master 已切到 extended，本端会读错布局。
+     * @note 一次读到的时钟值**不足以**对齐时间轴：还缺 Host 侧收发时点、
+     *       时钟单位/位宽/回绕信息与同步状态。本方法只提供原始观测。
+     */
+    [[nodiscard]] std::optional<GetDaqClockResponse> ReadDaqClock(
+        std::optional<bool> extended = std::nullopt);
+
+    /**
+     * @brief 请求 Slave 把 MTA 指向时钟信息数据块并读回原始字节
+     * @return 原始字节（长度由 CLOCK_INFO 位决定）；Slave 不支持时为 nullopt
+     * @throws XcpException(UnsupportedFeature) 地址粒度 > BYTE 时无法按字节
+     *         读取数据块（18/16/8 字节并非 AG 的整数倍）
+     * @throws XcpException(InvalidState) 尚未查询时间关联状态
+     * @details 只负责"取回字节"，**不解析**结构体：结构体布局与版本耦合
+     *          （Table 221-226），解析交给调用方或后续批次。
+     *          读取完成后 MTA 停在数据块末尾，且本方法不恢复原 MTA。
+     */
+    [[nodiscard]] std::optional<Bytes> UploadClockInfo();
+
+    /**
+     * @brief 探测某 DAQ List + 事件通道是否具备 Packed 前提
+     * @param daq_list DAQ List 号
+     * @param event_channel 关联事件通道号
+     * @return true 表示列表申报 PACKED、事件申报 PACKED 且事件为周期事件
+     *         （`EVENT_CHANNEL_TIME_CYCLE != 0`）
+     * @note 本函数只做**能力取证**，不改变任何配置。`GET_DAQ_LIST_INFO` 或
+     *       `GET_DAQ_EVENT_INFO` 不支持时返回 false（无法证明即不启用）。
+     */
+    [[nodiscard]] bool CanUseDaqPackedMode(std::uint16_t daq_list,
+                                           std::uint16_t event_channel);
+
+    /**
+     * @brief 查询某 DAQ List 当前生效的 Packed 模式
+     * @param daq_list DAQ List 号
+     * @return 解析结果；对端未实现该子命令（`ERR_CMD_UNKNOWN`）时返 `nullopt`
+     */
+    [[nodiscard]] std::optional<DaqPackedModeResponse> QueryDaqPackedMode(
+        std::uint16_t daq_list);
+
+    /**
+     * @brief DAQ Packed Mode 生效后回读的**运行时**参数
+     * @details `SET_DAQ_LIST_MODE` 里的 prescaler 只是请求值，规范允许 Slave
+     *          改写；packed 下非锚点采样的时间戳全部依赖
+     *          `事件周期 × 实际降频因子`，用请求值计算会把错误间隔伪装成
+     *          有效时间戳。故协商成功后另行回读，调用方必须使用这里的值。
+     */
+    struct DaqPackedRuntimeInfo {
+        bool prescaler_verified{false};   ///< true 表示 prescaler 来自回读
+        std::uint8_t prescaler{1U};       ///< 实际降频因子（0 按 1 处理）
+    };
+
+    /**
+     * @brief 设置并**回读确认**某 DAQ List 的 Packed 模式
+     * @param daq_list DAQ List 号
+     * @param mode 目标打包方式；`NotPacked` 表示复位为常规传输
+     * @param event_channel 该 List 绑定的 Event Channel；`mode != NotPacked`
+     *        时必须提供，用于取证 `DAQ_EVENT_PROPERTIES` 的 PACKED 位
+     * @param timestamp_mode 时间戳语义（仅 packed 有意义）
+     * @param sample_count 一帧采样数（仅 packed 有意义，合法范围 [2, 0xFFFF]）
+     * @return 协商结果；`active == false` 时 `reason` 说明失败环节，调用方
+     *         必须保持/退回非 packed 解码
+     * @note 逐个失败点都**不抛异常**（除本地参数非法）：能力缺失、组合被拒、
+     *       回读不一致都通过返回值表达，因为"退回非 packed"是正常业务分支，
+     *       不是程序错误。本地参数非法（如采样数 0/1）仍抛
+     *       `InvalidArgument`。
+     * @note 能力取证与 `CanUseDaqPackedMode` 同源：列表与**事件通道**都必须
+     *       申报 PACKED 且事件为周期事件。只查列表会让"列表支持、事件不支持"
+     *       的组合通过，随后按 packed 拆帧产生静默错位。
+     * @warning 切换模式前应先停止该列表的测量；切换后本地布局账本与解码路由
+     *          必须重建，旧代际 DTO 不得继续按新布局解码。
+     */
+    [[nodiscard]] DaqPackedModeNegotiation SetDaqPackedMode(
+        std::uint16_t daq_list, DaqPackedMode mode, std::uint16_t event_channel,
+        DaqPackedTimestampMode timestamp_mode, std::uint16_t sample_count);
+
+    /**
+     * @brief 回读 Packed List 的运行时降频因子
+     * @param daq_list DAQ List 号
+     * @return 回读结果；`GET_DAQ_LIST_MODE` 不支持或返回非法值时
+     *         `prescaler_verified == false`
+     * @details 与 `SetDaqPackedMode` 分离，因为 `SET_DAQ_LIST_MODE` 本身来自
+     *          规划器的下行配置，回读必须发生在配置之后、按 packed 解码之前。
+     */
+    [[nodiscard]] DaqPackedRuntimeInfo ReadDaqPackedRuntimeInfo(
+        std::uint16_t daq_list);
 
     // ---- 变量标定批次：Calibration / Page Switching（docs §7.5.2.5 / §7.5.3）----
 
@@ -636,8 +939,10 @@ public:
     enum class UnsupportedCapability : std::uint8_t {
         /// SET_DAQ_PACKED_MODE（0xC0,0x01）/ GET_DAQ_PACKED_MODE（0xC0,0x02）
         /// —— 原始 PDF 确认为 V1.5 新特性（§4.1.10、Table 172/155 的
-        /// DAQ_LIST_PROPERTIES/DAQ_EVENT_PROPERTIES Bit4 PACKED），
-        /// 本实现未提供编码路径。
+        /// DAQ_LIST_PROPERTIES/DAQ_EVENT_PROPERTIES Bit4 PACKED）。
+        /// @note 自 B4 批次起**本库已提供编码路径**，因此该项不再属于静态
+        ///       能力边界：`IsCapabilityUnsupported` 对其返回 false，是否可用
+        ///       由 `CanUseDaqPackedMode` 在运行时按列表/事件属性取证决定。
         DaqPackedMode = 0,
 
         /// 0xC0 族（Level-1 双字节命令码）中除 GET_VERSION（0xC0,0x00）外的
@@ -673,9 +978,37 @@ public:
     void ThrowIfUnsupported(UnsupportedCapability capability) const;
 
 private:
+    /**
+     * @brief 写出一个 ODT 的全部 Entry，并按实际下发顺序登记账本（B2）
+     * @param daq_list DAQ List 号（EPK）
+     * @param odt_number ODT 号（0 基）
+     * @param entries 该 ODT 的 Entry 序列（写入顺序即协议顺序）
+     * @details 两条路径的**账本结果完全一致**，差异只在报文形态：
+     *          - 默认：每个 Entry 前显式 SET_DAQ_PTR + WRITE_DAQ；
+     *          - 开启后：先 SET_DAQ_PTR 到 ODT 首个 Entry，再按
+     *            `(MAX_CTO-2)/8` 在**本 ODT 内**切包，逐包
+     *            WRITE_DAQ_MULTIPLE（绝不跨 ODT）。
+     * @note 若中途切包失败，已下发的包在 Slave 侧可能已生效且无法定位是哪
+     *       一条出错，规范称为"整份配置无效"；调用方（ConfigureDaq*）捕获
+     *       异常后会回滚账本并按需重新 CLEAR_DAQ_LIST，本函数不做局部修补。
+     * @throws XcpException(InvalidArgument) MAX_CTO 不足 10 却要求批量写
+     * @throws XcpException 协议错误、超时或恢复失败
+     */
+    void WriteOdtEntries(std::uint16_t daq_list, std::uint8_t odt_number,
+                         const std::vector<DaqEntrySpec>& entries);
+
     void ConfigureDaqListsDynamicImpl(const std::vector<DaqListSpec>& specs,
                                       std::size_t dto_identification_bytes,
                                       bool legacy_timestamp);
+
+    /// @brief 登记某个 DAQ List 的 Slave 侧状态为未知（B2）；已登记则不改
+    void MarkDaqListStateUnknown(std::uint16_t daq_list);
+
+    /// @brief 清除某个 DAQ List 的"状态未知"登记（B2）；未登记则无操作
+    void ClearDaqListStateUnknown(std::uint16_t daq_list);
+
+    /// @brief 清空全部"状态未知"登记（整表被证实复位时使用，B2）
+    void ClearAllDaqListStateUnknown();
 
     /**
      * @brief CONNECT 之后的版本裁决编排（批次 B1）
@@ -735,6 +1068,27 @@ private:
      *          不用 A2L 的 PREDEFINED 顺序。
      */
     std::vector<DaqLedgerEntry> m_daq_ledger_;
+    /// @brief 是否允许用 WRITE_DAQ_MULTIPLE 批量写 ODT Entry（B2，默认关闭）
+    /// @details 关闭时逐条 WRITE_DAQ；开启后仍按 MAX_CTO 在单个 ODT 内部
+    ///          切包，绝不跨 ODT 边界。详见 SetWriteDaqMultipleEnabled。
+    bool m_write_daq_multiple_enabled_{false};
+    /**
+     * @brief Slave 侧配置状态未知的 DAQ List 号（B2 失败状态策略）
+     * @details 配置事务中途失败后，本端账本被回滚，但 Slave 可能保留了
+     *          CLEAR_DAQ_LIST 之后的部分写入。把这类 List 登记在此，禁止
+     *          "账本里没有该 List"被误读成"Slave 上也没有该 List"。
+     *          排序无关，仅做成员判定；列表规模很小（个位数）。
+     */
+    std::vector<std::uint16_t> m_daq_lists_unknown_state_;
+    /**
+     * @brief 最近一次时间关联状态快照（B3）
+     * @details 只缓存“查询成功”的结果；`std::nullopt` 表示查询过但 Slave
+     *          不支持。布尔值区分“尚未查询”和“已知不支持”，避免把
+     *          “没查过”当成“legacy 布局”。
+     */
+    std::optional<ClockCorrelationSnapshot> m_clock_correlation_;
+    /// @brief 是否已成功查询过时间关联状态（B3）
+    bool m_clock_correlation_queried_{false};
     /**
      * @brief 本会话 GET_DAQ_PROCESSOR_INFO 的一次性取证缓存
      * @details `std::nullopt` 表示 Slave 对 Optional 命令返回 CMD_UNKNOWN，
