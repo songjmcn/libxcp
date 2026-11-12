@@ -86,8 +86,16 @@ namespace liba2l {
 //     （此前 `BuildCharacteristicSymbol` 完全不导出 DAQ_EVENT，导致
 //     CHARACTERISTIC 恒显示「未声明事件」——属信息缺失，不影响其能否 DAQ）。
 //     ABI 号提升同样因为 DTO 增加了 `std::vector` 成员（布局变化）。
+// v12（跳过缺失的非 A2L include 留痕）：`/include` 指向的**非 A2L** 伴生文件
+//     （典型是 AML 定义如 `XCP.aml`）不存在时，上游 `FixIncludeFile()` 会
+//     **跳过该 include 并继续解析**（加载仍然成功），但"模型少了一份声明"
+//     必须让调用方知情而不是静默消失。本版 IDoc +ListSkippedIncludes
+//     （out-param 风格，与 LastErrorChain 同分配惯例），数据源是已有的
+//     include 图预扫描（`WalkIncludes`）。缺失的 `.a2l` include 仍是
+//     kParseFailed，不进本列表。
+//     ABI 号提升的原因是 IDoc 增加了虚函数（vtable 布局变化）。
 // ----------------------------------------------------------------------------
-inline constexpr std::uint32_t kLibA2lAbiVersion = 11u;
+inline constexpr std::uint32_t kLibA2lAbiVersion = 12u;
 
 // ----------------------------------------------------------------------------
 // 错误码（B-19：SDK 边界用整型码 + LastError 文本，不用异常跨 ABI）
@@ -848,6 +856,24 @@ public:
      * LastError/LastErrorCode）。
      */
     virtual ErrorCode LastErrorChain(
+        std::vector<std::string>* out) const noexcept = 0;
+
+    /**
+     * @brief 加载期被跳过的 include 目标（v12；可空）。
+     * @param out 输出向量：由本 DLL 侧先 `clear()` 再填充（与
+     *            `LastErrorChain` 同一 out-param 分配惯例，§5.3.3 R2/R3）。
+     * @details 元素为 **canonical 全路径（UTF-8）**，按 `WalkIncludes` 的
+     *          深度优先遍历顺序排列。仅当 `/include` 指向的**非 A2L** 伴生
+     *          文件不存在时出现：上游解析器会跳过该 include 并继续，加载
+     *          仍然成功，但被跳过的事实必须让调用方知情。缺失的 `.a2l`
+     *          include 不算跳过而是解析失败（kParseFailed），故不会出现在
+     *          本列表；`/include` 的 A2L 循环/深度/越根同样走 kParseFailed。
+     *          每次 Load 成功时重新填充；未加载或加载失败时为空。
+     * @return kOk（含"无跳过项"的空输出）；out 为空指针返回 kBadArgument，
+     *         且**不改写**错误通道（查询方法不得污染
+     * LastError/LastErrorCode）。
+     */
+    virtual ErrorCode ListSkippedIncludes(
         std::vector<std::string>* out) const noexcept = 0;
 
     /**

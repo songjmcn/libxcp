@@ -15,6 +15,8 @@ using calmcar::xcp::a2l::SymbolKind;
 using calmcar::xcp::tools::AsamDataTypeName;
 using calmcar::xcp::tools::DescribeSymbolType;
 using calmcar::xcp::tools::FormatSymbolTypeLabel;
+using calmcar::xcp::tools::detail::ShortDataTypeName;
+using calmcar::xcp::tools::detail::ShortKindName;
 
 /**
  * @brief 验证归一化 A2L 基础类型的显示名称。
@@ -65,9 +67,9 @@ TEST(XcpMasterSymbolDisplayTest, DescribesOneDimensionalArray) {
     const auto description = DescribeSymbolType(symbol);
     EXPECT_EQ(description.data_shape, "一维数组[128]");
     EXPECT_EQ(FormatSymbolTypeLabel(symbol, "MEASUREMENT", false),
-              "MEASUREMENT · ULONG · 一维数组[128]");
+              "测量 U32 一维数组[128]");
     EXPECT_EQ(FormatSymbolTypeLabel(symbol, "MEASUREMENT", true),
-              "MEAS · ULONG · 数组[128]");
+              "测量 U32 [128]");
 }
 
 /**
@@ -84,7 +86,7 @@ TEST(XcpMasterSymbolDisplayTest, DescribesMapDimensions) {
 
     EXPECT_EQ(DescribeSymbolType(symbol).data_shape, "MAP[4×8]");
     EXPECT_EQ(FormatSymbolTypeLabel(symbol, "CHARACTERISTIC/MAP", true),
-              "CHAR/MAP · FLOAT32_IEEE · MAP[4×8]");
+              "特性/MAP F32 MAP[4×8]");
 }
 
 /**
@@ -101,7 +103,7 @@ TEST(XcpMasterSymbolDisplayTest, DescribesFixedAxisCurve) {
 
     EXPECT_EQ(DescribeSymbolType(symbol).data_shape, "曲线[4点]");
     EXPECT_EQ(FormatSymbolTypeLabel(symbol, "CHARACTERISTIC/CURVE", false),
-              "CHARACTERISTIC/CURVE · FLOAT64_IEEE · 曲线[4点]");
+              "特性/CURVE F64 曲线[4点]");
 }
 
 /**
@@ -125,7 +127,7 @@ TEST(XcpMasterSymbolDisplayTest, DoesNotInferUnknownTypeOrDimensions) {
     EXPECT_EQ(DescribeSymbolType(unknown_dimensions).data_shape,
               "数组/维度未解析");
     EXPECT_EQ(FormatSymbolTypeLabel(unknown_dimensions, "MEASUREMENT", true),
-              "MEAS · ULONG · 数组/维度未解析");
+              "测量 U32 维度未解析");
 }
 
 /**
@@ -156,6 +158,59 @@ TEST(XcpMasterSymbolDisplayTest, ReportsBlockAndAsciiShapesExplicitly) {
     ascii.characteristic_type = CharacteristicType::Ascii;
     ascii.dimensions.push_back(Dimension{0, 16, 1});
     EXPECT_EQ(DescribeSymbolType(ascii).data_shape, "ASCII文本[16字符]");
+}
+
+/**
+ * @brief 验证短类型名是一对一映射，不做任何宽度推断。
+ */
+TEST(XcpMasterSymbolDisplayTest, ShortDataTypeNamesAreOneToOne) {
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::UByte), "U8");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::SByte), "S8");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::UWord), "U16");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::SWord), "S16");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::ULong), "U32");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::SLong), "S32");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::ULong64), "U64");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::SLong64), "S64");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::Float16), "F16");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::Float32), "F32");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::Float64), "F64");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::Boolean), "BOOL");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::String), "STR");
+    EXPECT_EQ(ShortDataTypeName(AsamDataType::Unknown), "?");
+}
+
+/**
+ * @brief 验证类别缩写覆盖全部 CHARACTERISTIC 形态。
+ */
+TEST(XcpMasterSymbolDisplayTest, ShortKindNamesCoverAllKinds) {
+    EXPECT_EQ(ShortKindName("MEASUREMENT"), "测量");
+    EXPECT_EQ(ShortKindName("STRUCTURE"), "结构");
+    EXPECT_EQ(ShortKindName("CHARACTERISTIC"), "特性");
+    EXPECT_EQ(ShortKindName("CHARACTERISTIC/VALUE"), "特性/VALUE");
+    EXPECT_EQ(ShortKindName("CHARACTERISTIC/MAP"), "特性/MAP");
+    EXPECT_EQ(ShortKindName("CHARACTERISTIC/CURVE"), "特性/CURVE");
+    EXPECT_EQ(ShortKindName("CHARACTERISTIC/VAL_BLK"), "特性/VAL_BLK");
+    // 未知类别必须原样透出，避免新增类型被静默吞成固定文案。
+    EXPECT_EQ(ShortKindName("SOMETHING_NEW"), "SOMETHING_NEW");
+}
+
+/**
+ * @brief 标量形态省略「标量」后缀：无后缀即标量。
+ */
+TEST(XcpMasterSymbolDisplayTest, ScalarShapeIsOmitted) {
+    SymbolInfo symbol;
+    symbol.kind = SymbolKind::Characteristic;
+    symbol.characteristic_type = CharacteristicType::Value;
+    symbol.data_type = AsamDataType::Float32;
+    symbol.element_size_bytes = 4;
+
+    EXPECT_EQ(FormatSymbolTypeLabel(symbol, "CHARACTERISTIC/VALUE", false),
+              "特性/VALUE F32");
+    // 完整形态信息仍在 DescribeSymbolType 里，只是不再进列表行。
+    EXPECT_EQ(DescribeSymbolType(symbol).data_shape, "标量");
+    // 基础类型全名同样保留给详情弹窗使用。
+    EXPECT_EQ(AsamDataTypeName(symbol.data_type), "FLOAT32_IEEE");
 }
 
 }  // namespace
