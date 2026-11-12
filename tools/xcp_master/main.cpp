@@ -50,6 +50,7 @@
 #include "preview_refresh.hpp"
 #include "project_file.hpp"
 #include "windowed_menu.hpp"
+#include "calibration_view.hpp"
 #include "symbol_display.hpp"
 #include "tui_model.hpp"
 #include "libxcp/a2l/a2l_bridge.hpp"
@@ -614,13 +615,16 @@ public:
            calmcar::xcp::MeasurementSession& measurement_session,
            XcpMaster& master,
            std::vector<calmcar::xcp::A2lEventMetadata> events,
-           calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts = {})
+           calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts = {},
+           std::optional<calmcar::xcp::tools::EffectiveConnection>
+               effective_connection = std::nullopt)
         : options_(options),
           database_(database),
           measurement_database_(measurement_database),
           measurement_session_(measurement_session),
           master_(master),
           calibration_page_facts_(calibration_page_facts),
+          effective_connection_(std::move(effective_connection)),
           events_(std::move(events)) {}
 
     ~CliApp() { StopWatch(); }
@@ -677,12 +681,26 @@ public:
         auto preview_view =
             Container::Vertical({search_input, scope_menu, preview_menu});
 
+        // 标定视图只读 `calibration_view_labels_`，不需要可聚焦的子组件。
+        auto calibration_view =
+            Renderer([this] { return RenderCalibrationPanel(); });
+        // Container::Tab 只把事件分发给当前 Tab 里的子组件；切视图时
+        // 聚焦必须落在该视图内部的组件上，否则按键（↑↓/Del/F6/F3）
+        // 会留在旧视图而不生效。
+        preview_view_component_ = preview_view;
+        calibration_view_component_ = calibration_view;
+        // 面板号：1=结果，2=日志。视图号 1 已被标定视图占用，
+        // 因此 RenderPanel 内部用 viewport_index = panel + 1 映射滚动窗口。
         auto result_view = Renderer([this] { return RenderPanel(1U); });
         auto log_view = Renderer([this] { return RenderPanel(2U); });
         auto view_content = Container::Tab(
-            {preview_view, result_view, log_view}, &view_selected_);
+            {preview_view, calibration_view, result_view, log_view},
+            &view_selected_);
         MenuOption view_options = MenuOption::Horizontal();
         auto view_menu = Menu(&view_labels_, &view_selected_, view_options);
+        view_menu_ = view_menu;
+        preview_menu_focus_ = preview_menu;
+        result_log_view_component_ = result_view;
 
         InputOption calibration_index_options;
         calibration_index_options.placeholder = "0基数组元素/曲线点索引";
@@ -956,9 +974,15 @@ public:
                         ? "Enter执行 | ↑↓历史 | Esc预览 | F2视图 | F5停止"
                         : "Enter 执行 | ↑↓ 命令历史 | Esc 返回预览（保留草稿）"
                           " | F2 切换视图 | F5 停止 | quit 退出";
+            } else if (view_selected_ == 1) {
+                help = compact
+                           ? "↑↓选择 | Enter/F4标定 | Del移出 | F6采样 | "
+                             "F3详情 | F2视图"
+                           : "↑↓ 选择 | Enter/F4 打开标定表单 | Del 移出标定"
+                             "名单 | F6 切换观测 | F3 详情 | F2 切换视图";
             } else if (view_selected_ != 0) {
                 help = compact ? "F2视图 | F7命令 | PgUp/Dn翻页 | F5停止"
-                               : "F2 切换三视图 | F7 输入命令 | PgUp/PgDn "
+                               : "F2 切换视图 | F7 输入命令 | PgUp/PgDn "
                                  "浏览 | F5 停止";
             } else if (preview_menu->Focused()) {
                 help = compact
@@ -976,7 +1000,7 @@ public:
                                  "F7 输入命令 | F5 停止";
             } else {
                 help = compact ? "F2视图 | Tab焦点 | F7命令 | F5停止"
-                               : "F2 切换三视图 | Tab 在预览内切换焦点 | "
+                               : "F2 切换视图 | Tab 在预览内切换焦点 | "
                                  "F7 输入命令 | F5 停止";
             }
             const auto dimensions =
@@ -995,9 +1019,11 @@ public:
                                  std::to_string(options_.port) + "  |  " +
                                  mode_state + "  |  " + run_state)}),
                       hbox({text("A2L " + a2l_name),
-                            options_.module.empty()
-                                ? text("")
-                                : text("  |  MODULE " + options_.module),
+                            // 列表行只显示变量名，模块归属必须在这里说明；
+                            // 未指定 --module 时取候选集里首个模块名。
+                            text("  |  MODULE " +
+                                 (options_.module.empty() ? preview_module_name_
+                                                          : options_.module)),
                             text("  |  候选 " +
                                  std::to_string(preview_symbols_.size()) +
                                  "  |  采样集合 " +
@@ -1107,6 +1133,37 @@ public:
                 }
                 return true;
             }
+            // 标定视图是独立列表：↑↓ 选择，Enter/F4 打开标定表单，
+            // Del 移出名单，F6 切换采样，F3 只读详情。
+            if (!input_mode_.InCommandMode() && view_selected_ == 1) {
+                if (event == Event::ArrowUp || event == Event::ArrowDown) {
+                    std::lock_guard lock(output_mutex_);
+                    const int row_count =
+                        static_cast<int>(calibration_view_rows_.size());
+                    const int delta = event == Event::ArrowUp ? -1 : 1;
+                    calibration_view_selected_ =
+                        calmcar::xcp::tools::ClampCalibrationSelection(
+                            calibration_view_selected_ + delta,
+                            static_cast<std::size_t>(row_count));
+                    return true;
+                }
+                if (event == Event::F4 || event == Event::Return) {
+                    ActivateCalibrationViewRow();
+                    return true;
+                }
+                if (event == Event::Delete || event == Event::Backspace) {
+                    RemoveCalibrationViewRow();
+                    return true;
+                }
+                if (event == Event::F6) {
+                    ToggleCalibrationViewWatch();
+                    return true;
+                }
+                if (event == Event::F3) {
+                    OpenCalibrationViewDetails();
+                    return true;
+                }
+            }
             if (input_mode_.AllowsPreviewListAction(view_selected_,
                                                     preview_menu->Focused())) {
                 if (event == Event::F6) {
@@ -1152,10 +1209,27 @@ public:
             }
             if (event == Event::PageUp || event == Event::PageDown) {
                 if (view_selected_ == 0) return true;
+                if (view_selected_ == 1) {
+                    std::lock_guard lock(output_mutex_);
+                    const auto step =
+                        static_cast<int>(std::max<std::size_t>(
+                            1U, current_layout_.preview_rows));
+                    const int row_count =
+                        static_cast<int>(calibration_view_rows_.size());
+                    const int target =
+                        calibration_view_selected_ +
+                        (event == Event::PageUp ? -step : step);
+                    calibration_view_selected_ =
+                        calmcar::xcp::tools::ClampCalibrationSelection(
+                            target, static_cast<std::size_t>(row_count));
+                    return true;
+                }
                 std::lock_guard lock(output_mutex_);
-                const auto view = static_cast<std::size_t>(view_selected_);
+                // 面板号与视图号错开：视图 2=结果 / 3=日志，面板 1 / 2。
+                const auto view =
+                    static_cast<std::size_t>(view_selected_) - 1U;
                 const auto total =
-                    view_selected_ == 1
+                    view_selected_ == 2
                         ? (listing_active_ ? listing_rows_.size()
                                            : result_lines_.Size())
                         : log_lines_.Size();
@@ -1180,12 +1254,9 @@ public:
             if (event == Event::F2) {
                 view_selected_ = calmcar::xcp::tools::NextViewIndex(
                     view_selected_, view_labels_.size());
-                if (!input_mode_.InCommandMode()) {
-                    if (view_selected_ == 0)
-                        preview_menu->TakeFocus();
-                    else
-                        view_menu->TakeFocus();
-                }
+                // 标定视图按需重建：进入时才扫描名单与观测模型。
+                if (view_selected_ == 1) RebuildCalibrationView();
+                if (!input_mode_.InCommandMode()) TakeFocusForView();
                 return true;
             }
             return false;
@@ -1221,6 +1292,7 @@ public:
         const std::vector<std::string>& observe,
         const std::vector<std::string>& calibrate) {
         std::vector<std::string> notes;
+        std::size_t observe_accepted = 0;
         for (const auto& name : observe) {
             auto found = database_.Find(name);
             if (!found.HasValue()) {
@@ -1233,6 +1305,7 @@ public:
                                 "），已跳过。");
                 continue;
             }
+            ++observe_accepted;
             const auto canonical = QualifiedName(found.Value());
             std::lock_guard lock(watched_mutex_);
             if (std::find(watched_.begin(), watched_.end(), canonical) ==
@@ -1240,6 +1313,8 @@ public:
                 watched_.push_back(canonical);
             }
         }
+        std::size_t calibrate_added = 0;
+        std::size_t calibrate_accepted = 0;
         for (const auto& name : calibrate) {
             auto found = database_.Find(name);
             if (!found.HasValue()) {
@@ -1253,22 +1328,76 @@ public:
                                 "），已跳过。");
                 continue;
             }
+            ++calibrate_accepted;
             const auto canonical = QualifiedName(found.Value());
             std::lock_guard lock(calibrate_mutex_);
             if (std::find(calibrate_names_.begin(), calibrate_names_.end(),
                           canonical) == calibrate_names_.end()) {
                 calibrate_names_.push_back(canonical);
+                ++calibrate_added;
             }
         }
+        // 预置发生在 `Run()` 之前，此时还没有界面；但视图数据与名单必须
+        // 同步，否则第一帧里「标定」页仍是空名单（本轮报障的直接现象）。
+        if (calibrate_added > 0) RebuildCalibrationView();
+        // 汇总一行，便于对照文件内容判断是哪一步丢的：
+        // 文件里有 N 项 -> A2L 命中并准入 M 项 -> 实际加入名单 K 项。
+        notes.push_back("观测清单 " + std::to_string(observe.size()) +
+                        " 项（有效 " + std::to_string(observe_accepted) +
+                        "），标定清单 " + std::to_string(calibrate.size()) +
+                        " 项（有效 " + std::to_string(calibrate_accepted) +
+                        "，新加入 " + std::to_string(calibrate_added) + "）");
         return notes;
     }
 
 private:
+    /**
+     * @brief 渲染「标定」视图：只列出已登记的标定名单。
+     * @return 菜单 + 空名单提示 + 行号摘要的纵向布局。
+     * @details 只读 `calibration_view_labels_`，不做任何名单扫描；名单变化由
+     *          `RebuildCalibrationView()` 负责，因此本函数在每帧渲染里很便宜。
+     */
+    ftxui::Element RenderCalibrationPanel() {
+        using namespace ftxui;
+        std::lock_guard lock(output_mutex_);
+        const std::size_t visible_rows =
+            std::max<std::size_t>(1U, current_layout_.preview_rows);
+        Elements rows;
+        rows.push_back(text("标定对象（仅登记，不写入 ECU）：") | bold);
+        if (calibration_view_rows_.empty()) {
+            for (const auto& label : calibration_view_labels_)
+                rows.push_back(text(label));
+            rows.push_back(
+                text("F2 切换视图 | Del 移出名单 | calmark <name> 登记"));
+            return vbox(std::move(rows)) | frame;
+        }
+        const auto window = calmcar::xcp::tools::ComputePreviewWindow(
+            calibration_view_labels_.size(),
+            static_cast<std::size_t>(std::max(0, calibration_view_selected_)),
+            visible_rows, 0U);
+        for (std::size_t index = window.first;
+             index < window.first + window.count &&
+             index < calibration_view_labels_.size();
+             ++index) {
+            const bool selected =
+                static_cast<int>(index) == calibration_view_selected_;
+            auto row = text(calibration_view_labels_[index]);
+            rows.push_back(selected ? (row | inverted) : row);
+        }
+        rows.push_back(text("第 " + std::to_string(window.first + 1U) + "–" +
+                            std::to_string(window.first + window.count) +
+                            " / " +
+                            std::to_string(calibration_view_labels_.size()) +
+                            " 项 | PgUp/PgDn 翻页"));
+        return vbox(std::move(rows)) | frame;
+    }
+
     /** @brief 按当前尺寸渲染结果或日志分页，调用期间保护共享缓冲。 */
     ftxui::Element RenderPanel(std::size_t panel) {
         using namespace ftxui;
         std::lock_guard lock(output_mutex_);
-        const auto viewport_index = panel;
+        // 滚动窗口 0 留给变量预览，1 留给标定视图，因此面板号 +1 即视图号。
+        const auto viewport_index = panel + 1U;
         const auto& source =
             panel == 1U
                 ? (listing_active_ ? listing_rows_ : result_lines_.Lines())
@@ -1288,18 +1417,28 @@ private:
         return vbox(std::move(rows)) | vscroll_indicator | frame;
     }
 
-    /** @brief 构造变量表格中的名称、最新值、采样状态及写入资格摘要。 */
+    /**
+     * @brief 构造变量表格中的名称、最新值、采样状态及写入资格摘要。
+     * @param symbol A2L 符号。
+     * @param sample 该符号最新的观测快照。
+     * @param watched 是否已加入周期采样集合。
+     * @return 单行摘要文本。
+     * @details 列宽预算：名称只显示变量名（模块名由表头「A2L <module>」统一
+     *          说明，逐行重复 `module::` 前缀在 198k 候选下纯属浪费）；类型
+     *          用缩写；拒绝原因不再内联——那些是 30~60 字符的长文本，几乎
+     *          每行都会把终端撑爆，完整原因改由详情弹窗（F3）与 `read` 命令
+     *          返回的诊断给出。采样状态与「可标定」标记保留：前者决定要不要
+     *          按 F6，后者决定能不能按 F4，都是功能必需信息。
+     */
     std::string FormatPreviewLabel(
         const SymbolInfo& symbol,
         const std::optional<calmcar::xcp::tools::ObservationSnapshot>& sample,
         bool watched) const {
-        const auto name = QualifiedName(symbol);
         const std::string type_label =
             calmcar::xcp::tools::FormatSymbolTypeLabel(symbol, KindName(symbol),
                                                        current_layout_.compact);
-        std::string label = current_layout_.compact
-                                ? type_label + " | " + name + " | "
-                                : name + " | " + type_label + " | ";
+        // 顺序：名称 | 值 | 状态标记。名称最长，优先占左侧可视区。
+        std::string label = symbol.name + " | ";
         if (sample.has_value() && sample->has_value) {
             if (sample->is_array) {
                 label += "[" + std::to_string(sample->array_values.size()) +
@@ -1311,35 +1450,21 @@ private:
                 label += " " + symbol.conversion.unit;
             if (sample->stale) label += "（旧值）";
             if (sample->stopped) label += "（已停止）";
-            if (!current_layout_.compact && !sample->timestamp.empty())
-                label += " | " + sample->timestamp;
         } else {
             label += sample.has_value() && !sample->status.empty()
                          ? sample->status
                          : "—";
         }
-        label += watched ? " | 已加入采样" : " | 未采样";
-        const auto observation_reason = ObservationUnsupportedReason(symbol);
-        if (!observation_reason.empty()) {
-            // 标定量本就不属于周期采集范畴，用中性表述；其余是真正的
-            // 观测缺陷，保留「观测拒绝」以维持警示强度。
-            label += symbol.kind == SymbolKind::Characteristic
-                         ? " | 不适用周期采集: " + observation_reason
-                         : " | 观测拒绝: " + observation_reason;
+        // 采样与标定资格各用 2 字标记，宽度固定，便于肉眼扫列。
+        // 两个标记各自给出独立的后缀（" 采" / " 标定"），因此「采」出现在
+        // 采样且可标定的行上时不会被误读成「采标」。
+        label += watched ? " 采" : "";
+        if (symbol.kind != SymbolKind::Measurement &&
+            calmcar::xcp::tools::SymbolWriteUnsupportedReason(symbol).empty()) {
+            label += " 标定";
         }
-        if (symbol.kind != SymbolKind::Measurement) {
-            const auto write_reason =
-                calmcar::xcp::tools::SymbolWriteUnsupportedReason(symbol);
-            if (write_reason.empty()) {
-                // 明确区分「可标定」与「可周期采集」两件事：标定量既不能
-                // 被 DAQ 采集，也仍然可以通过标定表单按需读写。
-                label += symbol.kind == SymbolKind::Characteristic
-                             ? " | 可标定（可标定表单读写）"
-                             : " | 可标量候选";
-            } else {
-                label += " | 写入拒绝: " + write_reason;
-            }
-        }
+        // 类型放行尾：终端变窄时被裁掉的是类型而不是名称与数值。
+        label += " | " + type_label;
         return label;
     }
 
@@ -1382,7 +1507,8 @@ private:
         const PreviewRow& row, const SymbolInfo* symbol,
         const std::optional<calmcar::xcp::tools::ObservationSnapshot>& sample,
         bool watched, const std::string& read_reason) const {
-        if (symbol == nullptr) return row.symbol_name + " | A2L候选已失效";
+        if (symbol == nullptr)
+            return row.symbol_name + " | A2L候选已失效（Del 清理）";
         if (!row.is_child) return FormatPreviewLabel(*symbol, sample, watched);
         if (row.is_read_action)
             return "  └ [单次读取] 按 Enter 读取完整变量（不加入观测）";
@@ -1415,6 +1541,150 @@ private:
     }
 
     /** @brief 在界面线程重建父行/动作行/数据行并保留行身份。 */
+    /**
+     * @brief 重建「标定」视图的行数据与菜单文本。
+     * @details 只在进入视图、登记、移出名单以及后台观测到达时调用，不进入
+     *          每帧渲染路径。A2L 中已找不到的符号仍保留在名单里，但标记为
+     *          `symbol_valid = false`，让用户知道该用 Del 清理。
+     *          锁序与 `RebuildPreviewLabels()` 一致：
+     *          `output_mutex_` → `calibrate_mutex_`。
+     */
+    /**
+     * @brief 把键盘聚焦交给当前选中的视图。
+     * @details 预览视图交给展示列表；命令结果/日志交给滚动面板；标定视图
+     *          内部只有 Renderer，没有可聚焦子组件，在视图层级聚焦。
+     *          不能一律聚焦顶层标签栏：`Container::Tab` 不会把事件发给
+     *          标签栏之外的组件。
+     * @note 必须在主线程（事件循环）上调用。
+     */
+    void TakeFocusForView() {
+        if (!view_menu_) return;
+        switch (view_selected_) {
+            case 0:
+                if (preview_menu_focus_) preview_menu_focus_->TakeFocus();
+                else view_menu_->TakeFocus();
+                break;
+            case 1:
+                if (calibration_view_component_)
+                    calibration_view_component_->TakeFocus();
+                else view_menu_->TakeFocus();
+                break;
+            case 2:
+            case 3:
+                if (result_log_view_component_)
+                    result_log_view_component_->TakeFocus();
+                else view_menu_->TakeFocus();
+                break;
+            default:
+                view_menu_->TakeFocus();
+                break;
+        }
+    }
+
+    void RebuildCalibrationView() {
+        std::vector<calmcar::xcp::tools::CalibrationViewRow> rows;
+        {
+            std::lock_guard lock(output_mutex_);
+            std::lock_guard calibrate_lock(calibrate_mutex_);
+            rows.reserve(calibrate_names_.size());
+            for (const auto& name : calibrate_names_) {
+                calmcar::xcp::tools::CalibrationViewRow row;
+                row.name = name;
+                const auto symbol = database_.Find(name);
+                if (symbol.HasValue()) {
+                    const auto& info = symbol.Value();
+                    calmcar::xcp::tools::FillCalibrationViewRowFromSymbol(
+                        info, KindName(info), row);
+                }
+                if (const auto sample = observation_model_.Find(name);
+                    sample.has_value())
+                    row.sample = *sample;
+                rows.push_back(std::move(row));
+            }
+            calibration_view_rows_ = std::move(rows);
+            calibration_view_labels_ =
+                calmcar::xcp::tools::BuildCalibrationViewLabels(
+                    calibration_view_rows_, *calibration_view_formatter_,
+                    current_layout_.compact);
+            calibration_view_selected_ =
+                calmcar::xcp::tools::ClampCalibrationSelection(
+                    calibration_view_selected_, calibration_view_rows_.size());
+        }
+        // 工程配置预置发生在界面创建之前，`screen_` 仍为空；此时只准备
+        // 数据，不发重绘事件。
+        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
+    }
+
+    /** @brief 标定视图里对选中行按 Enter/F4：打开标定表单。 */
+    void ActivateCalibrationViewRow() {
+        const auto name = SelectedCalibrationViewName();
+        if (name.empty()) return;
+        OpenCalibrationFor(name);
+    }
+
+    /**
+     * @brief 把标定视图的选中行移出名单。
+     * @details 刻意不复用 `CalibrationUnmark()`：后者要先在 A2L 里找到符号，
+     *          而失效行正是最需要清理的，必须能直接按名字删除。
+     */
+    void RemoveCalibrationViewRow() {
+        const auto name = SelectedCalibrationViewName();
+        if (name.empty()) return;
+        bool removed = false;
+        {
+            std::lock_guard lock(calibrate_mutex_);
+            const auto removed_count = std::erase(calibrate_names_, name);
+            removed = removed_count > 0U;
+        }
+        if (!removed) {
+            Say("该变量不在标定名单: " + name);
+            return;
+        }
+        Say("已移出标定名单: " + name);
+        RebuildCalibrationView();
+    }
+
+    /** @brief 标定视图里 F6：把该符号加入/移出周期采样集合。 */
+    void ToggleCalibrationViewWatch() {
+        const auto name = SelectedCalibrationViewName();
+        if (name.empty()) return;
+        const auto found = database_.Find(name);
+        if (!found.HasValue()) {
+            Say("A2L 中已找不到 " + name + "，无法加入采样。");
+            return;
+        }
+        const auto canonical = QualifiedName(found.Value());
+        bool watched = false;
+        {
+            std::lock_guard lock(watched_mutex_);
+            watched = std::find(watched_.begin(), watched_.end(), canonical) !=
+                      watched_.end();
+        }
+        if (watched)
+            Remove(canonical);
+        else
+            Add(canonical);
+        RebuildCalibrationView();
+    }
+
+    /** @brief 标定视图里 F3：打开只读详情。 */
+    void OpenCalibrationViewDetails() {
+        const auto name = SelectedCalibrationViewName();
+        if (name.empty()) return;
+        OpenDetailsFor(name);
+    }
+
+    /** @brief 取标定视图当前选中行的规范名；列表为空时返回空串。 */
+    [[nodiscard]] std::string SelectedCalibrationViewName() const {
+        if (terminal_too_small_.load() || calibration_view_selected_ < 0 ||
+            static_cast<std::size_t>(calibration_view_selected_) >=
+                calibration_view_rows_.size())
+            return {};
+        return calibration_view_rows_[static_cast<std::size_t>(
+                                          calibration_view_selected_)]
+            .name;
+    }
+
     void RebuildPreviewLabels() {
         // 性能观测：整表重建是 O(候选数) 的热路径，耗时直接决定界面响应。
         const PerfStopwatch stopwatch;
@@ -1438,18 +1708,12 @@ private:
         std::unordered_map<std::string, std::string> read_reasons_by_name;
         std::lock_guard lock(output_mutex_);
         std::lock_guard watched_lock(watched_mutex_);
-        std::lock_guard calibrate_lock(calibrate_mutex_);
         for (const auto& symbol : preview_symbols_) {
             const auto name = QualifiedName(symbol);
             const bool watched = std::find(watched_.begin(), watched_.end(),
                                            name) != watched_.end();
-            // 页签 2「仅标定」按标定名单过滤；名单为空时该页签自然为空，
-            // 这是可接受的，因为 calmark 之前的标定名单本来就没有内容。
-            const bool marked =
-                std::find(calibrate_names_.begin(), calibrate_names_.end(),
-                          name) != calibrate_names_.end();
+            // 标定量已迁到独立的「标定」视图，这里只保留全部/仅采样两档。
             if (preview_scope_selected_ == 1 && !watched) continue;
-            if (preview_scope_selected_ == 2 && !marked) continue;
             const auto sample = observation_model_.Find(name);
             const bool expanded = expanded_preview_names_.contains(name);
             const bool has_sample = sample.has_value() && sample->has_value;
@@ -1532,6 +1796,9 @@ private:
                     : std::clamp(old_selected_index, 0,
                                  static_cast<int>(preview_labels_.size() - 1U));
         }
+        // 状态行要显示模块归属：列表行已不再逐行重复 `module::` 前缀。
+        if (preview_module_name_.empty() && !preview_symbols_.empty())
+            preview_module_name_ = preview_symbols_.front().module_name;
         const std::string active_filter =
             preview_active_filter_.empty() ? "*" : preview_active_filter_;
         preview_status_ = "结果筛选 " + active_filter + "：匹配 " +
@@ -1546,9 +1813,7 @@ private:
         LIBXCP_LOG_INFO(
             "UI 整表重建耗时 {:.1f} ms（候选 {} 个 / 展开后 {} 行 / 范围 {}）",
             stopwatch.ElapsedMs(), preview_symbols_.size(), preview_rows_.size(),
-            preview_scope_selected_ == 1   ? "仅采样"
-            : preview_scope_selected_ == 2 ? "仅标定"
-                                           : "全部");
+            preview_scope_selected_ == 1 ? "仅采样" : "全部");
     }
 
     /** @brief 保存一次成功样本；保留最近值并刷新预览行。 */
@@ -1561,6 +1826,7 @@ private:
             observation_model_.UpdateValue(name, value, status, timestamp);
         }
         RequestPreviewRefresh(name);
+        if (view_selected_ == 1) RebuildCalibrationView();
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
     }
 
@@ -1677,9 +1943,22 @@ private:
             static_cast<std::size_t>(preview_selected_) >= preview_rows_.size())
             return;
         const auto name = preview_rows_[preview_selected_].symbol_name;
-        const auto symbol = preview_symbol_index_.find(name);
-        if (symbol == preview_symbol_index_.end()) return;
-        modal_symbol_info_ = preview_symbols_[symbol->second];
+        OpenCalibrationFor(name);
+    }
+
+    /**
+     * @brief 按规范名打开标定表单（预览与标定视图共用）。
+     * @param name `module::name` 形式的规范名。
+     * @details 与预览进入标定表单的行为完全一致：填好当前值草稿、打开发布
+     *          弹窗，并把该符号登记进标定名单（只登记，不写 ECU）。
+     */
+    void OpenCalibrationFor(const std::string& name) {
+        const auto symbol = database_.Find(name);
+        if (!symbol.HasValue()) {
+            Say("A2L 中已找不到 " + name + "，无法打开标定表单。");
+            return;
+        }
+        modal_symbol_info_ = symbol.Value();
         modal_element_index_text_ =
             RequiresElementIndex(*modal_symbol_info_) ? "0" : "";
         {
@@ -1698,6 +1977,61 @@ private:
         }
         modal_page_selected_ = 1;
         calibration_modal_active_ = true;
+        modal_visible_ = true;
+        // F4 打开标定表单即把该符号登记进标定名单：登记只影响 `save`
+        // 写出的清单，不写 ECU；真正写入仍要走表单里的"申请写入"。
+        MarkCalibrationOnOpen(modal_symbol_info_);
+        if (screen_) screen_->PostEvent(ftxui::Event::Custom);
+    }
+
+    /**
+     * @brief 把当前打开的标定对象登记进标定名单（只登记，不写 ECU）。
+     * @param symbol 正在编辑的符号；空值表示没有可登记对象。
+     * @details 准入条件与 `calmark` 命令保持一致：必须能作为标定对象
+     *          （`SymbolWriteUnsupportedReason()` 为空）。已登记时不重复
+     *          记录也不刷屏，避免每次按 F4 都往结果区写一行。
+     */
+    void MarkCalibrationOnOpen(const std::optional<SymbolInfo>& symbol) {
+        if (!symbol.has_value()) return;
+        if (!calmcar::xcp::tools::SymbolWriteUnsupportedReason(*symbol).empty())
+            return;
+        const auto canonical = QualifiedName(*symbol);
+        {
+            std::lock_guard lock(calibrate_mutex_);
+            if (std::find(calibrate_names_.begin(), calibrate_names_.end(),
+                          canonical) != calibrate_names_.end())
+                return;
+            calibrate_names_.push_back(canonical);
+        }
+        Say("已登记标定对象: " + canonical);
+        RebuildCalibrationView();
+    }
+
+    /**
+     * @brief 按规范名打开只读详情（标定视图 F3 使用）。
+     * @param name `module::name` 形式的规范名。
+     */
+    void OpenDetailsFor(const std::string& name) {
+        if (terminal_too_small_.load()) {
+            Say("窗口小于 80×24，变量详情和编辑操作已禁用。");
+            return;
+        }
+        if (name.empty()) return;
+        const auto symbol = database_.Find(name);
+        if (!symbol.HasValue()) {
+            Say("A2L 中已找不到 " + name + "，无法打开详情。");
+            return;
+        }
+        modal_symbol_info_ = symbol.Value();
+        modal_element_index_text_.clear();
+        calibration_modal_active_ = false;
+        const auto layout = current_layout_;
+        if (!variable_modal_.Open(name, layout)) {
+            modal_symbol_info_.reset();
+            Say("无法打开变量详情，请检查终端尺寸和A2L符号。");
+            return;
+        }
+        modal_page_selected_ = 0;
         modal_visible_ = true;
         if (screen_) screen_->PostEvent(ftxui::Event::Custom);
     }
@@ -2235,7 +2569,7 @@ private:
         if (command.empty()) return true;
         {
             std::lock_guard lock(output_mutex_);
-            if (listing_active_) viewport_.FollowBottom(1);
+            if (listing_active_) viewport_.FollowBottom(2);
             listing_active_ = false;
         }
         if (command == "quit" || command == "exit") return false;
@@ -2316,6 +2650,9 @@ private:
         Say("工程配置：calmark <name> 登记标定对象（只登记不写入）、"
             "calunmark <name> 取消登记、callist 查看标定名单、"
             "save [path] 保存工程配置文件（缺省存到可执行文件目录）。");
+        Say("标定视图：F2 切到「标定」查看已登记名单；Enter/F4 打开标定表单，"
+            "Del 移出名单，F6 切换观测，F3 只读详情。"
+            "在变量预览按 F4 也会自动登记该对象。");
         Say("mode=" + options_.mode +
             (options_.mode == "poll"
                  ? "；watch 按目标周期 " +
@@ -2406,7 +2743,7 @@ private:
                 std::lock_guard lock(output_mutex_);
                 listing_rows_ = std::move(full_listing);
                 listing_active_ = true;
-                viewport_.ResetToTop(1);
+                viewport_.ResetToTop(2);
             }
             if (screen_) screen_->PostEvent(ftxui::Event::Custom);
         } else if (page_ < listing_.size()) {
@@ -2657,8 +2994,11 @@ private:
             Say("无法推导默认保存路径（A2L 路径为空）；请用 save <path> 指定。");
             return;
         }
-        // 保存的是生效值：`options_` 在 main() 里已被
-        // ResolveTransportSelection() 的结果回填过 host/port。
+        // 保存的是**运行时实际生效值**：连接段取自 `effective_connection_`
+        // （Connect() 成功后由 main() 组装），它记录了嗅探胜出的 Wire Profile、
+        // 实际对齐位宽与有权威证据的 PL/TL 版本。
+        // 退化路径：若尚未连上（理论上 save 只在 TUI 里可用，连接失败时根本
+        // 到不了界面），退回用户输入请求，此时版本号必然为 null。
         calmcar::xcp::tools::ProjectFile file;
         file.a2l_path = options_.a2l_path;
         file.observe = WatchedSnapshot();
@@ -2673,8 +3013,13 @@ private:
         if (!options_.a2l_snapshot_root.empty()) {
             file.connection.a2l_snapshot_root = options_.a2l_snapshot_root;
         }
-        calmcar::xcp::tools::ConnectionFromRequest(options_.transport_request,
-                                                   file.connection);
+        if (effective_connection_.has_value()) {
+            calmcar::xcp::tools::ConnectionFromEffective(*effective_connection_,
+                                                         file.connection);
+        } else {
+            calmcar::xcp::tools::ConnectionFromRequest(options_.transport_request,
+                                                       file.connection);
+        }
         const auto text = calmcar::xcp::tools::ProjectFileToJson(file);
         std::string error;
         if (!calmcar::xcp::tools::WriteProjectFileAtomically(target, text,
@@ -3784,6 +4129,9 @@ private:
     XcpMaster& master_;
     /** @brief A2L 声明的标定页命令能力（决定运行时是否查询 GET_CAL_PAGE/GET_PAGE_INFO）。 */
     calmcar::xcp::tools::CalibrationPageFacts calibration_page_facts_;
+    /** @brief 连上 ECU 后实际生效的连接参数；`save` 以它为写入来源。 */
+    std::optional<calmcar::xcp::tools::EffectiveConnection>
+        effective_connection_;
     std::vector<A2lEventMetadata> events_;
     mutable std::mutex output_mutex_;
     std::mutex command_mutex_;
@@ -3824,7 +4172,7 @@ private:
     std::size_t page_{0};
     bool list_all_{false};
     mutable calmcar::xcp::tools::PanelViewport viewport_{
-        3}; /**< 结果/日志两面板独立滚动窗口；受 output_mutex_ 保护。 */
+        4}; /**< 预览/标定/结果/日志四视图独立滚动窗口；受 output_mutex_ 保护。 */
     std::vector<std::string>
         listing_rows_;           /**< list all 完整、可回看的目录快照。 */
     bool listing_active_{false}; /**< 结果视图当前是否显示完整目录。 */
@@ -3864,16 +4212,50 @@ private:
         expanded_preview_names_; /**< 当前原位展开的符号规范名。 */
     /** @brief 变量预览菜单文本；空结果也用占位行保持焦点。 */
     std::vector<std::string> preview_labels_{"（正在加载A2L变量…）"};
-    std::vector<std::string> view_labels_{"变量预览", "命令结果",
-                                          "日志"}; /**< 顶部三视图标签。 */
-    std::vector<std::string> preview_scope_labels_{
-        "全部变量", "仅采样",
-        "仅标定"}; /**< 变量预览范围筛选：0=全部，1=仅观测，2=仅标定登记。 */
+    /**
+     * @brief 候选集所属模块名，仅用于状态行展示。
+     * @details 列表行只显示变量名，因此模块名不能逐行重复；这里取候选集
+     *          中首个模块名（多模块 A2L 场景下--module 会覆盖它）。
+     */
+    std::string preview_module_name_;
+    /** @brief 标定视图的行数据（与 `calibration_view_labels_` 一一对应）。 */
+    std::vector<calmcar::xcp::tools::CalibrationViewRow> calibration_view_rows_;
+    /** @brief 标定菜单文本；空名单时是一条提示行。 */
+    std::vector<std::string> calibration_view_labels_;
+    /** @brief 标定菜单当前选中行。 */
+    int calibration_view_selected_{0};
+    /**
+     * @brief 各视图的可聚焦组件，用于 F2 切换后把键盘焦点放到正确位置。
+     * @details 在 `Run()` 里创建界面时赋值，之后只读；`Container::Tab` 只把
+     *          事件分发给当前 Tab 内的子组件，聚焦落在标签栏之外的组件上会
+     *          导致按键丢失。
+     */
+    ftxui::Component view_menu_;
+    /** @brief 变量预览视图组件；用于切回预览时恢复列表焦点。 */
+    ftxui::Component preview_menu_focus_;
+    /** @brief 预览视图容器（搜索框 + 范围页签 + 列表）。 */
+    ftxui::Component preview_view_component_;
+    /** @brief 标定视图组件（只有 Renderer，无内部可聚焦子组件）。 */
+    ftxui::Component calibration_view_component_;
+    /** @brief 命令结果/日志视图组件；两者共用同一滚动面板实现。 */
+    ftxui::Component result_log_view_component_;
+    /**
+     * @brief 标定行文本格式化策略（虚接口，可替换）。
+     * @details 抽成抽象接口是为了让单元测试能在不起 FTXUI 的前提下验证
+     *          "一行到底长什么样"，界面侧只依赖 `Format()`。
+     */
+    std::unique_ptr<calmcar::xcp::tools::CalibrationViewFormatter>
+        calibration_view_formatter_{
+            std::make_unique<calmcar::xcp::tools::DefaultCalibrationViewFormatter>()};
+    /** @brief 顶部四视图标签：预览 / 标定 / 结果 / 日志。 */
+    std::vector<std::string> view_labels_{"变量预览", "标定", "命令结果", "日志"};
+    /** @brief 变量预览范围筛选：0=全部变量，1=仅采样。 */
+    std::vector<std::string> preview_scope_labels_{"全部变量", "仅采样"};
     calmcar::xcp::tools::TuiInputModeState
         input_mode_;                /**< 显式预览/命令输入模式及事件隔离。 */
-    int view_selected_{0};          /**< 当前选中视图：预览、结果、日志。 */
+    int view_selected_{0}; /**< 当前选中视图：0=预览，1=标定，2=结果，3=日志。 */
     int preview_selected_{0};       /**< 当前变量预览菜单行。 */
-    int preview_scope_selected_{0}; /**< 0=全部变量，1=仅采样，2=仅标定。 */
+    int preview_scope_selected_{0}; /**< 0=全部变量，1=仅采样。 */
     std::string preview_filter_;    /**< 当前变量名搜索输入框草稿。 */
     std::string preview_active_filter_; /**< 当前结果使用的实际筛选。 */
     calmcar::xcp::tools::SearchInputRevision
@@ -4169,7 +4551,9 @@ int main(int argc, char** argv) {
                      "不使用该 A2L 端点的传输层版本和对齐证据。\n";
     }
     std::string selection_error;
-    const auto selection = calmcar::xcp::ResolveTransportSelection(
+    // 非 const：嗅探模式（--tcp-profile auto/auto-legacy）下要把胜出候选的
+    // Wire Profile 与对齐回填进来，save 才能写出"实际在用"的布局。
+    auto selection = calmcar::xcp::ResolveTransportSelection(
         options->transport_request, a2l_facts, &selection_error);
     if (!selection.has_value()) {
         std::cerr << "传输层配置错误: " << selection_error << '\n';
@@ -4210,6 +4594,9 @@ int main(int argc, char** argv) {
         //    胜出后**另建一条**正式连接，绝不复用试连（设计文档 C1）。
         //  - auto-legacy：保留旧的首成功试连并直接留用该连接（存在线路歧义）。
         std::unique_ptr<calmcar::xcp::XcpMaster> master;
+        // 连上之后才有的"实际生效连接"，save 用它而不是用户输入。
+        std::optional<calmcar::xcp::tools::EffectiveConnection>
+            effective_connection;
         if (selection->transport == calmcar::xcp::TransportKind::Tcp &&
             selection->wire_profile_auto) {
             const bool strict_auto =
@@ -4371,6 +4758,13 @@ int main(int argc, char** argv) {
             // 不就地改写它（改写会让"解析结果"与"实际使用"两处不一致）。
             options->transport_request.packet_alignment_bits =
                 static_cast<std::uint8_t>(outcome.selected->alignment);
+            // 回填胜出候选：`selection` 原本在嗅探模式下保持 Unknown，
+            // 若不回填，save 会写出"TCP 但无 Profile"或与对齐自相矛盾的组合。
+            // 这里回填的是**验证通过的那个候选**，不是猜测值。
+            selection->wire_profile = outcome.selected->profile;
+            selection->alignment = outcome.selected->alignment;
+            selection->alignment_source =
+                calmcar::xcp::AlignmentSource::ProfileDefault;
 
             if (strict_auto) {
                 // 正式会话另建连接：试连连接已由验证组件关闭，绝不复用。
@@ -4414,6 +4808,33 @@ int main(int argc, char** argv) {
             // 运行期版本证据：reported 与 effective 必须并排展示（§8.1）
             const auto pl = master->GetProtocolVersionSnapshot();
             const auto tl = master->GetTransportVersionSnapshot();
+            // save 只认"有权威证据"的生效版本：证据来源仍是 Unknown 时
+            // effective 只是占位值，写进配置文件会让下次加载基于错误前提做
+            // 版本裁决。宁可写 null，让加载端回到 CONNECT 协商路径重新取证。
+            const auto authoritative = [](const auto& evidence) {
+                return evidence.source != calmcar::xcp::VersionSource::Unknown &&
+                       evidence.confidence !=
+                           calmcar::xcp::VersionConfidence::Unknown;
+            };
+            const std::optional<calmcar::xcp::XcpProtocolVersion> pl_effective =
+                authoritative(pl.evidence)
+                    ? std::optional<calmcar::xcp::XcpProtocolVersion>(
+                          pl.effective)
+                    : std::nullopt;
+            const std::optional<calmcar::xcp::XcpProtocolVersion> tl_effective =
+                authoritative(tl.evidence)
+                    ? std::optional<calmcar::xcp::XcpProtocolVersion>(
+                          tl.effective)
+                    : std::nullopt;
+            effective_connection = calmcar::xcp::tools::MakeEffectiveConnection(
+                *selection, pl_effective, tl_effective);
+            if (!options->a2l_snapshot_root.empty()) {
+                effective_connection->a2l_snapshot_root =
+                    options->a2l_snapshot_root;
+            }
+            if (options->transport_request.preset_xcplite) {
+                effective_connection->preset_xcplite = true;
+            }
             calmcar::xcp::tools::RuntimeVersionStatus version_status;
             version_status.pl_reported = pl.evidence.reported;
             version_status.pl_effective = pl.effective;
@@ -4451,7 +4872,7 @@ int main(int argc, char** argv) {
         }
         CliApp app(*options, *database, event_bound_database,
                    measurement_session, *master, std::move(event_metadata),
-                   calibration_page_facts);
+                   calibration_page_facts, effective_connection);
         // 工程配置文件里带来的观测/标定清单：启动时预置（不读写 ECU）。
         if (options->config_explicit) {
             const auto preload_notes =

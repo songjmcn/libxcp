@@ -26,7 +26,12 @@ namespace {
 using calmcar::xcp::TcpWireProfile;
 using calmcar::xcp::TransportKind;
 using calmcar::xcp::TransportSelectionRequest;
+using calmcar::xcp::tools::AlignmentBitsOf;
+using calmcar::xcp::tools::ConnectionFromEffective;
+using calmcar::xcp::tools::EffectiveConnection;
 using calmcar::xcp::tools::kProjectFileSchemaVersion;
+using calmcar::xcp::tools::MakeEffectiveConnection;
+using calmcar::xcp::tools::WireProfileText;
 using calmcar::xcp::tools::ParseProjectFileJson;
 using calmcar::xcp::tools::ProjectConnection;
 using calmcar::xcp::tools::ProjectConnectionToRequest;
@@ -590,6 +595,180 @@ TEST(ProjectFileIo, ReportsMissingFile) {
     std::string error;
     EXPECT_FALSE(calmcar::xcp::tools::LoadProjectFile(missing, loaded, error));
     EXPECT_NE(error.find("无法读取"), std::string::npos) << error;
+}
+
+/// @brief 生效连接写出的是具体 Profile，绝不落盘 "auto"
+TEST(ProjectEffectiveConnection, WritesConcreteProfileNotAuto) {
+    EffectiveConnection effective;
+    effective.transport = "tcp";
+    effective.host = "192.168.2.137";
+    effective.port = 5559;
+    effective.tcp_profile = "asam-v1.5";
+    effective.packet_alignment_bits = 16;
+
+    ProjectConnection connection;
+    ConnectionFromEffective(effective, connection);
+
+    EXPECT_EQ(connection.transport, std::string("tcp"));
+    EXPECT_EQ(connection.host, std::string("192.168.2.137"));
+    EXPECT_EQ(connection.port, 5559U);
+    // 关键断言：auto 表示"尚未确定"，能保存说明已确定，必须写具体值。
+    EXPECT_EQ(connection.tcp_profile, std::string("asam-v1.5"));
+    ASSERT_TRUE(connection.packet_alignment_bits.has_value());
+    EXPECT_EQ(*connection.packet_alignment_bits, 16U);
+}
+
+/// @brief 生效连接往返：写出再读回，请求与原生效值一致且不冲突
+TEST(ProjectEffectiveConnection, RoundTripsThroughRequest) {
+    EffectiveConnection effective;
+    effective.transport = "tcp";
+    effective.host = "10.0.0.5";
+    effective.port = 1234;
+    effective.tcp_profile = "asam-v1.5";
+    effective.packet_alignment_bits = 32;
+    effective.protocol_version = "1.3";
+    effective.transport_version = "1.4";
+
+    ProjectConnection connection;
+    ConnectionFromEffective(effective, connection);
+
+    TransportSelectionRequest request;
+    std::string error;
+    ASSERT_TRUE(ProjectConnectionToRequest(connection, request, error)) << error;
+    EXPECT_EQ(request.transport, TransportKind::Tcp);
+    ASSERT_TRUE(request.tcp_profile.has_value());
+    EXPECT_EQ(*request.tcp_profile, TcpWireProfile::AsamV15);
+    ASSERT_TRUE(request.packet_alignment_bits.has_value());
+    EXPECT_EQ(*request.packet_alignment_bits, 32U);
+    ASSERT_TRUE(request.protocol_version.has_value());
+    EXPECT_EQ(request.protocol_version->ToString(), std::string("1.3"));
+    ASSERT_TRUE(request.transport_version.has_value());
+    EXPECT_EQ(request.transport_version->ToString(), std::string("1.4"));
+}
+
+/// @brief 旧文件里 auto 与显式对齐并存时，丢弃对齐而不是拒绝整个配置
+TEST(ProjectEffectiveConnection, DropsExplicitAlignmentUnderAuto) {
+    ProjectConnection connection;
+    connection.transport = "tcp";
+    connection.host = "127.0.0.1";
+    connection.port = 5555;
+    connection.tcp_profile = "auto";
+    connection.packet_alignment_bits = 8;
+
+    TransportSelectionRequest request;
+    std::string error;
+    ASSERT_TRUE(ProjectConnectionToRequest(connection, request, error)) << error;
+    EXPECT_TRUE(request.tcp_profile_auto);
+    // auto 的语义是"对齐由胜出候选决定"，残留值必须被丢弃，
+    // 否则 ResolveTransportSelection() 规则 8 会拒绝整份配置。
+    EXPECT_FALSE(request.packet_alignment_bits.has_value());
+}
+
+/// @brief 具体 Profile 下显式对齐照常保留（容错只针对 auto）
+TEST(ProjectEffectiveConnection, KeepsAlignmentUnderConcreteProfile) {
+    ProjectConnection connection;
+    connection.transport = "tcp";
+    connection.host = "127.0.0.1";
+    connection.port = 5555;
+    connection.tcp_profile = "asam-v1.5";
+    connection.packet_alignment_bits = 16;
+
+    TransportSelectionRequest request;
+    std::string error;
+    ASSERT_TRUE(ProjectConnectionToRequest(connection, request, error)) << error;
+    EXPECT_FALSE(request.tcp_profile_auto);
+    ASSERT_TRUE(request.packet_alignment_bits.has_value());
+    EXPECT_EQ(*request.packet_alignment_bits, 16U);
+}
+
+/// @brief 无权威版本证据时写 null，绝不编造占位版本
+TEST(ProjectEffectiveConnection, LeavesVersionsNullWithoutEvidence) {
+    calmcar::xcp::ResolvedTransportSelection resolved;
+    resolved.transport = TransportKind::Tcp;
+    resolved.host = "127.0.0.1";
+    resolved.port = 5555;
+    resolved.wire_profile = TcpWireProfile::AsamV15;
+    resolved.alignment = calmcar::xcp::PacketAlignment::Bit8;
+
+    const auto effective =
+        MakeEffectiveConnection(resolved, std::nullopt, std::nullopt);
+    EXPECT_FALSE(effective.protocol_version.has_value());
+    EXPECT_FALSE(effective.transport_version.has_value());
+
+    ProjectFile file;
+    ConnectionFromEffective(effective, file.connection);
+    const auto text = ProjectFileToJson(file);
+    EXPECT_NE(text.find("\"protocol_version\": null"), std::string::npos)
+        << text;
+    EXPECT_NE(text.find("\"transport_version\": null"), std::string::npos)
+        << text;
+}
+
+/// @brief 有权威证据时写生效版本
+TEST(ProjectEffectiveConnection, WritesAuthoritativeVersions) {
+    calmcar::xcp::ResolvedTransportSelection resolved;
+    resolved.transport = TransportKind::Tcp;
+    resolved.host = "127.0.0.1";
+    resolved.port = 5555;
+    resolved.wire_profile = TcpWireProfile::AsamV15;
+    resolved.alignment = calmcar::xcp::PacketAlignment::Bit8;
+
+    const auto effective = MakeEffectiveConnection(
+        resolved, calmcar::xcp::XcpProtocolVersion{1, 3},
+        calmcar::xcp::XcpProtocolVersion{1, 4});
+    ASSERT_TRUE(effective.protocol_version.has_value());
+    EXPECT_EQ(*effective.protocol_version, std::string("1.3"));
+    ASSERT_TRUE(effective.transport_version.has_value());
+    EXPECT_EQ(*effective.transport_version, std::string("1.4"));
+}
+
+/// @brief UDP 生效连接不写 Profile
+TEST(ProjectEffectiveConnection, UdpHasNoProfile) {
+    calmcar::xcp::ResolvedTransportSelection resolved;
+    resolved.transport = TransportKind::Udp;
+    resolved.host = "192.168.0.9";
+    resolved.port = 5555;
+    resolved.alignment = calmcar::xcp::PacketAlignment::Bit8;
+
+    const auto effective =
+        MakeEffectiveConnection(resolved, std::nullopt, std::nullopt);
+    EXPECT_EQ(effective.transport, std::string("udp"));
+    EXPECT_TRUE(effective.tcp_profile.empty());
+    EXPECT_FALSE(effective.endpoint_from_a2l);
+}
+
+/// @brief 端点来自 A2L 时必须记下来源，加载端据此决定是否要求 --host/--port
+TEST(ProjectEffectiveConnection, RecordsEndpointFromA2l) {
+    calmcar::xcp::ResolvedTransportSelection resolved;
+    resolved.transport = TransportKind::Tcp;
+    resolved.host = "192.168.2.137";
+    resolved.port = 5559;
+    resolved.endpoint_source = calmcar::xcp::EndpointSource::A2l;
+    resolved.wire_profile = TcpWireProfile::AsamV15;
+    resolved.alignment = calmcar::xcp::PacketAlignment::Bit8;
+
+    const auto effective =
+        MakeEffectiveConnection(resolved, std::nullopt, std::nullopt);
+    EXPECT_TRUE(effective.endpoint_from_a2l);
+
+    ProjectConnection connection;
+    ConnectionFromEffective(effective, connection);
+    EXPECT_TRUE(connection.endpoint_from_a2l);
+}
+
+/// @brief 对齐与 Profile 文本的换算边界
+TEST(ProjectEffectiveConnection, AlignmentAndProfileHelpers) {
+    EXPECT_FALSE(AlignmentBitsOf(calmcar::xcp::PacketAlignment::Unknown)
+                     .has_value());
+    EXPECT_EQ(*AlignmentBitsOf(calmcar::xcp::PacketAlignment::Bit8), 8U);
+    EXPECT_EQ(*AlignmentBitsOf(calmcar::xcp::PacketAlignment::Bit16), 16U);
+    EXPECT_EQ(*AlignmentBitsOf(calmcar::xcp::PacketAlignment::Bit32), 32U);
+
+    EXPECT_EQ(WireProfileText(TcpWireProfile::AsamV15),
+              std::string("asam-v1.5"));
+    EXPECT_EQ(WireProfileText(TcpWireProfile::AsamV14),
+              std::string("asam-v1.4"));
+    EXPECT_TRUE(WireProfileText(TcpWireProfile::Unknown).empty());
 }
 
 }  // namespace

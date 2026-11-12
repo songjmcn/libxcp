@@ -444,6 +444,16 @@ std::string FormatIncludeChain(const std::vector<std::filesystem::path>& chain,
     return out;
 }
 
+/** @brief 扩展名是否为 `.a2l`（大小写不敏感，与上游 FixIncludeFile 同口径）。 */
+bool IsA2lPath(const std::filesystem::path& p) {
+    const std::u8string ext = p.extension().u8string();
+    if (ext.size() != 4) {
+        return false;
+    }
+    return ext[0] == u8'.' && (ext[1] == u8'a' || ext[1] == u8'A') &&
+           ext[2] == u8'2' && (ext[3] == u8'l' || ext[3] == u8'L');
+}
+
 /**
  * @brief 递归扫描 include 图（单一链式 DFS，chain 即当前路径）。
  *
@@ -455,13 +465,16 @@ std::string FormatIncludeChain(const std::vector<std::filesystem::path>& chain,
  * @param err 失败信息输出。
  * @param err_line 失败相关行号（0=无信息）。
  * @param out_chain 结构化 include 链输出（批次12；四个失败点均填充）。
+ * @param skipped 被跳过的 include 目标输出（v12；非 A2L 伴生文件缺失时
+ *                上游会跳过该 include 并继续，此处留痕）。
  * @return true = 扫描通过；false = 存在循环/越根/超深。
  */
 bool WalkIncludes(const std::filesystem::path& current,
                   const std::filesystem::path& root, bool allow_outside,
                   std::vector<std::filesystem::path>* chain, int depth,
                   std::string* err, std::uint32_t* err_line,
-                  std::vector<std::string>* out_chain) {
+                  std::vector<std::string>* out_chain,
+                  std::vector<std::string>* skipped) {
     constexpr int kMaxDepth = 32;  // B-18：最大深度 32
     if (depth > kMaxDepth) {
         *err = "include depth exceeds " + std::to_string(kMaxDepth) + ": " +
@@ -514,8 +527,10 @@ bool WalkIncludes(const std::filesystem::path& current,
                         return false;
                     }
                 }
-                if (std::filesystem::exists(resolved) &&
-                    std::filesystem::is_regular_file(resolved, ec)) {
+                const bool target_present =
+                    std::filesystem::exists(resolved) &&
+                    std::filesystem::is_regular_file(resolved, ec);
+                if (target_present) {
                     // B-18 深度检查放在父层（递归调用点），以便携带引发
                     // 超深的 /include 所在行号（入口层无行号信息）
                     if (depth + 1 > kMaxDepth) {
@@ -529,13 +544,19 @@ bool WalkIncludes(const std::filesystem::path& current,
                     chain->push_back(resolved);
                     const bool ok =
                         WalkIncludes(resolved, root, allow_outside, chain,
-                                     depth + 1, err, err_line, out_chain);
+                                     depth + 1, err, err_line, out_chain,
+                                     skipped);
                     chain->pop_back();
                     if (!ok) {
                         return false;
                     }
+                } else if (skipped != nullptr && !IsA2lPath(resolved)) {
+                    // 非 A2L 伴生文件缺失：上游 FixIncludeFile 会跳过该
+                    // include 并继续解析（加载成功）。把"被跳过的事实"记下来，
+                    // 否则调用方会以为解析出的是完整模型。
+                    skipped->push_back(PathFullUtf8(resolved));
                 }
-                // 缺失/非常规文件不在此报错：交由上游 FixIncludeFile 原样报
+                // 缺失/非常规 .a2l 不在此报错：交由上游 FixIncludeFile 原样报
             }
         }
         if (eol == std::string::npos) {
@@ -553,13 +574,19 @@ bool WalkIncludes(const std::filesystem::path& current,
  * @param err 失败信息；@param err_line 失败相关行号。
  * @param out_chain 结构化 include 链（批次12；入口先清空，失败时由
  *                  `WalkIncludes` 填充）。
+ * @param out_skipped 被跳过的 include 目标（v12；非 A2L 伴生文件缺失时
+ *                    上游跳过该 include，此处留痕；入口先清空）。
  * @return true = 通过（或无 include）。
  */
 bool PreScanIncludes(const std::string& main_path, bool allow_outside,
                      std::string* err, std::uint32_t* err_line,
-                     std::vector<std::string>* out_chain) {
+                     std::vector<std::string>* out_chain,
+                     std::vector<std::string>* out_skipped) {
     if (out_chain != nullptr) {
         out_chain->clear();
+    }
+    if (out_skipped != nullptr) {
+        out_skipped->clear();
     }
     try {
         std::error_code ec;
@@ -572,7 +599,7 @@ bool PreScanIncludes(const std::string& main_path, bool allow_outside,
         const std::filesystem::path root = start.parent_path();
         std::vector<std::filesystem::path> chain{start};
         return WalkIncludes(start, root, allow_outside, &chain, 1, err,
-                            err_line, out_chain);
+                            err_line, out_chain, out_skipped);
     } catch (const std::exception& ex) {
         *err = std::string("include pre-scan failed: ") + ex.what();
         return false;
@@ -1465,14 +1492,18 @@ public:
             std::string include_err;
             std::uint32_t include_line = 0;
             std::vector<std::string> include_chain;
+            std::vector<std::string> skipped_includes;
             if (!PreScanIncludes(file_path, allow_include_outside_root_,
-                                 &include_err, &include_line, &include_chain)) {
+                                 &include_err, &include_line, &include_chain,
+                                 &skipped_includes)) {
                 SetError(ErrorCode::kParseFailed, include_err, include_line);
                 // 批次12：结构化链单独存放（仅预扫描错误携带；ClearError
                 // 与成功路径一并复位）
                 last_include_chain_ = std::move(include_chain);
                 return ErrorCode::kParseFailed;
             }
+            // v12：预扫描记下的"被跳过的 include"随本次加载一起发布
+            skipped_includes_ = std::move(skipped_includes);
             PublishProgressTo(progress_cb, kProgressStagePreScan);
             if (!file_->ParseFile()) {
                 const std::uint32_t line =
@@ -1537,6 +1568,22 @@ public:
             *out = last_include_chain_;
         } catch (...) {
             // 分配失败：清空输出并以 kInternal 如实报告
+            out->clear();
+            return ErrorCode::kInternal;
+        }
+        return ErrorCode::kOk;
+    }
+
+    /** @copydoc IDoc::ListSkippedIncludes */
+    ErrorCode ListSkippedIncludes(
+        std::vector<std::string>* out) const noexcept override {
+        if (out == nullptr) {
+            // 查询方法不得改写错误通道（LastError/LastErrorCode 保持原值）
+            return ErrorCode::kBadArgument;
+        }
+        try {
+            *out = skipped_includes_;
+        } catch (...) {
             out->clear();
             return ErrorCode::kInternal;
         }
@@ -1779,6 +1826,7 @@ private:
         conversions_.clear();
         if_data_xcp_ = {};
         last_include_chain_.clear();
+        skipped_includes_.clear();
         file_.reset();
     }
 
@@ -2218,6 +2266,13 @@ private:
     std::uint32_t last_error_line_ = 0;
     /** 最近错误的 include 链（批次12，B-18；仅预扫描错误非空）。 */
     std::vector<std::string> last_include_chain_;
+    /**
+     * @brief 被跳过的 include 目标（v12；非 A2L 伴生文件缺失）。
+     * @details 上游 `FixIncludeFile()` 对缺失的非 A2L 文件是"跳过并继续"，
+     *          本 SDK 在预扫描阶段把它们记下来（UTF-8 全路径），供桥接层
+     *          转成 LoadWarning。成功加载后保持可用，ResetState 清空。
+     */
+    std::vector<std::string> skipped_includes_;
     /** IF_DATA XCP 来源 MODULE（B-17；空=自动选择）。 */
     std::string active_module_;
     /** 是否允许 include 越根（B-18 默认禁止）。 */

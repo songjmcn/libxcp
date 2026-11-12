@@ -400,7 +400,9 @@ if(LIBXCP_BUILD_TOOLS)
           # B-T5：传输层选择解析层（纯函数）的规则级用例。
           xcp_master_transport_selection_test.cpp
           # 工程配置文件（JSON）的序列化、校验与原子写入用例。
-          xcp_master_project_file_test.cpp)
+          xcp_master_project_file_test.cpp
+          # 标定视图行文本、空名单提示与四视图导航用例。
+          xcp_master_calibration_view_test.cpp)
   target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
   target_include_directories(XcpMasterSymbolPolicyTest PRIVATE
           ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include
@@ -556,6 +558,25 @@ add_custom_command(TARGET A2lMultiEndpointTest POST_BUILD
                 "$<TARGET_FILE_DIR:A2lMultiEndpointTest>")
 gtest_discover_tests(A2lMultiEndpointTest DISCOVERY_TIMEOUT 120)
 
+# ----------------------------------------------------------------------------
+# A2lMissingNonA2lIncludeTest —— `/include` 目标缺失时的处理语义
+# 存在则按原逻辑解析（含 .aml）；缺失时非 A2L 跳过并留痕（LoadWarning）、
+# `.a2l` 仍然报错。语料内联在用例里（写到临时目录），不依赖 golden 夹具。
+# ----------------------------------------------------------------------------
+add_executable(A2lMissingNonA2lIncludeTest
+        a2l_missing_non_a2l_include_test.cpp)
+target_compile_features(A2lMissingNonA2lIncludeTest PRIVATE cxx_std_20)
+target_link_libraries(A2lMissingNonA2lIncludeTest PRIVATE
+        libxcp::a2lbridge GTest::gtest libxcp_test_main)
+if(MSVC)
+  target_compile_options(A2lMissingNonA2lIncludeTest PRIVATE /utf-8)
+endif()
+add_custom_command(TARGET A2lMissingNonA2lIncludeTest POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:liba2l::liba2l>"
+                "$<TARGET_FILE_DIR:A2lMissingNonA2lIncludeTest>")
+gtest_discover_tests(A2lMissingNonA2lIncludeTest DISCOVERY_TIMEOUT 120)
+
 # Boost.Locale-backed A2L log timestamp compatibility test.
 add_executable(A2lLogTimestampTest a2l_log_timestamp_test.cpp)
 target_compile_features(A2lLogTimestampTest PRIVATE cxx_std_20)
@@ -564,6 +585,18 @@ target_include_directories(A2lLogTimestampTest PRIVATE
 target_link_libraries(A2lLogTimestampTest PRIVATE
         a2l Boost::locale GTest::gtest libxcp_test_main)
 gtest_discover_tests(A2lLogTimestampTest DISCOVERY_TIMEOUT 60)
+
+# include 解析失败的日志通道：缺失 `.a2l` include 必须经 `A2lLogStream`（kError）
+# 留下一条记录，而不是只抛异常。用例直接链接 a2llib 的静态目标 `a2l`，因为
+# `A2lLogStream` 未从 liba2l.dll 导出，桥接层用例注册的回调落在另一份副本上。
+add_executable(A2lIncludeLogTest a2l_include_log_test.cpp)
+target_compile_features(A2lIncludeLogTest PRIVATE cxx_std_20)
+target_link_libraries(A2lIncludeLogTest PRIVATE
+        a2l Boost::locale GTest::gtest libxcp_test_main)
+if(MSVC)
+  target_compile_options(A2lIncludeLogTest PRIVATE /utf-8)
+endif()
+gtest_discover_tests(A2lIncludeLogTest DISCOVERY_TIMEOUT 60)
 
 if(LIBXCP_ENABLE_LOG)
   # 独立探针用于黑盒检查日志文件、标准流隔离、不可写目录与 discovery。

@@ -83,20 +83,68 @@ namespace detail {
 }
 
 /**
- * @brief 将对象类别缩短为适合窄终端的标签。
- * @param kind_name 完整 A2L 对象类别名。
- * @return 窄屏类别标签。
+ * @brief 将对象类别缩短为两字中文标签，供列表行使用。
+ * @param kind_name 完整 A2L 对象类别名（`KindName()` 输出）。
+ * @return 缩写后的类别标签；未知类别原样返回以便暴露新增类型。
+ * @details 列表行要在单行内容纳名称、类型与值，类别必须让位给中文缩写；
+ *          完整名称在详情弹窗（F3）里仍可见，因此这里不做信息损失补偿。
  */
-[[nodiscard]] inline std::string CompactKindName(std::string_view kind_name) {
-    if (kind_name == "MEASUREMENT") return "MEAS";
-    if (kind_name == "STRUCTURE") return "STRUCT";
+[[nodiscard]] inline std::string ShortKindName(std::string_view kind_name) {
+    if (kind_name == "MEASUREMENT") return "测量";
+    if (kind_name == "STRUCTURE") return "结构";
     constexpr std::string_view characteristic_prefix = "CHARACTERISTIC/";
     if (kind_name.starts_with(characteristic_prefix)) {
-        return "CHAR/" +
+        return "特性/" +
                std::string(kind_name.substr(characteristic_prefix.size()));
     }
-    if (kind_name == "CHARACTERISTIC") return "CHAR";
+    if (kind_name == "CHARACTERISTIC") return "特性";
     return std::string(kind_name);
+}
+
+/**
+ * @brief 将 A2L 基础类型缩短为列表行可用的短名。
+ * @param type 归一化后的 A2L 基础数据类型。
+ * @return 短名（如 `FLOAT32_IEEE` → `F32`、`UBYTE` → `U8`）；未知类型返回
+ *         `?`，与详情弹窗里的「未知」区分开的是上下文而非用词。
+ * @details 缩写表刻意保持一对一映射，不做任何宽度推断：`F16`/`F32`/`F64`
+ *          分别对应三种 IEEE 浮点，`U`/`S` 前缀加位宽对应整型。
+ */
+[[nodiscard]] inline std::string ShortDataTypeName(
+    calmcar::xcp::a2l::AsamDataType type) {
+    using calmcar::xcp::a2l::AsamDataType;
+    switch (type) {
+        case AsamDataType::UByte:
+            return "U8";
+        case AsamDataType::SByte:
+            return "S8";
+        case AsamDataType::UWord:
+            return "U16";
+        case AsamDataType::SWord:
+            return "S16";
+        case AsamDataType::ULong:
+            return "U32";
+        case AsamDataType::SLong:
+            return "S32";
+        case AsamDataType::ULong64:
+            return "U64";
+        case AsamDataType::SLong64:
+            return "S64";
+        case AsamDataType::Float16:
+            return "F16";
+        case AsamDataType::Float32:
+            return "F32";
+        case AsamDataType::Float64:
+            return "F64";
+        case AsamDataType::Boolean:
+            return "BOOL";
+        case AsamDataType::BitText:
+            return "BIT";
+        case AsamDataType::String:
+            return "STR";
+        case AsamDataType::Unknown:
+        default:
+            return "?";
+    }
 }
 
 /**
@@ -217,26 +265,41 @@ namespace detail {
 }
 
 /**
- * @brief 组合列表中显示的对象类别、基础类型和数据形态标签。
+ * @brief 组合列表行显示的对象类别、基础类型和数据形态标签。
  * @param symbol A2L 符号信息。
- * @param kind_name 已有类别格式化结果。
- * @param compact 是否使用窄屏短标签。
- * @return 类别、基础类型和形态组成的单行标签。
+ * @param kind_name 已有类别格式化结果（`KindName()` 的完整输出）。
+ * @param compact 是否为窄终端（跳过「数组」二字的重复修饰）。
+ * @return 类别、基础类型和形态组成的短标签，例如
+ *         `特性/VALUE F32 标量`、`测量 U16 [128]`。
+ * @details 列表行是宽度瓶颈，因此三类信息都用短名并只用单空格分隔；
+ *          标量形态省略后缀——没有形态后缀即表示标量，这是列表里最常见的
+ *          情况，省去后每行平均少 6 列。完整名称（`MEASUREMENT`、
+ *          `FLOAT32_IEEE`、`一维数组[128]`）在详情弹窗里照常显示。
  */
 [[nodiscard]] inline std::string FormatSymbolTypeLabel(
     const calmcar::xcp::a2l::SymbolInfo& symbol, std::string_view kind_name,
     bool compact) {
     const SymbolTypeDescription description = DescribeSymbolType(symbol);
-    const std::string kind =
-        compact ? detail::CompactKindName(kind_name) : std::string(kind_name);
+    const std::string kind = detail::ShortKindName(kind_name);
     std::string shape = description.data_shape;
-    if (compact) {
-        const std::size_t array_label = shape.find("数组[");
-        if (array_label != std::string::npos) {
-            shape = shape.substr(array_label);
+    // 标量是默认形态，省略后缀即可；其余形态必须保留，否则会与标量混淆。
+    if (shape == "标量") {
+        shape.clear();
+    } else if (compact) {
+        // 窄屏去掉「数组」修饰：「一维数组[128]」「数组/维度未解析」都只留
+        // 方括号与斜杠后的部分；二维及以上必须保留「N维」，否则维度数丢失。
+        for (const std::string_view marker :
+             {std::string_view("数组/"), std::string_view("一维数组")}) {
+            if (shape.starts_with(marker)) {
+                shape = shape.substr(marker.size());
+                break;
+            }
         }
     }
-    return kind + " · " + description.base_type + " · " + shape;
+    std::string label = kind + " " +
+                        detail::ShortDataTypeName(symbol.data_type);
+    if (!shape.empty()) label += " " + shape;
+    return label;
 }
 
 }  // namespace calmcar::xcp::tools

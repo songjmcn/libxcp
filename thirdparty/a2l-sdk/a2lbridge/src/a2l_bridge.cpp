@@ -151,6 +151,23 @@ struct A2lBridge::Impl {
         // ② 未声明 FIRST_PID 的 DAQ_LIST —— 它们的解码只能按"列表号回退"，
         //    属弱权威（F1/D1），必须让用户知情而不是以为拿到了取证布局。
         load_warnings = database->LoadWarnings();
+        // v12 差量补齐：`/include` 指向的非 A2L 伴生文件（典型是 XCP.aml）
+        // 缺失时，上游解析器会跳过该 include 并继续（加载成功），但"模型少了
+        // 一份声明"必须留痕。SDK 在 include 预扫描阶段记录了这些目标。
+        std::vector<std::string> skipped_includes;
+        if (doc->ListSkippedIncludes(&skipped_includes) ==
+            liba2l::ErrorCode::kOk) {
+            for (const std::string& path : skipped_includes) {
+                LoadWarning warning;
+                warning.code = ErrorCode::NotFound;
+                warning.phase = Phase::Load;
+                warning.subject = path;
+                warning.message =
+                    "A2L 引用的非 A2L 伴生文件不存在，已跳过该 include：" +
+                    path;
+                load_warnings.push_back(std::move(warning));
+            }
+        }
         for (const DaqListLayout& list : xcp_info->static_daq_lists) {
             if (list.first_pid.has_value()) {
                 continue;

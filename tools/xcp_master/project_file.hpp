@@ -147,6 +147,63 @@ struct ProjectFile {
     std::vector<std::string> calibrate;
 };
 
+/**
+ * @brief 运行时**实际生效**的连接参数
+ *
+ * @details 与 `TransportSelectionRequest`（用户输入）和
+ *          `ResolvedTransportSelection`（解析结果）都不同：本结构记录的是
+ *          连上 ECU 之后**真正在用**的那一组值——
+ *          - Wire Profile：`--tcp-profile auto` 时是嗅探胜出的真实布局，
+ *            而不是 "auto" 这个"还没定下来"的选择；
+ *          - 对齐：嗅探胜出候选实际携带的位宽；
+ *          - 协议层/传输层版本：`XcpMaster::GetProtocolVersionSnapshot()` 与
+ *            `GetTransportVersionSnapshot()` 的 `effective` 值。
+ *
+ *          工程配置文件的 `connection` 段保存的是本结构，这样 `save` 之后
+ *          用 `-c` 重新加载能直接复现同一次运行，不需要再嗅探一遍。
+ *
+ * @note `protocol_version` / `transport_version` 为空的含义是"运行时没有
+ *       取得权威证据"。此时**必须**写 null 而不是编造一个值：加载时会回到
+ *       CONNECT 协商路径重新取证，编造值反而会让版本裁决基于错误前提。
+ */
+struct EffectiveConnection {
+    /// @brief 传输层类别：`"udp"` 或 `"tcp"`
+    std::string transport{"udp"};
+
+    /// @brief 生效的目标主机；TCP 端点来自 A2L 时可为空
+    std::string host;
+
+    /// @brief 生效的目标端口；由 A2L 提供时可为 0
+    std::uint16_t port{0};
+
+    /// @brief 端点（host/port）是否由 A2L 的 `XCP_ON_*_IP` 提供
+    bool endpoint_from_a2l{false};
+
+    /// @brief 生效的 Wire Profile：`"asam-v1.5"` / `"asam-v1.4"` / 空（UDP）
+    std::string tcp_profile;
+
+    /// @brief 生效的 PACKET_ALIGNMENT 位宽（8/16/32）；未知为空
+    /// @details Wire Profile 具有固定含义时也照实写出（asam-v1.4 恒 8），
+    ///          因为加载端据此构造的请求与运行期一致。
+    std::optional<std::uint8_t> packet_alignment_bits;
+
+    /// @brief 生效的协议层版本（形如 `"1.3"`）；无权威证据为空
+    std::optional<std::string> protocol_version;
+
+    /// @brief 生效的传输层版本（形如 `"1.4"`）；无权威证据为空
+    std::optional<std::string> transport_version;
+
+    /// @brief 是否由 `--preset xcplite` 展开而来；未使用预设为空
+    std::optional<bool> preset_xcplite;
+
+    /// @brief 受控 A2L 快照根目录；为空表示使用缺省 `<exe 目录>/tmp`
+    std::optional<std::string> a2l_snapshot_root;
+
+    /// @brief 版本与对齐的取值说明，供人工核对（不写入 JSON）
+    /// @details 例如 `"Profile=auto→asam-v1.5"`、`"PL 来自 GET_VERSION"`。
+    std::vector<std::string> notes;
+};
+
 namespace detail {
 
 /**
@@ -780,6 +837,13 @@ template <typename T>
  * @details 只做"文本 → 枚举"的还原，**不**做任何补全或推断：
  *          是否与 A2L 冲突、是否需要额外对齐，仍由
  *          `ResolveTransportSelection()` 统一裁决，避免工具层另立判词。
+ *
+ *          唯一例外是 `auto`/`auto-legacy` 与显式对齐同时出现：这两者在
+ *          `ResolveTransportSelection()` 规则 8 里互斥，而早期版本的本工具
+ *          在 auto 模式下写盘时恰好会留下这一组合（auto 尚未定下来、对齐却
+ *          已落盘），导致 save 出的文件自己加载不回来。auto 的语义本就是
+ *          "对齐由胜出候选决定"，因此这里丢弃对齐值、保留 auto 语义，属于
+ *          按语义舍弃冗余字段，不构成推断。
  */
 [[nodiscard]] inline bool ProjectConnectionToRequest(
     const ProjectConnection& connection, TransportSelectionRequest& out,
@@ -809,7 +873,13 @@ template <typename T>
         }
     }
 
-    request.packet_alignment_bits = connection.packet_alignment_bits;
+    // auto/auto-legacy 下对齐由胜出候选决定；旧文件里若残留显式对齐，
+    // 直接丢弃，否则规则 8 会以"自动模式不接受显式对齐"拒绝整个配置。
+    const bool profile_is_auto =
+        request.tcp_profile_auto || request.tcp_profile_auto_legacy;
+    if (!profile_is_auto) {
+        request.packet_alignment_bits = connection.packet_alignment_bits;
+    }
     if (connection.protocol_version.has_value()) {
         request.protocol_version =
             ParseVersionText(*connection.protocol_version);
@@ -920,6 +990,107 @@ inline void ConnectionFromRequest(const TransportSelectionRequest& request,
         out.transport_version = request.transport_version->ToString();
     }
     if (request.preset_xcplite) out.preset_xcplite = true;
+}
+
+/**
+ * @brief 把运行时生效连接写入工程配置文件的连接段
+ *
+ * @details 与 `ConnectionFromRequest()` 的区别是取值来源：本函数写入的是
+ *          「连上之后实际在用」的 `EffectiveConnection`，因此：
+ *          - `tcp_profile` 恒为具体的 `"asam-v1.5"` / `"asam-v1.4"`，
+ *            **绝不**写 `"auto"`——auto 表示"尚未确定"，而能走到保存说明
+ *            已经嗅探完成；写 auto 会让下次加载重复嗅探，且与下面写出的
+ *            具体对齐值在 `ResolveTransportSelection()` 规则 8 里直接冲突；
+ *          - 版本号无权威证据时写 null，加载端回到 CONNECT 协商路径取证。
+ *
+ * @param effective 运行时生效参数
+ * @param out 输出连接段
+ */
+inline void ConnectionFromEffective(const EffectiveConnection& effective,
+                                    ProjectConnection& out) {
+    out = ProjectConnection{};
+    out.transport = effective.transport;
+    out.host = effective.host;
+    out.port = effective.port;
+    out.endpoint_from_a2l = effective.endpoint_from_a2l;
+    out.tcp_profile = effective.tcp_profile;
+    out.packet_alignment_bits = effective.packet_alignment_bits;
+    out.protocol_version = effective.protocol_version;
+    out.transport_version = effective.transport_version;
+    out.preset_xcplite = effective.preset_xcplite;
+    out.a2l_snapshot_root = effective.a2l_snapshot_root;
+}
+
+/**
+ * @brief 把 `PacketAlignment` 换算为配置文件中的位宽数值
+ * @param alignment 对齐枚举
+ * @return 8/16/32；`Unknown` 返回空
+ */
+[[nodiscard]] inline std::optional<std::uint8_t> AlignmentBitsOf(
+    PacketAlignment alignment) {
+    switch (alignment) {
+        case PacketAlignment::Bit8:
+            return static_cast<std::uint8_t>(8);
+        case PacketAlignment::Bit16:
+            return static_cast<std::uint8_t>(16);
+        case PacketAlignment::Bit32:
+            return static_cast<std::uint8_t>(32);
+        default:
+            return std::nullopt;
+    }
+}
+
+/**
+ * @brief 把 `TcpWireProfile` 换算为配置文件中的文本
+ * @param profile Wire Profile
+ * @return `"asam-v1.5"` / `"asam-v1.4"`；`Unknown` 返回空字符串
+ */
+[[nodiscard]] inline std::string WireProfileText(TcpWireProfile profile) {
+    switch (profile) {
+        case TcpWireProfile::AsamV15:
+            return "asam-v1.5";
+        case TcpWireProfile::AsamV14:
+            return "asam-v1.4";
+        default:
+            return {};
+    }
+}
+
+/**
+ * @brief 由解析结果与运行期版本证据组装生效连接
+ *
+ * @param resolved `ResolveTransportSelection()` 的结果；嗅探模式下其
+ *                 `wire_profile` / `alignment` 需由调用方回填胜出候选
+ * @param protocol_version 协议层生效版本；无权威证据为空
+ * @param transport_version 传输层生效版本；无权威证据为空
+ * @return 组装好的生效连接
+ *
+ * @note `resolved.wire_profile` 为 `Unknown` 时 `tcp_profile` 写空字符串，
+ *       由 `MergeProjectFileIntoOptions()` 在加载时判定为"TCP 但未指定
+ *       Profile"并报出明确错误，而不是在保存端静默编造。
+ */
+[[nodiscard]] inline EffectiveConnection
+MakeEffectiveConnection(const ResolvedTransportSelection& resolved,
+                        const std::optional<XcpProtocolVersion>& protocol_version,
+                        const std::optional<XcpProtocolVersion>&
+                            transport_version) {
+    EffectiveConnection effective;
+    effective.transport = std::string(TransportKindName(resolved.transport));
+    effective.host = resolved.host;
+    effective.port = resolved.port;
+    effective.endpoint_from_a2l =
+        resolved.endpoint_source == EndpointSource::A2l;
+    if (resolved.transport == TransportKind::Tcp) {
+        effective.tcp_profile = WireProfileText(resolved.wire_profile);
+    }
+    effective.packet_alignment_bits = AlignmentBitsOf(resolved.alignment);
+    if (protocol_version.has_value() && protocol_version->IsValid()) {
+        effective.protocol_version = protocol_version->ToString();
+    }
+    if (transport_version.has_value() && transport_version->IsValid()) {
+        effective.transport_version = transport_version->ToString();
+    }
+    return effective;
 }
 
 }  // namespace calmcar::xcp::tools
