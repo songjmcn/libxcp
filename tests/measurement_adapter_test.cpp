@@ -16,8 +16,8 @@
  * A2L 栈为必编组件，本目标随测试构建无条件生成（独立 MeasurementAdapterTest）。
  */
 
-#include "adapter/a2l/a2l_measurement_database.hpp"
-#include "adapter/a2l/measurement_runtime_profile.hpp"
+#include "a2l/a2l_measurement_database.hpp"
+#include "a2l/measurement_runtime_profile.hpp"
 
 #include "libxcp/a2l/a2l_result.hpp"
 #include "libxcp/a2l/a2l_types.hpp"

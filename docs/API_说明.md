@@ -1,6 +1,6 @@
 # libxcp C++ API 说明
 
-本文面向将 libxcp 集成到 C++ 应用的开发者，依据当前公开头文件整理。库使用 C++20，命名空间为 `calmcar::xcp`；A2L 桥接类型位于 `calmcar::xcp::a2l`。不要将本文未列出的 `src/`、`adapter/` 实现细节视为稳定公共接口。
+本文面向将 libxcp 集成到 C++ 应用的开发者，依据当前公开头文件整理。库使用 C++20，命名空间为 `calmcar::xcp`；A2L 桥接类型位于 `calmcar::xcp::a2l`。不要将本文未列出的 `src/`、`thirdparty/a2l-sdk/adapter/` 实现细节视为稳定公共接口。
 
 ## 1. 构建与依赖
 

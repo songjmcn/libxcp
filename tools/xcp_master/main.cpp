@@ -47,6 +47,8 @@
 
 #include "calibration_policy.hpp"
 #include "cli_selection.hpp"
+#include "include_resolver.hpp"
+#include "transport_sniff.hpp"
 #include "preview_refresh.hpp"
 #include "project_file.hpp"
 #include "windowed_menu.hpp"
@@ -255,8 +257,14 @@ void PrintUsage(std::ostream& out) {
            "copy (default: <exe dir>/tmp). It must be writable only by the "
            "current user; if its ACL/links cannot be proven, A2L-based TCP "
            "alignment stays untrusted.\n"
-           "--host/--port may be omitted for tcp when the A2L declares "
-           "XCP_ON_TCP_IP.\n";
+           "--host/--port may be omitted for both transports when the A2L "
+           "declares the endpoint (XCP_ON_TCP_IP for tcp, XCP_ON_UDP_IP for "
+           "udp); a declared endpoint is only used when --transport was not "
+           "given explicitly.\n"
+           "When --transport is omitted, xcp_master loads the A2L and tries "
+           "every declared endpoint (TCP framing candidates first) and keeps "
+           "the first one that answers; --transport udp/tcp cancels the sniff "
+           "and keeps the explicit choice.\n";
 }
 
 bool ParseUnsigned(std::string_view text, std::uint64_t& value) {
@@ -444,6 +452,24 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
         error = "--a2l is required (or supply --config/-c)";
         return std::nullopt;
     }
+    // 传输层类别是否由用户显式指定：`--transport`，或隐含 TCP 的
+    // `--preset xcplite`。未显式指定时启动阶段才做双路嗅探（计划 §9.9）；
+    // 同时这也是规则 9 放宽（UDP 可从 A2L 取端点）的判定依据。
+    options.transport_request.transport_explicit =
+        transport_explicit || options.transport_request.preset_xcplite;
+    // 显式 `--transport tcp` 但没给 `--tcp-profile`：直接报"必须指定"等于
+    // 要求用户先知道对端的帧布局，而这恰恰是可以试出来的。改为隐含
+    // `--tcp-profile auto`（计划 §8.2 / §9.9），只嗅 TCP 候选。
+    if (options.transport_request.transport ==
+            calmcar::xcp::TransportKind::Tcp &&
+        !options.transport_request.preset_xcplite &&
+        !options.transport_request.tcp_profile.has_value() &&
+        !options.transport_request.tcp_profile_auto &&
+        !options.transport_request.tcp_profile_auto_legacy) {
+        options.transport_request.tcp_profile_auto = true;
+        std::cout << "提示: 未指定 --tcp-profile，按 TCP 帧布局候选逐个试连"
+                     "（等效 --tcp-profile auto）。\n";
+    }
     return options;
 }
 
@@ -501,6 +527,10 @@ bool MergeProjectFileIntoOptions(Options& options,
             return false;
         }
         options.transport_request = request;
+        // 配置文件里的 `transport` 是**上次运行实际选中的结果**（可能来自
+        // 嗅探），回放时不应再嗅探一遍：否则每次加载都要多花几秒试连，
+        // 且可能连到与上次不同的传输层（计划 §10.3 第 5 条）。
+        options.transport_request.transport_explicit = true;
         // 端点来源：文件明确写下 host/port 时才算"命令行显式给出"。
         options.host_explicit = request.host.has_value();
         options.port_explicit = request.port.has_value();
@@ -3010,6 +3040,9 @@ private:
                       static_cast<std::uint64_t>(options_.interval.count()))
                 : std::nullopt;
         if (!options_.module.empty()) file.session.module = options_.module;
+        // 只读来源标记：本文件由 TUI 在已连接的运行态写出，版本号/对齐都是
+        // 实际生效值，因此标记为 `runtime`，供人工区分手写文件。
+        file.session.config_source = std::string("runtime");
         if (!options_.a2l_snapshot_root.empty()) {
             file.connection.a2l_snapshot_root = options_.a2l_snapshot_root;
         }
@@ -4290,6 +4323,54 @@ private:
         confirmation_gate_; /**< 单次危险操作的确认状态。 */
 };
 
+
+/**
+ * @brief 把 A2L 的某一类传输层端点归纳为嗅探计划的输入摘要
+ *
+ * @param info A2L 的 `IF_DATA XCP` 事实
+ * @param kind 需要归纳的传输层类别
+ * @return 该类的端点摘要；未声明时 `declared` 为 false
+ *
+ * @details 只保留"能否发起一次连接尝试"所需的字段：
+ *          - 多个实例且地址/端口不一致时置 `ambiguous`，由调用方给出
+ *            "请显式指定端点"的诊断，而不是替用户猜一个——连错实例不会
+ *            报错，只会连到另一台 ECU；
+ *          - 对齐只取**显式声明**值，未声明时保持 0（不假定 8 bit）。
+ *
+ * @note 不复用 `A2lTransportFacts`：后者还带着 TCP alignment 的原文核对
+ *       结论，属于解析阶段职责，不应渗进嗅探阶段。
+ */
+calmcar::xcp::tools::A2lEndpointSummary SummarizeA2lEndpoint(
+    const calmcar::xcp::a2l::IfDataXcpInfo& info,
+    calmcar::xcp::a2l::TransportEndpoint::Kind kind) {
+  calmcar::xcp::tools::A2lEndpointSummary summary;
+  for (const auto& endpoint : info.transports) {
+    if (endpoint.kind != kind) continue;
+    if (!summary.declared) {
+      summary.declared = true;
+      summary.host = endpoint.remote_host;
+      summary.port = endpoint.remote_port;
+      summary.transport_layer_version = endpoint.version;
+      summary.instance_count =
+          endpoint.instance_count == 0U ? 1U : endpoint.instance_count;
+      if (endpoint.packet_alignment_declared &&
+          endpoint.packet_alignment != 0U) {
+        summary.packet_alignment_bits = endpoint.packet_alignment;
+      }
+      continue;
+    }
+    // 同一类的第二条声明：只要地址或端口不同就无法自动判定该连哪个。
+    if (endpoint.remote_host != summary.host ||
+        endpoint.remote_port != summary.port) {
+      summary.ambiguous = true;
+    }
+  }
+  if (info.ambiguous) {
+    summary.ambiguous = true;
+  }
+  return summary;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -4340,14 +4421,24 @@ int main(int argc, char** argv) {
     // 建立快照。SDK 从快照路径解析，避免"校验的和解析的不是同一份字节"。
     std::optional<calmcar::xcp::TrustedA2lSnapshot> a2l_snapshot;
     std::string a2l_load_path = options->a2l_path;
-    if (options->transport_request.transport ==
-        calmcar::xcp::TransportKind::Tcp) {
+    const bool boot_is_tcp =
+        options->transport_request.transport ==
+        calmcar::xcp::TransportKind::Tcp;
+    const bool transport_kind_explicit =
+        options->transport_request.transport_explicit;
+    // TCP alignment 证据只在两种启动下可能用到：显式 TCP，以及"传输层尚未
+    // 确定"（稍后的双路嗅探可能选中 TCP）。快照一律提前准备好，但**只有
+    // 显式 TCP 才从快照解析**——未确定时从原始路径解析，避免让最终走 UDP
+    // 的那次启动也承担快照带来的 include 相对路径变化。
+    if (boot_is_tcp || !transport_kind_explicit) {
         a2l_snapshot = calmcar::xcp::StageTrustedA2lSnapshot(
             options->a2l_path, options->a2l_snapshot_root);
         if (a2l_snapshot->trusted) {
-            a2l_load_path = a2l_snapshot->path.string();
-            std::cout << "A2L 受控快照: " << a2l_snapshot->reason << '\n';
-        } else {
+            if (boot_is_tcp) {
+                a2l_load_path = a2l_snapshot->path.string();
+                std::cout << "A2L 受控快照: " << a2l_snapshot->reason << '\n';
+            }
+        } else if (boot_is_tcp) {
             std::cerr << "A2L 受控快照不可信: " << a2l_snapshot->reason
                       << "；本次连接的 TCP alignment 不作为依据。\n";
         }
@@ -4418,6 +4509,141 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- 传输层嗅探（计划 §9 / 实施步骤 T5）------------------------------
+    // 只有"用户没有显式指定传输层类别"时才嗅探。显式 `--transport` 表达的
+    // 是部署意图，用嗅探去推翻它只会让人以为是 bug（计划 §9.9）。
+    // 显式 `--transport tcp` 但未给 Profile 的情况，已在解析参数时隐含
+    // `--tcp-profile auto`，由下方的 auto 分支只嗅 TCP 候选。
+    if (!options->transport_request.transport_explicit) {
+        calmcar::xcp::tools::A2lEndpointSummary tcp_summary;
+        calmcar::xcp::tools::A2lEndpointSummary udp_summary;
+        if (const auto* sniff_info = bridge->XcpInfo();
+            sniff_info != nullptr) {
+            tcp_summary = SummarizeA2lEndpoint(
+                *sniff_info,
+                calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp);
+            udp_summary = SummarizeA2lEndpoint(
+                *sniff_info,
+                calmcar::xcp::a2l::TransportEndpoint::Kind::UdpIp);
+            if (sniff_info->ambiguous) {
+                std::cerr << "A2L 的 IF_DATA XCP 存在歧义（多 MODULE 且未给出 "
+                             "--module）：端点不作为嗅探依据。\n";
+            }
+        }
+        const auto plan = calmcar::xcp::tools::BuildDualSniffPlan(
+            tcp_summary, udp_summary, options->transport_request.host,
+            options->transport_request.port,
+            calmcar::xcp::tools::SniffScope::Dual);
+        if (plan.empty()) {
+            std::cerr << "没有可用于连接的端点：命令行未给出 --host/--port，"
+                         "A2L 也未声明 XCP_ON_TCP_IP / XCP_ON_UDP_IP。\n";
+            return calmcar::xcp::tools::kAutoNegotiationAllRejected;
+        }
+        // 判定谓词：TCP 走候选验证组件（含协议层三态），UDP 新建一条连接
+        // 做 CONNECT 域内校验。判据必须与 TCP 侧一致——否则"能收包"会把
+        // 完全无关的服务端也判成成功。
+        const calmcar::xcp::tools::SniffAttemptFn sniff_attempt =
+            [](const calmcar::xcp::tools::SniffPlanEntry& entry)
+            -> calmcar::xcp::FramingVerificationResult {
+            calmcar::xcp::FramingVerificationResult verdict;
+            const auto start = std::chrono::steady_clock::now();
+            const auto elapsed = [&start]() {
+                return static_cast<long long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start)
+                        .count());
+            };
+            try {
+                if (entry.transport == calmcar::xcp::TransportKind::Tcp) {
+                    if (!entry.candidate.has_value()) {
+                        verdict.reason = "TCP 条目缺少帧布局候选";
+                        verdict.elapsed_ms = elapsed();
+                        return verdict;
+                    }
+                    calmcar::xcp::TcpFramingProbeConfig probe;
+                    probe.host = entry.host;
+                    probe.port = entry.port;
+                    probe.connect_timeout_ms = 3000U;
+                    probe.command_timeout_ms = 1000U;
+                    return calmcar::xcp::VerifyTcpFramingCandidate(
+                        probe, *entry.candidate);
+                }
+                // UDP 没有帧布局概念，只有对齐：嗅探阶段一律按 8 bit 试，
+                // 16/32 bit 的对齐由 A2L 证据在解析阶段决定。
+                calmcar::xcp::UdpTransportConfig udp_config;
+                udp_config.remote_host = entry.host;
+                udp_config.remote_port = entry.port;
+                udp_config.packet_alignment =
+                    calmcar::xcp::PacketAlignment::Bit8;
+                calmcar::xcp::XcpMasterOptions sniff_options;
+                auto candidate_master =
+                    std::make_unique<calmcar::xcp::XcpMaster>(
+                        std::make_unique<calmcar::xcp::UdpTransport>(
+                            udp_config),
+                        sniff_options);
+                candidate_master->Connect();
+                const auto session =
+                    candidate_master->GetSessionParameters().connect;
+                if (session.max_cto < 8U) {
+                    verdict.reason = "CONNECT 后的 MAX_CTO 小于 8";
+                } else if (session.max_dto < 8U) {
+                    verdict.reason = "CONNECT 后的 MAX_DTO 小于 8";
+                } else if (session.protocol_layer_version != 1U) {
+                    verdict.reason = "CONNECT 的 PL 主版本不是 1";
+                } else if (session.transport_layer_version != 1U) {
+                    verdict.reason = "CONNECT 的 TL 主版本不是 1";
+                } else {
+                    verdict.verdict =
+                        calmcar::xcp::FramingVerdict::Accepted;
+                }
+            } catch (const std::exception& error) {
+                // 连不上/超时无法证明对端拒绝，按"未决"记录（退出码 4）。
+                verdict.reason = error.what();
+            }
+            verdict.elapsed_ms = elapsed();
+            return verdict;
+        };
+        std::cout << "传输层嗅探：" << plan.size()
+                  << " 个候选依次试连，首个合法响应即采用\n";
+        const auto sniff_result =
+            calmcar::xcp::tools::SniffTransport(plan, sniff_attempt);
+        for (const auto& item : sniff_result.attempts) {
+            std::cout << "  试连 "
+                      << calmcar::xcp::tools::DescribeSniffEntry(item.entry)
+                      << "："
+                      << calmcar::xcp::FramingVerdictName(item.verdict)
+                      << "，耗时 " << item.elapsed_ms << " ms";
+            if (!item.reason.empty()) {
+                std::cout << "，原因：" << item.reason;
+            }
+            std::cout << '\n';
+        }
+        if (!sniff_result.Succeeded()) {
+            std::cerr << sniff_result.FailureReport() << '\n';
+            return calmcar::xcp::tools::SniffExitCode(sniff_result);
+        }
+        const auto& winner = *sniff_result.selected;
+        options->transport_request.transport = winner.transport;
+        if (winner.transport == calmcar::xcp::TransportKind::Tcp) {
+            // 布局已被端到端验证：固化为显式请求，后续解析与建连不再走
+            // auto 分支（正式会话另建连接，绝不复用试连连接，计划 C1）。
+            options->transport_request.tcp_profile = winner.candidate->profile;
+            options->transport_request.tcp_profile_auto = false;
+            options->transport_request.tcp_profile_auto_legacy = false;
+            options->transport_request.packet_alignment_bits =
+                static_cast<std::uint8_t>(winner.candidate->alignment);
+        }
+        // 端点不在此处回填：若来自 A2L，交给 ResolveTransportSelection()
+        // 走 A2L 分支，`endpoint_source` 才能如实记为 A2l 而不是 Cli。
+        std::cout << "嗅探结论：使用 "
+                  << calmcar::xcp::tools::SniffTransportName(winner.transport)
+                  << " " << winner.host << ":" << winner.port;
+        if (winner.endpoint_from_a2l) {
+            std::cout << "（端点取自 A2L）";
+        }
+        std::cout << '\n';
+    }
+
     // ---- 传输层选择（B-T5 §8.1）------------------------------------------
     // 把 A2L 事实按本次 `--transport` **过滤后**再交给纯函数解析：
     // 规则 5 要求端点/对齐/Profile 同属一个 transport kind，因此这里绝不
@@ -4441,8 +4667,14 @@ int main(int argc, char** argv) {
         if (wanted == calmcar::xcp::a2l::TransportEndpoint::Kind::TcpIp) {
             tcp_alignment_verdict.reason = "A2L 快照不可信，未做原文核对";
             if (a2l_snapshot.has_value() && a2l_snapshot->trusted) {
+                // 传入 include 解析回调：含 `/include` 的 A2L 才能证明
+                // "端点声明唯一"，否则一律按不受信处理（fail closed）。
                 const auto candidate = calmcar::xcp::ScanA2lTcpCandidate(
-                    a2l_snapshot->bytes);
+                    a2l_snapshot->bytes,
+                    calmcar::xcp::tools::MakeIncludeResolver(
+                        {std::filesystem::path(options->a2l_path)
+                             .parent_path(),
+                         calmcar::xcp::tools::kIncludeMaxBytes}));
                 if (!candidate.has_value()) {
                     tcp_alignment_verdict.reason =
                         "A2L 原文不在受限子集内，无法证明 alignment 声明位置";

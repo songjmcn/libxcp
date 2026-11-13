@@ -140,3 +140,11 @@ add_library(liba2l::liba2l ALIAS liba2l)
 # bridge 只依赖本工程的 liba2l::liba2l（不引用主树 libxcp 头，已实测 0 命中），
 # 故可完全脱离主树构建；其 C++20 约束与 P9 隔离扫描在子工程内自带。
 add_subdirectory(a2lbridge ${CMAKE_CURRENT_BINARY_DIR}/a2lbridge-build)
+
+# --- A2L 适配层（可选子模块；只在主树构建时可用）-----------------------------
+# 适配层把桥接层接到核心的窄接口上，依赖 libxcp 核心，因此只有在主树
+# （根 CMakeLists.txt 已先创建 libxcp 目标）构建时才创建本目标；
+# 独立 SDK 构建（build-sdk.ps1）没有 libxcp 目标，整目录跳过。
+if(TARGET libxcp)
+    add_subdirectory(adapter ${CMAKE_CURRENT_BINARY_DIR}/adapter-build)
+endif()

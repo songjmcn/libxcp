@@ -164,6 +164,80 @@ TEST(TransportSelection, UdpTakesExplicitA2lAlignment) {
 }
 
 // ---------------------------------------------------------------------------
+// 规则 9 放宽（计划 §9.5 / 实施步骤 T4）
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief 未显式指定传输层时，UDP 端点允许回落到 A2L 的 `XCP_ON_UDP_IP`。
+ * @details 改动前这里必然失败（`--a2l, --host 与 --port 为必填项`）。
+ *          放宽的**唯一**依据是"用户没有用 `--transport` 表达意图"：
+ *          显式指定时仍然要求命令行端点（见下一个用例）。
+ */
+TEST(TransportSelection, UdpFallsBackToA2lEndpointWhenTransportNotExplicit) {
+    TransportSelectionRequest request;
+    request.transport = TransportKind::Udp;
+    // 不设 transport_explicit：等价于用户只给了 `--a2l`。
+
+    A2lTransportFacts facts;
+    facts.declared = true;
+    facts.host = "192.168.2.137";
+    facts.port = 5559;
+    facts.instance_count = 1;
+
+    const auto resolved = Resolve(request, facts);
+
+    EXPECT_EQ(resolved.transport, TransportKind::Udp);
+    EXPECT_EQ(resolved.host, "192.168.2.137");
+    EXPECT_EQ(resolved.port, 5559U);
+    // 来源必须如实记为 A2L：save 依赖它写 endpoint_from_a2l。
+    EXPECT_EQ(resolved.endpoint_source, EndpointSource::A2l);
+    bool noted = false;
+    for (const auto& note : resolved.notes) {
+        if (note.find("XCP_ON_UDP_IP") != std::string::npos) noted = true;
+    }
+    EXPECT_TRUE(noted) << "放宽路径必须在 notes 里说明端点取自 A2L";
+}
+
+/**
+ * @brief 显式 `--transport udp` 时仍要求命令行端点（既有契约不回归）。
+ */
+TEST(TransportSelection, ExplicitUdpStillRequiresCliEndpoint) {
+    TransportSelectionRequest request;
+    request.transport = TransportKind::Udp;
+    // 用户写了 `--transport udp`：这是部署意图，不得被 A2L 静默改写。
+    request.transport_explicit = true;
+
+    A2lTransportFacts facts;
+    facts.declared = true;
+    facts.host = "192.168.2.137";
+    facts.port = 5559;
+    facts.instance_count = 1;
+
+    const auto error = ResolveExpectFailure(request, facts);
+
+    EXPECT_NE(error.find("--host/--port"), std::string::npos);
+    EXPECT_NE(error.find("XCP_ON_UDP_IP"), std::string::npos);
+}
+
+/**
+ * @brief A2L 声明了 UDP 但端点缺地址：不得静默连到空地址。
+ */
+TEST(TransportSelection, UdpA2lEndpointWithoutAddressIsRejected) {
+    TransportSelectionRequest request;
+    request.transport = TransportKind::Udp;
+
+    A2lTransportFacts facts;
+    facts.declared = true;
+    facts.host.clear();
+    facts.port = 5559;
+    facts.instance_count = 1;
+
+    const auto error = ResolveExpectFailure(request, facts);
+
+    EXPECT_NE(error.find("XCP_ON_UDP_IP"), std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
 // 规则 1 / 4：TCP 必须显式 Profile；端点可回落 A2L
 // ---------------------------------------------------------------------------
 

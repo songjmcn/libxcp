@@ -375,6 +375,12 @@ if(LIBXCP_BUILD_TOOLS)
   add_test(NAME XcpMasterToolConfigOption
            COMMAND ${CMAKE_COMMAND} "-DXCP_MASTER=$<TARGET_FILE:xcp_master>"
                    -P "${CMAKE_CURRENT_SOURCE_DIR}/xcp_master_config_option_test.cmake")
+  # 传输层与端点从 A2L 推导：只给 --a2l 不再要求 --host/--port、显式 tcp 缺
+  # profile 时的提示、--help 里的端点来源说明。嗅探本身需要交互式终端，
+  # 端口层断言见脚本头部说明。
+  add_test(NAME XcpMasterToolTransportInference
+           COMMAND ${CMAKE_COMMAND} "-DXCP_MASTER=$<TARGET_FILE:xcp_master>"
+                   -P "${CMAKE_CURRENT_SOURCE_DIR}/xcp_master_transport_inference_test.cmake")
   add_test(NAME XcpMasterToolRejectsMissingArgs COMMAND xcp_master)
   set_tests_properties(XcpMasterToolRejectsMissingArgs PROPERTIES WILL_FAIL TRUE)
   add_test(NAME XcpMasterToolRejectsPollingIntervalInDaq
@@ -402,7 +408,9 @@ if(LIBXCP_BUILD_TOOLS)
           # 工程配置文件（JSON）的序列化、校验与原子写入用例。
           xcp_master_project_file_test.cpp
           # 标定视图行文本、空名单提示与四视图导航用例。
-          xcp_master_calibration_view_test.cpp)
+          xcp_master_calibration_view_test.cpp
+          # T1/T9：双路嗅探计划顺序、跳过规则与"首胜即停"契约用例。
+          xcp_master_transport_sniff_test.cpp)
   target_compile_features(XcpMasterSymbolPolicyTest PRIVATE cxx_std_20)
   target_include_directories(XcpMasterSymbolPolicyTest PRIVATE
           ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include

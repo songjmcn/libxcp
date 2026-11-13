@@ -153,8 +153,41 @@ TEST(ProjectFile, RoundTripPreservesEveryField) {
     EXPECT_EQ(parsed.session.mode, original.session.mode);
     EXPECT_EQ(parsed.session.interval_ms, original.session.interval_ms);
     EXPECT_EQ(parsed.session.module, original.session.module);
+    EXPECT_EQ(parsed.session.config_source, original.session.config_source);
     EXPECT_EQ(parsed.observe, original.observe);
     EXPECT_EQ(parsed.calibrate, original.calibrate);
+}
+
+/// @brief `session.config_source` 写入后出现在 JSON 里并可原样读回
+TEST(ProjectFile, WritesAndReadsConfigSource) {
+    auto file = MakeBaseline();
+    file.session.config_source = std::string("runtime");
+
+    const auto text = ProjectFileToJson(file);
+    EXPECT_NE(text.find("\"config_source\": \"runtime\""), std::string::npos)
+        << text;
+
+    ProjectFile parsed;
+    std::string error;
+    ASSERT_TRUE(ParseProjectFileJson(text, parsed, error)) << error;
+    ASSERT_TRUE(parsed.session.config_source.has_value());
+    EXPECT_EQ(*parsed.session.config_source, "runtime");
+}
+
+/// @brief `config_source` 是只读标记：任意字符串都接受，不做取值校验
+TEST(ProjectFile, AcceptsAnyConfigSourceText) {
+    auto text = MinimalJson();
+    ReplaceLiteral(
+        text, "\"session\": {\"mode\": \"poll\", \"interval_ms\": 500, "
+              "\"module\": null}",
+        "\"session\": {\"mode\": \"poll\", \"interval_ms\": 500, "
+        "\"module\": null, \"config_source\": \"handwritten\"}");
+
+    ProjectFile parsed;
+    std::string error;
+    ASSERT_TRUE(ParseProjectFileJson(text, parsed, error)) << error;
+    ASSERT_TRUE(parsed.session.config_source.has_value());
+    EXPECT_EQ(*parsed.session.config_source, "handwritten");
 }
 
 /// @brief Windows 反斜杠路径与中文路径往返后逐字节一致

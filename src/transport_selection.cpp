@@ -261,13 +261,28 @@ ResolveTransportSelection(const TransportSelectionRequest& request,
         resolved.notes.push_back(
             "端点取自 A2L XCP_ON_TCP_IP 声明：" + resolved.host + ":" +
             std::to_string(resolved.port));
+    } else if (a2l.declared && !request.transport_explicit) {
+        // 规则 9 的放宽（计划 §9.5 / T4）：**未显式指定**传输层时，
+        // 传输层由嗅探决定，此时 UDP 与 TCP 对称地从 A2L 取端点。
+        // 显式 `--transport udp` 不走这里：那是"我就要 UDP"，不该替用户
+        // 猜测一个 A2L 里碰巧存在的端点。
+        resolved.host = a2l.host;
+        resolved.port = a2l.port;
+        resolved.endpoint_source = EndpointSource::A2l;
+        if (resolved.host.empty() || resolved.port == 0) {
+            return fail("A2L 的 XCP_ON_UDP_IP 端点缺少可用的地址或端口");
+        }
+        resolved.notes.push_back(
+            "端点取自 A2L XCP_ON_UDP_IP 声明：" + resolved.host + ":" +
+            std::to_string(resolved.port));
     } else {
-        // UDP 保持既有契约：host/port 必填，不做 A2L 自动选择（规则 9）
+        // 显式指定了传输层却没有任何端点：保持既有必填契约。
         if (request.transport == TransportKind::Tcp) {
             return fail("TCP 传输需要 --host/--port，或 A2L 中声明 "
                         "XCP_ON_TCP_IP 端点");
         }
-        return fail("--a2l, --host 与 --port 为必填项");
+        return fail("UDP 传输需要 --host/--port，或 A2L 中声明 "
+                    "XCP_ON_UDP_IP 端点");
     }
 
     // ---- 规则 2 / 规则 3：PACKET_ALIGNMENT ---------------------------------

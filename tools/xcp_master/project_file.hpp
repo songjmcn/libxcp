@@ -122,6 +122,12 @@ struct ProjectSession {
 
     /// @brief A2L 模块过滤；不过滤时为空
     std::optional<std::string> module;
+
+    /// @brief 配置来源标记，本工具写入固定为 `"runtime"`
+    /// @details 只读字段：`-c` 加载时读取但**不参与**任何取值决策，仅用于人工
+    ///          判断这份 JSON 是"运行时实际生效值"快照还是手写的意图文件。
+    ///          因此它不进入 `MergeProjectFileIntoOptions` 的优先级链。
+    std::optional<std::string> config_source;
 };
 
 /**
@@ -435,6 +441,8 @@ template <typename T>
     session["interval_ms"] =
         detail::ToJsonOptionalUnsigned(file.session.interval_ms);
     session["module"] = detail::ToJsonOptional(file.session.module);
+    session["config_source"] =
+        detail::ToJsonOptional(file.session.config_source);
     root["session"] = std::move(session);
 
     root["observe"] = file.observe;
@@ -663,8 +671,9 @@ template <typename T>
         return false;
     }
     const auto& session = *session_it;
-    if (!detail::RequireOnlyKeys(session, {"mode", "interval_ms", "module"},
-                                 "session", error)) {
+    if (!detail::RequireOnlyKeys(
+            session, {"mode", "interval_ms", "module", "config_source"},
+            "session", error)) {
         return false;
     }
     if (!detail::ReadRequiredString(session, "mode", "session.mode",
@@ -691,6 +700,12 @@ template <typename T>
     }
     if (!detail::ReadOptionalString(session, "module", "session.module",
                                     parsed.session.module, error)) {
+        return false;
+    }
+    // 只读标记：读出来仅供回写与人工核对，不参与任何默认值或优先级决策。
+    if (!detail::ReadOptionalString(session, "config_source",
+                                    "session.config_source",
+                                    parsed.session.config_source, error)) {
         return false;
     }
 
