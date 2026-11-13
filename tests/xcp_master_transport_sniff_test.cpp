@@ -30,7 +30,9 @@ namespace {
 using calmcar::xcp::FramingVerdict;
 using calmcar::xcp::FramingVerificationResult;
 using calmcar::xcp::TransportKind;
+using calmcar::xcp::tools::A2lEndpointDeclaration;
 using calmcar::xcp::tools::A2lEndpointSummary;
+using calmcar::xcp::tools::SummarizeA2lEndpoints;
 using calmcar::xcp::tools::BuildDualSniffPlan;
 using calmcar::xcp::tools::DescribeSniffEntry;
 using calmcar::xcp::tools::SniffExitCode;
@@ -408,6 +410,162 @@ TEST(TransportSniffRun, EmptyPredicateIsInconclusive) {
 }
 
 // ---------------------------------------------------------------------------
+// 端点摘要归纳（评审问题 1/2：判歧义必须看四要素）
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief 构造一条端点声明
+ * @param host 地址
+ * @param port 端口
+ * @param version 传输层版本，0 表示未声明
+ * @param alignment 对齐位宽，0 表示未声明
+ * @param instances A2L 中同类端点的声明个数
+ * @return 声明对象
+ */
+A2lEndpointDeclaration Declaration(const std::string& host,
+                                   std::uint16_t port,
+                                   std::uint16_t version = 0,
+                                   std::uint8_t alignment = 0,
+                                   std::uint32_t instances = 1) {
+    A2lEndpointDeclaration declaration;
+    declaration.host = host;
+    declaration.port = port;
+    declaration.transport_layer_version = version;
+    declaration.packet_alignment_bits = alignment;
+    declaration.instance_count = instances;
+    return declaration;
+}
+
+/**
+ * @brief 单条声明：没有可比对象，不可能判歧义。
+ * @details 同时钉住"未声明的版本不得出现在摘要里"——`optional` 为空表示
+ *          没有证据，而不是"版本 0"。
+ */
+TEST(TransportSniffSummary, SingleDeclarationIsNotAmbiguous) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555, 0x0104U, 8U)};
+
+    const auto summary = SummarizeA2lEndpoints(declarations, false);
+
+    EXPECT_TRUE(summary.declared);
+    EXPECT_FALSE(summary.ambiguous);
+    EXPECT_EQ(summary.host, "192.168.0.1");
+    EXPECT_EQ(summary.port, 5555U);
+    EXPECT_EQ(summary.packet_alignment_bits, 8U);
+    ASSERT_TRUE(summary.transport_layer_version.has_value());
+    EXPECT_EQ(*summary.transport_layer_version, 0x0104U);
+    EXPECT_EQ(summary.instance_count, 1U);
+}
+
+/**
+ * @brief 未声明版本时摘要的 `optional` 保持为空。
+ */
+TEST(TransportSniffSummary, UndeclaredVersionStaysEmpty) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555)};
+
+    const auto summary = SummarizeA2lEndpoints(declarations, false);
+
+    EXPECT_FALSE(summary.transport_layer_version.has_value());
+    EXPECT_EQ(summary.packet_alignment_bits, 0U);
+}
+
+/**
+ * @brief 完全重复的声明（生成器重复输出）去重后仍是唯一，不判歧义。
+ */
+TEST(TransportSniffSummary, IdenticalDuplicatesAreNotAmbiguous) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555, 0x0104U, 8U),
+        Declaration("192.168.0.1", 5555, 0x0104U, 8U)};
+
+    const auto summary = SummarizeA2lEndpoints(declarations, false);
+
+    EXPECT_FALSE(summary.ambiguous);
+    EXPECT_EQ(summary.host, "192.168.0.1");
+    EXPECT_EQ(summary.port, 5555U);
+}
+
+/**
+ * @brief 地址不同：连错实例不会报错，只会连到另一台 ECU，必须判歧义。
+ */
+TEST(TransportSniffSummary, DifferentHostIsAmbiguous) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555), Declaration("192.168.0.2", 5555)};
+
+    EXPECT_TRUE(SummarizeA2lEndpoints(declarations, false).ambiguous);
+}
+
+/**
+ * @brief 端口不同：同上。
+ */
+TEST(TransportSniffSummary, DifferentPortIsAmbiguous) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555), Declaration("192.168.0.1", 5559)};
+
+    EXPECT_TRUE(SummarizeA2lEndpoints(declarations, false).ambiguous);
+}
+
+/**
+ * @brief 传输层版本不同：同址同端口但线路线格式不同，仍不能替用户选。
+ * @details 这正是评审问题 2：只比 host+port 会把这种情况漏掉，让首实例的
+ *          证据悄悄决定 TCP 候选顺序。
+ */
+TEST(TransportSniffSummary, DifferentTransportLayerVersionIsAmbiguous) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555, 0x0104U),
+        Declaration("192.168.0.1", 5555, 0x0105U)};
+
+    EXPECT_TRUE(SummarizeA2lEndpoints(declarations, false).ambiguous);
+}
+
+/**
+ * @brief 对齐不同：同址同端口同版本，但线路线宽不同，同样判歧义。
+ */
+TEST(TransportSniffSummary, DifferentAlignmentIsAmbiguous) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555, 0x0104U, 8U),
+        Declaration("192.168.0.1", 5555, 0x0104U, 16U)};
+
+    EXPECT_TRUE(SummarizeA2lEndpoints(declarations, false).ambiguous);
+}
+
+/**
+ * @brief 只有一条记录却声明了多个实例（v9 兼容路径不展开）：fail closed。
+ */
+TEST(TransportSniffSummary, InstanceCountAboveOneWithoutDetailsIsAmbiguous) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555, 0x0104U, 8U, 3U)};
+
+    const auto summary = SummarizeA2lEndpoints(declarations, false);
+
+    EXPECT_TRUE(summary.declared);
+    EXPECT_TRUE(summary.ambiguous);
+    EXPECT_EQ(summary.instance_count, 3U);
+}
+
+/**
+ * @brief 桥接层已判多 MODULE 歧义时透传，即使只有一条端点记录。
+ */
+TEST(TransportSniffSummary, ModuleAmbiguityPropagates) {
+    const std::vector<A2lEndpointDeclaration> declarations{
+        Declaration("192.168.0.1", 5555)};
+
+    EXPECT_TRUE(SummarizeA2lEndpoints(declarations, true).ambiguous);
+}
+
+/**
+ * @brief 完全没有声明：`declared` 为 false，不参与嗅探计划。
+ */
+TEST(TransportSniffSummary, EmptyDeclarationsStayUndeclared) {
+    const auto summary =
+        SummarizeA2lEndpoints(std::vector<A2lEndpointDeclaration>{}, false);
+
+    EXPECT_FALSE(summary.declared);
+    EXPECT_FALSE(summary.ambiguous);
+    EXPECT_EQ(summary.instance_count, 0U);
+}
+
+// ---------------------------------------------------------------------------
 // 诊断文本（§9.8 / T8）
 // ---------------------------------------------------------------------------
 
@@ -478,6 +636,70 @@ TEST(TransportSniffReport, DescribesEntries) {
     }
     EXPECT_TRUE(saw_tcp);
     EXPECT_TRUE(saw_udp);
+}
+
+/**
+ * @brief 只试过 TCP 时，汇总行不得宣称"UDP 也没响应"。
+ * @details 评审问题 6：用户会照汇总行去排查一个根本没尝试过的传输层。
+ */
+TEST(TransportSniffReport, FailureReportNamesOnlyAttemptedTransports) {
+    const auto plan =
+        BuildDualSniffPlan(Declared("192.168.0.1", 5555), A2lEndpointSummary{},
+                           std::nullopt, std::nullopt, SniffScope::TcpOnly);
+
+    const auto result = SniffTransport(
+        plan, VerdictPredicate(FramingVerdict::Rejected, nullptr));
+    const auto report = result.FailureReport();
+
+    EXPECT_NE(report.find("TCP 候选均未得到合法响应"), std::string::npos);
+    EXPECT_EQ(report.find("UDP"), std::string::npos);
+}
+
+/**
+ * @brief 只试过 UDP 时，汇总行只提 UDP。
+ */
+TEST(TransportSniffReport, FailureReportNamesUdpOnly) {
+    const auto plan = BuildDualSniffPlan(A2lEndpointSummary{},
+                                         Declared("192.168.0.1", 5559),
+                                         std::nullopt, std::nullopt,
+                                         SniffScope::Dual);
+    ASSERT_EQ(plan.size(), 1U);
+
+    const auto result = SniffTransport(
+        plan, VerdictPredicate(FramingVerdict::Inconclusive, nullptr));
+    const auto report = result.FailureReport();
+
+    EXPECT_NE(report.find("UDP 端点未得到合法响应"), std::string::npos);
+    EXPECT_EQ(report.find("TCP"), std::string::npos);
+}
+
+/**
+ * @brief 两路都试过时，汇总行才可以说"TCP 与 UDP 均未"。
+ */
+TEST(TransportSniffReport, FailureReportNamesBothTransports) {
+    const auto plan = BuildDualSniffPlan(Declared("192.168.0.1", 5555),
+                                         Declared("192.168.0.1", 5559),
+                                         std::nullopt, std::nullopt,
+                                         SniffScope::Dual);
+
+    const auto result = SniffTransport(
+        plan, VerdictPredicate(FramingVerdict::Rejected, nullptr));
+
+    EXPECT_NE(result.FailureReport().find("TCP 与 UDP 均未得到合法响应"),
+              std::string::npos);
+}
+
+/**
+ * @brief 一个候选都没有时，报告不能说"对端没响应"——那是配置不全。
+ */
+TEST(TransportSniffReport, FailureReportOnEmptyPlan) {
+    const auto result = SniffTransport(
+        std::vector<SniffPlanEntry>{},
+        VerdictPredicate(FramingVerdict::Rejected, nullptr));
+
+    EXPECT_FALSE(result.Succeeded());
+    EXPECT_NE(result.FailureReport().find("没有任何候选可试"),
+              std::string::npos);
 }
 
 /**

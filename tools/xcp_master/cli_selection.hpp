@@ -259,6 +259,11 @@ struct RuntimeVersionStatus {
 
 /// @brief auto 协商成功时使用的退出码
 inline constexpr int kAutoNegotiationOk = 0;
+/// @brief 嗅探/协商根本没有候选可试（端点配置不全）时使用的退出码
+/// @details 与"候选全被拒"(3)分开：3 表示对端在回话、只是线路参数不对，
+///          用户该改配置；而没有任何候选意味着**连一次连接都没发起**，
+///          属于参数/文件层面的配置不全，与进程其它配置错误保持同一个码。
+inline constexpr int kAutoNegotiationNoEndpoint = 2;
 /// @brief auto 协商"全部候选都被对端拒绝"时使用的退出码
 inline constexpr int kAutoNegotiationAllRejected = 3;
 /// @brief auto 协商"存在未决候选（对端无任何协议层回应）"时使用的退出码

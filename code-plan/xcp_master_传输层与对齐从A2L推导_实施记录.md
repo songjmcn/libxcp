@@ -132,10 +132,21 @@ host/port 留给随后的 `ResolveTransportSelection()` 走 A2L 分支。这样 
 | --- | --- | --- |
 | `ctest -R "XcpMaster|A2l|Transport"` | **344/344 通过** | 89.88 s |
 | `ctest -E "Example"` | **1265/1265 通过** | 237.67 s |
+| `ctest -R "Example"` | **19/19 通过** | 62.61 s |
+| `ctest`（全量，含 Example） | **1284/1284 通过** | 300.72 s |
 
 6 项未运行全部是既有 Disabled/Skipped（`TcpStreamDecoderFinish.HeaderOnlyIsTruncated`、
 `Ag1_Cto8`、`SnapshotTest` 3 项、`RendersFrameWithFieldSizeCandidateList`）。
-`Example*` 因本机 UDP 5555 被残留 `xcp_slave_demo.exe` 占用而未纳入，属环境问题。
+
+> **踩坑：Example 系列会因残留 slave 假失败。** 首次全量跑出现过 5 个 `Example*` 失败
+> （`ExampleXcpMasterUdp` / `ExampleMeasurementDemo` / `ExampleCppDemoMeasurement` /
+> `ExampleCppDemoCalibration` / `ExampleXcpIntegrationDemoCppDemo`），输出是
+> `[env] 端口 5555 已被占用（疑似已有 XCP slave 在跑），请先停止`，而不是断言失败。
+> 原因是上一次被中断的 ctest 留下一个 `xcp_slave_demo.exe` 仍占着 `UDP 127.0.0.1:5555`；
+> 该进程自行退出后 `ctest -R "Example"` 与全量 `ctest` 均 100% 通过。
+> 处置办法：跑之前 `netstat -ano | findstr :5555`，命中就结束对应 PID 再跑。
+> 这不是代码回归，`Examples` 也不能并行跑（并行会互相抢 5555，见
+> `code-plan/标定可写性_CALIBRATION_ACCESS参与判定_实施记录.md:114`）。
 
 ## 6. 人工验收步骤
 
@@ -177,7 +188,9 @@ cmake -DXCP_MASTER="<abs>/cmake-build-release/tools/xcp_master/xcp_master.exe" `
 set TMPDIR=<可写目录>
 set TEMP=%TMPDIR%
 set TMP=%TMPDIR%
-ctest --test-dir cmake-build-release -E "Example" --output-on-failure
+# 先确认没有残留 slave 占着 5555，否则 Example 系列会假失败
+netstat -ano | findstr :5555
+ctest --test-dir cmake-build-release --output-on-failure
 ```
 
 ## 9. 过程中的三次 EOL 事故（教训）

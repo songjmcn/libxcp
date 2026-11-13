@@ -26,7 +26,7 @@ For TCP the tool stages the A2L into a private snapshot before the SDK parses it
 
 ### Endpoint inference
 
-With only `--a2l <path>` the tool no longer demands `--host`/`--port`. When `--transport` is *not* given, `xcp_master` loads the A2L first, builds a sniffer plan from every declared endpoint, and tries them in order: TCP framing candidates first, then UDP. Each attempt is reported (`试连 TCP 127.0.0.1:5555 AsamV14/8bit：被拒，耗时 41 ms`), the first one that produces a legal XCP reply wins, and the session is then established on that transport. Exit codes match TCP `auto`: `0` connected, `3` every candidate was rejected by the peer, `4` at least one attempt stayed inconclusive.
+With only `--a2l <path>` the tool no longer demands `--host`/`--port`. When `--transport` is *not* given, `xcp_master` loads the A2L first, builds a sniffer plan from every declared endpoint, and tries them in order: TCP framing candidates first, then UDP. Each attempt is reported (`试连 TCP 127.0.0.1:5555 AsamV14/8bit：被拒，耗时 41 ms`), the first one that produces a legal XCP reply wins, and the session is then established on that transport. Exit codes match TCP `auto`: `0` connected, `2` there was no candidate at all (endpoint configuration is incomplete — nothing was contacted), `3` every candidate was rejected by the peer, `4` at least one attempt stayed inconclusive. The failure summary names only the transports that were actually attempted, so `TCP 候选均未得到合法响应` never implies UDP was tried.
 
 Explicit intent always wins over sniffing:
 
@@ -36,9 +36,10 @@ Explicit intent always wins over sniffing:
 | `--a2l x.a2l --transport tcp` | TCP only. Without `--tcp-profile` this is equivalent to `--tcp-profile auto` |
 | `--a2l x.a2l --transport tcp --tcp-profile asam-v1.4` | Use that profile, no sniffing |
 | `--a2l x.a2l --transport udp` | UDP with `--host`/`--port`; the A2L endpoint is *not* used |
+| `--a2l x.a2l --host 1.2.3.4` | Rejected before any connection: `--host 与 --port 必须成对出现（只给其中一个无法确定端点）` |
 | `-c project.json` | The file records the transport that last actually worked, so it is replayed as-is and never sniffed |
 
-Two A2L-level limitations are deliberate. Multiple `MODULE`s without `--module` make the declaration ambiguous, and `ambiguous` A2L endpoints are never used as sniff evidence (`A2L 的 IF_DATA XCP 存在歧义…`); several differing instances are treated the same way, because picking the wrong one connects to a different ECU without any error. The transport kind is still never *decided* by the A2L alone — it only decides the order in which declared endpoints are tried.
+Two A2L-level limitations are deliberate. Multiple `MODULE`s without `--module` make the declaration ambiguous, and `ambiguous` A2L endpoints are never used as sniff evidence (`A2L 的 IF_DATA XCP 存在歧义…`); several differing instances are treated the same way, because picking the wrong one connects to a different ECU without any error. *Differing* is judged on the same four elements the core uses for `SameWireTarget`: host, port, `PACKET_ALIGNMENT` and transport-layer version — two declarations that agree on the address but disagree on alignment or TL version are ambiguous too. A declaration whose instance count is above one but whose details are not expanded (legacy A2L) is also treated as ambiguous instead of trusting the first record. The transport kind is still never *decided* by the A2L alone — it only decides the order in which declared endpoints are tried.
 
 ### Project file
 

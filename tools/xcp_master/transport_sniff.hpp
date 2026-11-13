@@ -25,6 +25,7 @@
  *   报成"两种传输都不支持"。三态类型沿用 `FramingVerdict`。
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <optional>
@@ -73,6 +74,56 @@ struct A2lEndpointSummary {
     /// @brief A2L 显式声明的对齐位宽；0 表示未声明
     std::uint8_t packet_alignment_bits{0};
 };
+
+/**
+ * @brief 一条传输层端点声明（调用方从 A2L 事实映射而来）
+ *
+ * @details 字段是"四要素"的归一化形态，用来判定多实例是否真的冲突：
+ *          - 对齐未声明时填 0，**不得**填 8（AML 默认值不是 ECU 事实）；
+ *          - TL 版本未声明时填 0。
+ *          归一化口径与核心 `SameWireTarget()` 一致，避免嗅探阶段与解析
+ *          阶段对"同一个线路目标"给出不同答案。
+ */
+struct A2lEndpointDeclaration {
+    /// @brief 端点主机名/地址
+    std::string host;
+
+    /// @brief 端点端口
+    std::uint16_t port{0};
+
+    /// @brief 传输层版本（如 0x0104）；0 表示未声明
+    std::uint16_t transport_layer_version{0};
+
+    /// @brief 显式声明的对齐位宽；0 表示未声明
+    std::uint8_t packet_alignment_bits{0};
+
+    /// @brief A2L 中同类端点的声明个数（v9 兼容路径下可能大于 1 而只有一条记录）
+    std::uint32_t instance_count{0};
+};
+
+/**
+ * @brief 把同类端点声明归纳为嗅探计划的输入摘要
+ *
+ * @param declarations 同类端点的全部声明（可为空）
+ * @param module_ambiguous 桥接层是否已判定多 MODULE 歧义
+ * @return 摘要；无声明时 `declared` 为 false
+ *
+ * @details 判歧义只看"能不能唯一确定线路目标"，规则与核心
+ *          `SameWireTarget()` 同义：
+ *          - 四要素（host / port / 对齐 / TL 版本）去重后不止一个 →
+ *            `ambiguous`，由调用方给出"请显式指定端点"的诊断。**只比
+ *            host+port 是不够的**：同址但声明了不同对齐或 TL 版本时，
+ *            首实例的证据会悄悄决定 TCP 候选顺序；
+ *          - 只有一条记录却声明 `instance_count > 1`（v9 兼容路径不展开
+ *            实例）→ 无法验证唯一性，同样 `ambiguous`（fail closed）；
+ *          - 完全重复的声明（生成器重复输出）去重后仍是唯一，不判歧义。
+ *
+ * @note 对齐在此**只作排序线索**，不代表已核验；正式连接阶段的 TCP 对齐
+ *       由 `CrossCheckA2lTcpAlignment()` 双源核对决定。
+ */
+[[nodiscard]] A2lEndpointSummary SummarizeA2lEndpoints(
+    const std::vector<A2lEndpointDeclaration>& declarations,
+    bool module_ambiguous);
 
 /**
  * @brief 嗅探范围
@@ -154,7 +205,8 @@ struct TransportSniffResult {
      * @brief 生成失败时的逐行诊断文本
      * @return 多行中文文本；成功时返回空串
      * @details 形如：
-     *          `传输层嗅探失败：TCP 与 UDP 均未得到合法响应` 换行后逐行
+     *          `传输层嗅探失败：TCP 候选均未得到合法响应`（汇总行按**实际
+     *          尝试过的**传输层生成）换行后逐行
      *          `· TCP 192.168.0.1:5555 AsamV14/8bit：未决，耗时 1000 ms`。
      */
     [[nodiscard]] std::string FailureReport() const;
@@ -288,7 +340,27 @@ using SniffAttemptFn =
     if (selected.has_value()) {
         return std::string();
     }
-    std::string report = "传输层嗅探失败：TCP 与 UDP 均未得到合法响应";
+    // 汇总行必须与逐条列表一致：只试了 TCP 时不能说"TCP 与 UDP 均未"，
+    // 否则用户会去排查一个根本没尝试过的传输层。
+    bool has_tcp = false;
+    bool has_udp = false;
+    for (const SniffAttempt& item : attempts) {
+        if (item.entry.transport == TransportKind::Tcp) {
+            has_tcp = true;
+        } else {
+            has_udp = true;
+        }
+    }
+    std::string report = "传输层嗅探失败：";
+    if (has_tcp && has_udp) {
+        report += "TCP 与 UDP 均未得到合法响应";
+    } else if (has_tcp) {
+        report += "TCP 候选均未得到合法响应";
+    } else if (has_udp) {
+        report += "UDP 端点未得到合法响应";
+    } else {
+        report += "没有任何候选可试";
+    }
     for (const SniffAttempt& item : attempts) {
         report += "\n  · ";
         report += DescribeSniffEntry(item.entry);
@@ -303,6 +375,71 @@ using SniffAttemptFn =
         }
     }
     return report;
+}
+
+/**
+ * @brief 把同类端点声明归纳为嗅探计划的输入摘要
+ * @param declarations 同类端点的全部声明（可为空）
+ * @param module_ambiguous 桥接层是否已判定多 MODULE 歧义
+ * @return 摘要；无声明时 `declared` 为 false
+ */
+[[nodiscard]] inline A2lEndpointSummary SummarizeA2lEndpoints(
+    const std::vector<A2lEndpointDeclaration>& declarations,
+    bool module_ambiguous) {
+    A2lEndpointSummary summary;
+    if (module_ambiguous) {
+        summary.ambiguous = true;
+    }
+    if (declarations.empty()) {
+        return summary;
+    }
+
+    /// 去重用的"线路目标"：四要素归一化形态
+    struct WireTarget {
+        std::string host;      ///< 地址
+        std::uint16_t port;    ///< 端口
+        std::uint8_t alignment;///< 对齐位宽，0 表示未声明
+        std::uint16_t version; ///< TL 版本，0 表示未声明
+    };
+
+    std::vector<WireTarget> distinct;
+    std::uint32_t max_instances = 0;
+    for (const A2lEndpointDeclaration& declaration : declarations) {
+        max_instances = std::max(max_instances, declaration.instance_count);
+        const WireTarget target{declaration.host, declaration.port,
+                                declaration.packet_alignment_bits,
+                                declaration.transport_layer_version};
+        const bool seen =
+            std::any_of(distinct.begin(), distinct.end(),
+                        [&target](const WireTarget& other) {
+                            return other.host == target.host &&
+                                   other.port == target.port &&
+                                   other.alignment == target.alignment &&
+                                   other.version == target.version;
+                        });
+        if (!seen) {
+            distinct.push_back(target);
+        }
+    }
+
+    summary.declared = true;
+    summary.host = distinct.front().host;
+    summary.port = distinct.front().port;
+    summary.packet_alignment_bits = distinct.front().alignment;
+    if (distinct.front().version != 0U) {
+        summary.transport_layer_version = distinct.front().version;
+    }
+    summary.instance_count = max_instances == 0U ? 1U : max_instances;
+
+    // 两种必须 fail closed 的情形：
+    //  1) 四要素去重后不止一个 —— 真的可能连到另一台 ECU 或另一套线路参数；
+    //  2) 只有一条记录但声明计数 > 1 —— v9 兼容路径没有展开实例，无法验证。
+    if (distinct.size() > 1U) {
+        summary.ambiguous = true;
+    } else if (declarations.size() == 1U && max_instances > 1U) {
+        summary.ambiguous = true;
+    }
+    return summary;
 }
 
 /**
@@ -342,7 +479,11 @@ using SniffAttemptFn =
     const auto udp_endpoint = resolve(udp);
 
     // TCP 的候选序列：只在"8 bit 且声明了 TL 版本"时区分 V1.4/V1.5，
-    // 其余保持默认顺序。对齐声明仅用于排序，不代表已核验。
+    // 其余保持默认顺序。候选序列只决定**试连顺序**，全部候选最终都会被
+    // 尝试，因此这里用 A2L 的 TL 版本/对齐做排序线索不会漏掉正确布局；
+    // 但"声明"不等于"核验"——正式连接阶段的 TCP 对齐仍由
+    // CrossCheckA2lTcpAlignment() 双源核对决定，不得因为这里排了序就
+    // 把 A2L 的默认值当成 ECU 事实。
     std::vector<TcpFramingCandidate> tcp_candidates;
     if (tcp_endpoint.has_value()) {
         TcpFramingCandidateRequest evidence;

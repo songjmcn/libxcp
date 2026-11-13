@@ -448,6 +448,14 @@ std::optional<Options> ParseOptions(int argc, char** argv, bool& help,
     if (port_given) {
         options.transport_request.port = options.port;
     }
+    // host/port 必须成对：这条检查原本只在 ResolveTransportSelection() 里，
+    // 而嗅探发生在它之前——只给 --host 时嗅探会静默回落到 A2L 端点，先把
+    // A2L 里的 ECU 连一遍才发现参数不全。前移到参数解析，保证"端点半成品"
+    // 在发起任何连接之前就被拒绝；解析层保留同名检查作为纵深防御。
+    if (host_given != port_given) {
+        error = "--host 与 --port 必须成对出现（只给其中一个无法确定端点）";
+        return std::nullopt;
+    }
     if (options.a2l_path.empty() && !options.config_explicit) {
         error = "--a2l is required (or supply --config/-c)";
         return std::nullopt;
@@ -4331,44 +4339,39 @@ private:
  * @param kind 需要归纳的传输层类别
  * @return 该类的端点摘要；未声明时 `declared` 为 false
  *
- * @details 只保留"能否发起一次连接尝试"所需的字段：
- *          - 多个实例且地址/端口不一致时置 `ambiguous`，由调用方给出
- *            "请显式指定端点"的诊断，而不是替用户猜一个——连错实例不会
- *            报错，只会连到另一台 ECU；
- *          - 对齐只取**显式声明**值，未声明时保持 0（不假定 8 bit）。
+ * @details 这里只做"桥接层结构 → 纯逻辑声明列表"的映射，判歧义的规则
+ *          全部在 `SummarizeA2lEndpoints()` 里（可单测）：
+ *          - 四要素（host / port / 对齐 / TL 版本）去重后不止一个就置
+ *            `ambiguous`，由调用方给出"请显式指定端点"的诊断，而不是替
+ *            用户猜一个——连错实例不会报错，只会连到另一台 ECU；
+ *          - 只有一条记录但 `instance_count > 1` 时同样 fail closed；
+ *          - 对齐只取**显式声明**值，未声明时归一化为 0（不假定 8 bit）。
  *
  * @note 不复用 `A2lTransportFacts`：后者还带着 TCP alignment 的原文核对
- *       结论，属于解析阶段职责，不应渗进嗅探阶段。
+ *       结论，属于解析阶段职责，不应渗进嗅探阶段；这里只借用它的
+ *       "四要素"判定口径，保证两个阶段对同一份 A2L 给出同样的结论。
  */
 calmcar::xcp::tools::A2lEndpointSummary SummarizeA2lEndpoint(
     const calmcar::xcp::a2l::IfDataXcpInfo& info,
     calmcar::xcp::a2l::TransportEndpoint::Kind kind) {
-  calmcar::xcp::tools::A2lEndpointSummary summary;
+  std::vector<calmcar::xcp::tools::A2lEndpointDeclaration> declarations;
   for (const auto& endpoint : info.transports) {
     if (endpoint.kind != kind) continue;
-    if (!summary.declared) {
-      summary.declared = true;
-      summary.host = endpoint.remote_host;
-      summary.port = endpoint.remote_port;
-      summary.transport_layer_version = endpoint.version;
-      summary.instance_count =
-          endpoint.instance_count == 0U ? 1U : endpoint.instance_count;
-      if (endpoint.packet_alignment_declared &&
-          endpoint.packet_alignment != 0U) {
-        summary.packet_alignment_bits = endpoint.packet_alignment;
-      }
-      continue;
+    calmcar::xcp::tools::A2lEndpointDeclaration declaration;
+    declaration.host = endpoint.remote_host;
+    declaration.port = endpoint.remote_port;
+    declaration.transport_layer_version = endpoint.version;
+    // 未显式声明的对齐不得当成 "8 bit" 事实：归一化为 0 后参与去重，
+    // 与核心 A2lTransportFacts 的口径一致。
+    if (endpoint.packet_alignment_declared && endpoint.packet_alignment != 0U) {
+      declaration.packet_alignment_bits = endpoint.packet_alignment;
     }
-    // 同一类的第二条声明：只要地址或端口不同就无法自动判定该连哪个。
-    if (endpoint.remote_host != summary.host ||
-        endpoint.remote_port != summary.port) {
-      summary.ambiguous = true;
-    }
+    declaration.instance_count =
+        endpoint.instance_count == 0U ? 1U : endpoint.instance_count;
+    declarations.push_back(std::move(declaration));
   }
-  if (info.ambiguous) {
-    summary.ambiguous = true;
-  }
-  return summary;
+  return calmcar::xcp::tools::SummarizeA2lEndpoints(declarations,
+                                                   info.ambiguous);
 }
 
 }  // namespace
@@ -4535,9 +4538,11 @@ int main(int argc, char** argv) {
             options->transport_request.port,
             calmcar::xcp::tools::SniffScope::Dual);
         if (plan.empty()) {
+            // 一个候选都没有，说明"端点根本没配全"，不是"对端全部拒绝"：
+            // 前者该查参数与 A2L，后者该查线路参数，退出码必须能区分。
             std::cerr << "没有可用于连接的端点：命令行未给出 --host/--port，"
                          "A2L 也未声明 XCP_ON_TCP_IP / XCP_ON_UDP_IP。\n";
-            return calmcar::xcp::tools::kAutoNegotiationAllRejected;
+            return calmcar::xcp::tools::kAutoNegotiationNoEndpoint;
         }
         // 判定谓词：TCP 走候选验证组件（含协议层三态），UDP 新建一条连接
         // 做 CONNECT 域内校验。判据必须与 TCP 侧一致——否则"能收包"会把
@@ -4553,6 +4558,9 @@ int main(int argc, char** argv) {
                         std::chrono::steady_clock::now() - start)
                         .count());
             };
+            // UDP 分支的三态判定要看"连接是否已建立"：同一条错误在
+            // "连不上"与"连上后被拒"里含义完全不同（见 ClassifyFramingFailure）。
+            bool udp_connected = false;
             try {
                 if (entry.transport == calmcar::xcp::TransportKind::Tcp) {
                     if (!entry.candidate.has_value()) {
@@ -4575,13 +4583,27 @@ int main(int argc, char** argv) {
                 udp_config.remote_port = entry.port;
                 udp_config.packet_alignment =
                     calmcar::xcp::PacketAlignment::Bit8;
+                // 预算与 VerifyTcpFramingCandidate() 保持一致：不重试、不自动
+                // 探测版本、命令/恢复超时同为 1000 ms。默认的 2 次重试会让
+                // "对端不回话"的候选拖到数秒，整轮嗅探看起来像卡住；版本
+                // 探测则会把与"能否完成基本往返"无关的失败混进结论。
                 calmcar::xcp::XcpMasterOptions sniff_options;
+                sniff_options.timeouts.command_timeout =
+                    std::chrono::milliseconds(1000);
+                sniff_options.timeouts.synch_timeout =
+                    std::chrono::milliseconds(1000);
+                sniff_options.timeouts.max_retries = 0;
+                sniff_options.autodetect_version = false;
                 auto candidate_master =
                     std::make_unique<calmcar::xcp::XcpMaster>(
                         std::make_unique<calmcar::xcp::UdpTransport>(
                             udp_config),
                         sniff_options);
                 candidate_master->Connect();
+                udp_connected = true;
+                // 与 TCP 侧同一条判据：连续两次往返才说明对端真的在工作，
+                // 单次 CONNECT 成功可能只是碰上一个畸形应答。
+                (void)candidate_master->QueryStatus();
                 const auto session =
                     candidate_master->GetSessionParameters().connect;
                 if (session.max_cto < 8U) {
@@ -4596,8 +4618,24 @@ int main(int argc, char** argv) {
                     verdict.verdict =
                         calmcar::xcp::FramingVerdict::Accepted;
                 }
+                // 结论已定就显式断开：正式会话随后另建连接，绝不复用本次
+                // 试连。断开失败不改变结论，连接由析构兜底关闭。
+                try {
+                    candidate_master->Disconnect();
+                } catch (const std::exception&) {
+                    // 故意吞掉：结论以"能否完成往返"为准
+                }
+            } catch (const calmcar::xcp::XcpException& error) {
+                // 复用 TCP 侧的三态分类：超时/传输异常不等于"对端拒绝"。
+                // 若一律记 Rejected，退出码 3 会把"端口写错"误导成"对端
+                // 不支持 XCP"，而 4 才是"去查地址/端口/从站是否在跑"。
+                verdict.verdict = calmcar::xcp::ClassifyFramingFailure(
+                    error.Category(), udp_connected);
+                verdict.reason = error.what();
             } catch (const std::exception& error) {
-                // 连不上/超时无法证明对端拒绝，按"未决"记录（退出码 4）。
+                // 非 XCP 异常（socket 层直接抛）不足以证明对端拒绝，按未决
+                // 记录，避免把环境故障说成"对端拒绝"。
+                verdict.verdict = calmcar::xcp::FramingVerdict::Inconclusive;
                 verdict.reason = error.what();
             }
             verdict.elapsed_ms = elapsed();

@@ -5,10 +5,11 @@
 # 输出重定向到管道时，双路嗅探（需要真的去连 TCP/UDP）根本不会执行。
 # 真要验证嗅探，只能用交互式终端人工做（见实施记录 §6 人工验收）。
 #
-# 所以本脚本钉的是"参数层"的三条不变量，它们正好是这次改动最容易回归的地方：
+# 所以本脚本钉的是"参数层"的四条不变量，它们正好是这次改动最容易回归的地方：
 #   1. 只给 `--a2l` 不再被判为缺少 --host/--port（规则 9 放宽后可回落到 A2L）；
 #   2. 显式 `--transport tcp` 未给 profile 时给出确定的提示并继续（等效 auto）；
-#   3. `--help` 里能查到端点来源与嗅探的说明，用户不用翻源码猜。
+#   3. `--help` 里能查到端点来源与嗅探的说明，用户不用翻源码猜；
+#   4. 只给 `--host` 必须在发起任何连接之前被成对校验拒绝（PR#24 评审问题 3）。
 #
 # 任何一条不成立都说明启动链路被改回去了，属于必须拦住的功能回归。
 
@@ -58,6 +59,27 @@ foreach(keyword IN ITEMS "XCP_ON_TCP_IP" "XCP_ON_UDP_IP")
     message(FATAL_ERROR "--help 未提到 ${keyword}（端点可取自 A2L）")
   endif()
 endforeach()
+
+# ---- 4. 只给 --host：必须在发起任何连接之前成对拒绝 ----
+# 成对校验原先只在 ResolveTransportSelection() 里，而嗅探在它之前——只给
+# --host 时嗅探会先回落到 A2L 端点，等于把 A2L 里的 ECU 连了一遍才发现参数
+# 不全。前移之后这条命令必须停在参数解析，输出里不能出现任何试连记录。
+execute_process(
+  COMMAND "${XCP_MASTER}" --a2l "${a2l_path}" --host 127.0.0.1
+  RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 10)
+set(combined "${output}${error}")
+if(NOT combined MATCHES "--host 与 --port 必须成对出现")
+  message(FATAL_ERROR
+    "只给 --host 未被成对校验拒绝: ${result}; ${combined}")
+endif()
+if(combined MATCHES "试连")
+  message(FATAL_ERROR
+    "端点不完整时仍发起了嗅探试连（评审问题 3 未修复）: ${combined}")
+endif()
+if(NOT result EQUAL 2)
+  message(FATAL_ERROR
+    "端点不完整的退出码应为 2（配置不全），实际 ${result}")
+endif()
 
 file(REMOVE "${a2l_path}")
 message(STATUS "传输层推导 CLI 冒烟通过")
