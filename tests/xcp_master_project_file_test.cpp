@@ -804,4 +804,12 @@ TEST(ProjectEffectiveConnection, AlignmentAndProfileHelpers) {
     EXPECT_TRUE(WireProfileText(TcpWireProfile::Unknown).empty());
 }
 
+/// @brief 可执行文件目录应能由平台实现正常解析
+TEST(ProjectFilePaths, ExecutableDirectoryExists) {
+    const auto directory = calmcar::xcp::tools::ExecutableDirectory();
+
+    ASSERT_FALSE(directory.empty());
+    EXPECT_TRUE(std::filesystem::is_directory(directory));
+}
+
 }  // namespace

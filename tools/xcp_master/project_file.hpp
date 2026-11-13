@@ -935,9 +935,9 @@ template <typename T>
     return std::filesystem::path(buffer).parent_path();
 #elif defined(__APPLE__)
     std::uint32_t size = 0;
-    ::NSGetExecutablePath(nullptr, &size);
+    ::_NSGetExecutablePath(nullptr, &size);
     std::string buffer(size, '\0');
-    if (::NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+    if (::_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
     return std::filesystem::path(buffer.c_str()).parent_path();
 #else
     std::string buffer(1024, '\0');

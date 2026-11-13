@@ -35,6 +35,11 @@ struct MeasurementRoute {
     bool is_array{false};           ///< 是否为一条完整数组 Entry
     std::uint8_t element_count{1};  ///< 数组元素数（标量固定为 1）
     std::uint8_t element_size_bytes{0};  ///< 单元素实占字节数
+    /// DAQ Packed Mode 下，同一测量相邻两个采样之间的字节间隔（B4）
+    /// @details 0 表示非 packed（一个 DTO 只有一个采样）。element-grouped
+    ///          时为该 Entry 自身宽度；event-grouped 时为整个 ODT 单采样宽度
+    ///          （同 ODT 内各测量按采样组连续排列）。
+    std::size_t packed_stride{0};
 };
 
 /**
@@ -67,12 +72,26 @@ public:
      * @param address_granularity 会话 AG（来自 `GetSessionParameters()`）
      * @param timestamp_bytes `DaqTimestampBytesCached()` 缓存（0=无/未知，不猜）
      * @param daq_capabilities 已核验的 Entry 粒度/长度与数组准入；默认拒绝数组
+     * @param dto_counter 规划出的每个 DAQ List 是否置
+     *        `DaqListModeBit::kDtoCounter`（默认 false 保持既有行为；
+     *        实际是否生效仍须由会话回读 `GET_DAQ_LIST_MODE` 确认）
+     * @param counter_header_bytes 计数器**额外占用**的信封字节数（0 或 1）：
+     *        识别字段模式 `RelativeWordAligned` 时 CTR 取代 FILL 字节、不占
+     *        额外长度，故为 0；其余模式为 1。与 `dto_counter` 分开传是因为
+     *        “是否置位”与“是否多占一字节”是两件事
+     * @param packed_mode DAQ Packed Mode 的打包方式（B4，默认不打包）；
+     *        packed 时每个 ODT 的净荷容量按**单采样宽度 × 采样数**计
+     * @param packed_sample_count 一帧打包的采样数（仅 packed 有意义，
+     *        合法范围 [2, 0xFFFF]；非法值由本类拒绝）
      */
     explicit MeasurementPlanner(
         const IMeasurementDatabase& database, std::uint16_t max_dto,
         AddressGranularity address_granularity, std::size_t timestamp_bytes = 0,
         std::size_t identification_bytes = 1,
-        MeasurementDaqCapabilities daq_capabilities = {});
+        MeasurementDaqCapabilities daq_capabilities = {},
+        bool dto_counter = false, std::size_t counter_header_bytes = 0,
+        DaqPackedMode packed_mode = DaqPackedMode::NotPacked,
+        std::uint16_t packed_sample_count = 1);
     ~MeasurementPlanner();
 
     MeasurementPlanner(const MeasurementPlanner&) = delete;
@@ -89,6 +108,12 @@ private:
     std::size_t m_timestamp_bytes_{0};        ///< 信封时间戳头字节（0=无）
     std::size_t m_identification_bytes_{1};  ///< 识别字段头宽
     MeasurementDaqCapabilities m_daq_capabilities_{};  ///< 已核验的 Entry 限制
+    bool m_dto_counter_{false};  ///< 是否请求 DTO 计数器（Prepare 前配置）
+    std::size_t m_counter_header_bytes_{0};  ///< 计数器额外信封字节（0/1）
+    /// DAQ Packed Mode 的打包方式（B4）；`NotPacked` 时与既有行为完全一致
+    DaqPackedMode m_packed_mode_{DaqPackedMode::NotPacked};
+    /// 一帧打包的采样数（`m_packed_mode_ == NotPacked` 时固定按 1 处理）
+    std::uint16_t m_packed_sample_count_{1};
 };
 
 }  // namespace calmcar::xcp

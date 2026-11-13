@@ -8,10 +8,76 @@
 #ifndef CALMCAR_XCP_MEMORY_ACCESS_HPP_
 #define CALMCAR_XCP_MEMORY_ACCESS_HPP_
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+
 #include "libxcp/command_executor.hpp"
 #include "libxcp/session.hpp"
 
 namespace calmcar::xcp {
+
+/**
+ * @brief 标定数据写后校验的结论
+ */
+enum class CalibrationVerificationStatus : std::uint8_t {
+    Match,          ///< 已确认写入内容与期望一致
+    Mismatch,       ///< 已确认写入内容与期望**不**一致
+    Indeterminate   ///< 无法取得可信证据（既不能确认也不能否认）
+};
+
+/**
+ * @brief 校验所用的手段
+ */
+enum class CalibrationVerificationMethod : std::uint8_t {
+    Readback,       ///< SET_MTA + UPLOAD 读回后与期望字节逐字节比较
+    SlaveChecksum   ///< BUILD_CHECKSUM 由 Slave 计算，本地复算后比较
+};
+
+/**
+ * @brief VerifyBytes 的结果
+ * @details `Indeterminate` 不是失败也不是成功，而是“没有证据”：调用方不得
+ *          把它当成 Match 继续，也不应该当成 Mismatch 触发重写（重写可能
+ *          覆盖并发修改）。
+ */
+struct CalibrationVerificationResult {
+    /// @brief 结论
+    CalibrationVerificationStatus status{CalibrationVerificationStatus::Indeterminate};
+    /// @brief 实际采用的手段
+    CalibrationVerificationMethod method{CalibrationVerificationMethod::Readback};
+    /// @brief SlaveChecksum 路径下的算法类型（Readback 路径为空）
+    std::optional<CalibrationChecksumType> checksum_type;
+    /// @brief Slave 回报的校验和（仅 SlaveChecksum 路径有效）
+    std::uint32_t slave_checksum{0};
+    /// @brief 本地复算的校验和（仅 SlaveChecksum 且本地可复算时有效）
+    std::uint32_t local_checksum{0};
+};
+
+/**
+ * @brief 请求把标定数据保存到非易失存储的结果
+ * @details 依据规范（原始 PDF §7.5.2.13 SET_REQUEST）：正响应没有参数表，
+ *          只表示 Slave 已**接受**请求；真正完成由 GET_STATUS 中
+ *          STORE_CAL_REQ 位被清除表达。因此本结构区分"已接受未完成"与
+ *          "已确认完成"。
+ */
+enum class CalibrationStoreStatus : std::uint8_t {
+    Completed,  ///< GET_STATUS 中 STORE_CAL_REQ 已清除：Slave 声明本次保存完成
+    Pending,    ///< 请求已被接受，但观察期内请求位仍置位（可能仍在写入）
+    Unknown     ///< 无法观察（通信失败/应答丢失），保存是否发生不可知
+};
+
+/**
+ * @brief RequestCalibrationStore 的结果
+ */
+struct CalibrationStoreResult {
+    /// @brief 结论
+    CalibrationStoreStatus status{CalibrationStoreStatus::Pending};
+    /// @brief SET_REQUEST 是否已被 Slave 接受（Unknown 时可能为 true）
+    bool request_accepted{false};
+    /// @brief 实际执行的 GET_STATUS 轮询次数
+    std::size_t polls{0};
+};
 
 /**
  * @brief 内存访问接口
@@ -132,11 +198,69 @@ public:
                     std::uint8_t shift, std::uint16_t and_mask,
                     std::uint16_t xor_mask);
 
+    // ---- B1：标定闭环（写后校验 + 持久化请求）----
+
+    /**
+     * @brief 校验指定地址已写入的内容是否与期望字节一致
+     * @param address 32 位起始地址
+     * @param extension 地址扩展
+     * @param expected 期望的原始字节；**不得为空**，且长度必须是 AG 的整数倍
+     * @return 校验结论；`status == Indeterminate` 表示没有取得证据
+     * @details 优先用 BUILD_CHECKSUM（Slave 计算、本地复算后比较，避免把整段
+     *          标定数据搬回主机）；当 Slave 不支持该命令、或回报的算法本地
+     *          无法复现（`ComputeXcpChecksum` 返回空）时，退化为 SET_MTA +
+     *          UPLOAD 读回逐字节比较。读回过程中发生通信异常时返回
+     *          `Indeterminate` 而不是抛出——校验的语义就是"能否确认"，
+     *          确认不了本身就是结论，调用方据此决定是否重试。
+     * @throws XcpException(InvalidArgument) 参数非法（空、非 AG 整数倍、
+     *         地址溢出）或未连接
+     * @note 本方法**只**验证主机发起的这次写入在 Slave 内存中的可见结果，
+     *       不构成"已保存到非易失存储"的证明；持久化要用
+     *       `RequestCalibrationStore`。
+     */
+    [[nodiscard]] CalibrationVerificationResult VerifyBytes(
+        Address address, AddressExtension extension, BytesView expected);
+
+    /**
+     * @brief 请求 Slave 把标定数据保存到非易失存储，并观察其完成
+     * @param completion_timeout 等待完成的观察上限，必须大于 0
+     * @return 保存请求的观察结论
+     * @details 发送 SET_REQUEST（Mode 位 `STORE_CAL_REQ`）后轮询 GET_STATUS，
+     *          直到对应位被清除（`Completed`）或观察超时（`Pending`）。
+     *          `EV_STORE_CAL` 事件只作为"请核实"的提示，不作为完成证据——
+     *          事件可能丢失，且收到事件不等于数据已经落盘。
+     * @throws XcpException(InvalidArgument) `completion_timeout <= 0` 或未连接
+     * @throws XcpException(UnsupportedFeature) Slave 回 ERR_CMD_UNKNOWN：
+     *         规范没有可等效的自动持久化后备，必须明确报告
+     * @throws XcpException 其他协议错误（如不支持该 mode 时
+     *         ERR_OUT_OF_RANGE）或发送失败
+     * @note 观察期内通信失败时返回 `Unknown`（不是抛出）：请求可能已经生效，
+     *       调用方重发可能造成重复的持久化动作。
+     */
+    [[nodiscard]] CalibrationStoreResult RequestCalibrationStore(
+        std::chrono::milliseconds completion_timeout);
+
+    /**
+     * @brief 显式启用/停用块传输写入
+     * @param enabled true 表示允许 WriteBytes 在能力齐备时编排 DOWNLOAD /
+     *        DOWNLOAD_NEXT 块序列
+     * @details **默认关闭**。块序列在 Slice 侧依赖 Slave 逐帧自增 MTA，且
+     *          中间帧没有应答：一旦丢帧，后续数据会静默落到错误地址，主站
+     *          无法从协议层察觉。逐块 SET_MTA 虽然多一次往返，但每块都重新
+     *          落地址，超时恢复后可安全重试。只有在确认对端 Slave 的块实现
+     *          可信、且写入量足够大（往返开销成为瓶颈）时才应开启。
+     * @note 仅在启用后仍会检查 Slave 协商结果（SLAVE_BLOCK_MODE 与 MAX_BS）；
+     *       协商不满足时仍然退回逐块通路，不会因开启而强行走块序列。
+     */
+    void SetBlockModeEnabled(bool enabled);
+
 private:
     /// @brief 命令执行器（非拥有）
     CommandExecutor& m_executor_;
     /// @brief 会话（非拥有），提供 MAX_CTO / AG / SHORT_UPLOAD 可用性
     Session& m_session_;
+    /// @brief 是否允许块传输写入（默认关闭，见 SetBlockModeEnabled）
+    bool m_block_mode_enabled_{false};
 
     /// @brief 是否可走 SHORT_UPLOAD：能力可用且元素数不超过单包上限
     [[nodiscard]] bool CanUseShortUpload(ElementCount element_count) const;
@@ -152,6 +276,43 @@ private:
      *          不使用该 Optional 命令，因此按 DOWNLOAD 自身布局取整。
      */
     [[nodiscard]] ElementCount MaxDownloadElements() const;
+
+    /**
+     * @brief 是否可走块传输（DOWNLOAD / DOWNLOAD_NEXT 序列）
+     * @details 需要同时满足：调用方已显式启用块传输、已取得
+     *          GET_COMM_MODE_INFO 且其 `COMM_MODE_OPTIONAL` 置位
+     *          MASTER_BLOCK_MODE(bit0)、MAX_BS >= 1。任一条件缺失即视为
+     *          "不能确认可块传"，退回逐块 SET_MTA + DOWNLOAD。
+     *
+     *          **不使用 CONNECT 的 SLAVE_BLOCK_MODE(bit6)**：该位描述
+     *          Slave→Master 上传块，与 Master→Slave 下载块不是同一能力，
+     *          用它会同时造成"支持下载块却被降级"与"仅支持上传却下发续帧"。
+     *
+     *          **默认不启用**的理由：块序列依赖 Slave 逐帧自增 MTA，且中间
+     *          帧没有应答——丢一帧就会静默把后续数据写错位置，而逐块
+     *          SET_MTA 每块都重新落地址，代价是多一次往返但可恢复。因此
+     *          块传输只在调用方明确承担该风险时开启，不作为默认路径。
+     * @return true 表示可编排块序列
+     */
+    [[nodiscard]] bool CanUseBlockMode() const;
+
+    /**
+     * @brief 用块传输序列写入（DOWNLOAD 首帧 + DOWNLOAD_NEXT 续帧/末帧）
+     * @param address 32 位起始地址
+     * @param extension 地址扩展
+     * @param data 待写字节（长度必须是 AG 整数倍）
+     * @param element_count 由 data 派生的元素数
+     * @details 规范（原始 PDF §7.5.2.9 / §7.5.2.10）：
+     *          - 首帧 DOWNLOAD 的 size 字段是**本块总元素数**，携带首帧数据；
+     *          - 续帧 DOWNLOAD_NEXT 的 size 字段是**剩余元素数**（含本帧）；
+     *          - 块内只有**末帧**被肯定应答，中间帧无 RESPONSE；
+     *          - 块内 MTA 由 Slave 逐帧自增，不得重放 SET_MTA（会回到块首）。
+     *          块长度上限 = `min(255, MAX_BS × 单帧元素数)`。
+     * @throws XcpException 中间帧发送失败时立即中断：已发送的部分必须视为
+     *         "已写入但未经确认"，**不得**改用逐帧 DOWNLOAD 重发同一段数据
+     */
+    void DownloadBlock(Address address, AddressExtension extension,
+                       BytesView data, ElementCount element_count);
 
     /**
      * @brief SHORT_DOWNLOAD 单包最大元素数（= (MAX_CTO - 8) / AG，docs L2024）

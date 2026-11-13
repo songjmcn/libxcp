@@ -29,6 +29,36 @@ constexpr std::size_t kStartStopDaqListResMinSize = 1;
 /// @brief GET_DAQ_LIST_INFO 响应去掉 PID 后的最小长度
 /// （PROPERTIES/MAX_ODT/MAX_ODT_ENTRY/FIXED_EVENT(WORD)）
 constexpr std::size_t kGetDaqListInfoResMinSize = 5;
+/// @brief GET_DAQ_LIST_MODE 响应去掉 PID 后的最小长度
+/// （Current Mode/reserved(WORD)/Event Channel(WORD)/Prescaler/Priority）
+constexpr std::size_t kGetDaqListModeResMinSize = 7;
+/// @brief GET_DAQ_PACKED_MODE 响应去掉 PID 后的最小长度
+/// @details Table 128：mode=0 时 RES = [0xFF][Reserved][DAQ_PACKED_MODE]，
+///          剥掉 PID 后 2 字节；mode=1/2（Table 129）追加
+///          [DPM_TIMESTAMP_MODE][DPM_SAMPLE_COUNT WORD] 共 5 字节。
+constexpr std::size_t kDaqPackedModeResMinSize = 2;
+/// @brief GET_DAQ_PACKED_MODE 在 packed 模式下的响应长度（含 PID 时 6）
+constexpr std::size_t kDaqPackedModeResPackedSize = 5;
+/// @brief BUILD_CHECKSUM 响应去掉 PID 后的最小长度
+/// （Checksum type/Reserved(WORD)/Checksum(DWORD)）
+constexpr std::size_t kBuildChecksumResMinSize = 7;
+/// @brief DTO_CTR_PROPERTIES 响应去掉 PID 后的最小长度
+/// @details 规范 Table 164：RES = [0xFF][PROPERTIES BYTE]
+///          [Current Related Event Channel WORD][MODE BYTE]，剥掉 PID 后正好
+///          是 1 + 2 + 1 = 4 字节（不是 5）
+constexpr std::size_t kDtoCtrPropertiesResMinSize = 4;
+/// @brief GET_DAQ_CLOCK 响应去掉 PID 后的最小长度
+/// @details legacy Table 133：RES = [0xFF][reserved][TRIGGER_INFO]
+///          [PAYLOAD_FMT][DWORD]，剥掉 PID 后是 1 + 1 + 1 + 4 = 7 字节；
+///          extended 至少要能读到 slave 时钟，由解析函数按 PAYLOAD_FMT 再判。
+constexpr std::size_t kGetDaqClockResMinSize = 7;
+/// @brief TIME_CORRELATION_PROPERTIES 响应去掉 PID 后的长度
+/// @details Table 212：RES = [0xFF][SLAVE_CONFIG][OBSERVABLE_CLOCKS]
+///          [SYNC_STATE][CLOCK_INFO][RESERVED][CLUSTER_ID(WORD)]，
+///          剥掉 PID 后固定 1+1+1+1+1+2 = **7** 字节（含 PID 才是 8）。
+constexpr std::size_t kTimeCorrelationResMinSize = 7;
+/// @brief EV_TIME_SYNC legacy 载荷最小长度（reserved/reserved/DWORD）
+constexpr std::size_t kTimeSyncEventLegacyMinSize = 6;
 /// @brief GET_DAQ_EVENT_INFO 响应去掉 PID 后的最小长度（v0.3；XCPlite 实然
 /// xcp.h:819-825）
 /// （PROPERTIES/MAX_DAQ_LISTS/NAME_LENGTH/TIME_CYCLE/TIME_UNIT/PRIORITY）
@@ -119,6 +149,22 @@ std::optional<std::uint32_t> ResponseParser::ReadU32(BytesView data,
            (static_cast<std::uint32_t>(*b1) << 16) |
            (static_cast<std::uint32_t>(*b2) << 8) |
            static_cast<std::uint32_t>(*b3);
+}
+
+std::optional<std::uint64_t> ResponseParser::ReadU64(BytesView data,
+                                                     std::size_t offset) const {
+    // DLONG 时钟时间戳：逐字节拼装，越界即 nullopt
+    std::uint64_t value = 0;
+    for (std::size_t i = 0; i < 8; ++i) {
+        const auto byte = ReadU8(data, offset + i);
+        if (!byte) {
+            return std::nullopt;
+        }
+        const std::size_t shift =
+            m_byte_order_ == ByteOrder::Intel ? i : (7 - i);
+        value |= static_cast<std::uint64_t>(*byte) << (shift * 8);
+    }
+    return value;
 }
 
 std::optional<ParsedPacket> ResponseParser::Parse(
@@ -339,6 +385,353 @@ std::optional<GetDaqListInfoResponse> ResponseParser::ParseGetDaqListInfo(
     }
     resp.fixed_event = *fixed_event;
     return resp;
+}
+
+std::optional<DaqPackedModeResponse> ResponseParser::ParseDaqPackedMode(
+    BytesView res_data) const {
+    // 结构来源：原始 PDF Table 128（mode=0）/ Table 129（mode=1/2）。
+    // 两种载荷长度不同，按 mode 分支，不做长度猜测。
+    if (res_data.size() < kDaqPackedModeResMinSize) {
+        return std::nullopt;
+    }
+    const auto mode = ToDaqPackedMode(res_data[1]);
+    if (!mode) {
+        return std::nullopt;
+    }
+
+    DaqPackedModeResponse resp;
+    resp.mode = *mode;
+    if (resp.mode == DaqPackedMode::NotPacked) {
+        return resp;
+    }
+
+    if (res_data.size() < kDaqPackedModeResPackedSize) {
+        return std::nullopt;
+    }
+    const auto ts_mode = ToDaqPackedTimestampMode(res_data[2]);
+    if (!ts_mode) {
+        return std::nullopt;
+    }
+    resp.timestamp_mode = *ts_mode;
+    const auto sample_count = ReadU16(res_data, 3);
+    if (!sample_count.has_value()) {
+        return std::nullopt;
+    }
+    resp.sample_count = *sample_count;
+    return resp;
+}
+
+std::optional<GetDaqListModeResponse> ResponseParser::ParseGetDaqListMode(
+    BytesView res_data) const {
+    // GET_DAQ_LIST_MODE RES: [FF][Current Mode][reserved(WORD)]
+    //   [Event Channel(WORD)][Prescaler][Priority]（规范 Table 150）
+    // 注意：`mode` 是 Slave 当前状态位（含 SELECTED/RUNNING/RESUME），
+    //       与 SET_DAQ_LIST_MODE 请求的 MODE 位语义不同，调用方不得原样回填。
+    if (res_data.size() < kGetDaqListModeResMinSize) {
+        return std::nullopt;
+    }
+    GetDaqListModeResponse resp;
+    resp.mode = res_data[0];
+    const auto reserved = ReadU16(res_data, 1);
+    const auto event_channel = ReadU16(res_data, 3);
+    if (!reserved || !event_channel) {
+        return std::nullopt;
+    }
+    resp.reserved = *reserved;
+    resp.event_channel = *event_channel;
+    resp.prescaler = res_data[5];
+    resp.priority = res_data[6];
+    return resp;
+}
+
+std::optional<BuildChecksumResponse> ResponseParser::ParseBuildChecksum(
+    BytesView res_data) const {
+    // BUILD_CHECKSUM RES: [FF][Checksum type][Reserved(WORD)][Checksum(DWORD)]
+    // （原始 PDF 第 148 页 Table 74）；校验结果恒为 DWORD。
+    if (res_data.size() < kBuildChecksumResMinSize) {
+        return std::nullopt;
+    }
+    BuildChecksumResponse resp;
+    resp.raw_checksum_type = res_data[0];
+    // 未知类型不判失败：保留原字节，checksum_type 留空，上层按“无法验证”处理
+    resp.checksum_type = ToChecksumType(resp.raw_checksum_type);
+    const auto reserved = ReadU16(res_data, 1);
+    const auto checksum = ReadU32(res_data, 3);
+    if (!reserved || !checksum) {
+        return std::nullopt;
+    }
+    resp.reserved = *reserved;
+    resp.checksum = *checksum;
+    return resp;
+}
+
+std::optional<DtoCtrPropertiesResponse> ResponseParser::ParseDtoCtrProperties(
+    BytesView res_data) const {
+    // DTO_CTR_PROPERTIES RES: [FF][PROPERTIES][Related Event(WORD)][MODE]
+    // （docs §7.5.4.15 Table 164）；被查询的事件通道号不在响应中回显。
+    if (res_data.size() < kDtoCtrPropertiesResMinSize) {
+        return std::nullopt;
+    }
+    DtoCtrPropertiesResponse resp;
+    resp.properties = res_data[0];
+    const auto related = ReadU16(res_data, 1);
+    if (!related) {
+        return std::nullopt;
+    }
+    resp.related_event_channel = *related;
+    resp.mode = res_data[3];
+    return resp;
+}
+
+std::optional<GetDaqClockResponse> ResponseParser::ParseGetDaqClock(
+    BytesView res_data, bool extended) const {
+    // GET_DAQ_CLOCK RES（去掉 0xFF）：
+    //   legacy  Table 133: [reserved][TRIGGER_INFO][PAYLOAD_FMT][DWORD]
+    //   extended Table 134: [reserved][TRIGGER_INFO][PAYLOAD_FMT]
+    //                       [slave ts][opt grandm ts][opt ecu ts][opt SYNC_STATE]
+    if (res_data.size() < kGetDaqClockResMinSize) {
+        return std::nullopt;
+    }
+    GetDaqClockResponse resp;
+    resp.extended = extended;
+    resp.trigger_info = res_data[1];
+    resp.payload_fmt = res_data[2];
+    constexpr std::size_t kHeaderBytes = 3;  // reserved + TRIGGER_INFO + PAYLOAD_FMT
+    std::size_t offset = kHeaderBytes;
+
+    if (!extended) {
+        const auto value = ReadU32(res_data, offset);
+        if (!value) {
+            return std::nullopt;
+        }
+        resp.slave_clock = *value;
+        resp.slave_clock_bytes = 4;
+        return resp;
+    }
+
+    // extended：slave 时钟按 FMT_XCP_SLV 的宽度读取
+    const auto slave_fmt = XcpSlaveClockFormatOf(resp.payload_fmt);
+    if (!slave_fmt || *slave_fmt == ClockPayloadFormat::Absent) {
+        // 保留值 3，或 extended 却没给 slave 时钟：都无法解释布局
+        return std::nullopt;
+    }
+    if (*slave_fmt == ClockPayloadFormat::Dword) {
+        const auto value = ReadU32(res_data, offset);
+        if (!value) {
+            return std::nullopt;
+        }
+        resp.slave_clock = *value;
+        resp.slave_clock_bytes = 4;
+        offset += 4;
+    } else {
+        const auto value = ReadU64(res_data, offset);
+        if (!value) {
+            return std::nullopt;
+        }
+        resp.slave_clock = *value;
+        resp.slave_clock_bytes = 8;
+        offset += 8;
+    }
+
+    // grandmaster：格式为 Absent 表示不在载荷中
+    const auto grandm_fmt = GrandmasterClockFormatOf(resp.payload_fmt);
+    if (!grandm_fmt) {
+        return std::nullopt;
+    }
+    if (*grandm_fmt != ClockPayloadFormat::Absent) {
+        if (*grandm_fmt == ClockPayloadFormat::Dword) {
+            const auto value = ReadU32(res_data, offset);
+            if (!value) {
+                return std::nullopt;
+            }
+            resp.grandmaster_clock = *value;
+            offset += 4;
+        } else {
+            const auto value = ReadU64(res_data, offset);
+            if (!value) {
+                return std::nullopt;
+            }
+            resp.grandmaster_clock = *value;
+            offset += 8;
+        }
+    }
+
+    const auto ecu_fmt = EcuClockFormatOf(resp.payload_fmt);
+    if (!ecu_fmt) {
+        return std::nullopt;
+    }
+    if (*ecu_fmt != ClockPayloadFormat::Absent) {
+        if (*ecu_fmt == ClockPayloadFormat::Dword) {
+            const auto value = ReadU32(res_data, offset);
+            if (!value) {
+                return std::nullopt;
+            }
+            resp.ecu_clock = *value;
+            offset += 4;
+        } else {
+            const auto value = ReadU64(res_data, offset);
+            if (!value) {
+                return std::nullopt;
+            }
+            resp.ecu_clock = *value;
+            offset += 8;
+        }
+    }
+
+    // SYNC_STATE：只要还有字节就是它；没有则保持 nullopt，
+    // 由上层按“规范要求有可同步时钟就必须带”自行判定是否可疑。
+    if (offset < res_data.size()) {
+        resp.sync_state = res_data[offset];
+    }
+    return resp;
+}
+
+std::optional<TimeCorrelationPropertiesResponse>
+ResponseParser::ParseTimeCorrelationProperties(BytesView res_data) const {
+    // TIME_CORRELATION_PROPERTIES RES（去掉 0xFF）：[SLAVE_CONFIG]
+    //   [OBSERVABLE_CLOCKS][SYNC_STATE][CLOCK_INFO][RESERVED][CLUSTER_ID(WORD)]
+    // （docs §7.5.6.1 Table 212，剥掉 PID 后固定 8 字节）
+    if (res_data.size() < kTimeCorrelationResMinSize) {
+        return std::nullopt;
+    }
+    TimeCorrelationPropertiesResponse resp;
+    resp.slave_config = res_data[0];
+    resp.observable_clocks = res_data[1];
+    resp.sync_state = res_data[2];
+    resp.clock_info = res_data[3];
+    resp.reserved = res_data[4];
+    const auto cluster = ReadU16(res_data, 5);
+    if (!cluster) {
+        return std::nullopt;
+    }
+    resp.cluster_id = *cluster;
+    return resp;
+}
+
+std::optional<TimeSyncEvent> ResponseParser::ParseTimeSyncEvent(
+    BytesView res_data, TimeSyncLayout layout) const {
+    TimeSyncEvent event;
+    if (layout == TimeSyncLayout::Legacy) {
+        // Table 242: [reserved][reserved][DWORD]，没有 TRIGGER_INFO
+        if (res_data.size() < kTimeSyncEventLegacyMinSize) {
+            return std::nullopt;
+        }
+        const auto value = ReadU32(res_data, 2);
+        if (!value) {
+            return std::nullopt;
+        }
+        event.extended = false;
+        event.slave_clock = *value;
+        return event;
+    }
+
+    // 两种 extended 都需要至少 [TRIGGER_INFO][第二字节][DWORD]
+    if (res_data.size() < kTimeSyncEventLegacyMinSize) {
+        return std::nullopt;
+    }
+    event.extended = true;
+    event.trigger_info = res_data[0];
+
+    if (layout == TimeSyncLayout::ExtendedMaxCto8) {
+        // Table 247: [TRIGGER_INFO][counter 或 0][DWORD]，无 PAYLOAD_FMT
+        const auto value = ReadU32(res_data, 2);
+        if (!value) {
+            return std::nullopt;
+        }
+        event.slave_clock = *value;
+        if (res_data[1] != 0U) {
+            event.counter = res_data[1];
+        }
+        return event;
+    }
+
+    // Table 248: [TRIGGER_INFO][PAYLOAD_FMT][slave ts][opt grandm][opt ecu]
+    //            [opt CLUSTER_ID + counter][opt SYNC_STATE]
+    event.payload_fmt = res_data[1];
+    const auto slave_fmt = XcpSlaveClockFormatOf(event.payload_fmt);
+    if (!slave_fmt || *slave_fmt == ClockPayloadFormat::Absent) {
+        return std::nullopt;
+    }
+    std::size_t offset = 2;
+    if (*slave_fmt == ClockPayloadFormat::Dword) {
+        const auto value = ReadU32(res_data, offset);
+        if (!value) {
+            return std::nullopt;
+        }
+        event.slave_clock = *value;
+        offset += 4;
+    } else {
+        const auto value = ReadU64(res_data, offset);
+        if (!value) {
+            return std::nullopt;
+        }
+        event.slave_clock = *value;
+        offset += 8;
+    }
+
+    const auto grandm_fmt = GrandmasterClockFormatOf(event.payload_fmt);
+    if (!grandm_fmt) {
+        return std::nullopt;
+    }
+    if (*grandm_fmt != ClockPayloadFormat::Absent) {
+        if (*grandm_fmt == ClockPayloadFormat::Dword) {
+            const auto value = ReadU32(res_data, offset);
+            if (!value) {
+                return std::nullopt;
+            }
+            event.grandmaster_clock = *value;
+            offset += 4;
+        } else {
+            const auto value = ReadU64(res_data, offset);
+            if (!value) {
+                return std::nullopt;
+            }
+            event.grandmaster_clock = *value;
+            offset += 8;
+        }
+    }
+
+    const auto ecu_fmt = EcuClockFormatOf(event.payload_fmt);
+    if (!ecu_fmt) {
+        return std::nullopt;
+    }
+    if (*ecu_fmt != ClockPayloadFormat::Absent) {
+        if (*ecu_fmt == ClockPayloadFormat::Dword) {
+            const auto value = ReadU32(res_data, offset);
+            if (!value) {
+                return std::nullopt;
+            }
+            event.ecu_clock = *value;
+            offset += 4;
+        } else {
+            const auto value = ReadU64(res_data, offset);
+            if (!value) {
+                return std::nullopt;
+            }
+            event.ecu_clock = *value;
+            offset += 8;
+        }
+    }
+
+    if (HasClusterIdentifier(event.payload_fmt)) {
+        const auto cluster = ReadU16(res_data, offset);
+        if (!cluster) {
+            return std::nullopt;
+        }
+        event.cluster_id = *cluster;
+        offset += 2;
+        const auto counter = ReadU8(res_data, offset);
+        if (!counter) {
+            return std::nullopt;
+        }
+        event.counter = *counter;
+        offset += 1;
+    }
+
+    if (offset < res_data.size()) {
+        event.sync_state = res_data[offset];
+    }
+    return event;
 }
 
 std::optional<GetDaqEventInfoResponse> ResponseParser::ParseGetDaqEventInfo(

@@ -1650,15 +1650,18 @@ TEST(XcpMasterVersion, ContradictoryPolicyIsRejectedAtConstruction) {
 /// @details 原始 PDF 第 106 页 §7.4：Level-1 命令以双字节 0xC0 起始；
 ///          本实现只登记 GET_VERSION（0xC0,0x00）。方案要求"禁止内容探测式
 ///          尝试"——即不得靠发送命令看错误码来推断能力。
-TEST(VersionUnknown_HighVersionBlocked, DaqPackedModeIsBlockedLocally) {
+TEST(VersionUnknown_HighVersionBlocked, DaqPackedModeIsDecidedAtRuntime) {
     auto transport = std::make_unique<test::MockTransport>();
     XcpMasterOptions options;
     options.version_policy.probe_get_version = false;
     XcpMaster master(std::move(transport), options);
 
     using Cap = XcpMaster::UnsupportedCapability;
-    EXPECT_TRUE(master.IsCapabilityUnsupported(Cap::DaqPackedMode))
-        << "DAQ Packed Mode 是 V1.5 新特性且本实现未提供编码路径";
+    // B4 批次起本库已提供 SET/GET_DAQ_PACKED_MODE（0xC0,0x01 / 0xC0,0x02）
+    // 的编码路径，故它不再是"确定不提供"的静态边界；能否启用由
+    // CanUseDaqPackedMode 按列表/事件属性在运行时取证。
+    EXPECT_FALSE(master.IsCapabilityUnsupported(Cap::DaqPackedMode))
+        << "Packed Mode 已实现，不得再报静态 Block";
     EXPECT_TRUE(master.IsCapabilityUnsupported(Cap::Level1OtherSubcommand));
 }
 
@@ -1672,7 +1675,10 @@ TEST(VersionUnknown_HighVersionBlocked, ThrowIfUnsupportedRaisesUnsupported) {
     XcpMaster master(std::move(transport), options);
 
     using Cap = XcpMaster::UnsupportedCapability;
-    for (const Cap cap : {Cap::DaqPackedMode, Cap::Level1OtherSubcommand,
+    // Packed Mode 自 B4 起已实现：ThrowIfUnsupported 必须放行（不抛）
+    EXPECT_NO_THROW(
+        master.ThrowIfUnsupported(Cap::DaqPackedMode));
+    for (const Cap cap : {Cap::Level1OtherSubcommand,
                           Cap::Ipv6Transport, Cap::OptionalTlSubcommand}) {
         try {
             master.ThrowIfUnsupported(cap);

@@ -23,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -52,6 +53,8 @@ struct MeasurementStatistics {
     std::uint64_t dto_dropped{0};     ///< 有界队列溢出丢弃数
     std::uint64_t decode_errors{0};   ///< 单帧解码失败（drop 计数）
     std::uint64_t timestamp_wraps{0}; ///< 时间戳回卷次数
+    std::uint64_t counter_gaps{0};    ///< DTO 计数器不连续的次数（含重复值）
+    std::uint64_t counter_lost{0};    ///< 由计数器缺口推算出的丢帧总数
 };
 
 /**
@@ -162,6 +165,38 @@ public:
      */
     void SetDaqEntryCapabilities(MeasurementDaqCapabilities capabilities);
 
+    /**
+     * @brief 配置是否要求 DTO 携带计数器（须在 Prepare 前调用）
+     * @param enabled true=规划时置 `DaqListModeBit::kDtoCounter`，并在下发后
+     *                用 `GET_DAQ_LIST_MODE` 回读确认实际生效
+     * @throws XcpException(UnsupportedFeature) 已启用但 Slave 无法回读
+     *         `GET_DAQ_LIST_MODE`（无法确认布局，不静默假设）
+     * @throws XcpException(ProtocolError) 回读的 `DTO_CTR` 位与请求不一致
+     * @details 默认 false，与被本批次修改前的既有行为逐字节一致。启用后
+     *          解码布局的计数器位**只来自回读事实**，不来自本地期望；
+     *          计数器缺口经 `MeasurementFrame::counter_lost_before` 与
+     *          `MeasurementStatistics::counter_gaps/counter_lost` 上报。
+     *          运行中调用抛 InvalidState。
+     */
+    void SetDtoCounterEnabled(bool enabled);
+
+    /**
+     * @brief 请求会话使用 DAQ Packed Mode（须在 Prepare 前调用）
+     * @param mode 打包方式；`NotPacked` 表示常规单采样传输（默认）
+     * @param timestamp_mode 帧时间戳语义（仅 packed 有意义）
+     * @param sample_count 一帧打包的采样数（合法范围 [2, 0xFFFF]）
+     * @throws XcpException(InvalidArgument) 采样数越界或 packed 下给出了保留的
+     *         时间戳语义（本地拒绝，不发帧）
+     * @throws XcpException(InvalidState) 运行中调用
+     * @note 真正生效须在 `Prepare()` 中逐个列表协商并**回读确认**；对端不支持
+     *       或回读不一致时 `Prepare()` 报错（不会"一边按 packed 配置、一边按
+     *       普通 DTO 解码"）。切换 packed 后旧代际 DTO 必须丢弃：本类通过
+     *       `Stop()`→重新 `Prepare()` 建立新布局，不跨代际复用解码路由。
+     */
+    void SetDaqPackedMode(DaqPackedMode mode,
+                          DaqPackedTimestampMode timestamp_mode,
+                          std::uint16_t sample_count);
+
     // ---- IEventListener（供 XcpMaster 回调；RX 线程只入队，不阻塞）----
     void OnEvent(const EventPacket& /*event*/) override {}   ///< EV 不处理
     void OnService(const ServicePacket& /*service*/) override {}  ///< SERV 不处理
@@ -198,6 +233,20 @@ private:
     bool m_timestamp_first_odt_only_{
         false};  ///< 时间戳只随首 ODT 帧（v0.9 D13；SetTimestampFirstOdtOnly）
     bool m_timestamp_enabled_{true};  ///< Prepare 前配置；默认保持原有取证行为
+    bool m_dto_counter_enabled_{false};  ///< Prepare 前配置：是否要求 DTO 计数器
+    bool m_counter_active_{false};       ///< Prepare 回读确认后的实际布局位
+    DaqPackedMode m_packed_mode_{DaqPackedMode::NotPacked};  ///< 请求的打包方式
+    DaqPackedTimestampMode m_packed_timestamp_mode_{
+        DaqPackedTimestampMode::LastSample};  ///< 帧时间戳语义
+    std::uint16_t m_packed_sample_count_{1};  ///< 请求的一帧采样数
+    bool m_packed_active_{false};  ///< Prepare 回读确认后的实际 packed 状态
+    /// @brief 每个 DAQ List 的 packed 运行参数（仅 m_packed_active_ 时填充）
+    struct PackedListInfo {
+        std::uint16_t sample_count{1};    ///< 一帧采样数（DTO 内，[1, 0xFFFF]）
+        std::uint64_t sample_interval_ns{0};  ///< 相邻采样间隔（纳秒）
+        bool first_sample_timestamp{false};  ///< 帧时间戳是否指向首采样
+    };
+    std::map<std::uint16_t, PackedListInfo> m_packed_lists_;
     MeasurementDaqCapabilities m_daq_entry_capabilities_{};  ///< 已验证的 Entry 限制
     std::uint8_t m_first_pid_{0};     ///< Absolute 模式 START 返回的 FIRST_PID
 
@@ -216,6 +265,8 @@ private:
     std::atomic<std::uint64_t> m_dto_dropped_{0};
     std::atomic<std::uint64_t> m_decode_errors_{0};
     std::atomic<std::uint64_t> m_timestamp_wraps_{0};
+    std::atomic<std::uint64_t> m_counter_gaps_{0};
+    std::atomic<std::uint64_t> m_counter_lost_{0};
 
     /// @brief 已规划的路由视图（Prepare 时建立；(daq_list,odt) → 有序切片规格）
     struct OdtSlice {
@@ -226,6 +277,8 @@ private:
         bool is_array{false};      ///< 本 Entry 是完整的一维数组
         std::uint8_t element_count{1};
         std::uint8_t element_size_bytes{0};
+        /// packed 下同测量相邻采样的字节间隔（0=非 packed）
+        std::size_t packed_stride{0};
     };
     struct OdtView {
         std::uint8_t odt_number{0};

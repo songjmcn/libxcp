@@ -198,6 +198,8 @@ target_sources(libxcp PRIVATE
         src/link_budget.cpp
         src/command_executor.cpp
         src/memory_access.cpp
+        # B1：BUILD_CHECKSUM 的本地复算（XCP V1.5 Table 75 / Table 77）
+        src/checksum.cpp
         src/xcp_master.cpp
         src/daq/dto_envelope_decoder.cpp
         src/daq/dto_payload_decoder.cpp

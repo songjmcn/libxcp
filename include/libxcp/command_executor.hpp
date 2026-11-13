@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 
 #include "libxcp/command_codec.hpp"
@@ -412,6 +413,91 @@ public:
                          AddressExtension extension, Address address);
 
     /**
+     * @brief 执行 WRITE_DAQ_MULTIPLE（docs §7.5.4.6；Optional）
+     * @param elements 同一 ODT 内**连续**的 Entry 序列
+     * @details 相比逐条 WRITE_DAQ 把 N 次往返压缩成 1 次。规范要求
+     *          `MAX_CTO >= 10` 且 `n <= (MAX_CTO-2)/8`，因此本方法先按
+     *          `Session::MaxCto()` 校验，超限直接按参数错误拒绝——**不**
+     *          在这里偷偷切分成多帧，切分点必须由编排层按 ODT 边界决定。
+     * @note 失败语义比 WRITE_DAQ 更差：规范明确"无法定位是哪个条目出错，
+     *       整份配置视为无效"（docs §7.5.4.6），因此调用方失败后必须重做
+     *       整个 ODT，而不是只重发某一条。
+     * @throws XcpException(InvalidArgument) 序列为空或超出一帧容量；
+     *         其余为超时/协议错误/恢复失败
+     */
+    void ExecuteWriteDaqMultiple(std::span<const WriteDaqElement> elements);
+
+    /**
+     * @brief 执行 DTO_CTR_PROPERTIES（docs §7.5.4.15；Optional）
+     * @param modifier 修改器位；kNone 表示纯查询
+     * @param event_channel 目标事件通道号
+     * @param related_event_channel 新的相关事件通道号（未修改时传 0）
+     * @param daq_mode DAQ_MODE 取值（仅 kModifyDaqMode 时生效）
+     * @param stim_mode STIM_MODE 取值（仅 kModifyStimMode 时生效）
+     * @return 响应解析结果；Slave 回 `ERR_CMD_UNKNOWN` 时返回 `std::nullopt`
+     * @note 仅"命令未知"降级为无值。其余协议错误照常抛出——把
+     *       `ERR_OUT_OF_RANGE`（事件通道不存在/不支持计数器）吞成 nullopt
+     *       会让调用方误判为"查询成功但无属性"。
+     */
+    [[nodiscard]] std::optional<DtoCtrPropertiesResponse> ExecuteDtoCtrProperties(
+        DtoCtrModifierBit modifier, std::uint16_t event_channel,
+        std::uint16_t related_event_channel, DaqCounterMode daq_mode,
+        bool stim_mode);
+
+    /**
+     * @brief 执行 GET_DAQ_CLOCK（docs §7.5.4.10；Optional）
+     * @param extended 是否按 extended 布局解析响应；调用方必须依据会话
+     *        协商结果（SLAVE_CONFIG 的 RESPONSE_FMT）决定，不能用长度猜
+     * @return 响应解析结果；Slave 回 `ERR_CMD_UNKNOWN` 时返回 `std::nullopt`
+     * @note `ERR_RESOURCE_TEMPORARY_NOT_ACCESSIBLE`（时钟当前不可随机读）
+     *       照常抛出，不会被降级成 nullopt——那是“现在读不到”，不是
+     *       “不支持该命令”。
+     */
+    [[nodiscard]] std::optional<GetDaqClockResponse> ExecuteGetDaqClock(
+        bool extended);
+
+    /**
+     * @brief 执行 SET_DAQ_PACKED_MODE（V1.5 §7.5.4.7；Level-1 子命令 0x01）
+     * @param daq_list DAQ List 号
+     * @param mode 打包方式；`NotPacked` 表示复位为常规传输
+     * @param timestamp_mode 时间戳语义（仅 packed 有意义）
+     * @param sample_count 一帧采样数（仅 packed 有意义，合法范围 [2, 0xFFFF]）
+     * @throws XcpException(UnsupportedFeature) 对端未实现该子命令
+     * @throws XcpException(ProtocolError) 对端以 `ERR_MODE_NOT_VALID` /
+     *         `ERR_OUT_OF_RANGE` 拒绝该组合
+     * @throws XcpException(InvalidArgument) 本地参数非法（采样数越界等）
+     * @note 该命令是幂等的：超时后重发不会造成与重放无关的副作用。真正是否
+     *       生效仍须由调用方用 GET_DAQ_PACKED_MODE 回读确认。
+     */
+    void ExecuteSetDaqPackedMode(std::uint16_t daq_list, DaqPackedMode mode,
+                                 DaqPackedTimestampMode timestamp_mode,
+                                 std::uint16_t sample_count);
+
+    /**
+     * @brief 执行 GET_DAQ_PACKED_MODE（V1.5 §7.5.4.8；Level-1 子命令 0x02）
+     * @param daq_list DAQ List 号
+     * @return 解析结果；对端未实现该子命令时返 `nullopt`
+     */
+    [[nodiscard]] std::optional<DaqPackedModeResponse> ExecuteGetDaqPackedMode(
+        std::uint16_t daq_list);
+
+    /**
+     * @brief 执行 TIME_CORRELATION_PROPERTIES（docs §7.5.6.1；Optional）
+     * @param set_properties SET_PROPERTIES 字节（0 = 全部不改变）
+     * @param get_properties_request GET_PROPERTIES_REQUEST 字节
+     *        （bit0 GET_CLK_INFO = 让 Slave 把 MTA 指向时钟信息数据块）
+     * @param cluster_id CLUSTER_ID；未置 SET_CLUSTER_ID 时传 0
+     * @return 响应解析结果；Slave 回 `ERR_CMD_UNKNOWN` 时返回 `std::nullopt`
+     * @note 请求 CLK_INFO 后 MTA 会指向数据块，调用方随后必须用 UPLOAD
+     *       读取并自行恢复 MTA；本方法不改动 `m_last_mta_` 记录，除非
+     *       上层显式 UPLOAD。
+     */
+    [[nodiscard]] std::optional<TimeCorrelationPropertiesResponse>
+    ExecuteTimeCorrelationProperties(std::uint8_t set_properties,
+                                     std::uint8_t get_properties_request,
+                                     std::uint16_t cluster_id);
+
+    /**
      * @brief 执行 CLEAR_DAQ_LIST（docs L2431-2444；Static Mandatory）
      * @param daq_list DAQ List 号（EPK）
      * @details 无论 PREDEFINED 还是 configurable 列表，正在运行的数据传输都会
@@ -504,6 +590,18 @@ public:
         std::uint16_t daq_list);
 
     /**
+     * @brief 执行 GET_DAQ_LIST_MODE（规范 Table 150；**Optional**）
+     * @param daq_list DAQ List 号（EPK）
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
+     * @details 用于回读 Slave 侧实际生效的模式、事件通道、prescaler 与
+     *          priority，避免只依赖本端 SET_DAQ_LIST_MODE 的发送记录。
+     *          返回的 mode 是状态位，不能直接回填写命令。
+     * @throws XcpException 超时、其他协议错误或恢复失败
+     */
+    [[nodiscard]] std::optional<GetDaqListModeResponse> ExecuteGetDaqListMode(
+        std::uint16_t daq_list);
+
+    /**
      * @brief 执行 GET_DAQ_EVENT_INFO（v0.3；**Optional**，XCPlite 实然
      *        xcp.h:816-825：CRO 4 字节 = [D7][事件通道 WORD]，RES 六字段）
      * @param event_channel 事件通道号（uint16_t）
@@ -573,6 +671,78 @@ public:
     void ExecuteShortDownload(ElementCount number_of_elements,
                               AddressExtension extension, Address address,
                               BytesView data);
+
+    // ---- B1：标定闭环（块传输下载 / 持久化请求 / 区间校验）----
+
+    /**
+     * @brief 发送块传输首帧 DOWNLOAD（**不应答**）
+     * @param block_elements 本块总元素数（首帧 size 字段的语义）
+     * @param data 首帧数据（字节数 = min(block_elements, 单帧容量) × AG）
+     * @details 规范（原始 PDF §7.5.2.9）：块传输中只有末帧被肯定应答。
+     *          首帧的 SIZE 字段报的是**整块**元素数而不是本帧元素数——这是
+     *          与普通 DOWNLOAD 的唯一区别，容易写错，故单独成方法。
+     * @throws XcpException 发送失败（此时整块结论未知）
+     */
+    void ExecuteDownloadBlockHead(ElementCount block_elements, BytesView data);
+
+    /**
+     * @brief 发送一帧块模式中间帧 DOWNLOAD_NEXT（**不应答**）
+     * @param remaining_elements 本帧之后剩余元素数（含本帧）
+     * @param data 本帧数据（字节数必须 = 本帧元素数 × AG，由 MemoryAccess 保证）
+     * @details 规范（原始 PDF 第 144 页 Table 83）：块传输期间 Slave 只对
+     *          最后一帧肯定应答，中间帧不发 RESPONSE。因此本方法只占用命令
+     *          槽位完成发送并立即释放，不进入等待与恢复重试路径。
+     * @throws XcpException 发送失败（TransportError）或状态非法
+     * @note 发送失败即中断整个块：调用方必须把已发送部分视为"已写入但未经
+     *       确认"，不得改用逐帧 DOWNLOAD 重发同一段数据（可能重复写入）。
+     */
+    void ExecuteDownloadNextFrame(ElementCount remaining_elements,
+                                  BytesView data);
+
+    /**
+     * @brief 发送块模式末帧 DOWNLOAD_NEXT 并等待应答
+     * @param remaining_elements 末帧剩余元素数（即本帧元素数）
+     * @param data 末帧数据（字节数必须 = 本帧元素数 × AG）
+     * @details 与中间帧唯一的差别是**等待肯定应答**：Slave 在此帧回报整个
+     *          块的结论（成功，或 ERR_SEQUENCE 带期望元素数等负响应）。
+     *          超时按 OperationOutcomeUnknown 处理，不重放。
+     * @throws XcpException 负响应、超时或恢复失败
+     */
+    void ExecuteDownloadNextTail(ElementCount remaining_elements,
+                                 BytesView data);
+
+    /**
+     * @brief 执行 DOWNLOAD_MAX（固定满帧写入；**Optional**，无块传输）
+     * @param data 满帧数据字节，长度必须等于 `MAX_CTO - AG`
+     * @details 规范（原始 PDF 第 145 页 Table 85）明确它不支持块传输、也不得
+     *          出现在块传输序列中，故按普通命令走完整的一问一答流程。
+     * @throws XcpException 超时、负响应（含 ERR_MEMORY_OVERFLOW）或恢复失败
+     */
+    void ExecuteDownloadMax(BytesView data);
+
+    /**
+     * @brief 执行 BUILD_CHECKSUM（区间校验；**Optional**）
+     * @param block_size 参与校验的块长度（单位 AG），从当前隐含 MTA 起算
+     * @return 解析结果；Slave 回 ERR_CMD_UNKNOWN 时返回 std::nullopt
+     * @throws XcpException 负响应（对齐/超限时 ERR_OUT_OF_RANGE 带参数）、
+     *         超时或恢复失败
+     * @note 调用方必须先 SET_MTA；执行后 Slave 把 MTA 前移 block_size。
+     */
+    [[nodiscard]] std::optional<BuildChecksumResponse> ExecuteBuildChecksum(
+        std::uint32_t block_size);
+
+    /**
+     * @brief 执行 SET_REQUEST（请求保存到非易失存储；**Optional**）
+     * @param mode Mode 位掩码（本库主要用 STORE_CAL_REQ）
+     * @param session_configuration_id 会话配置 ID（随 DAQ 列表保存）
+     * @details 正响应无参数，只表示 Slave 收到请求；请求是否完成必须通过
+     *          GET_STATUS 中对应位被清除确认（规范第 128 页）。因此本方法
+     *          成功返回**不等价于**”已保存“。
+     * @throws XcpException(UnsupportedFeature) Slave 回 ERR_CMD_UNKNOWN
+     * @throws XcpException 负响应（不支持该 mode 时 ERR_OUT_OF_RANGE）、超时
+     */
+    void ExecuteSetRequest(SetRequestModeBit mode,
+                           std::uint16_t session_configuration_id);
 
     // ---- 变量标定批次：MODIFY_BITS + Page Switching（docs §7.5.2.5/§7.5.3）----
 
@@ -694,6 +864,17 @@ private:
     /// @throws 发送阶段的 XcpException（抛出前会先释放命令槽位）
     [[nodiscard]] std::optional<ParsedPacket> PerformAttempt(
         CommandCode cmd, BytesView encoded_packet);
+
+    /**
+     * @brief 只发送不等待：用于块传输中间帧（规范保证其无应答）
+     * @param cmd 命令码（占用命令槽位时记录）
+     * @param encoded_packet 已编码的完整 CTO Packet
+     * @throws XcpException 发送失败；抛出前已释放命令槽位
+     * @note 与 PerformAttempt 的差别仅在于不调用 WaitForResponse、不做恢复
+     *       重试。若 Slave 违规在此阶段提前返回负响应，该响应会留在响应槽位
+     *       中，由紧随其后的末帧等待取到并报告——不会被静默丢弃。
+     */
+    void SendFrameNoResponse(CommandCode cmd, BytesView encoded_packet);
 
     /// @brief 等待响应槽位被填充
     /// @details 收到 EV_CMD_PENDING 时重启本轮超时计时，但不重发原命令（计划

@@ -116,6 +116,143 @@ struct GetDaqListInfoResponse {
 };
 
 /**
+ * @brief GET_DAQ_LIST_MODE 响应解析结果（规范 Table 150）
+ * @details RES 数据（去掉 0xFF 后）为 7 字节：
+ *          [Current Mode][reserved WORD][Event Channel WORD][Prescaler]
+ *          [Priority]。注意 `mode` 是**Slave 当前状态位**（SELECTED/
+ *          DIRECTION/DTO_CTR/TIMESTAMP/PID_OFF/RUNNING/RESUME），与
+ *          SET_DAQ_LIST_MODE 的请求 MODE 位语义不同，
+ *          不能把 `mode` 原样回填给写命令。
+ */
+/**
+ * @brief GET_DAQ_PACKED_MODE 响应解析结果（V1.5 §7.5.4.8 Table 128/129）
+ * @details RES 数据（去掉 0xFF 后）：`mode = 0` 时只有 `[Reserved][Mode]`
+ *          两个字节；`mode = 1/2` 时追加 `[DPM_TIMESTAMP_MODE]` 与
+ *          `[DPM_SAMPLE_COUNT WORD]`。**不能按固定长度解析**。
+ */
+struct DaqPackedModeResponse {
+    DaqPackedMode mode{DaqPackedMode::NotPacked};  ///< 当前生效的打包方式
+    DaqPackedTimestampMode timestamp_mode{
+        DaqPackedTimestampMode::LastSample};  ///< 时间戳语义（mode=0 时无意义）
+    std::uint16_t sample_count{0};  ///< 一帧打包采样数（mode=0 时为 0）
+};
+
+struct GetDaqListModeResponse {
+    std::uint8_t mode{0};           ///< Current Mode 原始位
+    std::uint16_t reserved{0};      ///< 保留字（Slave 回填，调用方不应依赖）
+    std::uint16_t event_channel{0};  ///< 当前绑定的 Event Channel
+    std::uint8_t prescaler{0};      ///< 事件分频（0 = 未使用）
+    std::uint8_t priority{0};       ///< 优先级（越大优先级越高）
+};
+
+/**
+ * @brief BUILD_CHECKSUM 响应解析结果（原始 PDF 第 148 页 Table 74）
+ * @details RES 数据（去掉 0xFF 后）为 7 字节：
+ *          [Checksum type][Reserved(WORD)][Checksum(DWORD)]。
+ *          规范保证校验结果**恒为 DWORD**，与算法位宽无关；本结构保留原始
+ *          类型字节的枚举值，未知/厂商自定义类型时 `checksum_type` 为
+ *          `std::nullopt`，调用方不得据此判定校验一致。
+ * @note 负响应（Table 76）携带 `MTA_BLOCK_SIZE_ALIGN`(WORD) 与
+ *       `Maximum block size`(DWORD)，由错误路径的附加信息保留，不进入本结构。
+ */
+struct BuildChecksumResponse {
+    std::optional<CalibrationChecksumType> checksum_type;  ///< 算法类型
+    std::uint8_t raw_checksum_type{0};                    ///< 原始类型字节
+    std::uint16_t reserved{0};                            ///< 保留字
+    std::uint32_t checksum{0};                            ///< 校验结果（恒 DWORD）
+};
+
+/**
+ * @brief DTO_CTR_PROPERTIES 响应解析结果（docs §7.5.4.15 Table 164）
+ * @details RES 数据（去掉 0xFF 后）为 5 字节：
+ *          [PROPERTIES][Current Related Event Channel(WORD)][MODE]。
+ *          `properties` 保留原始位（语义见 `DtoCtrPropertiesBit`），
+ *          `mode` 保留原始位（bit0 DAQ_MODE、bit1 STIM_MODE）。
+ * @note 规范未在响应里回显被查询的事件通道号，调用方需自行保存入参。
+ */
+struct DtoCtrPropertiesResponse {
+    std::uint8_t properties{0};          ///< PROPERTIES 原始位
+    std::uint16_t related_event_channel{0};  ///< 当前相关事件通道号
+    std::uint8_t mode{0};                ///< MODE 原始位（DAQ/STIM 各一位）
+};
+
+/**
+ * @brief GET_DAQ_CLOCK 响应解析结果（docs §7.5.4.10 Table 133/134）
+ * @details RES 数据（去掉 0xFF 后）至少 6 字节：
+ *          [reserved][TRIGGER_INFO][PAYLOAD_FMT][时钟时间戳…]。
+ *          legacy 时时间戳固定为 DWORD（格式由 GET_DAQ_RESOLUTION_INFO 决定，
+ *          本结构只保留原值）；extended 时时间戳依次为
+ *          XCP slave（按 FMT_XCP_SLV 为 DWORD 或 DLONG）、
+ *          grandmaster（若 FMT_GRANDM != 0）、ECU（若 FMT_ECU != 0），
+ *          末尾在“存在可同步/锁频时钟”时追加 1 字节 SYNC_STATE。
+ * @note 规范禁止 master 使用 TRIGGER_INFO 里的 TRIGGER_INITIATOR 判定时钟
+ *       来源，这里仍保留原字节供诊断，但调用方不应据此分支。
+ * @note 各时钟时间戳为**原值**，不做单位换算与回绕延展；换算属上层模型。
+ */
+struct GetDaqClockResponse {
+    std::uint8_t trigger_info{0};   ///< TRIGGER_INFO 原始字节
+    std::uint8_t payload_fmt{0};    ///< PAYLOAD_FMT 原始字节
+    std::uint64_t slave_clock{0};   ///< XCP slave 时钟时间戳原值
+    std::size_t slave_clock_bytes{0};  ///< slave 时间戳宽度（4 或 8）
+    std::optional<std::uint64_t> grandmaster_clock;  ///< grandmaster 时钟原值
+    std::optional<std::uint64_t> ecu_clock;          ///< ECU 时钟原值
+    std::optional<std::uint8_t> sync_state;          ///< SYNC_STATE 原始字节
+    bool extended{false};  ///< 是否按 extended 布局解析
+};
+
+/**
+ * @brief TIME_CORRELATION_PROPERTIES 响应解析结果（docs §7.5.6.1 Table 212）
+ * @details RES 数据（去掉 0xFF 后）为 8 字节：
+ *          [SLAVE_CONFIG][OBSERVABLE_CLOCKS][SYNC_STATE][CLOCK_INFO]
+ *          [RESERVED][CLUSTER_ID(WORD)]。
+ */
+struct TimeCorrelationPropertiesResponse {
+    std::uint8_t slave_config{0};        ///< SLAVE_CONFIG 原始位
+    std::uint8_t observable_clocks{0};   ///< OBSERVABLE_CLOCKS 原始位
+    std::uint8_t sync_state{0};          ///< SYNC_STATE 原始位
+    std::uint8_t clock_info{0};          ///< CLOCK_INFO 原始位（指示数据块组成）
+    std::uint8_t reserved{0};            ///< 保留字节
+    std::uint16_t cluster_id{0};         ///< CLUSTER_ID
+};
+
+/**
+ * @brief EV_TIME_SYNC 事件载荷解析结果（docs Table 242 / 247 / 248）
+ * @details legacy（MAX_CTO = 8 或未启用高级特性）：
+ *          [reserved][reserved][DWORD 时间戳]。
+ *          extended 且 MAX_CTO = 8：[TRIGGER_INFO][counter 或 0][DWORD]。
+ *          extended 且 MAX_CTO != 8：[TRIGGER_INFO][PAYLOAD_FMT]
+ *          [可选 slave ts][可选 grandm ts][可选 ecu ts]
+ *          [可选 WORD cluster id][可选 BYTE counter][可选 SYNC_STATE]。
+ * @note 本结构只保留原始字节与已解析的时间戳，不推断时间同步质量。
+ */
+/**
+ * @brief EV_TIME_SYNC 事件的载荷布局（docs Table 242 / 247 / 248）
+ * @details 规范里三种布局的差异不只是“长短”，第二字节的语义都不同：
+ *          - Legacy：`[reserved][reserved][DWORD]`，没有 TRIGGER_INFO；
+ *          - ExtendedMaxCto8：`[TRIGGER_INFO][counter 或 0][DWORD]`，
+ *            **没有 PAYLOAD_FMT**（MAX_CTO=8 时协议无法塞下更多）；
+ *          - ExtendedPayloadFormat：`[TRIGGER_INFO][PAYLOAD_FMT][…]`。
+ *          用枚举而不是 bool 是为了让调用方必须显式选择，不能靠长度猜。
+ */
+enum class TimeSyncLayout : std::uint8_t {
+    Legacy,                ///< legacy：无 TRIGGER_INFO/PAYLOAD_FMT
+    ExtendedMaxCto8,       ///< extended 且 MAX_CTO = 8：无 PAYLOAD_FMT
+    ExtendedPayloadFormat  ///< extended：含 PAYLOAD_FMT，可按需带多时钟
+};
+
+struct TimeSyncEvent {
+    std::uint8_t trigger_info{0};  ///< TRIGGER_INFO 原始字节
+    std::uint8_t payload_fmt{0};   ///< PAYLOAD_FMT 原始字节（legacy 恒 0）
+    std::optional<std::uint64_t> slave_clock;         ///< slave 时钟原值
+    std::optional<std::uint64_t> grandmaster_clock;   ///< grandmaster 时钟原值
+    std::optional<std::uint64_t> ecu_clock;           ///< ECU 时钟原值
+    std::optional<std::uint16_t> cluster_id;          ///< 附加 cluster id
+    std::optional<std::uint8_t> counter;              ///< 附加 counter
+    std::optional<std::uint8_t> sync_state;           ///< SYNC_STATE 原始字节
+    bool extended{false};  ///< 是否按 extended 布局解析
+};
+
+/**
  * @brief GET_DAQ_EVENT_INFO 响应解析结果（v0.3；xCPlite 实然布局
  *        xcp.h:819-825，CRO_GET_DAQ_EVENT_INFO_LEN=4 / CRM_LEN=7）
  * @details RES 数据（去掉 0xFF 后）为 6 字节，**事件通道号不在响应中回显**
@@ -409,6 +546,79 @@ public:
         BytesView res_data) const;
 
     /**
+     * @brief 解析 GET_DAQ_LIST_MODE 响应（规范 Table 150）
+     * @param res_data RES 后的数据（去掉 0xFF 前缀，长度必须 >= 7：
+     *                 Current Mode/reserved(WORD)/Event Channel(WORD)/
+     *                 Prescaler/Priority）
+     */
+    [[nodiscard]] std::optional<GetDaqListModeResponse> ParseGetDaqListMode(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_DAQ_PACKED_MODE 正响应（V1.5 §7.5.4.8）
+     * @param res_data 已剥离 0xFF 的 RES 数据
+     * @return 解析结果；短帧、或 Slave 回了未定义的 DAQ_PACKED_MODE（3..255）、
+     *         或 packed 模式下 DPM_TIMESTAMP_MODE 为保留值，一律返 `nullopt`
+     * @note `mode = 0` 与 `mode = 1/2` 的载荷长度不同，按 mode 分支解析，
+     *       不用长度猜。
+     */
+    [[nodiscard]] std::optional<DaqPackedModeResponse> ParseDaqPackedMode(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 BUILD_CHECKSUM 响应（原始 PDF 第 148 页 Table 74）
+     * @param res_data RES 后的数据（去掉 0xFF 前缀，长度必须 >= 7：
+     *                 Checksum type/Reserved(WORD)/Checksum(DWORD)）
+     * @return 解析结果；长度不足返回 std::nullopt（不臆造校验值）
+     * @note 未知校验类型不视为解析失败：保留 `raw_checksum_type` 并把
+     *       `checksum_type` 置空，让上层按“无法验证”而非“验证通过”处理。
+     */
+    [[nodiscard]] std::optional<BuildChecksumResponse> ParseBuildChecksum(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 DTO_CTR_PROPERTIES 响应（docs §7.5.4.15 Table 164）
+     * @param res_data RES 后的数据（去掉 0xFF 前缀，长度必须 >= 5：
+     *                 PROPERTIES/Related Event Channel(WORD)/MODE）
+     * @return 解析结果；长度不足返回 std::nullopt
+     * @note 响应不回显被查询的事件通道号，调用方必须自己保留入参，
+     *       否则无法把结果与查询对象对应起来。
+     */
+    [[nodiscard]] std::optional<DtoCtrPropertiesResponse> ParseDtoCtrProperties(
+        BytesView res_data) const;
+
+    /**
+     * @brief 解析 GET_DAQ_CLOCK 响应（docs §7.5.4.10 Table 133/134）
+     * @param res_data RES 后的数据（去掉 0xFF 前缀）
+     * @param extended true = 按 extended 布局（PAYLOAD_FMT 决定各时钟宽度），
+     *        false = legacy（时间戳固定 DWORD）
+     * @return 解析结果；长度不足或 PAYLOAD_FMT 含保留值（3）返回 std::nullopt
+     * @note 时钟原值不做单位换算；SYNC_STATE 是否存在由布局长度决定，
+     *       不猜测缺省值。
+     */
+    [[nodiscard]] std::optional<GetDaqClockResponse> ParseGetDaqClock(
+        BytesView res_data, bool extended) const;
+
+    /**
+     * @brief 解析 TIME_CORRELATION_PROPERTIES 响应（docs §7.5.6.1 Table 212）
+     * @param res_data RES 后的数据（去掉 0xFF 前缀，长度必须 >= 8）
+     * @return 解析结果；长度不足返回 std::nullopt
+     */
+    [[nodiscard]] std::optional<TimeCorrelationPropertiesResponse>
+    ParseTimeCorrelationProperties(BytesView res_data) const;
+
+    /**
+     * @brief 解析 EV_TIME_SYNC 事件载荷（docs Table 242 / 247 / 248）
+     * @param res_data 事件包去掉 `[0xFD][0x08]` 之后的载荷
+     * @param layout 载荷布局；由调用方按会话协商结果决定，本方法不猜
+     * @return 解析结果；长度不足或 PAYLOAD_FMT 含保留值返回 std::nullopt
+     * @note 三个布局的第二字节语义不同（见 `TimeSyncLayout`），因此不能用
+     *       “先试长的再退回短的”来判定，必须由调用方显式给出布局。
+     */
+    [[nodiscard]] std::optional<TimeSyncEvent> ParseTimeSyncEvent(
+        BytesView res_data, TimeSyncLayout layout) const;
+
+    /**
      * @brief 解析 GET_DAQ_EVENT_INFO 响应（v0.3；XCPlite 实然 xcp.h:819-825，
      *        CRO_GET_DAQ_EVENT_INFO_LEN=4 / CRM_LEN=7）
      * @param res_data RES 后的数据（去掉 0xFF 前缀，长度必须 >= 6：
@@ -518,6 +728,13 @@ private:
     /// @param offset 字段起始偏移
     /// @return 取值；越界时返回 std::nullopt
     [[nodiscard]] std::optional<std::uint32_t> ReadU32(
+        BytesView data, std::size_t offset) const;
+
+    /// @brief 按 Session 字节序读取 64 位字段（B3：DLONG 时钟时间戳）
+    /// @param data 响应数据
+    /// @param offset 字段起始偏移
+    /// @return 取值；越界时返回 std::nullopt
+    [[nodiscard]] std::optional<std::uint64_t> ReadU64(
         BytesView data, std::size_t offset) const;
 
     /// @brief 读取单字节字段（带越界保护）

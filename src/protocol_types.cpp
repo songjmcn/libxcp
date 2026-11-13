@@ -96,6 +96,63 @@ std::optional<ErrorCode> ToErrorCode(std::uint8_t raw) noexcept {
     return std::nullopt;
 }
 
+std::string_view ChecksumTypeName(CalibrationChecksumType type) noexcept {
+    switch (type) {
+        case CalibrationChecksumType::Add11:
+            return "XCP_ADD_11";
+        case CalibrationChecksumType::Add12:
+            return "XCP_ADD_12";
+        case CalibrationChecksumType::Add14:
+            return "XCP_ADD_14";
+        case CalibrationChecksumType::Add22:
+            return "XCP_ADD_22";
+        case CalibrationChecksumType::Add24:
+            return "XCP_ADD_24";
+        case CalibrationChecksumType::Add44:
+            return "XCP_ADD_44";
+        case CalibrationChecksumType::Crc16:
+            return "XCP_CRC_16";
+        case CalibrationChecksumType::Crc16Citt:
+            return "XCP_CRC_16_CITT";
+        case CalibrationChecksumType::Crc32:
+            return "XCP_CRC_32";
+        case CalibrationChecksumType::UserDefined:
+            return "XCP_USER_DEFINED";
+    }
+    // 未知枚举值：不臆测算法，交由调用方按“无法验证”处理
+    return "XCP_CHECKSUM_UNKNOWN";
+}
+
+std::optional<CalibrationChecksumType> ToChecksumType(
+    std::uint8_t raw) noexcept {
+    switch (static_cast<CalibrationChecksumType>(raw)) {
+        case CalibrationChecksumType::Add11:
+        case CalibrationChecksumType::Add12:
+        case CalibrationChecksumType::Add14:
+        case CalibrationChecksumType::Add22:
+        case CalibrationChecksumType::Add24:
+        case CalibrationChecksumType::Add44:
+        case CalibrationChecksumType::Crc16:
+        case CalibrationChecksumType::Crc16Citt:
+        case CalibrationChecksumType::Crc32:
+        case CalibrationChecksumType::UserDefined:
+            return static_cast<CalibrationChecksumType>(raw);
+    }
+    return std::nullopt;
+}
+
+std::string_view DaqPackedModeName(DaqPackedMode mode) noexcept {
+    switch (mode) {
+        case DaqPackedMode::NotPacked:
+            return "DAQ_PACKED_MODE_NONE";
+        case DaqPackedMode::ElementGrouped:
+            return "DAQ_PACKED_MODE_ELEMENT_GROUPED";
+        case DaqPackedMode::EventGrouped:
+            return "DAQ_PACKED_MODE_EVENT_GROUPED";
+    }
+    return "DAQ_PACKED_MODE_UNKNOWN";
+}
+
 std::string_view EventCodeName(EventCode code) noexcept {
     switch (code) {
         case EventCode::ResumeMode:

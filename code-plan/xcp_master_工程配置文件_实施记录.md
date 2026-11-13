@@ -150,3 +150,11 @@ cmake-build-release/tests/XcpMasterSymbolPolicyTest.exe \
 ctest --test-dir cmake-build-release -R "XcpMasterTool" --output-on-failure
 ctest --test-dir cmake-build-release
 ```
+
+## 8. macOS 可执行文件路径编译修复
+
+- 日期：2026-11-12
+- 原因：macOS SDK 在 `<mach-o/dyld.h>` 中声明的函数名为 `_NSGetExecutablePath`，原实现误用了 `NSGetExecutablePath`，导致 `xcp_master` 编译失败。
+- 修改：仅修正 `tools/xcp_master/project_file.hpp` 的 Apple 条件分支中的两处调用；Windows/Linux 分支保持不变。
+- 测试：新增 `ProjectFilePaths.ExecutableDirectoryExists`，验证可执行文件目录可解析为现存目录。
+- 验证：仅运行 `macos.yml` workflow（run `43249112364`）；macOS Configure、Build 与 Test 均通过。
