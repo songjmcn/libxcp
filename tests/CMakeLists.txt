@@ -88,6 +88,7 @@ add_executable(libxcp_tests
         measurement_planner_test.cpp
         measurement_session_test.cpp
         measurement_counter_test.cpp
+        poll_session_test.cpp
         daq_timestamp_test.cpp
         measurement_session_hardening_test.cpp
         logging_test.cpp
@@ -163,7 +164,9 @@ if(LIBXCP_BUILD_XCPLITE_SLAVE)
           # 测量子系统 L3 全链路（v0.9）：桥接 + 适配器 + MeasurementSession
           xcplite_measurement_test.cpp
           # B-T5：XCPlite 真实 TCP 互操作 Gate（计划 §8.2）
-          xcplite_tcp_interop_test.cpp)
+          xcplite_tcp_interop_test.cpp
+          # P4：20 ms 周期下的 poll 容量标定（真实 UDP Slave，手动运行）
+          poll_capacity_calibration.cpp)
   target_compile_features(XcpliteIntegration PRIVATE cxx_std_20)
   target_link_libraries(XcpliteIntegration PRIVATE
           libxcp::libxcp

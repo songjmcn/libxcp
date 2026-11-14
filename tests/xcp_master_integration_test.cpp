@@ -846,7 +846,7 @@ TEST(XcpMasterIntegration, UnrecoverableTimeoutReportsRecoveryFailed) {
     // 第 1 次 UPLOAD 丢包后，恢复重试仍丢包 -> 耗尽
     Rig rig(MockXcpSlave{}, CommandTimeouts{std::chrono::milliseconds(100),
                                             std::chrono::milliseconds(100), 1});
-    // 元素数必须超过 MAX_CTO/AG(=8)，否则会走 SHORT_UPLOAD 而非 UPLOAD
+    // 元素数必须超过 MAX_CTO/AG-1(=7)，否则会走 SHORT_UPLOAD 而非 UPLOAD
     const ElementCount total = 20U;
     rig.slave.SetMemory(0x30000, Bytes(total, 0x5AU));
     rig.slave.DropCommand(CommandCode::Upload);

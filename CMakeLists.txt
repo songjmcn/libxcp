@@ -206,6 +206,8 @@ target_sources(libxcp PRIVATE
         src/daq/daq_timestamp.cpp
         src/measurement/measurement_planner.cpp
         src/measurement/measurement_session.cpp
+        # P1：poll 模式采集会话（主站主动轮询，非 DAQ）。
+        src/poll/poll_session.cpp
         # 第二阶段提取：A2L 对齐证据（受限扫描 + 双源核对）。
         src/a2l_tcp_alignment.cpp
         # 第二阶段提取：CLI/A2L 传输层选择解析（§8.1 规则）。

@@ -149,7 +149,7 @@ B3 的 `TIME_CORRELATION_PROPERTIES`（含 PID 8 / 剥 PID 7）已踩过，
 
 ## 5. 测试与实测
 
-新增 `tests/daq_packed_mode_test.cpp`（注册于 `tests/CMakeLists.txt:87`），5 个套件共 **27** 个用例：
+新增 `tests/daq_packed_mode_test.cpp`（注册于 `tests/CMakeLists.txt:87`），5 个套件；本记录撰写时为 **27** 个用例，后续在同一批次内补充至 **34** 个（校正说明见 5.5）：
 
 ### 5.1 用例清单
 
@@ -218,7 +218,30 @@ B4 专项：DaqPackedMode*  → 27 / 27 通过（25 ms）
       [  FAILED ] 0 tests
 ```
 
-批次间总量演进：B3 结束 939 → B4 新增 27 例 = 966。
+批次间总量演进：B3 结束 939 → B4 中期 27 例 = 966（上表实测即为该中期态）→ B4 终态 34 例。
+
+### 5.5 用例计数校正（P0 批次核对后补记）
+
+P0 批次核对全量回归时发现：本记录 §5.1 的 27 例是**撰写当时**的规模，之后同批次内
+又补充了 7 例，当前代码实际为 **34** 例：
+
+| 套件 | 本记录 27 例版 | 当前实际 |
+| --- | --- | --- |
+| `DaqPackedModeCodec` | 6 | 6 |
+| `DaqPackedModeParser` | 6 | 6 |
+| `DaqPackedModeMaster` | 7 | 7 |
+| `DaqPackedModePlanner` | 3 | 7 |
+| `DaqPackedModeSession` | 5 | 8 |
+| 合计 | 27 | **34** |
+
+因此 §5.4 的"966 tests"是 B4 中期数字，不是 B4 收尾基线。当前（P0 批次结束时）
+实测全量为 **978** 例：977 通过 + 1 跳过
+（`AgIntegration/XcpMasterAgTest.ByteApiRequiresMultipleOfAg/Ag1_Cto8`，B0 之前即跳过）
++ 0 失败，其中 4 例为 P0 新增的 `MemoryAccessShortUploadLimit` 套件。
+
+以上数字均可用 `libxcp_tests.exe --gtest_list_tests` 与全量运行复现；
+B0–B3 各批次记录中的用例总数同样存在"记录时点早于最终代码"的可能，
+后续批次如需引用应按当次实测为准。
 
 `git diff --stat`：20 文件、+4061 / −152（含 B0–B4 全部改动；B4 自身见 §3）。
 

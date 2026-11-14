@@ -518,7 +518,7 @@ TEST(MemoryAccessBasic, RequiresConnectedSession) {
 struct AgCase {
     AddressGranularity ag;
     std::uint8_t max_cto;
-    ElementCount short_upload_max;  ///< MAX_CTO/AG
+    ElementCount short_upload_max;  ///< MAX_CTO/AG - 1（原始 PDF §7.5.1.13）
     ElementCount upload_max;        ///< MAX_CTO/AG - 1
 };
 
@@ -591,6 +591,78 @@ TEST_P(MemoryAccessAgTest, BeyondShortUploadLimitFallsBackToChunked) {
     EXPECT_GT(h.slave.count(CommandCode::Upload), 0);
 }
 
+// --------------------------------------------------------------------------
+// P0：SHORT_UPLOAD 单包上限 off-by-one（原始 PDF §7.5.1.13 Table 72）
+//
+// 规范 n 范围是 [1..MAX_CTO/AG - 1]：正响应为 [PID][n×AG]，PID 固定占 1 字节，
+// 故 n=MAX_CTO/AG 时响应会超出 MAX_CTO，从机只能回 ERR_OUT_OF_RANGE。
+// 修复前代码按 MAX_CTO/AG 计算，会把该请求误判为"可单包"。
+// --------------------------------------------------------------------------
+
+TEST(MemoryAccessShortUploadLimit, ExactMaxCtoElementsAvoidsShortUpload) {
+    // MAX_CTO=8、AG=Byte：n=8 的响应需 1+8=9 字节，超出 MAX_CTO
+    Harness h(AddressGranularity::Byte, ByteOrder::Intel, 0x08U, 0x0020U);
+    const Bytes content(8U, 0x5AU);
+    h.slave.SetMemoryElements(0x5000, content, 1U);
+
+    MemoryAccess access(h.executor, h.session);
+    const Bytes got = access.ReadElements(0x5000, 0x00, 8U);
+
+    EXPECT_EQ(got, content);
+    EXPECT_EQ(h.slave.count(CommandCode::ShortUpload), 0)
+        << "n=MAX_CTO/AG 时响应 1+n*AG 超过 MAX_CTO，不得走 SHORT_UPLOAD";
+    EXPECT_GT(h.slave.count(CommandCode::Upload), 0);
+}
+
+TEST(MemoryAccessShortUploadLimit, MaxMinusOneStillUsesShortUpload) {
+    // 上限正好是 7 时仍应走单包 SHORT_UPLOAD（仍为 1 次往返）
+    Harness h(AddressGranularity::Byte, ByteOrder::Intel, 0x08U, 0x0020U);
+    const Bytes content(7U, 0xC3U);
+    h.slave.SetMemoryElements(0x5100, content, 1U);
+
+    MemoryAccess access(h.executor, h.session);
+    const Bytes got = access.ReadElements(0x5100, 0x00, 7U);
+
+    EXPECT_EQ(got, content);
+    EXPECT_EQ(h.slave.count(CommandCode::ShortUpload), 1);
+    EXPECT_EQ(h.slave.count(CommandCode::SetMta), 0);
+}
+
+TEST(MemoryAccessShortUploadLimit, ExplicitShortUploadRejectsExactMaxCto) {
+    // 显式 ShortUpload 入口也必须按 §7.5.1.13 拒绝 n=MAX_CTO/AG
+    Harness h(AddressGranularity::Byte, ByteOrder::Intel, 0x08U, 0x0020U);
+    const Bytes content(8U, 0x00U);
+    h.slave.SetMemoryElements(0x5200, content, 1U);
+
+    MemoryAccess access(h.executor, h.session);
+    EXPECT_THROW(static_cast<void>(access.ShortUpload(0x5200, 0x00, 8U)),
+                 XcpException);
+    try {
+        static_cast<void>(access.ShortUpload(0x5200, 0x00, 8U));
+    } catch (const XcpException& e) {
+        EXPECT_EQ(e.Category(), ErrorCategory::InvalidArgument);
+    }
+    EXPECT_EQ(h.slave.count(CommandCode::ShortUpload), 0)
+        << "越界请求必须在下发前拒绝";
+}
+
+TEST(MemoryAccessShortUploadLimit, UploadChunkLimitNotDerivedFromShortUpload) {
+    // MAX_CTO=16、AG=DWord => MAX_CTO/AG=4，两条上限都应为 3。
+    // 若 MaxUploadElements 仍按 "MaxShortUploadElements()-1" 派生，会退化成 2，
+    // 读 7 个元素将分成 4 块（2+2+2+1）而不是 3 块（3+3+1）。
+    Harness h(AddressGranularity::DWord, ByteOrder::Intel, 0x10U, 0x0040U);
+    const Bytes content(7U * 4U, 0x7EU);
+    h.slave.SetMemoryElements(0x6000, content, 4U);
+
+    MemoryAccess access(h.executor, h.session);
+    const Bytes got = access.ReadElements(0x6000, 0x00, 7U);
+
+    EXPECT_EQ(got, content);
+    EXPECT_EQ(h.slave.count(CommandCode::SetMta), 3)
+        << "每块 3 个元素：7 = 3 + 3 + 1，应分 3 块";
+    EXPECT_EQ(h.slave.count(CommandCode::Upload), 3);
+}
+
 TEST_P(MemoryAccessAgTest, AddressAdvancesByAgBytes) {
     const AgCase c = GetParam();
     const auto ag_bytes = AgToBytes(c.ag);
@@ -613,12 +685,12 @@ TEST_P(MemoryAccessAgTest, AddressAdvancesByAgBytes) {
 
 INSTANTIATE_TEST_SUITE_P(
     AgMatrix, MemoryAccessAgTest,
-    ::testing::Values(AgCase{AddressGranularity::Byte, 0x08U, 8U, 7U},
-                      AgCase{AddressGranularity::Word, 0x08U, 4U, 3U},
-                      AgCase{AddressGranularity::DWord, 0x08U, 2U, 1U},
-                      AgCase{AddressGranularity::Byte, 0x40U, 64U, 63U},
-                      AgCase{AddressGranularity::Word, 0x10U, 8U, 7U},
-                      AgCase{AddressGranularity::DWord, 0x20U, 8U, 7U}),
+    ::testing::Values(AgCase{AddressGranularity::Byte, 0x08U, 7U, 7U},
+                      AgCase{AddressGranularity::Word, 0x08U, 3U, 3U},
+                      AgCase{AddressGranularity::DWord, 0x08U, 1U, 1U},
+                      AgCase{AddressGranularity::Byte, 0x40U, 63U, 63U},
+                      AgCase{AddressGranularity::Word, 0x10U, 7U, 7U},
+                      AgCase{AddressGranularity::DWord, 0x20U, 7U, 7U}),
     [](const ::testing::TestParamInfo<AgCase>& info) {
         return std::string("Ag") + std::to_string(AgToBytes(info.param.ag)) +
                "_MaxCto" + std::to_string(info.param.max_cto);

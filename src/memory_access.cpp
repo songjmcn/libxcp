@@ -25,12 +25,28 @@ ElementCount MemoryAccess::MaxShortUploadElements() const {
     if (ag == 0U) {
         return 0U;
     }
-    return max_cto / ag;
+    // 依据原始 PDF §7.5.1.13 Table 72：SHORT_UPLOAD 的 n 范围是
+    // [1..MAX_CTO/AG - 1]。响应结构为 [PID][n×AG] 字节，PID 固定占 1 字节，
+    // 因此 n×AG 必须不超过 MAX_CTO-1；若按 MAX_CTO/AG 计算，n×AG+1 会超出
+    // MAX_CTO，从机只能回 ERR_OUT_OF_RANGE（该错误不满足 ReadElements 的
+    // 降级条件，会直接上抛）。
+    const auto limit = max_cto / ag;
+    return (limit == 0U) ? 0U : (limit - 1U);
 }
 
 ElementCount MemoryAccess::MaxUploadElements() const {
-    const auto limit = MaxShortUploadElements();
-    return limit == 0U ? 0U : limit - 1U;
+    // 依据原始 PDF §7.5.1.12 Table 70/71：UPLOAD 的 n 范围同为
+    // [1..MAX_CTO/AG - 1]，响应同样是 [PID][n×AG]。这里**刻意独立计算**
+    // 而不复用 MaxShortUploadElements()，避免将来调整其中一个上限时把
+    // 另一个连带改错（两者数值相同但协议依据不同）。
+    const auto max_cto = static_cast<ElementCount>(m_session_.MaxCto());
+    const auto ag = static_cast<ElementCount>(
+        AgToBytes(m_session_.GetAddressGranularity()));
+    if (ag == 0U) {
+        return 0U;
+    }
+    const auto limit = max_cto / ag;
+    return (limit == 0U) ? 0U : (limit - 1U);
 }
 
 void MemoryAccess::ValidateRead(Address address,

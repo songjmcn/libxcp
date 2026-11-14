@@ -85,9 +85,12 @@ struct CalibrationStoreResult {
  * 封装轮询读取逻辑：优先 SHORT_UPLOAD，必要时降级到 SET_MTA+UPLOAD；
  * 自动处理 AG 换算、分块和地址溢出检查。
  *
- * @par 长度上限（docs/XCP_1.3.0_document.md §7.5.1.11 / §7.5.1.12）
+ * @par 长度上限（原始 PDF §7.5.1.12 UPLOAD / §7.5.1.13 SHORT_UPLOAD）
  *   UPLOAD:       1 <= NumberOfElements <= MAX_CTO / AG - 1
- *   SHORT_UPLOAD: 1 <= NumberOfElements <= MAX_CTO / AG
+ *   SHORT_UPLOAD: 1 <= NumberOfElements <= MAX_CTO / AG - 1
+ * @note 两条上限数值相同但依据不同（各自的 CTO 语义独立），实现中分别独立
+ *       计算，不互相派生；共同点是响应结构 [PID][n×AG] 必须为 PID 留出
+ *       1 字节，故上限都是 MAX_CTO/AG - 1。
  */
 class MemoryAccess {
 public:
@@ -264,9 +267,10 @@ private:
 
     /// @brief 是否可走 SHORT_UPLOAD：能力可用且元素数不超过单包上限
     [[nodiscard]] bool CanUseShortUpload(ElementCount element_count) const;
-    /// @brief UPLOAD 单块最大元素数（= MAX_CTO/AG - 1，为 CTO 自身留出余量）
+    /// @brief UPLOAD 单块最大元素数（= MAX_CTO/AG - 1，为 PID 留出 1 字节）
     [[nodiscard]] ElementCount MaxUploadElements() const;
-    /// @brief SHORT_UPLOAD 单包最大元素数（= MAX_CTO/AG）
+    /// @brief SHORT_UPLOAD 单包最大元素数（= MAX_CTO/AG - 1，原始 PDF §7.5.1.13）
+    /// @note 与 MaxUploadElements 数值相同但各自独立计算，不得互相派生
     [[nodiscard]] ElementCount MaxShortUploadElements() const;
 
     /**
