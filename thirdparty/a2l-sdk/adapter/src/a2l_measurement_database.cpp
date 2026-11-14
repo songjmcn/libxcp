@@ -7,7 +7,7 @@
  * adapter/ 目录不在扫描范围，见 tests/a2l_isolation_check.cmake）。
  */
 
-#include "a2l_measurement_database.hpp"  // 本适配器类定义
+#include "a2l/a2l_measurement_database.hpp"  // 本适配器类定义
 
 #include "libxcp/measurement/measurement_database.hpp"  // IMeasurementDatabase / MeasurementSymbolInfo
 #include "libxcp/measurement/measurement_result.hpp"

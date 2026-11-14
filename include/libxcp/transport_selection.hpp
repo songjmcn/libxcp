@@ -94,6 +94,17 @@ struct TransportSelectionRequest {
 
     /// @brief `--preset xcplite`：展开为 XCPlite 部署的固定组合（§8.1 规则 7）
     bool preset_xcplite = false;
+
+    /**
+     * @brief 传输层类别是否由用户**显式**指定（`--transport` 或 preset）
+     * @details 只影响规则 9 的放宽范围：未显式指定时（即"交给嗅探决定"），
+     *          UDP 允许回落到 A2L 的 `XCP_ON_UDP_IP` 端点；显式
+     *          `--transport udp` 仍要求 `--host/--port`，避免把"我就要 UDP"
+     *          解释成"随便找一个 UDP 端点"。
+     *          默认 false：既有调用方（测试、示例）保持"未显式"语义，
+     *          因此 UDP 的 A2L 回落对它们同样生效。
+     */
+    bool transport_explicit = false;
 };
 
 /**

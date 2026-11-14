@@ -10,10 +10,14 @@
 
 ```text
 libxcp 核心 (IMeasurementDatabase 窄接口)
-    ↑  adapter/a2l/A2lMeasurementDatabase   ← 核心↔桥接层唯一接触点
+    ↑  thirdparty/a2l-sdk/adapter/A2lMeasurementDatabase   ← 核心↔桥接层唯一接触点
     ↑  libxcp::a2lbridge（thirdparty/a2l-sdk/a2lbridge，语义适配层）
     ↑  liba2l.dll（thirdparty/a2llib 上游解析库的 DLL 封装）
 ```
+
+适配器依赖核心窄接口，因此定义在 SDK 的可选子模块位置：`thirdparty/a2l-sdk/CMakeLists.txt`
+以 `if(TARGET libxcp)` 守卫 `add_subdirectory(adapter)`，主树构建时必编；
+`build-sdk.ps1` 的独立 SDK 构建没有核心目标，整个 adapter 目录跳过。
 
 边界纪律（`tests/a2l_isolation_check.cmake` ctest 门禁 `A2lIsolation`）：
 
@@ -26,7 +30,7 @@ libxcp 核心 (IMeasurementDatabase 窄接口)
 
 | 组件 | 位置 | 职责 |
 |---|---|---|
-| 适配器 `A2lMeasurementDatabase` | `adapter/a2l/a2l_measurement_database.*`，target `libxcp_measurement_adapter` | 把桥接层 `IA2lDatabase` 包装为核心 `IMeasurementDatabase`；只做 `Find`（符号→`MeasurementSymbolInfo`）与 `ToPhysical`（换算委托桥接库）两件事，**不实现任何换算/AG 逻辑** |
+| 适配器 `A2lMeasurementDatabase` | `thirdparty/a2l-sdk/adapter/`（`include/a2l` + `src`），target `libxcp_measurement_adapter` | 把桥接层 `IA2lDatabase` 包装为核心 `IMeasurementDatabase`；只做 `Find`（符号→`MeasurementSymbolInfo`）与 `ToPhysical`（换算委托桥接库）两件事，**不实现任何换算/AG 逻辑** |
 | 桥接层 `libxcp_a2lbridge` | `thirdparty/a2l-sdk/a2lbridge/`，target `libxcp::a2lbridge` | 语义适配：`A2lBridge` 门面（Load/LoadAsync、不可变快照）、`IA2lDatabase` 查询（Find/Search/Count/ByteSizeOf）、CompuMethod 求值、DAQ Layout、IF_DATA XCP、RecordLayout、结构体布局 |
 | A2L 栈构建工程 | `thirdparty/a2l-sdk/` | 默认形态：主树 `add_subdirectory` 直接编译（uchardet 桩 → 上游 a2l → `liba2l.dll` → `libxcp_a2lbridge.lib`，Boost 由根 CMakeLists.txt 自动发现）；`build-sdk.ps1` 保留为独立 SDK 开发入口（预构建准备根场景），不再是主树前置步骤 |
 

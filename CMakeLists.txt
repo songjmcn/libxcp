@@ -362,18 +362,9 @@ unset(_libxcp_boost_search_hints)
 # liba2l 为 SHARED 边界，标准差异不影响 ABI。a2lbridge 本身即 C++20。
 add_subdirectory(thirdparty/a2l-sdk)
 
-# --- 测量适配器（v0.5，测量子系统代码增长计划 §5.5 / D1）--------------------
-# 独立顶层目录 adapter/a2l + 独立 target libxcp_measurement_adapter。
-# 副产物不并入 libxcp；adapter/*.cpp 是核心<->桥接层唯一接触点
-# （A2lIsolation S2 仅扫描 include/ 与 src/，本目录不在扫描范围）。
-add_library(libxcp_measurement_adapter STATIC
-        adapter/a2l/a2l_measurement_database.cpp
-        adapter/a2l/measurement_runtime_profile.cpp)
-target_include_directories(libxcp_measurement_adapter PUBLIC
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/adapter>)
-target_link_libraries(libxcp_measurement_adapter PUBLIC
-        libxcp::libxcp libxcp::a2lbridge)
+# --- 测量适配器 --------------------------------------------------------------
+# 已并入 A2L 模块：目标 libxcp_measurement_adapter 由 thirdparty/a2l-sdk/adapter
+# 定义，并依赖核心 libxcp，故由 SDK 父工程以 if(TARGET libxcp) 守卫。
 
 # ----------------------------------------------------------------------------
 # 构建开关（先于子目录声明；判定与 add_subdirectory 分离，见下方各段）

@@ -18,11 +18,28 @@ Disable the tool with `-DLIBXCP_BUILD_TOOLS=OFF` (the default). This option is i
 xcp_master (--a2l <path> | -c <file>) [--host <IPv4> --port <1..65535>] [--transport udp|tcp] [--tcp-profile asam-v1.4|asam-v1.5|auto|auto-legacy] [--packet-alignment 8|16|32] [--module <name>] [--mode poll|daq] [--interval-ms <ms>] [--preset xcplite] [--a2l-trusted-snapshot-root <dir>] [--config <file>]
 ```
 
-Either an A2L file or a project file (`-c`/`--config`) is required. TCP may use an IPv4 endpoint from command-line options or a matching A2L transport declaration; UDP requires an explicit endpoint. `--module` filters the symbol listing. The default is `--mode poll`; the poll target interval is 500 ms. `--interval-ms` is rejected in DAQ mode; DAQ timing is controlled by ECU events. The DAQ DTO layout is selected from the slave's reported capabilities; there is no `--daq-profile` option. Use `--help` for the current transport options.
+Either an A2L file or a project file (`-c`/`--config`) is required. Both transports may take their endpoint from command-line options or from a matching A2L declaration (`XCP_ON_TCP_IP` / `XCP_ON_UDP_IP`); see [Endpoint inference](#endpoint-inference). `--module` filters the symbol listing. The default is `--mode poll`; the poll target interval is 500 ms. `--interval-ms` is rejected in DAQ mode; DAQ timing is controlled by ECU events. The DAQ DTO layout is selected from the slave's reported capabilities; there is no `--daq-profile` option. Use `--help` for the current transport options.
 
 TCP `auto` resolves the wire profile from real wire evidence: it builds a candidate list (the A2L TL version and `PACKET_ALIGNMENT` only *reorder* that list, they never decide it), then verifies each candidate on a brand-new connection with the real protocol stack (`VerifyTcpFramingCandidate`). The first `Accepted` candidate wins and the session is re-established on another fresh connection; the verification connections are always closed. Each attempt is reported as `被拒` (the peer answered with a protocol violation), `未决` (no protocol-level reply at all — typically a wrong address/port or a stopped slave) or `接受`. Exit codes: `0` resolved, `3` every candidate was rejected by the peer (fix the layout/alignment), `4` at least one candidate stayed inconclusive (check address, port, peer). `auto-legacy` explicitly opts into the older first-success attempts, which can affect the ECU session and do not establish a unique profile.
 
 For TCP the tool stages the A2L into a private snapshot before the SDK parses it (`--a2l-trusted-snapshot-root`, default `<exe dir>/tmp`) and only trusts the A2L alignment when the restricted raw-text scan and the SDK endpoint facts agree. The snapshot root and every ancestor must be writable only by the current user (plus SYSTEM/Administrators); if that cannot be proven — for example on a tree that grants `Users:(F)` — the tool prints `A2L 受控快照不可信: <reason>` and keeps the A2L alignment untrusted. In that case specify `--packet-alignment` for `asam-v1.5`. This conservative limitation does not change UDP.
+
+### Endpoint inference
+
+With only `--a2l <path>` the tool no longer demands `--host`/`--port`. When `--transport` is *not* given, `xcp_master` loads the A2L first, builds a sniffer plan from every declared endpoint, and tries them in order: TCP framing candidates first, then UDP. Each attempt is reported (`试连 TCP 127.0.0.1:5555 AsamV14/8bit：被拒，耗时 41 ms`), the first one that produces a legal XCP reply wins, and the session is then established on that transport. Exit codes match TCP `auto`: `0` connected, `2` there was no candidate at all (endpoint configuration is incomplete — nothing was contacted), `3` every candidate was rejected by the peer, `4` at least one attempt stayed inconclusive. The failure summary names only the transports that were actually attempted, so `TCP 候选均未得到合法响应` never implies UDP was tried.
+
+Explicit intent always wins over sniffing:
+
+| Input | Behaviour |
+| --- | --- |
+| `--a2l x.a2l` | Sniff: try every A2L-declared endpoint (TCP before UDP), plus a command-line endpoint if one was given |
+| `--a2l x.a2l --transport tcp` | TCP only. Without `--tcp-profile` this is equivalent to `--tcp-profile auto` |
+| `--a2l x.a2l --transport tcp --tcp-profile asam-v1.4` | Use that profile, no sniffing |
+| `--a2l x.a2l --transport udp` | UDP with `--host`/`--port`; the A2L endpoint is *not* used |
+| `--a2l x.a2l --host 1.2.3.4` | Rejected before any connection: `--host 与 --port 必须成对出现（只给其中一个无法确定端点）` |
+| `-c project.json` | The file records the transport that last actually worked, so it is replayed as-is and never sniffed |
+
+Two A2L-level limitations are deliberate. Multiple `MODULE`s without `--module` make the declaration ambiguous, and `ambiguous` A2L endpoints are never used as sniff evidence (`A2L 的 IF_DATA XCP 存在歧义…`); several differing instances are treated the same way, because picking the wrong one connects to a different ECU without any error. *Differing* is judged on the same four elements the core uses for `SameWireTarget`: host, port, `PACKET_ALIGNMENT` and transport-layer version — two declarations that agree on the address but disagree on alignment or TL version are ambiguous too. A declaration whose instance count is above one but whose details are not expanded (legacy A2L) is also treated as ambiguous instead of trusting the first record. The transport kind is still never *decided* by the A2L alone — it only decides the order in which declared endpoints are tried.
 
 ### Project file
 
@@ -74,6 +91,8 @@ whole file on the profile/alignment mutual exclusion.
 Precedence is command line > project file > built-in default, evaluated per field. An explicit CLI transport option (`--transport`, `--tcp-profile`, `--packet-alignment`, `--preset`) replaces the whole `connection` block, because mixing a CLI `--transport tcp` with a file `tcp_profile` could describe a combination that never connected. A CLI `--a2l` that disagrees with the file's `a2l_path` is an error, not a silent override.
 
 `save [path]` refuses to run while DAQ is active (the saved endpoint must be the one the session actually uses) and refuses to overwrite an existing file; it writes to `<path>.tmp` and renames. Without an argument the default is `<exe dir>/<A2L stem>.xcp.json`. Loading a file registers `observe` symbols in the observation set and `calibrate` symbols in the calibration list, but does not start watching: symbols that no longer exist or are not admissible are reported by name and skipped, and `watch` still needs to be typed.
+
+`session.config_source` is a read-only marker written by `save` as `"runtime"`. Loading accepts any string and ignores it: it exists so a human can tell a machine-written snapshot of an actually established session from a hand-edited intent file.
 
 ### Reusable pieces
 

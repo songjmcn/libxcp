@@ -77,12 +77,11 @@ libxcp/
 │   ├── daq/                    #   dto_envelope_decoder / dto_payload_decoder / daq_timestamp
 │   ├── detail/socket/          #   平台 Socket 实现（仅 _win/_posix 两份）
 │   └── measurement/            #   measurement_planner / measurement_session
-├── adapter/a2l/                # A2L 测量适配器（核心↔桥接层唯一接触点）
-│   └── a2l_measurement_database.*   # 包装桥接层 IA2lDatabase → 核心窄接口
 ├── thirdparty/                 # 第三方依赖（未经明确指示不得修改）
 │   ├── a2llib/                 #   git 子模块：上游 A2L 解析库（MIT）
 │   ├── a2l-sdk/                #   A2L 栈构建工程：主树经 add_subdirectory 直接编译（必编）
 │   │   ├── a2lbridge/          #     语义适配层 libxcp_a2lbridge（C++20）
+│   │   ├── adapter/            #     测量适配器 libxcp_measurement_adapter（核心↔桥接层唯一接触点）
 │   │   └── build-sdk.ps1       #     独立 SDK 开发入口：产出 liba2l.dll + 桥接库 + 头树
 │   └── XCPlite/                #   git 子模块：Vector 的开源 XCP Slave（测试对手端）
 ├── tests/                      # 测试用例（GoogleTest）与测试设施
@@ -109,10 +108,10 @@ libxcp/
 | DAQ 解码层 | `daq/` 四个头文件 | DTO 信封切分、ODT 净荷解码、时间戳换算（A2L-free） |
 | 测量层 | `measurement/` | 规划 → DAQ 配置 → 物理值帧回调（A2L-free） |
 | 传输层 | `IXcpTransport` → `UdpTransport` | 抽象接口 + 标准 UDP/IP 实现（预留 CAN 系实现位） |
-| A2L 组件（必编） | `adapter/a2l` + `thirdparty/a2l-sdk` | A2L 解析、语义适配、`IMeasurementDatabase` 实现 |
+| A2L 组件（必编） | `thirdparty/a2l-sdk`（含 `adapter/`） | A2L 解析、语义适配、`IMeasurementDatabase` 实现 |
 
 **依赖隔离**：核心库与测量路径不依赖 A2L——`IMeasurementDatabase` 是核心窄接口，
-A2L 接入是独立 target（`adapter/a2l/A2lMeasurementDatabase` →
+A2L 接入是独立 target（`thirdparty/a2l-sdk/adapter/A2lMeasurementDatabase` →
 `libxcp_measurement_adapter`），虽随主工程必编，但隔离由 ctest `A2lIsolation`
 门禁持续校验（扫描主树禁引用 A2L 栈 / 桥接层禁含上游头）。A2L 栈源码经
 `add_subdirectory(thirdparty/a2l-sdk)` 随主工程直接编译，不再消费预构建准备根。
