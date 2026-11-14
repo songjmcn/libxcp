@@ -36,6 +36,7 @@
 
 #include "libxcp/command_executor.hpp"  // IEventListener / DtoPacket / EventPacket / ServicePacket
 #include "libxcp/daq/dto_envelope_types.hpp"
+#include "libxcp/detail/perf_window.hpp"
 #include "libxcp/measurement/measurement_database.hpp"
 #include "libxcp/measurement/measurement_sample.hpp"
 #include "libxcp/protocol_types.hpp"
@@ -58,6 +59,24 @@ struct MeasurementStatistics {
 };
 
 /**
+ * @brief 测量会话性能快照（P-C：DAQ 六阶段滑动窗口）
+ *
+ * @details 与 `MeasurementStatistics` 分开：本结构只覆盖"自上次取快照
+ *          以来"的一个统计窗口，取走即清零；累计计数仍在
+ *          `MeasurementStatistics` 里，两者不互相影响。
+ */
+struct MeasurementPerfSnapshot {
+    PerfWindowSnapshot window;      ///< 六阶段耗时窗口（未到窗口边界时可为空）
+    std::uint64_t frames{0};        ///< 窗口内完成回调的 DTO 帧数
+    std::uint64_t payload_slices{0};///< 窗口内解码的净荷切片总数
+
+    /// @brief 窗口内没有任何样本
+    [[nodiscard]] bool Empty() const noexcept {
+        return window.samples == 0U && frames == 0U;
+    }
+};
+
+/**
  * @brief 测量会话（最终用户 API）
  *
  * @details 使用方法（最终应用码不变量，见计划 §5.5）：
@@ -77,7 +96,9 @@ public:
      * @brief 构造会话（此时 master 尚未绑定）
      * @param database IMeasurementDatabase 视图（适配器提供；生命周期须长于本对象）
      */
-    explicit MeasurementSession(IMeasurementDatabase& database);
+    explicit MeasurementSession(
+        IMeasurementDatabase& database,
+        PerfConfig perf_config = PerfConfigFromEnvironment());
     ~MeasurementSession() override;  // 尽力 Stop + join + 撤销配置
 
     MeasurementSession(const MeasurementSession&) = delete;
@@ -118,6 +139,21 @@ public:
 
     /// @brief 统计快照副本
     [[nodiscard]] MeasurementStatistics Statistics() const;
+
+    /**
+     * @brief 运行期整体替换性能统计配置（下一个窗口边界生效）
+     * @param config 新配置；`enabled=false` 时丢弃未完成的窗口
+     * @note 与 poll 侧同签名同语义，便于工具统一配置两条采集路径
+     */
+    void SetPerfConfig(const PerfConfig& config);
+
+    /// @brief 当前生效的性能统计配置
+    [[nodiscard]] PerfConfig PerfConfigValue() const;
+
+    /**
+     * @brief 取走当前窗口的性能快照（取走即清零窗口计数）
+     */
+    [[nodiscard]] MeasurementPerfSnapshot PerfSnapshot();
 
     /**
      * @brief 设定 DTO 识别字段模式（运行时取证用；须在 Prepare 前调用）
@@ -211,6 +247,21 @@ private:
     /// @brief worker 线程停止通知
     void NotifyWorker();
 
+    /// @brief 一帧 DAQ 处理的六阶段耗时（毫秒；负值表示该阶段未发生）
+    struct DaqFrameTiming {
+        double rx_enqueue_ms{0.0};       ///< RX 线程入队耗时
+        double queue_wait_ms{0.0};       ///< 入队 → worker 取帧的排队时间
+        double envelope_decode_ms{0.0};  ///< 信封解码耗时
+        double payload_decode_ms{-1.0};  ///< 净荷解码 + 换算耗时
+        double callback_ms{-1.0};        ///< 用户回调耗时（无回调时为负）
+        double e2e_ms{-1.0};             ///< 入队 → 回调开始的端到端延迟
+        std::size_t slices{0};           ///< 本帧解码的切片数
+    };
+    /// @brief 记录一帧的六阶段耗时，到窗口边界时输出日志
+    void RecordFramePerf(const DaqFrameTiming& timing);
+    /// @brief 输出一个性能窗口（调用方须持有 m_perf_mutex_）
+    void FlushPerfWindow();
+
     IMeasurementDatabase& m_database_;
     XcpMaster* m_master_{nullptr};         ///< 经 Bind 绑定（可为空）
     bool m_bound_{false};
@@ -256,7 +307,13 @@ private:
     bool m_running_{false};
     bool m_stop_requested_{false};
     MeasurementCallback m_callback_;
-    std::deque<Bytes> m_queue_;            ///< 有界 DTO 队列
+    /// @brief 队列元素：DTO 净荷 + 到达时刻（端到端延迟与排队等待需要）
+    struct QueuedDto {
+        Bytes bytes;                                      ///< DTO 净荷
+        std::chrono::steady_clock::time_point arrival{};  ///< RX 线程入队时刻
+        double enqueue_ms{0.0};                           ///< 入队本身耗时（毫秒）
+    };
+    std::deque<QueuedDto> m_queue_;        ///< 有界 DTO 队列（带到达时刻）
     std::unique_ptr<std::thread> m_worker_;
     static constexpr std::size_t kMaxQueue = 256;  ///< 有界队列容量
 
@@ -267,6 +324,12 @@ private:
     std::atomic<std::uint64_t> m_timestamp_wraps_{0};
     std::atomic<std::uint64_t> m_counter_gaps_{0};
     std::atomic<std::uint64_t> m_counter_lost_{0};
+
+    // 性能统计（worker 线程写、用户线程读，均经 m_perf_mutex_）
+    mutable std::mutex m_perf_mutex_;  ///< 保护 m_perf_ 与窗口计数
+    WindowAggregator m_perf_;          ///< 六阶段耗时滑动窗口
+    std::uint64_t m_perf_frames_{0};   ///< 窗口内已回调的帧数
+    std::uint64_t m_perf_slices_{0};   ///< 窗口内已解码的切片数
 
     /// @brief 已规划的路由视图（Prepare 时建立；(daq_list,odt) → 有序切片规格）
     struct OdtSlice {

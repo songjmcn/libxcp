@@ -92,7 +92,8 @@ add_executable(libxcp_tests
         daq_timestamp_test.cpp
         measurement_session_hardening_test.cpp
         logging_test.cpp
-        version_resolver_test.cpp)
+        version_resolver_test.cpp
+        perf_window_test.cpp)
 
 target_link_libraries(libxcp_tests PRIVATE
         libxcp::libxcp

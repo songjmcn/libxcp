@@ -717,5 +717,93 @@ TEST(MeasurementSessionPipeline, PrepareFailureWithUnknownSymbolThrowsBeforeDaq)
   EXPECT_EQ(rig.slave.Count(CommandCode::FreeDaq), 0);
 }
 
+// ---------------------------------------------------------------------------
+// 性能统计（P-C：DAQ 六阶段）
+// ---------------------------------------------------------------------------
+
+TEST(MeasurementSessionPerf, SnapshotReportsFrameAndStageTotals) {
+  Rig rig;
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& f) { collector(f); }));
+
+  const Bytes payload{0x11, 0x22, 0x33, 0x44};
+  for (std::uint32_t i = 0; i < 3U; ++i) {
+    rig.transport->InjectPacket(BytesView{MakeFrame(
+        0, 0, static_cast<std::uint32_t>(100U + i), BytesView{payload})});
+  }
+  ASSERT_TRUE(collector.WaitFor(3));
+  rig.session.Stop();
+
+  const auto snapshot = rig.session.PerfSnapshot();
+  EXPECT_EQ(snapshot.frames, 3U);
+  EXPECT_EQ(snapshot.payload_slices, 3U);
+  // 每帧记录 6 个阶段样本，因此窗口样本数是帧数的 6 倍
+  EXPECT_EQ(snapshot.window.samples, 18U);
+  EXPECT_EQ(snapshot.window.Stage(PerfStage::RxEnqueue).count, 3U);
+  EXPECT_EQ(snapshot.window.Stage(PerfStage::QueueWait).count, 3U);
+  EXPECT_EQ(snapshot.window.Stage(PerfStage::EnvelopeDecode).count, 3U);
+  EXPECT_EQ(snapshot.window.Stage(PerfStage::PayloadDecode).count, 3U);
+  EXPECT_EQ(snapshot.window.Stage(PerfStage::Callback).count, 3U);
+  EXPECT_EQ(snapshot.window.Stage(PerfStage::E2e).count, 3U);
+  // 端到端延迟覆盖整条链路，逐帧取最大后不应小于其中的信封解码最大值
+  EXPECT_GE(snapshot.window.Stage(PerfStage::E2e).max_ms,
+            snapshot.window.Stage(PerfStage::EnvelopeDecode).max_ms);
+  EXPECT_FALSE(snapshot.Empty());
+}
+
+TEST(MeasurementSessionPerf, DisabledConfigCollectsNoStages) {
+  Rig rig;
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+
+  PerfConfig config;
+  config.enabled = false;
+  rig.session.SetPerfConfig(config);
+  EXPECT_FALSE(rig.session.PerfConfigValue().enabled);
+
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& f) { collector(f); }));
+  const Bytes payload{0x11, 0x22, 0x33, 0x44};
+  rig.transport->InjectPacket(
+      BytesView{MakeFrame(0, 0, 7, BytesView{payload})});
+  ASSERT_TRUE(collector.WaitFor(1));
+  rig.session.Stop();
+
+  // 帧计数照常累加，但阶段窗口不采任何样本
+  const auto snapshot = rig.session.PerfSnapshot();
+  EXPECT_EQ(snapshot.frames, 1U);
+  EXPECT_EQ(snapshot.payload_slices, 1U);
+  EXPECT_EQ(snapshot.window.samples, 0U);
+  EXPECT_EQ(snapshot.window.Stage(PerfStage::PayloadDecode).count, 0U);
+}
+
+TEST(MeasurementSessionPerf, SnapshotResetsWindowCounters) {
+  Rig rig;
+  rig.session.Add("EngineSpeed");
+  rig.session.Prepare();
+
+  FrameCollector collector;
+  rig.session.Start(MeasurementCallback(
+      [&collector](const MeasurementFrame& f) { collector(f); }));
+  const Bytes payload{0x11, 0x22, 0x33, 0x44};
+  rig.transport->InjectPacket(
+      BytesView{MakeFrame(0, 0, 9, BytesView{payload})});
+  ASSERT_TRUE(collector.WaitFor(1));
+  rig.session.Stop();
+
+  const auto first = rig.session.PerfSnapshot();
+  EXPECT_EQ(first.frames, 1U);
+
+  const auto second = rig.session.PerfSnapshot();
+  EXPECT_EQ(second.frames, 0U);
+  EXPECT_EQ(second.window.samples, 0U);
+  EXPECT_TRUE(second.Empty());
+}
+
 }  // namespace
 }  // namespace calmcar::xcp

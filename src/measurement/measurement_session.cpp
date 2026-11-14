@@ -79,8 +79,9 @@ namespace {
 }
 }  // namespace
 
-MeasurementSession::MeasurementSession(IMeasurementDatabase& database)
-    : m_database_(database) {}
+MeasurementSession::MeasurementSession(IMeasurementDatabase& database,
+                                       PerfConfig perf_config)
+    : m_database_(database), m_perf_(perf_config) {}
 
 MeasurementSession::~MeasurementSession() {
     if (m_worker_ && m_worker_->joinable()) {
@@ -476,6 +477,118 @@ bool MeasurementSession::Running() const noexcept {
     return m_running_;
 }
 
+void MeasurementSession::SetPerfConfig(const PerfConfig& config) {
+    std::lock_guard<std::mutex> lock(m_perf_mutex_);
+    m_perf_.SetConfig(config);
+}
+
+PerfConfig MeasurementSession::PerfConfigValue() const {
+    std::lock_guard<std::mutex> lock(m_perf_mutex_);
+    return m_perf_.Config();
+}
+
+MeasurementPerfSnapshot MeasurementSession::PerfSnapshot() {
+    std::lock_guard<std::mutex> lock(m_perf_mutex_);
+    MeasurementPerfSnapshot snapshot;
+    snapshot.window = m_perf_.TakeSnapshot(std::chrono::steady_clock::now());
+    snapshot.frames = m_perf_frames_;
+    snapshot.payload_slices = m_perf_slices_;
+    m_perf_frames_ = 0;
+    m_perf_slices_ = 0;
+    return snapshot;
+}
+
+void MeasurementSession::FlushPerfWindow() {
+    // 调用方已持有 m_perf_mutex_：这里只做取快照与格式化，不再加锁
+    PerfWindowSnapshot window =
+        m_perf_.TakeSnapshot(std::chrono::steady_clock::now());
+    const PerfConfig config = m_perf_.ActiveConfig();
+    const std::uint64_t frames = m_perf_frames_;
+    const std::uint64_t slices = m_perf_slices_;
+    m_perf_frames_ = 0;
+    m_perf_slices_ = 0;
+    if (window.samples == 0U && frames == 0U) {
+        return;
+    }
+    // 六阶段之和即一帧的处理耗时（e2e 跨排队，不与它们相加）
+    const double stage_sum_ms =
+        window.Stage(PerfStage::RxEnqueue).sum_ms +
+        window.Stage(PerfStage::QueueWait).sum_ms +
+        window.Stage(PerfStage::EnvelopeDecode).sum_ms +
+        window.Stage(PerfStage::PayloadDecode).sum_ms +
+        window.Stage(PerfStage::Callback).sum_ms;
+    const double elapsed_s =
+        std::chrono::duration<double>(window.elapsed).count();
+    char head[320] = {};
+    std::snprintf(head, sizeof(head),
+                  "[perf][daq] window=%.3fs frames=%llu events=%llu "
+                  "samples=%llu slices=%llu",
+                  elapsed_s,
+                  static_cast<unsigned long long>(frames),
+                  static_cast<unsigned long long>(window.events),
+                  static_cast<unsigned long long>(window.samples),
+                  static_cast<unsigned long long>(slices));
+    std::string text(head);
+    const PerfStage order[] = {PerfStage::PayloadDecode,
+                               PerfStage::EnvelopeDecode,
+                               PerfStage::Callback,
+                               PerfStage::QueueWait,
+                               PerfStage::RxEnqueue,
+                               PerfStage::E2e};
+    for (const PerfStage stage : order) {
+        const StageWindow& values = window.Stage(stage);
+        if (values.count == 0U) {
+            continue;
+        }
+        if (!config.verbose_stages && stage != PerfStage::PayloadDecode) {
+            continue;
+        }
+        char share[32] = {};
+        if (stage != PerfStage::E2e && stage_sum_ms > 0.0) {
+            std::snprintf(share, sizeof(share), " (%.1f%%)",
+                          values.sum_ms * 100.0 / stage_sum_ms);
+        }
+        char line[256] = {};
+        std::snprintf(line, sizeof(line),
+                      "\n  %-15s mean=%.3fms p95=%.3fms max=%.3fms%s",
+                      PerfStageName(stage), values.MeanMs(),
+                      values.PercentileMs(0.95), values.max_ms, share);
+        text += line;
+    }
+    for (const SlowSpot& spot : window.slowest) {
+        const std::string symbol_name(spot.Symbol());
+        char line[256] = {};
+        std::snprintf(line, sizeof(line),
+                      "\n  slowest: %s[%s] n=%llu mean=%.3fms",
+                      symbol_name.c_str(), PerfStageName(spot.stage),
+                      static_cast<unsigned long long>(spot.count),
+                      spot.MeanMs());
+        text += line;
+    }
+    LIBXCP_LOG_INFO("%s", text.c_str());
+}
+
+void MeasurementSession::RecordFramePerf(const DaqFrameTiming& timing) {
+    std::lock_guard<std::mutex> lock(m_perf_mutex_);
+    m_perf_.Record(PerfStage::RxEnqueue, timing.rx_enqueue_ms);
+    m_perf_.Record(PerfStage::QueueWait, timing.queue_wait_ms);
+    m_perf_.Record(PerfStage::EnvelopeDecode, timing.envelope_decode_ms);
+    if (timing.payload_decode_ms >= 0.0) {
+        m_perf_.Record(PerfStage::PayloadDecode, timing.payload_decode_ms);
+    }
+    if (timing.callback_ms >= 0.0) {
+        m_perf_.Record(PerfStage::Callback, timing.callback_ms);
+    }
+    if (timing.e2e_ms >= 0.0) {
+        m_perf_.Record(PerfStage::E2e, timing.e2e_ms);
+    }
+    ++m_perf_frames_;
+    m_perf_slices_ += timing.slices;
+    if (m_perf_.Due(std::chrono::steady_clock::now())) {
+        FlushPerfWindow();
+    }
+}
+
 MeasurementStatistics MeasurementSession::Statistics() const {
     MeasurementStatistics s;
     s.dto_received = m_dto_received_.load();
@@ -489,6 +602,8 @@ MeasurementStatistics MeasurementSession::Statistics() const {
 
 void MeasurementSession::OnDto(const DtoPacket& dto) {
     // RX 线程：只入队，绝不阻塞。有界队列满 → 丢弃计数。
+    // 入队耗时与到达时刻都在这里取，worker 侧不再猜测。
+    const auto enqueue_start = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(m_run_mutex_);
     if (!m_running_) {
         return;
@@ -498,7 +613,13 @@ void MeasurementSession::OnDto(const DtoPacket& dto) {
         m_queue_.pop_front();
         m_dto_dropped_.fetch_add(1, std::memory_order_relaxed);
     }
-    m_queue_.emplace_back(dto.data.begin(), dto.data.end());
+    QueuedDto queued;
+    queued.bytes.assign(dto.data.begin(), dto.data.end());
+    queued.arrival = std::chrono::steady_clock::now();
+    queued.enqueue_ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - enqueue_start)
+                            .count();
+    m_queue_.push_back(std::move(queued));
     // 入队必须唤醒 worker（v0.9 L3 暴露）：worker 阻塞在 m_run_cv_.wait 上，
     // 没有 notify 就要等到 Stop 才一次性排空队列——实时流形同虚设。
     // 队列仍持锁，唤醒后 worker 重新判定谓词，无丢帧竞态。
@@ -555,6 +676,9 @@ void MeasurementSession::WorkerLoop() {
 
     for (;;) {
         Bytes frame;
+        QueuedDto queued;
+        std::chrono::steady_clock::time_point dequeue_time{};
+        DaqFrameTiming timing;
         {
             std::unique_lock<std::mutex> lock(m_run_mutex_);
             m_run_cv_.wait(lock, [&] {
@@ -563,19 +687,37 @@ void MeasurementSession::WorkerLoop() {
             if (m_stop_requested_ && m_queue_.empty()) {
                 break;
             }
-            frame = std::move(m_queue_.front());
+            queued = std::move(m_queue_.front());
             m_queue_.pop_front();
+            dequeue_time = std::chrono::steady_clock::now();
         }
+        frame = std::move(queued.bytes);
+        // 排队等待 = worker 取帧时刻 - RX 入队时刻
+        timing.rx_enqueue_ms = queued.enqueue_ms;
+        timing.queue_wait_ms =
+            std::chrono::duration<double, std::milli>(dequeue_time -
+                                                      queued.arrival)
+                .count();
 
         // 解码信封（失败该帧 → decode_errors++，drop 计数）
         DtoEnvelope envelope;
+        const auto envelope_start = std::chrono::steady_clock::now();
         try {
             envelope = decoder.Decode(BytesView{frame}, layout);
         } catch (const XcpException&) {
             LIBXCP_LOG_WARNING("DTO envelope decode failed; frame dropped");
             m_decode_errors_.fetch_add(1, std::memory_order_relaxed);
+            timing.envelope_decode_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - envelope_start)
+                    .count();
+            RecordFramePerf(timing);
             continue;
         }
+        timing.envelope_decode_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - envelope_start)
+                .count();
 
         // 定位路由：找 routes 中 (daq_list) → odt 匹配切片组
         const std::uint16_t dq = envelope.identity.daq_list;
@@ -596,6 +738,7 @@ void MeasurementSession::WorkerLoop() {
         }
         if (view == nullptr) {
             // 未匹配到已规划 ODT：视为无样本帧，不计数错误
+            RecordFramePerf(timing);
             continue;
         }
 
@@ -672,6 +815,10 @@ void MeasurementSession::WorkerLoop() {
             }
         }
 
+        const auto payload_start = std::chrono::steady_clock::now();
+        double callback_ms_total = 0.0;
+        std::chrono::steady_clock::time_point first_callback_start{};
+        bool first_callback_started = false;
         for (std::uint16_t sample_index = 0; sample_index < sample_total;
              ++sample_index) {
             // 按切片取出原始字节：packed 时第 k 个采样位于
@@ -818,9 +965,31 @@ void MeasurementSession::WorkerLoop() {
                 cb = m_callback_;
             }
             if (cb) {
+                if (!first_callback_started) {
+                    first_callback_start = std::chrono::steady_clock::now();
+                    first_callback_started = true;
+                }
+                const auto callback_start = std::chrono::steady_clock::now();
                 cb(frame_out);
+                callback_ms_total +=
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - callback_start)
+                        .count();
             }
+            timing.slices += frame_out.samples.size();
         }
+        timing.payload_decode_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - payload_start)
+                .count();
+        timing.callback_ms = first_callback_started ? callback_ms_total : -1.0;
+        if (first_callback_started) {
+            timing.e2e_ms =
+                std::chrono::duration<double, std::milli>(
+                    first_callback_start - queued.arrival)
+                    .count();
+        }
+        RecordFramePerf(timing);
 
     }
 }

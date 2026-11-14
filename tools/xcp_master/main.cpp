@@ -62,6 +62,8 @@
 #include "libxcp/measurement/measurement_session.hpp"
 #include "libxcp/transport_selection.hpp"
 #include "libxcp/trusted_a2l_snapshot.hpp"
+#include <cstdio>
+#include "libxcp/detail/perf_window.hpp"
 #include "libxcp/log.hpp"
 #include "libxcp/tcp_framing_candidates.hpp"
 #include "libxcp/tcp_framing_negotiation.hpp"
@@ -1065,7 +1067,8 @@ public:
                             text("  |  候选 " +
                                  std::to_string(preview_symbols_.size()) +
                                  "  |  采样集合 " +
-                                 std::to_string(watched_count))})});
+                                 std::to_string(watched_count) +
+                                 PollPerfStatusText())})});
             // 虚拟菜单需要每帧知道可视行数；窗口位置在此处提前算好，
             // 供状态行显示"第 a–b / N 行"（虚拟化后滚动条已无意义）。
             const std::size_t preview_visible_rows =
@@ -3747,6 +3750,91 @@ private:
                watched_.end();
     }
 
+    /**
+     * @brief 记录一轮 poll 的实际周期与读取耗时，窗口到点输出一行汇总。
+     * @param cycle_start 本轮开始时刻
+     * @details 调用点必须在一轮所有变量读取完成之后、进入条件变量等待之前，
+     *          这样 `TickTotal` 恰好覆盖本轮读取；实际周期用相邻两轮的
+     *          `cycle_start` 之差，而不是"读取耗时 + 等待耗时"，避免把
+     *          条件变量抖动算进周期。
+     */
+    void RecordPollCyclePerf(
+        const std::chrono::steady_clock::time_point cycle_start) {
+        const auto now = std::chrono::steady_clock::now();
+        const double tick_ms =
+            std::chrono::duration<double, std::milli>(now - cycle_start).count();
+        std::string flush_text;
+        {
+            std::lock_guard lock(poll_perf_mutex_);
+            if (poll_has_last_cycle_) {
+                const double cycle_ms =
+                    std::chrono::duration<double, std::milli>(
+                        cycle_start - poll_last_cycle_)
+                        .count();
+                poll_perf_.Record(calmcar::xcp::PerfStage::CycleActual,
+                                  cycle_ms);
+            }
+            poll_last_cycle_ = cycle_start;
+            poll_has_last_cycle_ = true;
+            poll_perf_.Record(calmcar::xcp::PerfStage::TickTotal, tick_ms);
+            if (poll_perf_.Due(now)) {
+                const auto snapshot = poll_perf_.TakeSnapshot(now);
+                const auto& cycle_window =
+                    snapshot.Stage(calmcar::xcp::PerfStage::CycleActual);
+                const auto& tick_window =
+                    snapshot.Stage(calmcar::xcp::PerfStage::TickTotal);
+                poll_status_cycle_ms_ = cycle_window.MeanMs();
+                poll_status_tick_ms_ = tick_window.MeanMs();
+                poll_status_ticks_ = tick_window.count;
+                poll_status_has_ = tick_window.count > 0U;
+                flush_text = FormatPollPerfLog(snapshot);
+            }
+        }
+        if (!flush_text.empty()) {
+            Say(flush_text);
+        }
+    }
+
+    /**
+     * @brief 把一个窗口的快照格式化成一行日志。
+     * @param snapshot 窗口快照（调用方已持锁取得）
+     * @return 单行文本，不含换行
+     */
+    [[nodiscard]] std::string FormatPollPerfLog(
+        const calmcar::xcp::PerfWindowSnapshot& snapshot) const {
+        const auto& cycle_window =
+            snapshot.Stage(calmcar::xcp::PerfStage::CycleActual);
+        const auto& tick_window =
+            snapshot.Stage(calmcar::xcp::PerfStage::TickTotal);
+        char buffer[320];
+        std::snprintf(
+            buffer, sizeof(buffer),
+            "[perf][poll] window=%.3fs ticks=%llu cycle=%.2fms "
+            "read mean=%.3fms p95=%.3fms max=%.3fms target=%lldms",
+            static_cast<double>(snapshot.elapsed.count()) / 1000.0,
+            static_cast<unsigned long long>(tick_window.count),
+            cycle_window.MeanMs(), tick_window.MeanMs(),
+            tick_window.PercentileMs(95.0), tick_window.max_ms,
+            static_cast<long long>(options_.interval.count()));
+        return std::string(buffer);
+    }
+
+    /**
+     * @brief 状态行里显示的性能摘要段（未到窗口时返回空串）。
+     * @return 形如 `  |  周期 500.1ms / 读取 1.82ms`
+     */
+    [[nodiscard]] std::string PollPerfStatusText() const {
+        std::lock_guard lock(poll_perf_mutex_);
+        if (!poll_status_has_) {
+            return std::string();
+        }
+        char buffer[128];
+        std::snprintf(buffer, sizeof(buffer),
+                      "  |  周期 %.1fms / 读取 %.2fms",
+                      poll_status_cycle_ms_, poll_status_tick_ms_);
+        return std::string(buffer);
+    }
+
     void StartWatch() {
         if (options_.mode == "daq") {
             StartDaqWatch();
@@ -3821,6 +3909,7 @@ private:
                         }
                     }
                 }
+                RecordPollCyclePerf(cycle_start);
                 std::unique_lock lock(wait_mutex_);
                 wait_cv_.wait_until(lock, cycle_start + options_.interval,
                                     [this] { return !watching_.load(); });
@@ -4192,6 +4281,28 @@ private:
     double frame_perf_max_ms_{0.0};
     bool profile_configured_{false};
     std::thread watch_thread_;
+    /**
+     * @brief 工具侧 poll 周期的耗时聚合器（本工具不复用 PollSession，独立统计）。
+     * @details 只统计两个量：`CycleActual`（相邻两轮开始的间隔，反映真实周期）
+     *          与 `TickTotal`（一轮读取的耗时，反映读取负载）。窗口缺省 5 s，
+     *          可用 `LIBXCP_PERF_*` 环境变量调整。
+     */
+    calmcar::xcp::WindowAggregator poll_perf_{
+        calmcar::xcp::PerfConfigFromEnvironment()};
+    /** @brief 保护 `poll_perf_` 与下面四个摘要字段（watch 线程写、界面线程读）。 */
+    mutable std::mutex poll_perf_mutex_;
+    /** @brief 上一轮 poll 的开始时刻，用来算实际周期。 */
+    std::chrono::steady_clock::time_point poll_last_cycle_{};
+    /** @brief 是否已经有过一轮 poll（首轮没有"上一轮"，不记周期）。 */
+    bool poll_has_last_cycle_{false};
+    /** @brief 当前窗口是否已有可用摘要（否则状态行不显示性能段）。 */
+    bool poll_status_has_{false};
+    /** @brief 最近一个窗口的平均实际周期（毫秒）。 */
+    double poll_status_cycle_ms_{0.0};
+    /** @brief 最近一个窗口的平均单轮读取耗时（毫秒）。 */
+    double poll_status_tick_ms_{0.0};
+    /** @brief 最近一个窗口统计到的轮数。 */
+    std::uint64_t poll_status_ticks_{0U};
     std::mutex frame_mutex_;
     std::condition_variable frame_cv_;
     std::deque<MeasurementFrame> frame_queue_;

@@ -25,6 +25,7 @@
 #include <thread>
 #include <vector>
 
+#include "libxcp/detail/perf_window.hpp"
 #include "libxcp/measurement/measurement_database.hpp"
 #include "libxcp/measurement/measurement_result.hpp"
 #include "libxcp/poll/poll_types.hpp"
@@ -32,6 +33,28 @@
 namespace calmcar::xcp {
 
 class XcpMaster;
+
+/**
+ * @brief poll 会话的运行期性能快照（P-B）。
+ * @details 阶段耗时窗口 + slowest 榜单 + 合并读取的字节量。
+ *          取快照即清零：与内部窗口日志共用同一个窗口，先取者得。
+ * @note 字节量只统计成功的合并组读取；回退单读单独计入
+ *       `single_read_bytes`，不与合并组混算（否则"合并是否值得"会被高估）。
+ */
+struct PollPerfSnapshot {
+    PerfWindowSnapshot window;              ///< 阶段耗时窗口（含 slowest 榜单）
+    std::uint64_t ticks{0};                 ///< 本窗口的 tick 数
+    std::uint64_t overruns{0};              ///< 本窗口因迟到而整周期跳过的次数
+    std::uint64_t variables{0};             ///< 本窗口读取的变量总次数
+    std::uint64_t groups{0};                ///< 本窗口的合并读组总次数
+    std::uint64_t group_bytes_total{0};     ///< 本窗口合并组读取的总字节
+    std::uint64_t group_bytes_max{0};       ///< 单次合并组读取的最大字节
+    std::uint64_t group_slices_total{0};    ///< 被合并进组的变量总次数
+    std::uint64_t single_read_bytes{0};     ///< 回退单读累计字节
+
+    /// @brief 是否为空窗口（没有采集到任何样本）
+    [[nodiscard]] bool Empty() const noexcept { return window.Empty(); }
+};
 
 /**
  * @brief 多 event 的 poll 采集会话（每个 event 独立周期）。
@@ -56,7 +79,8 @@ public:
      * @param database 变量数据库（非拥有，生命周期须长于本对象）
      * @throws XcpException(InvalidArgument) 依赖为空指针
      */
-    PollSession(XcpMaster& master, const IMeasurementDatabase& database);
+    PollSession(XcpMaster& master, const IMeasurementDatabase& database,
+                PerfConfig perf_config = PerfConfigFromEnvironment());
 
     /// @brief 析构：若仍在运行则先 Stop（不抛异常）
     ~PollSession();
@@ -112,7 +136,48 @@ public:
     /// @brief 已注册的 event 数量
     [[nodiscard]] std::size_t EventCount() const noexcept;
 
+    /**
+     * @brief 运行期替换性能统计配置（下一个窗口边界生效）。
+     * @param config 新配置（整体替换，不提供逐字段 setter）
+     * @note 只影响窗口划分与 slowest 容量，不改变采集语义；`enabled=false`
+     *       会丢弃尚未结束的窗口，不输出半截日志。
+     */
+    void SetPerfConfig(const PerfConfig& config) noexcept;
+
+    /// @brief 当前生效的性能统计配置
+    [[nodiscard]] PerfConfig PerfConfigValue() const noexcept;
+
+    /**
+     * @brief 取性能快照（**消耗**当前窗口：取后清零）。
+     * @return 阶段耗时 + slowest + 合并字节量；未开始统计时返回空快照
+     * @note 与内部窗口日志共用同一窗口；请在调度线程或 `Stop()` 之后调用。
+     */
+    [[nodiscard]] PollPerfSnapshot PerfSnapshot();
+
 private:
+    /// @brief 输出一次窗口性能日志（窗口到点时由调度线程调用）
+    void FlushPerfWindow(std::string_view event_name);
+
+    /// @brief 保护窗口计数（`PerfSnapshot` 可能来自其它线程）
+    mutable std::mutex m_perf_mutex_;
+    /// @brief 阶段耗时与 slowest 聚合（只由调度线程写入）
+    WindowAggregator m_perf_;
+    /// @brief 窗口内 tick 数
+    std::uint64_t m_perf_ticks_{0};
+    /// @brief 窗口内因迟到而整周期跳过的次数
+    std::atomic<std::uint64_t> m_perf_overruns_{0};
+    /// @brief 窗口内读取的变量总次数
+    std::uint64_t m_perf_variables_{0};
+    /// @brief 窗口内合并读组总次数
+    std::uint64_t m_perf_groups_{0};
+    /// @brief 窗口内合并组读取的总字节
+    std::uint64_t m_perf_group_bytes_{0};
+    /// @brief 单次合并组读取的最大字节
+    std::uint64_t m_perf_group_bytes_max_{0};
+    /// @brief 被合并进组的变量总次数
+    std::uint64_t m_perf_group_slices_{0};
+    /// @brief 回退单读累计字节
+    std::uint64_t m_perf_single_read_bytes_{0};
     /// @brief 已解析的变量布局
     struct ResolvedVariable {
         std::string symbol;              ///< 变量名

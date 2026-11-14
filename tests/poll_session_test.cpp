@@ -618,4 +618,150 @@ TEST(PollSessionAddressMerge, MergedReadFailureFallsBackPerVariable) {
 }
 
 }  // namespace
+// ---- 性能窗口（P-B）：poll 阶段埋点 ----
+
+namespace {
+
+/// @brief 从快照里取指定阶段的窗口累计值
+/// @details 按值返回：窗口结构很小（16 个桶 + 三个标量），复制比持有引用更安全。
+StageWindow StageOf(const PollPerfSnapshot& snapshot, PerfStage stage) {
+    return snapshot.window.Stage(stage);
+}
+
+/// @brief 在慢变量榜单里查找「阶段 + 符号」条目，找不到返回 nullptr
+const SlowSpot* FindSpot(const PollPerfSnapshot& snapshot, PerfStage stage,
+                         const std::string& symbol) {
+    for (const auto& spot : snapshot.window.slowest) {
+        if (spot.stage == stage && spot.Symbol() == symbol) {
+            return &spot;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+TEST(PollSessionPerf, SnapshotReportsTickAndStageTotals) {
+    Rig rig;
+    PerfConfig config;  // 默认窗口 5 s，用例执行期间不会触发窗口日志
+    config.log_to_logger = false;
+    rig.session->SetPerfConfig(config);
+    rig.session->AddEvent(
+        PollEventSpec{"fast", std::chrono::milliseconds(20), {"sig0", "sig1"}});
+
+    Collector collector;
+    rig.session->Start([&collector](const PollSample& sample) { collector(sample); });
+    ASSERT_TRUE(collector.WaitFor(4, std::chrono::milliseconds(3000)));
+    rig.session->Stop();
+
+    const auto snapshot = rig.session->PerfSnapshot();
+    ASSERT_GE(snapshot.ticks, 4U);
+    // 变量数与合并组数按 tick 累加，所以窗口内等于 ticks 乘以每 tick 的个数
+    EXPECT_EQ(snapshot.variables, snapshot.ticks * 2U);
+    EXPECT_EQ(snapshot.groups, snapshot.ticks);
+    // 阶段按每 tick 记一次，计数应与 ticks 一一对应
+    EXPECT_EQ(StageOf(snapshot, PerfStage::TickTotal).count, snapshot.ticks);
+    EXPECT_EQ(StageOf(snapshot, PerfStage::GroupRead).count, snapshot.ticks);
+    EXPECT_EQ(StageOf(snapshot, PerfStage::Convert).count, snapshot.ticks);
+    EXPECT_EQ(StageOf(snapshot, PerfStage::ScheduleGap).count, snapshot.ticks);
+    // 可加和：读组 + 换算 + 装配不超过 tick 总耗时（schedule_gap 在总耗时之外）
+    const double sum_ms = StageOf(snapshot, PerfStage::GroupRead).sum_ms +
+                          StageOf(snapshot, PerfStage::SingleRead).sum_ms +
+                          StageOf(snapshot, PerfStage::Convert).sum_ms +
+                          StageOf(snapshot, PerfStage::Assemble).sum_ms;
+    EXPECT_LE(sum_ms, StageOf(snapshot, PerfStage::TickTotal).sum_ms + 1e-6);
+}
+
+TEST(PollSessionPerf, MergedGroupBytesAreReported) {
+    Rig rig;
+    PerfConfig config;
+    config.log_to_logger = false;
+    rig.session->SetPerfConfig(config);
+    // sig0..sig3 在 0x1000..0x1003 首尾相接（各 1 字节）→ 每 tick 一次 4 字节合并读
+    rig.session->AddEvent(PollEventSpec{"fast", std::chrono::milliseconds(20),
+                                        {"sig0", "sig1", "sig2", "sig3"}});
+
+    Collector collector;
+    rig.session->Start([&collector](const PollSample& sample) { collector(sample); });
+    ASSERT_TRUE(collector.WaitFor(3, std::chrono::milliseconds(3000)));
+    rig.session->Stop();
+
+    const auto snapshot = rig.session->PerfSnapshot();
+    ASSERT_GE(snapshot.ticks, 3U);
+    EXPECT_EQ(snapshot.variables, snapshot.ticks * 4U);
+    EXPECT_EQ(snapshot.groups, snapshot.ticks);  // 四个变量合成一组
+    EXPECT_EQ(snapshot.group_slices_total, snapshot.ticks * 4U);
+    EXPECT_EQ(snapshot.group_bytes_total, snapshot.ticks * 4U);
+    EXPECT_EQ(snapshot.group_bytes_max, 4U);
+    EXPECT_EQ(snapshot.single_read_bytes, 0U);
+
+    const auto* spot = FindSpot(snapshot, PerfStage::GroupRead, "sig0");
+    ASSERT_NE(spot, nullptr);
+    EXPECT_EQ(spot->group_size, 4U);
+    EXPECT_EQ(spot->group_bytes, 4U);
+}
+
+TEST(PollSessionPerf, ConvertSpotsAreRecordedPerSymbol) {
+    Rig rig;
+    PerfConfig config;
+    config.log_to_logger = false;
+    rig.session->SetPerfConfig(config);
+    rig.session->AddEvent(
+        PollEventSpec{"fast", std::chrono::milliseconds(20), {"sig0", "sig1"}});
+
+    Collector collector;
+    rig.session->Start([&collector](const PollSample& sample) { collector(sample); });
+    ASSERT_TRUE(collector.WaitFor(2, std::chrono::milliseconds(3000)));
+    rig.session->Stop();
+
+    const auto snapshot = rig.session->PerfSnapshot();
+    ASSERT_FALSE(snapshot.window.slowest.empty());
+    // 每个变量的换算耗时各自成槽，才能回答"慢在哪个变量"
+    EXPECT_NE(FindSpot(snapshot, PerfStage::Convert, "sig0"), nullptr);
+    EXPECT_NE(FindSpot(snapshot, PerfStage::Convert, "sig1"), nullptr);
+}
+
+TEST(PollSessionPerf, DisabledConfigCollectsNoStages) {
+    Rig rig;
+    PerfConfig config;
+    config.enabled = false;
+    config.log_to_logger = false;
+    rig.session->SetPerfConfig(config);
+    rig.session->AddEvent(
+        PollEventSpec{"fast", std::chrono::milliseconds(20), {"sig0"}});
+
+    Collector collector;
+    rig.session->Start([&collector](const PollSample& sample) { collector(sample); });
+    ASSERT_TRUE(collector.WaitFor(2, std::chrono::milliseconds(3000)));
+    rig.session->Stop();
+
+    const auto snapshot = rig.session->PerfSnapshot();
+    // tick 计数与采样开关无关（关掉统计仍要知道跑了多少 tick）
+    EXPECT_GE(snapshot.ticks, 2U);
+    EXPECT_EQ(StageOf(snapshot, PerfStage::TickTotal).count, 0U);
+    EXPECT_TRUE(snapshot.window.slowest.empty());
+}
+
+TEST(PollSessionPerf, SnapshotResetsWindowCounters) {
+    Rig rig;
+    PerfConfig config;
+    config.log_to_logger = false;
+    rig.session->SetPerfConfig(config);
+    rig.session->AddEvent(
+        PollEventSpec{"fast", std::chrono::milliseconds(20), {"sig0"}});
+
+    Collector collector;
+    rig.session->Start([&collector](const PollSample& sample) { collector(sample); });
+    ASSERT_TRUE(collector.WaitFor(2, std::chrono::milliseconds(3000)));
+    rig.session->Stop();
+
+    const auto first = rig.session->PerfSnapshot();
+    ASSERT_GT(first.ticks, 0U);
+    // 取快照即归零：第二次拿到的是空窗口
+    const auto second = rig.session->PerfSnapshot();
+    EXPECT_EQ(second.ticks, 0U);
+    EXPECT_EQ(second.group_bytes_total, 0U);
+    EXPECT_TRUE(second.window.slowest.empty());
+}
+
 }  // namespace calmcar::xcp

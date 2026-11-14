@@ -17,7 +17,7 @@
  * 运行方式（手动，不进入 `libxcp_tests` 常规套件）：
  * @code
  *   ./cmake-build-release/tests/XcpliteIntegration.exe \
- *       --gtest_filter='XcplitePollCapacityTest.*'
+ *       --gtest_filter='*PollCapacity*'
  * @endcode
  * 可用环境变量 `LIBXCP_POLL_CALIBRATION_WINDOW_MS` 缩短窗口以便快速自检，
  * 但正式标定必须保持默认 10000 ms。
@@ -45,6 +45,7 @@
 
 #include <gtest/gtest.h>
 
+#include "libxcp/detail/perf_window.hpp"
 #include "libxcp/measurement/measurement_database.hpp"
 #include "libxcp/poll/poll_session.hpp"
 #include "libxcp/tcp_transport.hpp"
@@ -198,6 +199,7 @@ private:
 struct CapacityRun {
     std::size_t variables{0};            ///< 本次轮询的变量数
     PollStatistics stats{};              ///< 会话统计
+    PollPerfSnapshot perf{};             ///< 本轮的性能窗口快照（阶段分解）
     double mean_interval_ms{0.0};        ///< 相邻 tick 的平均间隔
     double worst_interval_ms{0.0};       ///< 相邻 tick 的最大间隔
     double overrun_ratio{0.0};           ///< 超期比例（skipped / 计划 tick 总数）
@@ -218,6 +220,15 @@ CapacityRun RunOne(XcpMaster& master, const IMeasurementDatabase& database,
     run.variables = variables;
 
     PollSession session(master, database);
+
+    // 窗口设成比运行窗口更长：标定期间不输出任何窗口日志，
+    // 跑完取一次快照即可得到整轮的阶段分解（避免日志噪声干扰测量）。
+    calmcar::xcp::PerfConfig perf_config;
+    perf_config.enabled = true;
+    perf_config.window = window + std::chrono::milliseconds{60000};
+    perf_config.log_to_logger = false;
+    session.SetPerfConfig(perf_config);
+
     PollEventSpec spec;
     spec.name = "capacity";
     spec.period = PollSession::kMinPeriod;
@@ -243,6 +254,7 @@ CapacityRun RunOne(XcpMaster& master, const IMeasurementDatabase& database,
     std::this_thread::sleep_for(window);
     session.Stop();
     run.stats = session.Statistics();
+    run.perf = session.PerfSnapshot();
 
     {
         std::lock_guard<std::mutex> lock(mutex);
@@ -277,6 +289,56 @@ CapacityRun RunOne(XcpMaster& master, const IMeasurementDatabase& database,
     return run;
 }
 
+/// @brief 打印一轮标定的阶段分解（P-E：把 poll 性能窗口接进容量报告）
+/// @param run 本轮测量结果
+/// @details 只打印一次读完的汇总，不含每次 tick 的明细；阶段耗时以
+///          `TickTotal` 为分母算占比，`merged` 用 1 - groups/variables。
+void PrintRunPerf(const CapacityRun& run) {
+    const auto& window = run.perf.window;
+    const auto stage = [&window](calmcar::xcp::PerfStage index) -> const StageWindow& {
+        return window.stages[static_cast<std::size_t>(index)];
+    };
+    const StageWindow& total = stage(calmcar::xcp::PerfStage::TickTotal);
+    if (window.samples == 0U || total.count == 0U) {
+        std::printf("       perf: 无样本（窗口未启动或统计被关闭）\n");
+        return;
+    }
+
+    const double total_sum = total.sum_ms > 0.0 ? total.sum_ms : 0.0;
+    const auto share = [total_sum](const StageWindow& item) {
+        return total_sum > 0.0 ? item.sum_ms * 100.0 / total_sum : 0.0;
+    };
+
+    const double groups_per_tick =
+        run.perf.ticks > 0U
+            ? static_cast<double>(run.perf.groups) / static_cast<double>(run.perf.ticks)
+            : 0.0;
+    const double merged = run.perf.variables > 0U
+                              ? 100.0 *
+                                    (1.0 - static_cast<double>(run.perf.groups) /
+                                               static_cast<double>(run.perf.variables))
+                              : 0.0;
+    const double bytes_per_tick =
+        run.perf.ticks > 0U
+            ? static_cast<double>(run.perf.group_bytes_total) /
+                  static_cast<double>(run.perf.ticks)
+            : 0.0;
+
+    const StageWindow& group = stage(calmcar::xcp::PerfStage::GroupRead);
+    const StageWindow& single = stage(calmcar::xcp::PerfStage::SingleRead);
+    const StageWindow& convert = stage(calmcar::xcp::PerfStage::Convert);
+    const StageWindow& assemble = stage(calmcar::xcp::PerfStage::Assemble);
+
+    std::printf(
+        "       perf: tick mean=%.3f p95=%.3f max=%.3f ms | "
+        "group=%.3f(%.0f%%) single=%.3f(%.0f%%) convert=%.3f(%.0f%%) "
+        "assemble=%.3f(%.0f%%) | groups/tick=%.2f merged=%.1f%% bytes/tick=%.0fB\n",
+        total.MeanMs(), total.PercentileMs(0.95), total.max_ms, group.MeanMs(),
+        share(group), single.MeanMs(), share(single), convert.MeanMs(),
+        share(convert), assemble.MeanMs(), share(assemble), groups_per_tick,
+        merged, bytes_per_tick);
+}
+
 /// @brief 打印一行标定结果
 void PrintRun(const CapacityRun& run) {
     std::printf(
@@ -289,6 +351,7 @@ void PrintRun(const CapacityRun& run) {
         static_cast<unsigned long long>(run.stats.callback_errors),
         run.mean_interval_ms, run.worst_interval_ms,
         run.passed ? "PASS" : "FAIL");
+    PrintRunPerf(run);
 }
 
 /// @brief 一轮标定的结论
