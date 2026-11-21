@@ -91,7 +91,8 @@ add_executable(libxcp_tests
         daq_timestamp_test.cpp
         measurement_session_hardening_test.cpp
         logging_test.cpp
-        version_resolver_test.cpp)
+        version_resolver_test.cpp
+        format_compat_test.cpp)
 
 target_link_libraries(libxcp_tests PRIVATE
         libxcp::libxcp
@@ -460,7 +461,8 @@ if(LIBXCP_BUILD_TOOLS)
     target_include_directories(XcpMasterRenderBenchTest PRIVATE
             ${PROJECT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/include)
     target_link_libraries(XcpMasterRenderBenchTest PRIVATE
-            libxcp::a2lbridge ftxui::ftxui GTest::gtest libxcp_test_main)
+            libxcp::a2lbridge ftxui::ftxui GTest::gtest libxcp_test_main
+            libxcp::format)
     target_compile_definitions(XcpMasterRenderBenchTest PRIVATE
             # 40 MB 合成样本（约 198k 符号）的路径；也可用环境变量
             # LIBXCP_UI_PERF_A2L 指向真实大 A2L。

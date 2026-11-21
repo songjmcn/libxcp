@@ -24,7 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <format>
+#include "libxcp/detail/format_compat.hpp"
 #include <fstream>
 #include <optional>
 #include <utility>
@@ -96,7 +96,7 @@ constexpr std::size_t kWindowVisibleRows = 20U;
  * @return 形如「模块::路径.signal_NNN = 12345.6 mV | POLL」的标签。
  */
 std::string MakePreviewLabel(std::size_t index) {
-    return std::format(
+    return calmcar::xcp::detail::FormatText(
         "apa_complex::algo_status_info.apa_control_status.signal_{:06d}"
         " = 12345.6 mV | POLL | 2026-10-23 20:08:00",
         index);
@@ -236,7 +236,7 @@ TEST(XcpMasterRenderBenchTest, RendersFrameWithFieldSizeCandidateList) {
 
     // 3) 机器能力门控：本机明显慢于参考机时显式跳过，而不是让慢机变红。
     if (capability_factor > kMachineCapabilityTolerance) {
-        GTEST_SKIP() << std::format(
+        GTEST_SKIP() << calmcar::xcp::detail::FormatText(
             "本机算力与参考机不匹配，绝对毫秒预算无判别力：实测单帧 {:.1f} ms，"
             "参考预算 {:.0f} ms，硬上限 {:.0f} ms（已通过）；本机每行 {:.2f} µs，"
             "参考每行 {:.2f} µs，能力系数 {:.2f} > 容忍倍数 {:.1f}。"
@@ -247,7 +247,7 @@ TEST(XcpMasterRenderBenchTest, RendersFrameWithFieldSizeCandidateList) {
     }
 
     // 同档机器上的真实劣化：照常失败。
-    EXPECT_LT(frame_ms, reference_limit) << std::format(
+    EXPECT_LT(frame_ms, reference_limit) << calmcar::xcp::detail::FormatText(
         "单帧渲染耗时较参考值劣化超过 3 倍：候选 {} 行，实测 {:.1f} ms；"
         "本机能力系数 {:.2f}（未超过容忍倍数 {:.1f}，故不按机器能力豁免）",
         kFieldCandidateCount, frame_ms, capability_factor,
