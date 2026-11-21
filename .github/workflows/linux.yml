@@ -25,13 +25,13 @@ jobs:
         with:
           submodules: recursive
 
-      # 项目启用日志需要 C++20 <format>，ubuntu-22.04 默认 GCC 11 不支持，需安装 GCC 13
-      - name: 安装构建工具与 GCC 13
+      # ubuntu-22.04 自带的 GCC 11.4 即可：工具链缺少 std::format 时，CMake 会在
+      # 配置期自动回退到 fmt（见 include/libxcp/detail/format_compat.hpp），
+      # 因此不再需要 GCC 13，也不再依赖第三方 ppa:ubuntu-toolchain-r/test。
+      - name: 安装构建工具
         run: |
           sudo apt-get update
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build gcc-13 g++-13
+          sudo apt-get install -y build-essential cmake ninja-build
 
       # 预编译 Boost（含 locale/filesystem/process，动态库）
       - name: 安装 Boost ${{ env.BOOST_VERSION }}
@@ -48,12 +48,11 @@ jobs:
         run: echo "LD_LIBRARY_PATH=${{ steps.install-boost.outputs.BOOST_ROOT }}/lib" >> "$GITHUB_ENV"
 
       # POSITION_INDEPENDENT_CODE：静态库 liba2l 需链接进共享库 libliba2l.so
-      # 示例目录暂关闭：xcp_master_udp.cpp 缺少 <cstring>，GCC 13 下编译失败
+      # 示例目录全量开启：GCC 11 下 examples（含 xcp_master_udp）可完整构建；
+      # 历史上记录的 "<cstring> 缺失导致 GCC 13 编译失败" 在 GCC 11 上未复现。
       - name: Configure
         run: >
           cmake -B build -S . -G Ninja
-          -DCMAKE_C_COMPILER=gcc-13
-          -DCMAKE_CXX_COMPILER=g++-13
           -DCMAKE_BUILD_TYPE=$BUILD_TYPE
           -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           -DLIBXCP_BUILD_TESTS=ON
@@ -111,12 +110,11 @@ jobs:
         with:
           submodules: recursive
 
-      - name: 安装构建工具与 GCC 13
+      # 与 build 任务一致：GCC 11 即可（该任务 LIBXCP_ENABLE_LOG=OFF，本就不依赖 format）。
+      - name: 安装构建工具
         run: |
           sudo apt-get update
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build gcc-13 g++-13
+          sudo apt-get install -y build-essential cmake ninja-build
 
       - name: 安装 Boost ${{ env.BOOST_VERSION }}
         uses: MarkusJx/install-boost@v2.4.5
@@ -134,8 +132,6 @@ jobs:
       - name: Configure（ThreadSanitizer）
         run: >
           cmake -B build-tsan -S . -G Ninja
-          -DCMAKE_C_COMPILER=gcc-13
-          -DCMAKE_CXX_COMPILER=g++-13
           -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_POSITION_INDEPENDENT_CODE=ON
           -DLIBXCP_SANITIZER=thread

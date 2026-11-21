@@ -161,6 +161,29 @@ template <class... Args>
 | 日志开启组合（`-DLIBXCP_ENABLE_LOG=ON`，独立构建目录 `cmake-build-linux-log`） | configure 成功（glog 自动获取）；`libxcp` 46/46 编译链接成功，`libxcp.a` 3.34 MB，`error:` 计数 0。其中 `src/session.cpp`、`src/xcp_master.cpp`、`src/measurement/measurement_session.cpp` 等**实际使用 `LIBXCP_LOG_*` 的 TU 全部编过**，证明 glog + fmt 组合可用 |
 | 全量 ctest | 见 §4.3 |
 
+### 4.2.1 CI 形态复现（LOG=ON + tools + examples）—— 暴露一处真实缺口
+
+本地 CI 形态构建（`LIBXCP_ENABLE_LOG=ON` + `LIBXCP_BUILD_TOOLS=ON` + `LIBXCP_BUILD_EXAMPLES=ON`）
+第一次失败：`examples/xcp_slave_demo` 与 `examples/xcp_master_udp` 编译报
+
+```
+format_compat.hpp:30: #error "缺少 std::format；请通过 CMake 构建（配置期会自动启用 fmt 回退）"
+format_compat.hpp:51: error: 'fmt' has not been declared
+```
+
+根因：`LIBXCP_HAVE_FMT` 只挂在 `libxcp::format` 上，而这两个示例**没有链接 `libxcp` 核心**
+（它们只链 `libxcp::a2lbridge` + `xcplite::xcplite`），日志能力来自
+`libxcp_configure_program_logging()` 辅助函数 —— 该函数给了 glog 与 include 路径，
+却没给格式化后端。
+
+修复：在 `libxcp_configure_program_logging()` 的 `LIBXCP_ENABLE_LOG` 分支里补
+`target_link_libraries(${target} PRIVATE libxcp::format)`。
+
+修复后同一组合构建成功：`BUILD_EXIT=0`、`error:` 计数 **0**，产物到位
+（`xcp_master_udp` 1.53 MB / `xcp_slave_demo` 1.12 MB / `xcp_master` 3.50 MB）。
+
+> 教训：只构建 `libxcp` 目标无法覆盖这条传播链，必须按 CI 的完整目标集验证。
+
 ### 4.3 全量回归对比
 
 | 平台 | 改动前 | 改动后 |
@@ -214,6 +237,26 @@ Windows 侧在**与 Linux 全量 ctest 并发执行**的两轮里，
 断言用**逐字节相等的期望字符串**，因此两个后端必须产出一致结果才算通过。
 
 ---
+
+## 5.1 CI 调整（`.github/workflows/linux.yml`）
+
+兼容层落地后，GCC 13 不再是 Linux CI 的必要条件，两个 job 的编译器前提改为
+ubuntu-22.04 自带的 GCC 11.4：
+
+| 位置 | 改动 |
+| --- | --- |
+| `build-linux` 安装步骤 | 删除 `ppa:ubuntu-toolchain-r/test` 与 `gcc-13 g++-13`，只装 `build-essential cmake ninja-build` |
+| `build-linux` Configure | 删除 `-DCMAKE_C_COMPILER=gcc-13` / `-DCMAKE_CXX_COMPILER=g++-13` |
+| `sanitize-thread` 安装步骤 | 同上（该 job `LIBXCP_ENABLE_LOG=OFF`，本就不依赖 format） |
+| `sanitize-thread` Configure | 同上 |
+| `build-linux` 注释 | 更新为"GCC 11 即可，缺少 std::format 时自动回退 fmt"，并说明 `xcp_master_udp` 的 `<cstring>` 历史问题在 GCC 11 下未复现 |
+
+收益：去掉第三方 PPA（其 GPG/可用性问题是 CI 常见的不稳定来源）、每个 job 省一轮
+`apt-get update`，同时把 CI 钉在"用户实际的最低环境"上。
+
+代价：Linux CI 走 fmt 回退分支，`std::format` 分支在 Linux 侧不再编译；
+该分支仍由 Windows（MSVC）job 覆盖。若后续需要 Linux 侧的 std 分支覆盖，
+建议新增 `ubuntu-24.04`（自带 GCC 13，无需 PPA）的精简 job，而不是回到 PPA。
 
 ## 6. 已知限制
 
@@ -273,3 +316,4 @@ cmake-build-release\tests\libxcp_tests.exe --gtest_filter="FormatCompat*"
 | `tests/xcp_master_render_bench_test.cpp` | 修改（头文件 + 3 处调用） |
 | `tests/format_compat_test.cpp` | **新增** |
 | `tests/CMakeLists.txt` | 修改（注册单测、基准测试补链） |
+| `.github/workflows/linux.yml` | 修改（两个 job 从 GCC 13 降到 GCC 11，去掉 PPA） |

@@ -360,6 +360,10 @@ function(libxcp_configure_program_logging target)
   endif()
   if(LIBXCP_ENABLE_LOG)
     target_link_libraries(${target} PRIVATE libxcp_program_logging)
+    # 日志宏内部走 format_compat：除 glog 外还必须获得格式化后端
+    # （有 std::format 时为空实现，否则是 fmt）。不链接 libxcp 核心的目标
+    # （如纯 XCPlite 的 xcp_slave_demo）尤其不能漏。
+    target_link_libraries(${target} PRIVATE libxcp::format)
   else()
     target_compile_definitions(${target} PRIVATE LIBXCP_ENABLE_LOG=0)
   endif()
