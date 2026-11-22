@@ -20,7 +20,8 @@
 # 本目录属本工程自建，不违反"不改 thirdparty/a2llib"约束。
 # ============================================================================
 
-cmake_minimum_required(VERSION 3.24)
+# 最低版本 3.20：与上层 a2l-sdk / a2llib 保持一致，兼容 Ubuntu 22.04 自带 CMake 3.22。
+cmake_minimum_required(VERSION 3.20)
 
 project(uchardet_shim
         VERSION 0.0.8

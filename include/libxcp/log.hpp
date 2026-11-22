@@ -11,7 +11,7 @@
 
 #if LIBXCP_ENABLE_LOG
 
-#include <format>
+#include "libxcp/detail/format_compat.hpp"
 #include <string>
 
 #include <glog/logging.h>
@@ -34,29 +34,29 @@ inline void WriteLogMessage(const char* file, int line,
 }  // namespace calmcar::xcp::detail
 
 /**
- * @brief 记录 INFO 级别日志；格式参数使用 C++20 std::format 语法。
+ * @brief 记录 INFO 级别日志；格式参数使用 std::format / fmt 兼容语法。
  * @param ... 格式串及其对应的格式化参数。
  */
 #define LIBXCP_LOG_INFO(...)                                                   \
     do {                                                                       \
         try {                                                                  \
-            ::calmcar::xcp::detail::WriteLogMessage(__FILE__, __LINE__,        \
-                                                    google::GLOG_INFO,         \
-                                                    std::format(__VA_ARGS__)); \
+            ::calmcar::xcp::detail::WriteLogMessage(                           \
+                    __FILE__, __LINE__, google::GLOG_INFO,                     \
+                    ::calmcar::xcp::detail::FormatText(__VA_ARGS__));          \
         } catch (...) {                                                        \
         }                                                                      \
     } while (false)
 
 /**
- * @brief 记录 WARNING 级别日志；格式参数使用 C++20 std::format 语法。
+ * @brief 记录 WARNING 级别日志；格式参数使用 std::format / fmt 兼容语法。
  * @param ... 格式串及其对应的格式化参数。
  */
 #define LIBXCP_LOG_WARNING(...)                                                \
     do {                                                                       \
         try {                                                                  \
-            ::calmcar::xcp::detail::WriteLogMessage(__FILE__, __LINE__,        \
-                                                    google::GLOG_WARNING,      \
-                                                    std::format(__VA_ARGS__)); \
+            ::calmcar::xcp::detail::WriteLogMessage(                           \
+                    __FILE__, __LINE__, google::GLOG_WARNING,                  \
+                    ::calmcar::xcp::detail::FormatText(__VA_ARGS__));          \
         } catch (...) {                                                        \
         }                                                                      \
     } while (false)
@@ -68,9 +68,9 @@ inline void WriteLogMessage(const char* file, int line,
 #define LIBXCP_LOG_ERROR(...)                                                  \
     do {                                                                       \
         try {                                                                  \
-            ::calmcar::xcp::detail::WriteLogMessage(__FILE__, __LINE__,        \
-                                                    google::GLOG_ERROR,        \
-                                                    std::format(__VA_ARGS__)); \
+            ::calmcar::xcp::detail::WriteLogMessage(                           \
+                    __FILE__, __LINE__, google::GLOG_ERROR,                    \
+                    ::calmcar::xcp::detail::FormatText(__VA_ARGS__));          \
         } catch (...) {                                                        \
         }                                                                      \
     } while (false)

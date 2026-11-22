@@ -21,7 +21,32 @@
 # 但退出码非 0）。去掉 -j 使用串行构建即稳定通过；产物本身不受影响。
 # ============================================================================
 
-cmake_minimum_required(VERSION 3.24)
+# 最低版本 3.20：本工程未使用 3.21–3.24 期间的任何新增命令，而降到这里
+# 才能直接使用 Ubuntu 22.04 自带的 CMake 3.22；3.20 与 thirdparty/a2llib
+# 自身声明的下限保持同一口径。已使用的 3.20 之后引入的 policy（CMP0128、
+# CMP0135）在下方显式置 NEW，避免降版本后行为回退。
+cmake_minimum_required(VERSION 3.20)
+
+# 降 minimum 后，3.20 之后引入的 policy 会处于"未设置"状态（按 OLD 处理）。
+# 这两条会实际改变行为：CMP0128 影响语言标准 flag 是否附加、CMP0135 影响
+# FetchContent 解压时间戳。显式置 NEW 保持与原先 3.24 语义一致。
+if(POLICY CMP0128)
+  cmake_policy(SET CMP0128 NEW)
+endif()
+if(POLICY CMP0135)
+  cmake_policy(SET CMP0135 NEW)
+endif()
+
+# ExternalProject 直到 CMake 3.24 才认识 DOWNLOAD_EXTRACT_TIMESTAMP 这个关键字；
+# 更早的版本（如 Ubuntu 22.04 自带的 3.22）会把它当成 URL_HASH 的后续片段，
+# 直接以 "URL_HASH is set to ...;DOWNLOAD_EXTRACT_TIMESTAMP;TRUE" 报错中止。
+# 因此统一用该变量按版本传参，而不是在各处重复写死。
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+  set(LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+else()
+  set(LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS "")
+endif()
 
 project(libxcp
         VERSION 2.0.0
@@ -67,22 +92,87 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 日志开启时才要求 C++20 std::format 并解析/获取 glog；关闭时不触碰后端依赖。
-if(LIBXCP_ENABLE_LOG)
-  include(CheckCXXSourceCompiles)
-  check_cxx_source_compiles([[
-    #include <format>
-    int main() {
-      const auto formatted = std::format("value={} hex={:02x}", 42, 42);
-      return formatted.empty();
-    }
-  ]] LIBXCP_HAS_CXX20_STD_FORMAT)
-  if(NOT LIBXCP_HAS_CXX20_STD_FORMAT)
-    message(FATAL_ERROR
-      "LIBXCP_ENABLE_LOG=ON 需要支持 C++20 <format> 的编译器与标准库；"
-      "请更换工具链或关闭 LIBXCP_ENABLE_LOG。")
-  endif()
+# ---------------------------------------------------------------------------
+# std::format 能力探测与 fmt 回退
+#
+# 基准测试 tests/xcp_master_render_bench_test.cpp 无条件使用 std::format，
+# 日志宏（log.hpp）在 LIBXCP_ENABLE_LOG=ON 时同样需要；而 GCC 11 的 libstdc++
+# 尚未提供 <format>。因此在配置期统一探测一次：可用则全程使用 std::format，
+# 不可用则回退到 fmt（优先复用系统 CONFIG 包，其次按固定 URL 下载）。
+#
+# 降级不影响调用点语法：两者共用 C++20 格式串，差异由
+# include/libxcp/detail/format_compat.hpp 在编译期消化。
+# ---------------------------------------------------------------------------
+include(CheckCXXSourceCompiles)
+# 探测同时校验 __cpp_lib_format 与真实调用（含本项目在用的 {:06d} / {:.1f}），
+# 避免"有头文件但功能不完整"的标准库被误判为可用。
+check_cxx_source_compiles([[
+  #include <version>
+  #if !defined(__cpp_lib_format) || (__cpp_lib_format < 201907L)
+  #  error "std::format is unavailable"
+  #endif
+  #include <format>
+  int main() {
+    const auto formatted = std::format("value={} hex={:06d} f={:.1f}", 42, 42, 1.5);
+    return formatted.empty();
+  }
+]] LIBXCP_HAS_CXX20_STD_FORMAT)
 
+# 回退 fmt 时默认总是使用本工程固定版本的源码（FetchContent）。
+# 之所以不默认 find_package：跨平台工程里 CMake 的默认搜索路径可能把其它平台的
+# 安装（例如 WSL 下 /mnt/c 的 conda）解析进来，造成头文件与二进制不匹配。
+option(LIBXCP_USE_SYSTEM_FMT
+       "回退 fmt 时优先使用系统已安装的 fmt（默认关闭）" OFF)
+
+if(LIBXCP_HAS_CXX20_STD_FORMAT)
+  message(STATUS "libxcp: 使用标准库 std::format")
+else()
+  message(STATUS "libxcp: 当前工具链缺少 std::format，回退到 fmt")
+  if(LIBXCP_USE_SYSTEM_FMT AND NOT TARGET fmt::fmt-header-only
+     AND NOT TARGET fmt::fmt)
+    find_package(fmt CONFIG QUIET)
+  endif()
+  if(NOT TARGET fmt::fmt-header-only AND NOT TARGET fmt::fmt)
+    include(FetchContent)
+    # 在函数作用域内固定 fmt 的构建选项，避免改写父工程缓存。
+    function(libxcp_fetch_fmt)
+      set(FMT_INSTALL OFF CACHE BOOL "" FORCE)
+      set(FMT_TEST OFF CACHE BOOL "" FORCE)
+      set(FMT_DOC OFF CACHE BOOL "" FORCE)
+      FetchContent_Declare(
+        fmt
+        URL https://github.com/fmtlib/fmt/archive/refs/tags/11.2.0.tar.gz
+        URL_HASH SHA256=bc23066d87ab3168f27cef3e97d545fa63314f5c79df5ea444d41d56f962c6af
+        ${LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS})
+      FetchContent_MakeAvailable(fmt)
+    endfunction()
+    libxcp_fetch_fmt()
+  endif()
+  if(NOT TARGET fmt::fmt-header-only AND NOT TARGET fmt::fmt)
+    message(FATAL_ERROR
+      "当前工具链缺少 std::format，且未能提供 fmt：请安装 fmt 11.x CONFIG 包、"
+      "设置 FETCHCONTENT_SOURCE_DIR_FMT，或改用支持 std::format 的编译器。")
+  endif()
+endif()
+
+# 格式化后端入口目标：只负责把宏与包含路径传播给需要的目标；
+# 具体用哪个后端由公共头自探测，避免依赖传播遗漏导致静默换实现。
+add_library(libxcp_format INTERFACE)
+add_library(libxcp::format ALIAS libxcp_format)
+target_include_directories(libxcp_format INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+if(NOT LIBXCP_HAS_CXX20_STD_FORMAT)
+  target_compile_definitions(libxcp_format INTERFACE LIBXCP_HAVE_FMT=1)
+  # header-only 形态：不产生链接产物，公共头因此不引入额外的二进制 ABI 依赖。
+  if(TARGET fmt::fmt-header-only)
+    target_link_libraries(libxcp_format INTERFACE fmt::fmt-header-only)
+  else()
+    target_link_libraries(libxcp_format INTERFACE fmt::fmt)
+  endif()
+endif()
+
+# 日志后端 glog 仅在开启日志时解析；关闭时不触碰任何日志依赖。
+if(LIBXCP_ENABLE_LOG)
   if(NOT TARGET glog::glog)
     # 程序日志生命周期依赖 IsGoogleLoggingInitialized，旧版 glog 不满足此接口。
     find_package(glog 0.7.1 CONFIG QUIET)
@@ -101,7 +191,7 @@ if(LIBXCP_ENABLE_LOG)
         glog
         URL https://github.com/google/glog/archive/v0.7.1.zip
         URL_HASH SHA256=c17d85c03ad9630006ef32c7be7c65656aba2e7e2fbfc82226b7e680c771fc88
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+        ${LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS})
       FetchContent_MakeAvailable(glog)
     endfunction()
     libxcp_fetch_glog()
@@ -234,6 +324,8 @@ target_include_directories(libxcp
         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_definitions(libxcp PUBLIC
         LIBXCP_ENABLE_LOG=$<BOOL:${LIBXCP_ENABLE_LOG}>)
+# std::format / fmt 后端入口：公共头 log.hpp 依赖它，必须对消费者可见。
+target_link_libraries(libxcp PUBLIC libxcp::format)
 
 # 协议核心仅依赖线程库（Session/Executor 内部同步）；
 # UdpTransport 使用平台 Socket，Windows 需显式链接 ws2_32。
@@ -279,6 +371,10 @@ function(libxcp_configure_program_logging target)
   endif()
   if(LIBXCP_ENABLE_LOG)
     target_link_libraries(${target} PRIVATE libxcp_program_logging)
+    # 日志宏内部走 format_compat：除 glog 外还必须获得格式化后端
+    # （有 std::format 时为空实现，否则是 fmt）。不链接 libxcp 核心的目标
+    # （如纯 XCPlite 的 xcp_slave_demo）尤其不能漏。
+    target_link_libraries(${target} PRIVATE libxcp::format)
   else()
     target_compile_definitions(${target} PRIVATE LIBXCP_ENABLE_LOG=0)
   endif()

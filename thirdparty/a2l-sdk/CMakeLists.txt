@@ -20,7 +20,9 @@
 # 在目标级处理跨平台构建差异（日志实现替换、标准头兼容），不写入子模块。
 # =============================================================================
 
-cmake_minimum_required(VERSION 3.24)
+# 最低版本 3.20：与 thirdparty/a2llib 上游声明一致；本工程未使用 3.21+ 的新命令，
+# 降到这里才能直接使用 Ubuntu 22.04 自带的 CMake 3.22。
+cmake_minimum_required(VERSION 3.20)
 
 project(liba2l_sdk
         VERSION 0.1.0
