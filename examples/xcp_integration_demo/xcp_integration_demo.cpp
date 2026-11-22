@@ -848,6 +848,42 @@ Bytes FetchAndSaveA2l(const Options& o) {
     return a2l_bytes;
 }
 
+// 判断刚上传的 A2L 是否已经包含全部待观测符号。
+//
+// cpp_demo 从进程在收到 CONNECT 时才把 A2L 定稿；主机若连得过早，标定量
+// （temperature/speed/counter/sum）还没注册，上传内容就会缺符号。这里直接
+// 加载刚写盘的 A2L 并逐个查找，而不是用固定延时去猜「从进程是否就绪」。
+bool UploadedA2lCoversSymbols(const Options& o) {
+    if (o.symbols.empty()) return true;
+    auto loaded = a2l::A2lBridge::Load(
+        o.uploaded_a2l_path.string(),
+        a2l::LoadOptions{.require_if_data_xcp = false});
+    if (!loaded.HasValue()) return false;
+    auto bridge = std::move(loaded).Value();
+    if (bridge == nullptr || bridge->Database() == nullptr) return false;
+    A2lMeasurementDatabase database(*bridge->Database());
+    for (const auto& symbol : o.symbols) {
+        if (!database.Find(symbol).HasValue()) return false;
+    }
+    return true;
+}
+
+// 清理 run-dir 里由从进程生成的 A2L（保留随包附带的 XCP_104.aml）。
+//
+// 从进程发现同名 A2L「版本匹配」时会跳过生成并直接复用，因此重试前必须
+// 删掉上一次的产物，否则新的从进程只会沿用缺符号的旧文件。
+void RemoveGeneratedA2l(const Options& o) {
+    std::error_code iterate_error;
+    for (const auto& entry :
+         fs::directory_iterator(o.run_dir, iterate_error)) {
+        const auto name = entry.path().filename().string();
+        if (entry.path().extension() != ".a2l") continue;
+        if (name == "XCP_104.aml") continue;
+        std::error_code remove_error;
+        fs::remove(entry.path(), remove_error);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -870,7 +906,40 @@ int main(int argc, char** argv) {
             StartLocalCppDemo(options, cpp_demo_process);
         }
         if (options.upload_a2l) {
-            (void)FetchAndSaveA2l(options);
+            // 从进程是异步启动的：XCPlite 在收到 CONNECT 时就把 A2L 定稿，
+            // 连得太早只会拿到「半个 A2L」（缺标定量）。因此先让步、再校验，
+            // 缺符号就重启从进程并逐步加大让步重试；上传本身抛错也一并重试。
+            constexpr int kMaxA2lUploadAttempts = 5;
+            const bool require_symbols =
+                options.cpp_demo_profile && !options.symbols.empty();
+            std::string upload_error;
+            for (int attempt = 1; attempt <= kMaxA2lUploadAttempts; ++attempt) {
+                if (require_symbols) {
+                    std::this_thread::sleep_for(400ms * attempt);
+                }
+                upload_error.clear();
+                try {
+                    (void)FetchAndSaveA2l(options);
+                } catch (const std::exception& error) {
+                    upload_error = error.what();
+                }
+                if (upload_error.empty() &&
+                    (!require_symbols || UploadedA2lCoversSymbols(options))) {
+                    break;
+                }
+                if (attempt >= kMaxA2lUploadAttempts) {
+                    throw std::runtime_error(
+                        upload_error.empty()
+                            ? "上传的 A2L 缺少待观测符号（已重试 " +
+                                  std::to_string(kMaxA2lUploadAttempts) + " 次）"
+                            : "上传 A2L 失败：" + upload_error);
+                }
+                if (require_symbols) {
+                    cpp_demo_process.Stop();
+                    RemoveGeneratedA2l(options);
+                    StartLocalCppDemo(options, cpp_demo_process);
+                }
+            }
             if (options.cpp_demo_profile) {
                 // The vendored demo is finalized for the A2L upload session;
                 // restart the process before creating the measurement

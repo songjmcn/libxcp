@@ -37,6 +37,17 @@ if(POLICY CMP0135)
   cmake_policy(SET CMP0135 NEW)
 endif()
 
+# ExternalProject 直到 CMake 3.24 才认识 DOWNLOAD_EXTRACT_TIMESTAMP 这个关键字；
+# 更早的版本（如 Ubuntu 22.04 自带的 3.22）会把它当成 URL_HASH 的后续片段，
+# 直接以 "URL_HASH is set to ...;DOWNLOAD_EXTRACT_TIMESTAMP;TRUE" 报错中止。
+# 因此统一用该变量按版本传参，而不是在各处重复写死。
+if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
+  set(LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+else()
+  set(LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS "")
+endif()
+
 project(libxcp
         VERSION 2.0.0
         DESCRIPTION "XCP protocol master core (V1.3-V1.5) with UDP/IP transport"
@@ -132,7 +143,7 @@ else()
         fmt
         URL https://github.com/fmtlib/fmt/archive/refs/tags/11.2.0.tar.gz
         URL_HASH SHA256=bc23066d87ab3168f27cef3e97d545fa63314f5c79df5ea444d41d56f962c6af
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+        ${LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS})
       FetchContent_MakeAvailable(fmt)
     endfunction()
     libxcp_fetch_fmt()
@@ -180,7 +191,7 @@ if(LIBXCP_ENABLE_LOG)
         glog
         URL https://github.com/google/glog/archive/v0.7.1.zip
         URL_HASH SHA256=c17d85c03ad9630006ef32c7be7c65656aba2e7e2fbfc82226b7e680c771fc88
-        DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+        ${LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS})
       FetchContent_MakeAvailable(glog)
     endfunction()
     libxcp_fetch_glog()

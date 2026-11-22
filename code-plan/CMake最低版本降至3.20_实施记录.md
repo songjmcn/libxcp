@@ -136,14 +136,41 @@ create_directories: Access is denied.: "C:\Users\songj\AppData\Local\Temp\libxcp
 
 ## 6. 已知影响与后续
 
-1. **Linux 侧仍未打通**：本次只解决了 CMake 版本这一层。Ubuntu 22.04 上真正的硬阻塞是
-   `find_package(Boost CONFIG REQUIRED COMPONENTS locale filesystem process)`——
-   系统 Boost 1.74 只提供 `boost_headers` / `boost_system` 的 CMake config，
-   缺 `locale`/`filesystem`/`process`（`process` 在 1.74 里还没有 config 文件）。
+1. **Linux 侧已打通**：Linux 真正的硬阻塞不是 CMake，而是 Boost——系统 Boost 1.74 只提供
+   `boost_headers` / `boost_system` 的 CMake config，缺 `locale`/`filesystem`/`process`。
+   自建 Boost 1.86 静态库并加 `-fPIC` 后，GCC 11.4 + CMake 3.22.1 可完整构建并跑通全量测试，
+   细节见 `code-plan/Linux_WSL_构建验证_实施记录.md`。
 2. **GCC 13 不是 A2L 栈的需求**：`<format>` 只出现在 `include/libxcp/log.hpp`，
    且被 `#if LIBXCP_ENABLE_LOG` 包住；A2L 栈自己的 `<format>`/ranges 问题已由
    a2l-sdk 的源替换与 PCH 处理。即：日志关闭时 GCC 11 够用，开日志才需要 GCC 13。
-3. `DOWNLOAD_EXTRACT_TIMESTAMP` 在 CMake < 3.24 上只是 warning，已由 CMP0135 NEW 固定语义。
+3. **`DOWNLOAD_EXTRACT_TIMESTAMP` 在 CMake 3.22 上不是 warning，而是硬错误**（实测推翻早前判断）：
+   ExternalProject 直到 3.24 才认识该关键字，3.22 会把它并入 `URL_HASH`，报
+   `URL_HASH is set to SHA256=…;DOWNLOAD_EXTRACT_TIMESTAMP;TRUE but must be ALGO=value`。
+   处置见 §6.1。CMP0135 NEW 只能固定「解压时间戳取归档时间」的语义，不能补上这个关键字。
+
+### 6.1 真实 CMake 3.22.1 的适配（本次补做）
+
+用 Ubuntu 22.04 自带的 `/usr/bin/cmake`（3.22.1）实测，暴露两处必须在 3.22 上才能发现的阻塞：
+
+| 位置 | 问题 | 处置 |
+| --- | --- | --- |
+| `CMakeLists.txt` 顶层 | 无（用于放置公共变量） | 新增 `LIBXCP_DOWNLOAD_EXTRACT_TIMESTAMP_ARGS`：`CMAKE_VERSION >= 3.24` 时为 `DOWNLOAD_EXTRACT_TIMESTAMP TRUE`，否则为空串 |
+| fmt `FetchContent_Declare` | 3.22 下把关键字并入 `URL_HASH` → 配置中止 | 改用上述变量传参 |
+| glog `FetchContent_Declare` | 同上（`URL_HASH is set to SHA256=c17d85c0…;DOWNLOAD_EXTRACT_TIMESTAMP;TRUE`） | 同上 |
+
+实测结果（Ubuntu 22.04 / GCC 11.4 / CMake 3.22.1 / Ninja / LOG=ON / tools+examples+tests）：
+
+```
+CFG_EXIT=0  BUILD_EXIT=0  ERRORS=0      # 433/433 目标
+-- libxcp: 当前工具链缺少 std::format，回退到 fmt
+-- {fmt} version: 11.2.0
+```
+
+即：**CMake 3.22 现在可以完整构建**，与 CI 的 `apt install cmake` 版本一致。
+
+4. **WSL 上的 `file RENAME` 失败不是代码问题**：`/mnt/d` 是 9p 挂载，CMake 3.22 解压 FetchContent
+   包后对目录做 rename 会失败（`ex-fmt-populate1234/fmt-11.2.0 → fmt-src`）。本地验证时用
+   `-DFETCHCONTENT_SOURCE_DIR_{FMT,GLOG,FTXUI}=<已解压源码>` 绕开；CI 在 ext4 上不存在该问题。
 
 ## 7. 复现命令
 

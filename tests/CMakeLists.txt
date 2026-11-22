@@ -110,6 +110,20 @@ if(MSVC)
   target_compile_options(libxcp_tests PRIVATE /utf-8)
 endif()
 
+# ----------------------------------------------------------------------------
+# GCC 11 的 libtsan 不拦截 pthread_cond_clockwait（glibc 2.30+ 提供、libstdc++ 11
+# 用它实现 condition_variable::wait_*），导致「等待期间释放/重取互斥量」没有被建模，
+# 任何 mutex + condition_variable 的正确代码都会被误报成 double lock / data race。
+# 该配置下注入转发 shim，把 clockwait 落到已被 libtsan 拦截的 cond_timedwait 上。
+# 只影响测试可执行文件，不进库本体；详见 code-plan/TSan报错排查_GCClibtsan误报结论.md。
+# ----------------------------------------------------------------------------
+if(LIBXCP_SANITIZER STREQUAL "thread"
+   AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12)
+  target_sources(libxcp_tests PRIVATE tsan_cond_clockwait_shim.cpp)
+  message(STATUS "ThreadSanitizer: 注入 pthread_cond_clockwait 转发 shim（GCC 11 误报规避）")
+endif()
+
 include(GoogleTest)
 gtest_discover_tests(libxcp_tests DISCOVERY_TIMEOUT 60)
 
