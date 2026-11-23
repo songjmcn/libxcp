@@ -130,7 +130,7 @@ else()
   message(STATUS "libxcp: 当前工具链缺少 std::format，回退到 fmt")
   if(LIBXCP_USE_SYSTEM_FMT AND NOT TARGET fmt::fmt-header-only
      AND NOT TARGET fmt::fmt)
-    find_package(fmt CONFIG QUIET)
+    find_package(fmt 11 CONFIG QUIET)
   endif()
   if(NOT TARGET fmt::fmt-header-only AND NOT TARGET fmt::fmt)
     include(FetchContent)

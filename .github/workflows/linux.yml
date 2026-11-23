@@ -112,7 +112,7 @@ jobs:
 
       # 与 build-linux 一致，使用系统自带的 GCC 11。
       # GCC 11 的 libtsan 不拦截 pthread_cond_clockwait，CMake 会在该配置下为
-      # libxcp_tests 注入转发 shim（tests/support/pthread_cond_clockwait_shim.cpp），
+      # libxcp_tests 注入转发 shim（tests/tsan_cond_clockwait_shim.cpp），
       # 详见 code-plan/TSan报错排查_GCClibtsan误报结论.md。
       - name: 安装构建工具
         run: |

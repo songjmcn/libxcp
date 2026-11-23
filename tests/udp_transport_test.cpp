@@ -1537,6 +1537,15 @@ TEST(UdpTransportLifecycle, WarningCallbackMayReadLastReceiveCtr) {
     transport.Send(BytesView{BytesOf({0xFD, 0x00})});
 
     EXPECT_TRUE(listener.WaitForWarnings(1, std::chrono::seconds(2)));
+    // WaitForWarnings 等的是"告警已入队"，而入队发生在
+    // RecordingListener::OnTransportWarning 内、ReentrantWarningListener 的
+    // 重入回读之前。TSan 下回调变慢，主线程可能抢在 m_reentered 置位前断言，
+    // 造成偶发假失败（实测 TSan 反复跑 6 次挂 1 次，非 TSan 跑 10 次全过）。
+    // 故这里自旋等待重入标志，给回调线程留出完成窗口。
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!listener.Reentered() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
     EXPECT_TRUE(listener.Reentered());
     transport.Close();
     slave.Stop();

@@ -121,6 +121,11 @@ if(LIBXCP_SANITIZER STREQUAL "thread"
    AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
    AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 12)
   target_sources(libxcp_tests PRIVATE tsan_cond_clockwait_shim.cpp)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # shim 自身也有语义风险（时钟基准换算错误会从"误报"退化成"永久挂起"），
+    # 故只有真正编译 shim 时才把它的回归用例加进来。
+    target_sources(libxcp_tests PRIVATE tsan_cond_clockwait_shim_test.cpp)
+  endif()
   message(STATUS "ThreadSanitizer: 注入 pthread_cond_clockwait 转发 shim（GCC 11 误报规避）")
 endif()
 

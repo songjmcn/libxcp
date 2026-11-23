@@ -12,16 +12,38 @@
 //
 // 处置
 // ----
-// 在 TSan + GCC(<12) 的测试可执行文件里定义同名符号，把按指定时钟的超时换算成
-// CLOCK_REALTIME 的绝对时刻后转调 pthread_cond_timedwait()；
+// 在 TSan + GCC(<12) 的测试可执行文件里定义同名符号，先算出相对剩余时长，
+// 再用 **CLOCK_REALTIME** 的 now + 剩余时长构造死线，转调 pthread_cond_timedwait()；
 // libtsan 对该函数有完整拦截，于是互斥量释放/重取被正确建模，误报消失。
 //
-// 约束
+// 为什么是 CLOCK_REALTIME 而不是 clock_id
+// ----
+// pthread_cond_timedwait **不接收 clock 参数**，它解释 abstime 时只用条件变量
+// 创建时绑定的那个时钟。而调用方传来的 clock_id 与 cond 的绑定时钟**可以不同**：
+//
+//   场景                                传入 clock_id    cond 绑定时钟
+//   libstdc++ wait_until(steady_clock)    REALTIME         MONOTONIC
+//   原生 pthread / Boost.Asio（若出现）   MONOTONIC        MONOTONIC
+//
+// libstdc++ 在 condition_variable:200 已经把 steady_clock 死线换算成
+// **CLOCK_REALTIME 绝对时刻**再调用 clockwait，所以按 REALTIME 取 now 造死线
+// 与它传入的 abstime 基准一致，是正确路径；反过来按 clock_id 取 now 会得到
+// ~0 的剩余时长，让 wait_until 立即返回（测试变绿但语义已坏，即假绿）。
+//
+// 约束（必须读，改动本文件前先看这一节）
 // ----
 // - 仅在 Linux/glibc 上生效：其它平台编译为空翻译单元。
 // - 仅由 tests/CMakeLists.txt 在 `LIBXCP_SANITIZER=thread` 且 GCC < 12 时加入
 //   libxcp_tests，不进入库本体，也不影响普通构建。
-// - 语义与 clockwait 一致：超时按调用时给出的时钟计算，已过期则立即返回。
+// - **已知边界**：若出现「MONOTONIC 绑定的 condvar + MONOTONIC 死线」，
+//   本 shim 会把 REALTIME 死线当成"MONOTONIC 轴上十几亿秒之后"而永久挂起
+//   （实测 REALTIME 与 MONOTONIC 相差约 17.95 亿秒，见
+//   docs/review/TSAN-RECHECK-PR25.md）。当前仓库 4 处 wait_until 全部经
+//   libstdc++（传 REALTIME），触发不到；一旦命中，CI 会以超时方式显式失败，
+//   不会静默通过。彻底根治需要 hook pthread_cond_init 维护 cond→clock 映射，
+//   glibc 不导出可转调的 __pthread_cond_init，本轮不做。
+// - 见 tests/tsan_cond_clockwait_shim_test.cpp 的 `SteadyClockWaitActuallyWaits`：
+//   它守住"不得假绿"这条线。
 
 // __GLIBC__ 由 <features.h> 定义，必须在条件编译之前先包含它，
 // 否则下面的 #if 永远为假（本文件曾因此被编译成空翻译单元，shim 静默失效）。
@@ -33,6 +55,9 @@
 
 #include <pthread.h>
 #include <time.h>
+
+// EINVAL 来自 <errno.h>；<pthread.h> 不保证间接引入它。
+#include <errno.h>
 
 namespace {
 
@@ -56,11 +81,12 @@ int pthread_cond_clockwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
                            const struct timespec* abstime) noexcept {
     struct timespec base{};
     if (abstime == nullptr || !ReadClock(clock_id, base)) {
-        // 拿不到基准时钟：退回原语，行为由 libc 决定，不吞掉错误。
-        return ::pthread_cond_timedwait(cond, mutex, abstime);
+        // 拿不到基准时钟：此时 abstime 的相对时长无法计算。
+        // 直接返回 EINVAL，让错误在测试里立刻暴露，而不是静默变成死等。
+        return EINVAL;
     }
 
-    // 先算出相对剩余时间，再换算到 CLOCK_REALTIME，避免两种时钟基准混用。
+    // 先算出「以 clock_id 为基准」的相对剩余时长（相对时长跨时钟可移植）。
     long long delta_ns =
         static_cast<long long>(abstime->tv_sec - base.tv_sec) * 1000000000LL +
         (static_cast<long long>(abstime->tv_nsec) - base.tv_nsec);
@@ -68,9 +94,12 @@ int pthread_cond_clockwait(pthread_cond_t* cond, pthread_mutex_t* mutex,
         delta_ns = 0;  // 已过期：立即超时，与 clockwait 语义一致
     }
 
+    // 死线用 CLOCK_REALTIME 构造：libstdc++ 传入的 abstime 已经是 REALTIME
+    // 绝对时刻（condition_variable:200），二者基准一致。
+    // 用 clock_id 取 now 会让 steady_clock 路径的 delta≈0，造成假绿。
     struct timespec realtime_now{};
     if (!ReadClock(CLOCK_REALTIME, realtime_now)) {
-        return ::pthread_cond_timedwait(cond, mutex, abstime);
+        return EINVAL;
     }
 
     struct timespec deadline = realtime_now;
