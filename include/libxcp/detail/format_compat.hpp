@@ -10,8 +10,10 @@
  * 2. 否则若构建系统定义了 LIBXCP_HAVE_FMT，使用 fmt；
  * 3. 两者都不可用时直接触发 #error，避免静默退化成不可读的输出。
  *
- * 说明：本头文件自行探测后端，不依赖编译定义从目标传播下来，
- * 因此某个目标漏链 libxcp::format 时会在编译期立即暴露，而不是悄悄换后端。
+ * 说明：本头文件只探测标准库是否提供 std::format；是否可用 fmt 由构建系统
+ * 定义 LIBXCP_HAVE_FMT 告知（该定义由 libxcp::format 目标传播）。
+ * 这里刻意不使用 __has_include(<fmt/format.h>) 之类的自探测：那会把
+ * "某目标漏链 libxcp::format"从编译期硬错退化成运行时静默换后端。
  */
 
 #include <string>
@@ -27,7 +29,7 @@
 /** @brief 标记当前使用 fmt 后端。 */
 #define LIBXCP_FORMAT_BACKEND_FMT 1
 #else
-#error "缺少 std::format；请通过 CMake 构建（配置期会自动启用 fmt 回退）"
+#error "libxcp 格式化后端未就绪：当前编译器没有 std::format，且未定义 LIBXCP_HAVE_FMT。请把目标链接到 libxcp::format（libxcp 核心已 PUBLIC 传播），或在 CMake 中确认配置期已启用 fmt 回退（配置日志应出现“回退到 fmt”）。"
 #endif
 
 namespace calmcar::xcp::detail {

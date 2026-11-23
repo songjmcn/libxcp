@@ -161,7 +161,8 @@ TCP/UDP 传输层已按平台分文件，公共层不再出现任何原生 Socke
 
 ### 3.1 环境要求
 
-- CMake ≥ 3.24，C++20 编译器（Windows 默认 VS 2022 生成器，根脚本自动指定）
+- CMake ≥ 3.20，C++20 编译器（Windows 默认 VS 2022 生成器，根脚本自动指定）；
+  缺少 std::format 的编译器（如 GCC 11）会在配置期自动回退到 fmt
 - 跑测试需 GoogleTest：在线 FetchContent 拉取；离线环境预置
   `.deps-cache/googletest/`（自动改用本地源）
 - **Boost 为硬依赖**（A2L 栈必编所致）：CONFIG 包，组件 locale / filesystem /
